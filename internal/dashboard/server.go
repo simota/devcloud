@@ -60,7 +60,8 @@ func (s *Server) Run(ctx context.Context) error {
 
 func (s *Server) routes() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/", s.handleIndex)
+	mux.HandleFunc("/", s.handleServiceIndex)
+	mux.HandleFunc("/mail", s.handleMailIndex)
 	mux.HandleFunc("/s3", s.handleS3Index)
 	mux.HandleFunc("/api/messages", s.handleMessages)
 	mux.HandleFunc("/api/messages/", s.handleMessage)
@@ -70,7 +71,16 @@ func (s *Server) routes() http.Handler {
 	return mux
 }
 
-func (s *Server) handleIndex(w http.ResponseWriter, _ *http.Request) {
+func (s *Server) handleServiceIndex(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/" {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	io.WriteString(w, serviceIndexHTML)
+}
+
+func (s *Server) handleMailIndex(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	io.WriteString(w, indexHTML)
 }

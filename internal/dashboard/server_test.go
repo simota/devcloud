@@ -100,9 +100,35 @@ func (s *dashboardStore) DeleteAll(context.Context) error {
 	return nil
 }
 
-func TestIndexServesStaticMailDashboard(t *testing.T) {
+func TestIndexServesServiceLinks(t *testing.T) {
 	server := NewServer(Config{}, newDashboardStore(nil, nil))
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	rec := httptest.NewRecorder()
+
+	server.routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+	if got := rec.Header().Get("Content-Type"); !strings.HasPrefix(got, "text/html") {
+		t.Fatalf("Content-Type = %q, want text/html", got)
+	}
+	body := rec.Body.String()
+	for _, want := range []string{
+		"devcloud Services",
+		`href="/mail"`,
+		`href="/s3"`,
+		"Local service dashboards",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("service index HTML missing %q", want)
+		}
+	}
+}
+
+func TestMailPathServesStaticMailDashboard(t *testing.T) {
+	server := NewServer(Config{}, newDashboardStore(nil, nil))
+	req := httptest.NewRequest(http.MethodGet, "/mail", nil)
 	rec := httptest.NewRecorder()
 
 	server.routes().ServeHTTP(rec, req)
