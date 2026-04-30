@@ -654,12 +654,6 @@ Routes:
 
 If routing simplicity is preferred for the next implementation slice, `/` may remain Mail and `/s3` can be added independently.
 
-### Mock Reference
-
-`mock/s3/` is the interactive reference artifact for this design. It should be used to validate layout, density, empty states, dialogs, and responsive behavior before implementing the Go-served dashboard.
-
-Do not port the mock's React/Vite dependency graph into production by default. The production dashboard remains static HTML/CSS/JS served from Go unless a separate architecture decision changes that direction.
-
 ### Later
 
 When 3+ services exist, introduce a shared dashboard shell:
