@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"devcloud/internal/services/mail"
+	s3svc "devcloud/internal/services/s3"
 )
 
 type dashboardStore struct {
@@ -99,9 +100,35 @@ func (s *dashboardStore) DeleteAll(context.Context) error {
 	return nil
 }
 
-func TestIndexServesStaticMailDashboard(t *testing.T) {
+func TestIndexServesServiceLinks(t *testing.T) {
 	server := NewServer(Config{}, newDashboardStore(nil, nil))
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	rec := httptest.NewRecorder()
+
+	server.routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+	if got := rec.Header().Get("Content-Type"); !strings.HasPrefix(got, "text/html") {
+		t.Fatalf("Content-Type = %q, want text/html", got)
+	}
+	body := rec.Body.String()
+	for _, want := range []string{
+		"devcloud Services",
+		`href="/mail"`,
+		`href="/s3"`,
+		"Local service dashboards",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("service index HTML missing %q", want)
+		}
+	}
+}
+
+func TestMailPathServesStaticMailDashboard(t *testing.T) {
+	server := NewServer(Config{}, newDashboardStore(nil, nil))
+	req := httptest.NewRequest(http.MethodGet, "/mail", nil)
 	rec := httptest.NewRecorder()
 
 	server.routes().ServeHTTP(rec, req)
@@ -127,6 +154,138 @@ func TestIndexServesStaticMailDashboard(t *testing.T) {
 	for _, forbidden := range []string{"react", "vite", "tailwind"} {
 		if strings.Contains(strings.ToLower(body), forbidden) {
 			t.Fatalf("dashboard HTML unexpectedly contains %q", forbidden)
+		}
+	}
+}
+
+func TestS3DashboardPageAndAPIExposeObjects(t *testing.T) {
+	s3Store := s3svc.NewFileBucketStore(t.TempDir())
+	if _, created, err := s3Store.CreateBucket(context.Background(), "demo-bucket"); err != nil || !created {
+		t.Fatalf("create bucket created=%t err=%v", created, err)
+	}
+	if _, err := s3Store.PutObject(context.Background(), s3svc.PutObjectInput{
+		Bucket:      "demo-bucket",
+		Key:         "docs/readme.txt",
+		Body:        strings.NewReader("hello from dashboard\n"),
+		ContentType: "text/plain",
+		Metadata:    map[string]string{"source": "dashboard-test"},
+	}); err != nil {
+		t.Fatalf("put object: %v", err)
+	}
+	if _, err := s3Store.PutObject(context.Background(), s3svc.PutObjectInput{
+		Bucket:      "demo-bucket",
+		Key:         "docs/read%2Fme.txt",
+		Body:        strings.NewReader("literal percent key\n"),
+		ContentType: "text/plain",
+	}); err != nil {
+		t.Fatalf("put object with escaped-looking key: %v", err)
+	}
+	routes := NewServer(Config{
+		S3Endpoint:    "http://127.0.0.1:4566",
+		S3Region:      "us-east-1",
+		S3AuthMode:    "relaxed",
+		S3StoragePath: ".devcloud/data/s3",
+	}, newDashboardStore(nil, nil), s3Store).routes()
+
+	page := performRequest(routes, http.MethodGet, "/s3")
+	if page.Code != http.StatusOK {
+		t.Fatalf("s3 page status = %d, want %d", page.Code, http.StatusOK)
+	}
+	if body := page.Body.String(); !strings.Contains(body, "devcloud S3") || !strings.Contains(body, "/api/s3/buckets") {
+		t.Fatalf("s3 page missing expected shell: %s", body)
+	}
+
+	status := performRequest(routes, http.MethodGet, "/api/s3/status")
+	if status.Code != http.StatusOK {
+		t.Fatalf("s3 status code = %d, want %d", status.Code, http.StatusOK)
+	}
+	if !strings.Contains(status.Body.String(), `"running"`) {
+		t.Fatalf("s3 status missing running state: %s", status.Body.String())
+	}
+
+	buckets := performRequest(routes, http.MethodGet, "/api/s3/buckets")
+	if buckets.Code != http.StatusOK {
+		t.Fatalf("s3 buckets code = %d, want %d", buckets.Code, http.StatusOK)
+	}
+	if !strings.Contains(buckets.Body.String(), "demo-bucket") {
+		t.Fatalf("s3 buckets missing bucket: %s", buckets.Body.String())
+	}
+
+	objects := performRequest(routes, http.MethodGet, "/api/s3/buckets/demo-bucket/objects?prefix=docs/")
+	if objects.Code != http.StatusOK {
+		t.Fatalf("s3 objects code = %d, want %d", objects.Code, http.StatusOK)
+	}
+	body := objects.Body.String()
+	for _, want := range []string{"docs/readme.txt", `"contentType":"text/plain"`, `"source":"dashboard-test"`, "s3://demo-bucket/docs/readme.txt"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("s3 objects missing %q: %s", want, body)
+		}
+	}
+	var objectList struct {
+		Objects []struct {
+			Key         string `json:"key"`
+			DownloadURL string `json:"downloadUrl"`
+		} `json:"objects"`
+	}
+	if err := json.Unmarshal(objects.Body.Bytes(), &objectList); err != nil {
+		t.Fatalf("decode object list: %v", err)
+	}
+	var escapedLookingDownloadURL string
+	for _, object := range objectList.Objects {
+		if object.Key == "docs/read%2Fme.txt" {
+			escapedLookingDownloadURL = object.DownloadURL
+		}
+	}
+	if escapedLookingDownloadURL == "" {
+		t.Fatalf("object list missing escaped-looking key: %s", objects.Body.String())
+	}
+
+	download := performRequest(routes, http.MethodGet, "/api/s3/buckets/demo-bucket/objects/docs/readme.txt/download")
+	if download.Code != http.StatusOK {
+		t.Fatalf("s3 download code = %d, want %d", download.Code, http.StatusOK)
+	}
+	if got := download.Body.String(); got != "hello from dashboard\n" {
+		t.Fatalf("s3 download body = %q", got)
+	}
+	if got := download.Header().Get("Content-Type"); got != "text/plain" {
+		t.Fatalf("s3 download Content-Type = %q, want text/plain", got)
+	}
+	if got := download.Header().Get("x-amz-meta-source"); got != "dashboard-test" {
+		t.Fatalf("s3 download metadata = %q, want dashboard-test", got)
+	}
+	if got := download.Header().Get("Content-Disposition"); got != `attachment; filename="readme.txt"` {
+		t.Fatalf("s3 download Content-Disposition = %q", got)
+	}
+
+	escapedLookingDownload := performRequest(routes, http.MethodGet, escapedLookingDownloadURL)
+	if escapedLookingDownload.Code != http.StatusOK {
+		t.Fatalf("escaped-looking key download code = %d, want %d; body=%s", escapedLookingDownload.Code, http.StatusOK, escapedLookingDownload.Body.String())
+	}
+	if got := escapedLookingDownload.Body.String(); got != "literal percent key\n" {
+		t.Fatalf("escaped-looking key download body = %q", got)
+	}
+}
+
+func TestS3DashboardEscapesDynamicObjectValues(t *testing.T) {
+	for _, want := range []string{
+		"function escapeHTML(value)",
+		"escapeHTML(object.key)",
+		"escapeHTML(object.s3Uri)",
+		"escapeHTML(metadata[key])",
+		"data-index",
+	} {
+		if !strings.Contains(s3IndexHTML, want) {
+			t.Fatalf("s3 dashboard HTML missing %q", want)
+		}
+	}
+	for _, forbidden := range []string{
+		`data-bucket="' + bucket.name + '"`,
+		`<td class="key">' + object.key + '</td>`,
+		`<dt>Key</dt><dd>' + object.key + '</dd>`,
+		`metadata[key] + '</dd>`,
+	} {
+		if strings.Contains(s3IndexHTML, forbidden) {
+			t.Fatalf("s3 dashboard HTML still contains unsafe interpolation %q", forbidden)
 		}
 	}
 }

@@ -1,5 +1,115 @@
 package dashboard
 
+const serviceIndexHTML = `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>devcloud Services</title>
+  <style>
+    :root {
+      --surface-base: #f7f8f5;
+      --surface-panel: #ffffff;
+      --text-primary: #1d211c;
+      --text-secondary: #5f675d;
+      --border: #d9ded5;
+      --accent: #176b4d;
+      --accent-soft: #ddefe7;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: linear-gradient(180deg, var(--surface-base), #f2f4ee);
+      color: var(--text-primary);
+      font: 14px/20px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    main {
+      width: min(960px, calc(100vw - 32px));
+      margin: 0 auto;
+      padding: 48px 0;
+    }
+    header {
+      display: flex;
+      align-items: flex-end;
+      justify-content: space-between;
+      gap: 20px;
+      margin-bottom: 24px;
+    }
+    h1 {
+      margin: 0;
+      font-size: 28px;
+      line-height: 36px;
+      font-weight: 650;
+    }
+    p {
+      margin: 6px 0 0;
+      color: var(--text-secondary);
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+      gap: 12px;
+    }
+    .service {
+      display: block;
+      min-height: 150px;
+      padding: 18px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--surface-panel);
+      color: inherit;
+      text-decoration: none;
+      box-shadow: 0 1px 2px rgba(0,0,0,0.04);
+    }
+    .service:hover {
+      border-color: #b9c4b5;
+      box-shadow: 0 8px 22px rgba(24, 35, 26, 0.08);
+    }
+    .service h2 {
+      margin: 0 0 8px;
+      font-size: 18px;
+      line-height: 24px;
+    }
+    .meta {
+      display: inline-flex;
+      margin-top: 18px;
+      border-radius: 999px;
+      padding: 4px 10px;
+      background: var(--accent-soft);
+      color: var(--accent);
+      font-weight: 650;
+      font-size: 12px;
+    }
+    code {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <div>
+        <h1>devcloud</h1>
+        <p>Local service dashboards for development and E2E inspection.</p>
+      </div>
+    </header>
+    <section class="grid" aria-label="Services">
+      <a class="service" href="/mail">
+        <h2>Mail</h2>
+        <p>Inspect messages received by the local SMTP server.</p>
+        <span class="meta">SMTP <code>127.0.0.1:1025</code></span>
+      </a>
+      <a class="service" href="/s3">
+        <h2>S3</h2>
+        <p>Browse buckets, objects, metadata, and local S3 activity.</p>
+        <span class="meta">S3 <code>127.0.0.1:4566</code></span>
+      </a>
+    </section>
+  </main>
+</body>
+</html>`
+
 const indexHTML = `<!doctype html>
 <html lang="en">
 <head>

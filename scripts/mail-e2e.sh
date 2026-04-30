@@ -97,7 +97,7 @@ EOF
 
 assert_dashboard_shell() {
   local html_file="${TMP_DIR}/dashboard.html"
-  curl -fsS "http://127.0.0.1:${DASHBOARD_PORT}/" > "${html_file}"
+  curl -fsS "http://127.0.0.1:${DASHBOARD_PORT}/mail" > "${html_file}"
   grep -q '<title>devcloud Mail</title>' "${html_file}"
   grep -q 'aria-label="Inbox"' "${html_file}"
   grep -q 'id="messages"' "${html_file}"
@@ -189,7 +189,7 @@ PY
 show_interactive_hint() {
   cat <<EOF
 [e2e] browser check:
-[e2e]   URL: http://127.0.0.1:${DASHBOARD_PORT}/
+[e2e]   URL: http://127.0.0.1:${DASHBOARD_PORT}/mail
 [e2e]   Expected message subject is printed above.
 [e2e]   Use Refresh if the inbox is already open.
 EOF

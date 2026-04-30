@@ -13,7 +13,7 @@ go run ./cmd/devcloud up
 Open the dashboard:
 
 ```text
-http://127.0.0.1:8025/
+http://127.0.0.1:8025/mail
 ```
 
 Send mail to:
@@ -44,10 +44,28 @@ Run the Mail MVP acceptance gate:
 VERIFY_STAGE=full bash scripts/mail-autoloop/verify.sh
 ```
 
+Run the S3 implementation loop foundation gate:
+
+```bash
+VERIFY_STAGE=foundation bash scripts/s3-autoloop/verify.sh
+```
+
 Run the E2E smoke test:
 
 ```bash
 scripts/mail-e2e.sh
+```
+
+Run the S3 E2E smoke test with `awscli-local`:
+
+```bash
+scripts/s3-e2e.sh
+```
+
+Keep the S3 server running after the E2E journey so you can inspect the bucket and objects:
+
+```bash
+E2E_INTERACTIVE=true scripts/s3-e2e.sh
 ```
 
 Run the E2E script in browser inspection mode. This keeps the server running and leaves the smoke mail visible in the Web UI until `Ctrl-C`.
@@ -60,10 +78,13 @@ If the default ports are already in use:
 
 ```bash
 E2E_INTERACTIVE=true E2E_SMTP_PORT=1125 E2E_DASHBOARD_PORT=8125 scripts/mail-e2e.sh
+E2E_INTERACTIVE=true E2E_S3_PORT=14566 E2E_DASHBOARD_PORT=18025 E2E_SMTP_PORT=11025 scripts/s3-e2e.sh
 ```
 
 ## Notes
 
 - Runtime data is stored under `.devcloud/`.
 - `scripts/mail-autoloop/` contains the Codex-driven implementation loop and final verification gate.
+- `scripts/s3-autoloop/` contains the Codex-driven implementation loop for the S3-compatible server.
 - `mock/mail/` contains the design mock used as the Web UI reference.
+- `mock/s3/` contains the S3 Object Explorer design mock.
