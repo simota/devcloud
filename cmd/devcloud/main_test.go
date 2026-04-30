@@ -9,7 +9,7 @@ import (
 )
 
 func TestRunInitCreatesWorkspace(t *testing.T) {
-	t.Chdir(t.TempDir())
+	chdir(t, t.TempDir())
 
 	if _, err := captureStdout(func() error {
 		return run([]string{"init"})
@@ -30,7 +30,7 @@ func TestRunInitCreatesWorkspace(t *testing.T) {
 }
 
 func TestRunDashboardPrintsConfiguredURL(t *testing.T) {
-	t.Chdir(t.TempDir())
+	chdir(t, t.TempDir())
 	if err := os.MkdirAll(".devcloud", 0o755); err != nil {
 		t.Fatalf("create .devcloud: %v", err)
 	}
@@ -51,7 +51,7 @@ func TestRunDashboardPrintsConfiguredURL(t *testing.T) {
 }
 
 func TestRunResetRecreatesStorage(t *testing.T) {
-	t.Chdir(t.TempDir())
+	chdir(t, t.TempDir())
 
 	if _, err := captureStdout(func() error {
 		return run([]string{"init"})
@@ -98,4 +98,20 @@ func captureStdout(fn func() error) (string, error) {
 		return string(data), closeErr
 	}
 	return string(data), readErr
+}
+
+func chdir(t *testing.T, dir string) {
+	t.Helper()
+	original, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("get working directory: %v", err)
+	}
+	if err := os.Chdir(dir); err != nil {
+		t.Fatalf("change working directory: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := os.Chdir(original); err != nil {
+			t.Fatalf("restore working directory: %v", err)
+		}
+	})
 }
