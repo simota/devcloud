@@ -7,7 +7,7 @@ import (
 )
 
 func TestInitWorkspaceCreatesDefaultsWithoutOverwritingConfig(t *testing.T) {
-	t.Chdir(t.TempDir())
+	chdir(t, t.TempDir())
 	cfg := DefaultConfig()
 
 	if err := InitWorkspace(cfg); err != nil {
@@ -92,7 +92,7 @@ func TestLoadConfigUsesDefaultsWhenConfigIsMissing(t *testing.T) {
 }
 
 func TestWorkspaceStoragePathMustStayUnderDevcloud(t *testing.T) {
-	t.Chdir(t.TempDir())
+	chdir(t, t.TempDir())
 	cfg := DefaultConfig()
 	cfg.Storage.Path = "data"
 	if err := InitWorkspace(cfg); err == nil {
@@ -146,4 +146,20 @@ func TestLoadConfigIgnoresUnknownKeysAndRejectsInvalidKnownValues(t *testing.T) 
 	if _, err := LoadConfig(unboundedPath); err == nil {
 		t.Fatal("LoadConfig() unbounded maxMessageBytes error = nil")
 	}
+}
+
+func chdir(t *testing.T, dir string) {
+	t.Helper()
+	original, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("get working directory: %v", err)
+	}
+	if err := os.Chdir(dir); err != nil {
+		t.Fatalf("change working directory: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := os.Chdir(original); err != nil {
+			t.Fatalf("restore working directory: %v", err)
+		}
+	})
 }
