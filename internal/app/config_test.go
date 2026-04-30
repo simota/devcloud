@@ -21,6 +21,12 @@ func TestInitWorkspaceCreatesDefaultsWithoutOverwritingConfig(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(cfg.Storage.Path, "mail", "index.json")); err != nil {
 		t.Fatalf("mail index not created: %v", err)
 	}
+	if _, err := os.Stat(filepath.Join(cfg.Storage.Path, "s3", "buckets")); err != nil {
+		t.Fatalf("s3 bucket storage not created: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(cfg.Storage.Path, "s3", "multipart")); err != nil {
+		t.Fatalf("s3 multipart storage not created: %v", err)
+	}
 
 	custom := []byte("project: custom\n")
 	if err := os.WriteFile(configPath, custom, 0o644); err != nil {
@@ -46,10 +52,15 @@ func TestLoadConfigReadsGeneratedConfigValues(t *testing.T) {
 server:
   smtpPort: 2525
   dashboardPort: 8825
+  s3Port: 4567
 
 auth:
   smtp:
     mode: off
+  s3:
+    mode: relaxed
+    accessKeyId: local
+    secretAccessKey: secret
 
 storage:
   path: .devcloud/custom-data
@@ -58,6 +69,14 @@ services:
   mail:
     enabled: true
     maxMessageBytes: 512
+  s3:
+    enabled: true
+    region: ap-northeast-1
+    pathStyle: true
+    virtualHostStyle: true
+    maxObjectBytes: 1024
+    multipart:
+      minPartBytes: 128
 `)
 	if err := os.WriteFile(path, data, 0o644); err != nil {
 		t.Fatalf("write config: %v", err)
@@ -70,14 +89,45 @@ services:
 	if cfg.Project != "custom" {
 		t.Fatalf("Project = %q", cfg.Project)
 	}
-	if cfg.Server.SMTPPort != 2525 || cfg.Server.DashboardPort != 8825 {
+	if cfg.Server.SMTPPort != 2525 || cfg.Server.DashboardPort != 8825 || cfg.Server.S3Port != 4567 {
 		t.Fatalf("Server = %#v", cfg.Server)
+	}
+	if cfg.Auth.S3.AccessKeyID != "local" || cfg.Auth.S3.SecretAccessKey != "secret" {
+		t.Fatalf("Auth.S3 = %#v", cfg.Auth.S3)
 	}
 	if cfg.Storage.Path != ".devcloud/custom-data" {
 		t.Fatalf("Storage.Path = %q", cfg.Storage.Path)
 	}
 	if cfg.Services.Mail.MaxMessageBytes != 512 {
 		t.Fatalf("MaxMessageBytes = %d", cfg.Services.Mail.MaxMessageBytes)
+	}
+	if cfg.Services.S3.Region != "ap-northeast-1" || !cfg.Services.S3.VirtualHostStyle {
+		t.Fatalf("Services.S3 = %#v", cfg.Services.S3)
+	}
+	if cfg.Services.S3.MaxObjectBytes != 1024 || cfg.Services.S3.Multipart.MinPartBytes != 128 {
+		t.Fatalf("Services.S3 sizing = %#v", cfg.Services.S3)
+	}
+}
+
+func TestDefaultConfigIncludesS3Defaults(t *testing.T) {
+	cfg := DefaultConfig()
+	if cfg.Server.S3Port != 4566 {
+		t.Fatalf("Server.S3Port = %d", cfg.Server.S3Port)
+	}
+	if cfg.Auth.S3.Mode != "relaxed" || cfg.Auth.S3.AccessKeyID != "dev" || cfg.Auth.S3.SecretAccessKey != "dev" {
+		t.Fatalf("Auth.S3 = %#v", cfg.Auth.S3)
+	}
+	if !cfg.Services.S3.Enabled || cfg.Services.S3.Region != "us-east-1" {
+		t.Fatalf("Services.S3 = %#v", cfg.Services.S3)
+	}
+	if !cfg.Services.S3.PathStyle || cfg.Services.S3.VirtualHostStyle {
+		t.Fatalf("S3 addressing defaults = %#v", cfg.Services.S3)
+	}
+	if cfg.Services.S3.MaxObjectBytes != 5*1024*1024*1024 {
+		t.Fatalf("MaxObjectBytes = %d", cfg.Services.S3.MaxObjectBytes)
+	}
+	if cfg.Services.S3.Multipart.MinPartBytes != 5*1024*1024 {
+		t.Fatalf("Multipart.MinPartBytes = %d", cfg.Services.S3.Multipart.MinPartBytes)
 	}
 }
 
@@ -108,6 +158,9 @@ func TestWorkspaceStoragePathMustStayUnderDevcloud(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(".devcloud", "custom-data", "mail", "index.json")); err != nil {
 		t.Fatalf("custom mail index not created: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(".devcloud", "custom-data", "s3", "buckets")); err != nil {
+		t.Fatalf("custom s3 bucket storage not created: %v", err)
 	}
 }
 
@@ -145,6 +198,14 @@ func TestLoadConfigIgnoresUnknownKeysAndRejectsInvalidKnownValues(t *testing.T) 
 	}
 	if _, err := LoadConfig(unboundedPath); err == nil {
 		t.Fatal("LoadConfig() unbounded maxMessageBytes error = nil")
+	}
+
+	invalidS3Path := filepath.Join(dir, "invalid-s3.yaml")
+	if err := os.WriteFile(invalidS3Path, []byte("services:\n  s3:\n    multipart:\n      minPartBytes: 0\n"), 0o644); err != nil {
+		t.Fatalf("write invalid s3 config: %v", err)
+	}
+	if _, err := LoadConfig(invalidS3Path); err == nil {
+		t.Fatal("LoadConfig() invalid s3 multipart minPartBytes error = nil")
 	}
 }
 

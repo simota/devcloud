@@ -21,6 +21,8 @@ func TestRunInitCreatesWorkspace(t *testing.T) {
 		filepath.Join(".devcloud", "config.yaml"),
 		filepath.Join(".devcloud", "data", "blobs"),
 		filepath.Join(".devcloud", "data", "mail", "index.json"),
+		filepath.Join(".devcloud", "data", "s3", "buckets"),
+		filepath.Join(".devcloud", "data", "s3", "multipart"),
 		filepath.Join(".devcloud", "logs"),
 	} {
 		if _, err := os.Stat(path); err != nil {
@@ -74,6 +76,9 @@ func TestRunResetRecreatesStorage(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(".devcloud", "data", "mail", "index.json")); err != nil {
 		t.Fatalf("mail index not recreated: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(".devcloud", "data", "s3", "buckets")); err != nil {
+		t.Fatalf("s3 bucket storage not recreated: %v", err)
 	}
 }
 

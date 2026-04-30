@@ -20,14 +20,22 @@ type Config struct {
 type ServerConfig struct {
 	SMTPPort      int
 	DashboardPort int
+	S3Port        int
 }
 
 type AuthConfig struct {
 	SMTP SMTPAuthConfig
+	S3   S3AuthConfig
 }
 
 type SMTPAuthConfig struct {
 	Mode string
+}
+
+type S3AuthConfig struct {
+	Mode            string
+	AccessKeyID     string
+	SecretAccessKey string
 }
 
 type StorageConfig struct {
@@ -36,11 +44,25 @@ type StorageConfig struct {
 
 type ServicesConfig struct {
 	Mail MailServiceConfig
+	S3   S3ServiceConfig
 }
 
 type MailServiceConfig struct {
 	Enabled         bool
 	MaxMessageBytes int64
+}
+
+type S3ServiceConfig struct {
+	Enabled          bool
+	Region           string
+	PathStyle        bool
+	VirtualHostStyle bool
+	MaxObjectBytes   int64
+	Multipart        S3MultipartConfig
+}
+
+type S3MultipartConfig struct {
+	MinPartBytes int64
 }
 
 func DefaultConfig() Config {
@@ -49,15 +71,31 @@ func DefaultConfig() Config {
 		Server: ServerConfig{
 			SMTPPort:      1025,
 			DashboardPort: 8025,
+			S3Port:        4566,
 		},
 		Auth: AuthConfig{
 			SMTP: SMTPAuthConfig{Mode: "off"},
+			S3: S3AuthConfig{
+				Mode:            "relaxed",
+				AccessKeyID:     "dev",
+				SecretAccessKey: "dev",
+			},
 		},
 		Storage: StorageConfig{Path: ".devcloud/data"},
 		Services: ServicesConfig{
 			Mail: MailServiceConfig{
 				Enabled:         true,
 				MaxMessageBytes: 10 * 1024 * 1024,
+			},
+			S3: S3ServiceConfig{
+				Enabled:          true,
+				Region:           "us-east-1",
+				PathStyle:        true,
+				VirtualHostStyle: false,
+				MaxObjectBytes:   5 * 1024 * 1024 * 1024,
+				Multipart: S3MultipartConfig{
+					MinPartBytes: 5 * 1024 * 1024,
+				},
 			},
 		},
 	}
@@ -123,6 +161,12 @@ func InitWorkspace(cfg Config) error {
 	if err := ensureFile(filepath.Join(cfg.Storage.Path, "mail", "index.json"), []byte("{}\n")); err != nil {
 		return fmt.Errorf("create mail index: %w", err)
 	}
+	if err := os.MkdirAll(filepath.Join(cfg.Storage.Path, "s3", "buckets"), 0o755); err != nil {
+		return fmt.Errorf("create s3 bucket storage: %w", err)
+	}
+	if err := os.MkdirAll(filepath.Join(cfg.Storage.Path, "s3", "multipart"), 0o755); err != nil {
+		return fmt.Errorf("create s3 multipart storage: %w", err)
+	}
 	if err := os.MkdirAll(".devcloud/logs", 0o755); err != nil {
 		return fmt.Errorf("create log directory: %w", err)
 	}
@@ -153,10 +197,15 @@ func defaultConfigYAML(cfg Config) string {
 server:
   smtpPort: %d
   dashboardPort: %d
+  s3Port: %d
 
 auth:
   smtp:
     mode: %s
+  s3:
+    mode: %s
+    accessKeyId: %s
+    secretAccessKey: %s
 
 storage:
   path: %s
@@ -165,7 +214,15 @@ services:
   mail:
     enabled: %t
     maxMessageBytes: %d
-`, cfg.Project, cfg.Server.SMTPPort, cfg.Server.DashboardPort, cfg.Auth.SMTP.Mode, cfg.Storage.Path, cfg.Services.Mail.Enabled, cfg.Services.Mail.MaxMessageBytes)
+  s3:
+    enabled: %t
+    region: %s
+    pathStyle: %t
+    virtualHostStyle: %t
+    maxObjectBytes: %d
+    multipart:
+      minPartBytes: %d
+`, cfg.Project, cfg.Server.SMTPPort, cfg.Server.DashboardPort, cfg.Server.S3Port, cfg.Auth.SMTP.Mode, cfg.Auth.S3.Mode, cfg.Auth.S3.AccessKeyID, cfg.Auth.S3.SecretAccessKey, cfg.Storage.Path, cfg.Services.Mail.Enabled, cfg.Services.Mail.MaxMessageBytes, cfg.Services.S3.Enabled, cfg.Services.S3.Region, cfg.Services.S3.PathStyle, cfg.Services.S3.VirtualHostStyle, cfg.Services.S3.MaxObjectBytes, cfg.Services.S3.Multipart.MinPartBytes)
 }
 
 func ensureFile(path string, data []byte) error {
@@ -193,8 +250,20 @@ func applyConfigValue(cfg *Config, path []string, value string) error {
 			return fmt.Errorf("parse server.dashboardPort: %w", err)
 		}
 		cfg.Server.DashboardPort = port
+	case "server.s3Port":
+		port, err := strconv.Atoi(value)
+		if err != nil {
+			return fmt.Errorf("parse server.s3Port: %w", err)
+		}
+		cfg.Server.S3Port = port
 	case "auth.smtp.mode":
 		cfg.Auth.SMTP.Mode = value
+	case "auth.s3.mode":
+		cfg.Auth.S3.Mode = value
+	case "auth.s3.accessKeyId":
+		cfg.Auth.S3.AccessKeyID = value
+	case "auth.s3.secretAccessKey":
+		cfg.Auth.S3.SecretAccessKey = value
 	case "storage.path":
 		cfg.Storage.Path = value
 	case "services.mail.enabled":
@@ -212,6 +281,44 @@ func applyConfigValue(cfg *Config, path []string, value string) error {
 			return fmt.Errorf("parse services.mail.maxMessageBytes: must be positive")
 		}
 		cfg.Services.Mail.MaxMessageBytes = maxBytes
+	case "services.s3.enabled":
+		enabled, err := strconv.ParseBool(value)
+		if err != nil {
+			return fmt.Errorf("parse services.s3.enabled: %w", err)
+		}
+		cfg.Services.S3.Enabled = enabled
+	case "services.s3.region":
+		cfg.Services.S3.Region = value
+	case "services.s3.pathStyle":
+		enabled, err := strconv.ParseBool(value)
+		if err != nil {
+			return fmt.Errorf("parse services.s3.pathStyle: %w", err)
+		}
+		cfg.Services.S3.PathStyle = enabled
+	case "services.s3.virtualHostStyle":
+		enabled, err := strconv.ParseBool(value)
+		if err != nil {
+			return fmt.Errorf("parse services.s3.virtualHostStyle: %w", err)
+		}
+		cfg.Services.S3.VirtualHostStyle = enabled
+	case "services.s3.maxObjectBytes":
+		maxBytes, err := strconv.ParseInt(value, 10, 64)
+		if err != nil {
+			return fmt.Errorf("parse services.s3.maxObjectBytes: %w", err)
+		}
+		if maxBytes <= 0 {
+			return fmt.Errorf("parse services.s3.maxObjectBytes: must be positive")
+		}
+		cfg.Services.S3.MaxObjectBytes = maxBytes
+	case "services.s3.multipart.minPartBytes":
+		minBytes, err := strconv.ParseInt(value, 10, 64)
+		if err != nil {
+			return fmt.Errorf("parse services.s3.multipart.minPartBytes: %w", err)
+		}
+		if minBytes <= 0 {
+			return fmt.Errorf("parse services.s3.multipart.minPartBytes: must be positive")
+		}
+		cfg.Services.S3.Multipart.MinPartBytes = minBytes
 	default:
 		return nil
 	}
