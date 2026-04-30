@@ -129,8 +129,10 @@ func TestIndexServesServiceLinks(t *testing.T) {
 func TestDashboardServicesAPIListsServiceRegistry(t *testing.T) {
 	s3Store := s3svc.NewFileBucketStore(t.TempDir())
 	server := NewServer(Config{
-		MailEndpoint: "smtp://127.0.0.1:2525",
-		S3Endpoint:   "http://127.0.0.1:4567",
+		MailEndpoint:    "smtp://127.0.0.1:2525",
+		MailStoragePath: ".devcloud/test/mail",
+		S3Endpoint:      "http://127.0.0.1:4567",
+		S3StoragePath:   ".devcloud/test/s3",
 	}, newDashboardStore(nil, nil), s3Store)
 
 	rec := performRequest(server.routes(), http.MethodGet, "/api/dashboard/services")
@@ -149,18 +151,20 @@ func TestDashboardServicesAPIListsServiceRegistry(t *testing.T) {
 		t.Fatalf("services len = %d, want 2: %#v", len(response.Services), response.Services)
 	}
 	assertService(t, response.Services[0], DashboardService{
-		ID:       "mail",
-		Name:     "Mail",
-		Path:     "/mail",
-		Status:   "running",
-		Endpoint: "smtp://127.0.0.1:2525",
+		ID:          "mail",
+		Name:        "Mail",
+		Path:        "/mail",
+		Status:      "running",
+		Endpoint:    "smtp://127.0.0.1:2525",
+		StoragePath: ".devcloud/test/mail",
 	})
 	assertService(t, response.Services[1], DashboardService{
-		ID:       "s3",
-		Name:     "S3",
-		Path:     "/s3",
-		Status:   "running",
-		Endpoint: "http://127.0.0.1:4567",
+		ID:          "s3",
+		Name:        "S3",
+		Path:        "/s3",
+		Status:      "running",
+		Endpoint:    "http://127.0.0.1:4567",
+		StoragePath: ".devcloud/test/s3",
 	})
 }
 
@@ -198,6 +202,77 @@ func TestDashboardServicesAPIRejectsUnsupportedMethods(t *testing.T) {
 	if got := rec.Header().Get("Allow"); got != "GET" {
 		t.Fatalf("Allow = %q, want GET", got)
 	}
+}
+
+func TestReactDashboardAssetsServeWithoutInterceptingCompatibilityRoutes(t *testing.T) {
+	routes := NewServer(Config{}, newDashboardStore(nil, nil)).routes()
+
+	index := performRequest(routes, http.MethodGet, "/dashboard/")
+	if index.Code != http.StatusOK {
+		t.Fatalf("react dashboard status = %d, want %d", index.Code, http.StatusOK)
+	}
+	if got := index.Header().Get("Content-Type"); !strings.HasPrefix(got, "text/html") {
+		t.Fatalf("react dashboard Content-Type = %q, want text/html", got)
+	}
+	if body := index.Body.String(); !strings.Contains(body, "devcloud Dashboard") {
+		t.Fatalf("react dashboard index missing title: %s", body)
+	}
+
+	nestedRoute := performRequest(routes, http.MethodGet, "/dashboard/mail")
+	if nestedRoute.Code != http.StatusOK {
+		t.Fatalf("react nested route status = %d, want %d", nestedRoute.Code, http.StatusOK)
+	}
+	if body := nestedRoute.Body.String(); !strings.Contains(body, "devcloud Dashboard") {
+		t.Fatalf("react nested route did not fall back to index: %s", body)
+	}
+	if got := nestedRoute.Header().Get("Cache-Control"); got != "no-cache" {
+		t.Fatalf("react nested route Cache-Control = %q, want no-cache", got)
+	}
+
+	assetPath := reactAssetPath(t, index.Body.String())
+	asset := performRequest(routes, http.MethodGet, assetPath)
+	if asset.Code != http.StatusOK {
+		t.Fatalf("react asset status = %d, want %d for %s", asset.Code, http.StatusOK, assetPath)
+	}
+	if got := asset.Header().Get("Cache-Control"); got != "public, max-age=31536000, immutable" {
+		t.Fatalf("react asset Cache-Control = %q, want immutable cache", got)
+	}
+	missingAsset := performRequest(routes, http.MethodGet, "/dashboard/assets/missing.js")
+	if missingAsset.Code != http.StatusNotFound {
+		t.Fatalf("missing react asset status = %d, want %d", missingAsset.Code, http.StatusNotFound)
+	}
+
+	compatMail := performRequest(routes, http.MethodGet, "/mail")
+	if compatMail.Code != http.StatusOK || !strings.Contains(compatMail.Body.String(), "devcloud Mail") {
+		t.Fatalf("compat mail route changed: status=%d body=%s", compatMail.Code, compatMail.Body.String())
+	}
+
+	registry := performRequest(routes, http.MethodGet, "/api/dashboard/services")
+	if registry.Code != http.StatusOK {
+		t.Fatalf("registry status = %d, want %d", registry.Code, http.StatusOK)
+	}
+	if got := registry.Header().Get("Content-Type"); !strings.HasPrefix(got, "application/json") {
+		t.Fatalf("registry Content-Type = %q, want application/json", got)
+	}
+}
+
+func reactAssetPath(t *testing.T, indexHTML string) string {
+	t.Helper()
+	marker := `src="/dashboard/`
+	start := strings.Index(indexHTML, marker)
+	if start == -1 {
+		marker = `href="/dashboard/`
+		start = strings.Index(indexHTML, marker)
+	}
+	if start == -1 {
+		t.Fatalf("react index missing dashboard asset reference: %s", indexHTML)
+	}
+	start += len(marker) - len("/dashboard/")
+	end := strings.Index(indexHTML[start:], `"`)
+	if end == -1 {
+		t.Fatalf("react index has unterminated asset reference: %s", indexHTML)
+	}
+	return indexHTML[start : start+end]
 }
 
 func TestMailPathServesStaticMailDashboard(t *testing.T) {
@@ -497,7 +572,7 @@ func performRequest(handler http.Handler, method string, target string) *httptes
 
 func assertService(t *testing.T, got DashboardService, want DashboardService) {
 	t.Helper()
-	if got.ID != want.ID || got.Name != want.Name || got.Path != want.Path || got.Status != want.Status || got.Endpoint != want.Endpoint {
+	if got.ID != want.ID || got.Name != want.Name || got.Path != want.Path || got.Status != want.Status || got.Endpoint != want.Endpoint || got.StoragePath != want.StoragePath {
 		t.Fatalf("service = %#v, want fields %#v", got, want)
 	}
 	if got.Description == "" {

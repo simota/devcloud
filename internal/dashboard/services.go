@@ -6,6 +6,7 @@ type DashboardService struct {
 	Path        string `json:"path"`
 	Status      string `json:"status"`
 	Endpoint    string `json:"endpoint,omitempty"`
+	StoragePath string `json:"storagePath,omitempty"`
 	Description string `json:"description"`
 }
 
@@ -21,6 +22,7 @@ func (s *Server) dashboardServices() []DashboardService {
 			Path:        "/mail",
 			Status:      mailServiceStatus(s.config.MailDisabled),
 			Endpoint:    defaultString(s.config.MailEndpoint, "smtp://127.0.0.1:1025"),
+			StoragePath: defaultString(s.config.MailStoragePath, ".devcloud/data/mail"),
 			Description: "Inspect messages received by the local SMTP server.",
 		},
 	}
@@ -31,6 +33,7 @@ func (s *Server) dashboardServices() []DashboardService {
 		Path:        "/s3",
 		Status:      s3ServiceStatus(s.s3 != nil),
 		Endpoint:    defaultString(s.config.S3Endpoint, "http://127.0.0.1:4566"),
+		StoragePath: defaultString(s.config.S3StoragePath, ".devcloud/data/s3"),
 		Description: "Browse buckets, objects, metadata, and local S3 activity.",
 	})
 

@@ -10,10 +10,10 @@ type RouteProps = {
 
 export function renderRoute({ services, path }: RouteProps): JSX.Element {
   if (path === '/mail') {
-    return <MailDashboard />
+    return <MailDashboard service={services.find((service) => service.id === 'mail')} />
   }
   if (path === '/s3') {
-    return <S3Dashboard />
+    return <S3Dashboard service={services.find((service) => service.id === 's3')} />
   }
   return <ServiceIndex services={services} />
 }

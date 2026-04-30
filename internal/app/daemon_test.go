@@ -2,9 +2,11 @@ package app
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -64,6 +66,9 @@ func freeTCPPort(t *testing.T) int {
 	t.Helper()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
+		if errors.Is(err, os.ErrPermission) {
+			t.Skipf("cannot bind loopback TCP port in this environment: %v", err)
+		}
 		t.Fatalf("listen on free port: %v", err)
 	}
 	defer listener.Close()

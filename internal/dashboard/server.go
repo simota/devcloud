@@ -64,6 +64,8 @@ func (s *Server) Run(ctx context.Context) error {
 func (s *Server) routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", s.handleServiceIndex)
+	mux.HandleFunc("/dashboard", s.handleReactDashboardAssets)
+	mux.HandleFunc("/dashboard/", s.handleReactDashboardAssets)
 	mux.HandleFunc("/mail", s.handleMailIndex)
 	mux.HandleFunc("/s3", s.handleS3Index)
 	mux.HandleFunc("/api/dashboard/services", s.handleDashboardServices)

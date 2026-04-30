@@ -10,6 +10,7 @@ export type S3ObjectSummary = {
   etag: string
   contentType: string
   lastModified: string
+  metadata?: Record<string, string>
   s3Uri: string
   downloadUrl: string
 }

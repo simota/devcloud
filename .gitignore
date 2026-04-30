@@ -16,3 +16,12 @@ scripts/s3-autoloop/progress.md
 scripts/s3-autoloop/done.md
 scripts/s3-autoloop/iteration-*.out
 scripts/s3-autoloop/prompt-*.*
+scripts/dashboard-design-renewal-autoloop/.run-loop.lock
+scripts/dashboard-design-renewal-autoloop/.circuit-state
+scripts/dashboard-design-renewal-autoloop/runner.jsonl
+scripts/dashboard-design-renewal-autoloop/runner.log
+scripts/dashboard-design-renewal-autoloop/state.env
+scripts/dashboard-design-renewal-autoloop/progress.md
+scripts/dashboard-design-renewal-autoloop/done.md
+scripts/dashboard-design-renewal-autoloop/iteration-*.out
+scripts/dashboard-design-renewal-autoloop/prompt-*.*

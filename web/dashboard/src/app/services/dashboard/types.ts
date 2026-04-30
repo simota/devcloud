@@ -6,6 +6,7 @@ export type DashboardService = {
   path: string
   status: ServiceStatus
   endpoint?: string
+  storagePath?: string
   description: string
 }
 

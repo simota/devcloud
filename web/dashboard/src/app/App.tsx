@@ -3,6 +3,7 @@ import { readDashboardServices, resetDashboardServices } from './serviceResource
 import { renderRoute } from './routes'
 import { AppShell } from './shell/AppShell'
 import { EmptyState } from '../ui/EmptyState'
+import { normalizeDashboardPath } from './dashboardPaths'
 
 type ErrorBoundaryState = {
   error?: Error
@@ -35,7 +36,7 @@ class ErrorBoundary extends Component<{ children: ReactNode }, ErrorBoundaryStat
 
 function DashboardApp(): JSX.Element {
   const { services } = readDashboardServices()
-  const path = window.location.pathname
+  const path = normalizeDashboardPath(window.location.pathname)
 
   return <AppShell services={services}>{renderRoute({ services, path })}</AppShell>
 }
