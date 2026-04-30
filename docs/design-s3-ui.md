@@ -626,6 +626,12 @@ aws --endpoint-url http://127.0.0.1:4566 s3api head-object --bucket demo --key R
 
 ## Implementation Strategy
 
+### Common Shell Direction
+
+The next dashboard architecture is defined in `docs/design-dashboard-shell.md`.
+
+v0.1 can remain Go-served static HTML/CSS/JS, but future multi-service expansion should move S3 into the shared React/Vite dashboard shell. Production runtime must remain a single Go binary that serves embedded built assets and does not require Node.js.
+
 ### v0.1 Static Dashboard
 
 Use the same production direction as Mail:
@@ -647,29 +653,30 @@ internal/dashboard/
 Routes:
 
 ```txt
-/             existing service landing or Mail default
+/             service landing
 /mail         Mail dashboard
 /s3           S3 dashboard
 ```
 
-If routing simplicity is preferred for the next implementation slice, `/` may remain Mail and `/s3` can be added independently.
+`/` is the service landing and should remain the entry point for all enabled dashboards.
 
 ### Mock Reference
 
 `mock/s3/` is the interactive reference artifact for this design. It should be used to validate layout, density, empty states, dialogs, and responsive behavior before implementing the Go-served dashboard.
 
-Do not port the mock's React/Vite dependency graph into production by default. The production dashboard remains static HTML/CSS/JS served from Go unless a separate architecture decision changes that direction.
+Do not copy the mock's React/Vite dependency graph directly into production. When React migration proceeds, implement S3 under `web/dashboard` according to the shared shell design.
 
 ### Later
 
-When 3+ services exist, introduce a shared dashboard shell:
+When React migration starts, introduce the shared dashboard shell:
 
 ```txt
-internal/dashboard/static/
-  shell.go
-  mail.go
-  s3.go
-  components.go
+web/dashboard/
+  src/app/shell/
+  src/services/s3/
+
+internal/dashboard/
+  assets.go
 ```
 
 ## E2E Test Plan
@@ -714,8 +721,9 @@ Browser-oriented checks:
 
 ## Open Questions
 
-1. Should `/` become a service switcher once S3 is added, or should Mail remain default?
-2. Should upload be supported in the dashboard v0.1, or should v0.1 only inspect SDK/CLI uploads?
-3. Should object preview sanitize HTML objects or always show HTML as raw text?
-4. Should dashboard delete support recursive prefix deletion, or avoid bulk delete until versioning semantics are implemented?
-5. Should we create `mock/s3` before production UI implementation?
+Resolved: `/` is the service landing for enabled dashboards.
+
+1. Should upload be supported in the dashboard v0.1, or should v0.1 only inspect SDK/CLI uploads?
+2. Should object preview sanitize HTML objects or always show HTML as raw text?
+3. Should dashboard delete support recursive prefix deletion, or avoid bulk delete until versioning semantics are implemented?
+4. Should built React assets be committed, or generated only in CI/release?

@@ -459,12 +459,13 @@ Reason:
 
 - No frontend build tool is required for v0.
 - Single binary distribution stays simple.
-- Later migration to React/Vue/Svelte remains possible if dashboard complexity grows.
+- Future React migration should happen through the shared dashboard shell in `docs/design-dashboard-shell.md`, not as a one-off Mail rewrite.
 
 Mock handling rules:
 
 - Keep `mock/mail` useful as a visual and interaction reference.
-- Do not copy the mock's React dependency graph into the Go dashboard implementation.
+- Do not copy the mock's React dependency graph directly into the Go dashboard implementation.
+- When Mail is ported to React, implement it under the common `web/dashboard` shell and keep Go serving embedded built assets at runtime.
 - Keep v0-only UI actions active; future areas such as Search, Activity, SMTP log, Help, and Settings should be hidden or disabled until implemented.
 - HTML email preview must be sanitized before rendering. If sanitization is not implemented, show the plain text body and raw source instead.
 - Do not commit generated OS files such as `.DS_Store`.
