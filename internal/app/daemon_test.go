@@ -2,9 +2,11 @@ package app
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -43,6 +45,12 @@ func TestDaemonDoesNotExposeS3DashboardAPIWhenS3Disabled(t *testing.T) {
 	if !strings.Contains(statusBody, `"status":"disabled"`) || !strings.Contains(statusBody, `"running":false`) {
 		t.Fatalf("S3 status should be disabled, got %s", statusBody)
 	}
+	servicesBody := getBody(t, baseURL+"/api/dashboard/services")
+	for _, want := range []string{`"id":"mail"`, `"status":"disabled"`, `"id":"s3"`} {
+		if !strings.Contains(servicesBody, want) {
+			t.Fatalf("dashboard services missing %q: %s", want, servicesBody)
+		}
+	}
 
 	resp, err := http.Get(baseURL + "/api/s3/buckets")
 	if err != nil {
@@ -58,6 +66,9 @@ func freeTCPPort(t *testing.T) int {
 	t.Helper()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
+		if errors.Is(err, os.ErrPermission) {
+			t.Skipf("cannot bind loopback TCP port in this environment: %v", err)
+		}
 		t.Fatalf("listen on free port: %v", err)
 	}
 	defer listener.Close()
