@@ -1,0 +1,32 @@
+name: Mail MVP
+
+on:
+  push:
+    branches:
+      - main
+      - feat/**
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run tests
+        run: go test ./...
+
+      - name: Run Mail MVP acceptance gate
+        run: VERIFY_STAGE=full bash scripts/mail-autoloop/verify.sh
+
+      - name: Run Mail E2E
+        run: scripts/mail-e2e.sh

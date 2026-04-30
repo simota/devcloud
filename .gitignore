@@ -1,0 +1,9 @@
+.DS_Store
+.devcloud/
+node_modules/
+dist/
+scripts/mail-autoloop/.run-loop.lock
+scripts/mail-autoloop/runner.jsonl
+scripts/mail-autoloop/runner.log
+scripts/mail-autoloop/state.env
+scripts/mail-autoloop/prompt-*.*
