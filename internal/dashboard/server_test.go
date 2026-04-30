@@ -126,6 +126,80 @@ func TestIndexServesServiceLinks(t *testing.T) {
 	}
 }
 
+func TestDashboardServicesAPIListsServiceRegistry(t *testing.T) {
+	s3Store := s3svc.NewFileBucketStore(t.TempDir())
+	server := NewServer(Config{
+		MailEndpoint: "smtp://127.0.0.1:2525",
+		S3Endpoint:   "http://127.0.0.1:4567",
+	}, newDashboardStore(nil, nil), s3Store)
+
+	rec := performRequest(server.routes(), http.MethodGet, "/api/dashboard/services")
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+	if got := rec.Header().Get("Content-Type"); !strings.HasPrefix(got, "application/json") {
+		t.Fatalf("Content-Type = %q, want application/json", got)
+	}
+	var response dashboardServicesResponse
+	if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
+		t.Fatalf("decode services response: %v", err)
+	}
+	if len(response.Services) != 2 {
+		t.Fatalf("services len = %d, want 2: %#v", len(response.Services), response.Services)
+	}
+	assertService(t, response.Services[0], DashboardService{
+		ID:       "mail",
+		Name:     "Mail",
+		Path:     "/mail",
+		Status:   "running",
+		Endpoint: "smtp://127.0.0.1:2525",
+	})
+	assertService(t, response.Services[1], DashboardService{
+		ID:       "s3",
+		Name:     "S3",
+		Path:     "/s3",
+		Status:   "running",
+		Endpoint: "http://127.0.0.1:4567",
+	})
+}
+
+func TestDashboardServicesAPIMarksDisabledServices(t *testing.T) {
+	server := NewServer(Config{MailDisabled: true}, newDashboardStore(nil, nil))
+
+	rec := performRequest(server.routes(), http.MethodGet, "/api/dashboard/services")
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+	var response dashboardServicesResponse
+	if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
+		t.Fatalf("decode services response: %v", err)
+	}
+	if len(response.Services) != 2 {
+		t.Fatalf("services len = %d, want 2: %#v", len(response.Services), response.Services)
+	}
+	if response.Services[0].ID != "mail" || response.Services[0].Status != "disabled" {
+		t.Fatalf("mail service = %#v, want disabled mail", response.Services[0])
+	}
+	if response.Services[1].ID != "s3" || response.Services[1].Status != "disabled" {
+		t.Fatalf("s3 service = %#v, want disabled s3", response.Services[1])
+	}
+}
+
+func TestDashboardServicesAPIRejectsUnsupportedMethods(t *testing.T) {
+	server := NewServer(Config{}, newDashboardStore(nil, nil))
+
+	rec := performRequest(server.routes(), http.MethodPost, "/api/dashboard/services")
+
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusMethodNotAllowed)
+	}
+	if got := rec.Header().Get("Allow"); got != "GET" {
+		t.Fatalf("Allow = %q, want GET", got)
+	}
+}
+
 func TestMailPathServesStaticMailDashboard(t *testing.T) {
 	server := NewServer(Config{}, newDashboardStore(nil, nil))
 	req := httptest.NewRequest(http.MethodGet, "/mail", nil)
@@ -419,4 +493,14 @@ func performRequest(handler http.Handler, method string, target string) *httptes
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
 	return rec
+}
+
+func assertService(t *testing.T, got DashboardService, want DashboardService) {
+	t.Helper()
+	if got.ID != want.ID || got.Name != want.Name || got.Path != want.Path || got.Status != want.Status || got.Endpoint != want.Endpoint {
+		t.Fatalf("service = %#v, want fields %#v", got, want)
+	}
+	if got.Description == "" {
+		t.Fatalf("service %q description is empty", got.ID)
+	}
 }

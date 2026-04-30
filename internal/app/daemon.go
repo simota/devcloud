@@ -47,11 +47,14 @@ func (d *Daemon) Run(ctx context.Context) error {
 		SecretAccessKey: d.config.Auth.S3.SecretAccessKey,
 	}, s3Store)
 	dashboardConfig := dashboard.Config{
-		Addr:          loopbackAddr(d.config.Server.DashboardPort),
-		S3Endpoint:    "http://" + loopbackAddr(d.config.Server.S3Port),
-		S3Region:      d.config.Services.S3.Region,
-		S3AuthMode:    d.config.Auth.S3.Mode,
-		S3StoragePath: filepath.Join(d.config.Storage.Path, "s3"),
+		Addr:            loopbackAddr(d.config.Server.DashboardPort),
+		MailDisabled:    !d.config.Services.Mail.Enabled,
+		MailEndpoint:    "smtp://" + loopbackAddr(d.config.Server.SMTPPort),
+		MailStoragePath: filepath.Join(d.config.Storage.Path, "mail"),
+		S3Endpoint:      "http://" + loopbackAddr(d.config.Server.S3Port),
+		S3Region:        d.config.Services.S3.Region,
+		S3AuthMode:      d.config.Auth.S3.Mode,
+		S3StoragePath:   filepath.Join(d.config.Storage.Path, "s3"),
 	}
 	var dashboardServer *dashboard.Server
 	if d.config.Services.S3.Enabled {

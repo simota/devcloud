@@ -17,11 +17,14 @@ import (
 )
 
 type Config struct {
-	Addr          string
-	S3Endpoint    string
-	S3Region      string
-	S3AuthMode    string
-	S3StoragePath string
+	Addr            string
+	MailDisabled    bool
+	MailEndpoint    string
+	MailStoragePath string
+	S3Endpoint      string
+	S3Region        string
+	S3AuthMode      string
+	S3StoragePath   string
 }
 
 type Server struct {
@@ -63,6 +66,7 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("/", s.handleServiceIndex)
 	mux.HandleFunc("/mail", s.handleMailIndex)
 	mux.HandleFunc("/s3", s.handleS3Index)
+	mux.HandleFunc("/api/dashboard/services", s.handleDashboardServices)
 	mux.HandleFunc("/api/messages", s.handleMessages)
 	mux.HandleFunc("/api/messages/", s.handleMessage)
 	mux.HandleFunc("/api/s3/status", s.handleS3Status)
@@ -88,6 +92,14 @@ func (s *Server) handleMailIndex(w http.ResponseWriter, _ *http.Request) {
 func (s *Server) handleS3Index(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	io.WriteString(w, s3IndexHTML)
+}
+
+func (s *Server) handleDashboardServices(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w, "GET")
+		return
+	}
+	writeJSON(w, dashboardServicesResponse{Services: s.dashboardServices()})
 }
 
 func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
