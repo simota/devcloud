@@ -302,12 +302,12 @@ blob/
 
 API：
 
-```ts
-interface BlobStore {
-  put(stream, metadata): BlobID
-  get(id): ReadStream
-  delete(id): void
-  stat(id): BlobStat
+```go
+type BlobStore interface {
+	Put(ctx context.Context, r io.Reader, metadata BlobMetadata) (BlobID, error)
+	Get(ctx context.Context, id BlobID) (io.ReadCloser, error)
+	Delete(ctx context.Context, id BlobID) error
+	Stat(ctx context.Context, id BlobID) (BlobStat, error)
 }
 ```
 
@@ -367,18 +367,18 @@ Dashboard
 
 ### 内部モデル
 
-```ts
-type MailMessage = {
-  id: string
-  from: string
-  to: string[]
-  subject: string
-  headers: Record<string, string[]>
-  raw: BlobID
-  textBody?: string
-  htmlBody?: string
-  attachments: Attachment[]
-  receivedAt: Time
+```go
+type MailMessage struct {
+	ID          string
+	From        string
+	To          []string
+	Subject     string
+	Headers     map[string][]string
+	Raw         BlobID
+	TextBody    string
+	HTMLBody    string
+	Attachments []Attachment
+	ReceivedAt  time.Time
 }
 ```
 
@@ -397,28 +397,28 @@ S3 API  ---> Object Core <--- GCS API
 
 ### Object Core
 
-```ts
-type Bucket = {
-  id: string
-  name: string
-  owner: string
-  location: string
-  versioning: boolean
-  createdAt: Time
+```go
+type Bucket struct {
+	ID         string
+	Name       string
+	Owner      string
+	Location   string
+	Versioning bool
+	CreatedAt  time.Time
 }
 
-type ObjectEntry = {
-  bucket: string
-  key: string
-  generation: string
-  versionId?: string
-  size: number
-  etag: string
-  contentType?: string
-  metadata: Record<string, string>
-  blob: BlobID
-  createdAt: Time
-  deletedAt?: Time
+type ObjectEntry struct {
+	Bucket      string
+	Key         string
+	Generation  string
+	VersionID   string
+	Size        int64
+	ETag        string
+	ContentType string
+	Metadata    map[string]string
+	Blob        BlobID
+	CreatedAt   time.Time
+	DeletedAt   *time.Time
 }
 ```
 
@@ -498,18 +498,33 @@ DynamoDB は自作しやすそうに見えて、実は **expression parser** が
 
 ### DynamoDB Core
 
-```ts
-type Table = {
-  name: string
-  partitionKey: Attribute
-  sortKey?: Attribute
-  gsis: GlobalSecondaryIndex[]
-  lsis: LocalSecondaryIndex[]
-  billingMode: "PAY_PER_REQUEST" | "PROVISIONED"
-  status: "CREATING" | "ACTIVE" | "DELETING"
+```go
+type BillingMode string
+
+const (
+	BillingModePayPerRequest BillingMode = "PAY_PER_REQUEST"
+	BillingModeProvisioned   BillingMode = "PROVISIONED"
+)
+
+type TableStatus string
+
+const (
+	TableStatusCreating TableStatus = "CREATING"
+	TableStatusActive   TableStatus = "ACTIVE"
+	TableStatusDeleting TableStatus = "DELETING"
+)
+
+type Table struct {
+	Name         string
+	PartitionKey Attribute
+	SortKey      *Attribute
+	GSIs         []GlobalSecondaryIndex
+	LSIs         []LocalSecondaryIndex
+	BillingMode  BillingMode
+	Status       TableStatus
 }
 
-type Item = Record<string, AttributeValue>
+type Item map[string]AttributeValue
 ```
 
 ### MVP API
@@ -589,37 +604,44 @@ SQS API ---> Message Core <--- Pub/Sub API
 
 ### Message Core
 
-```ts
-type Topic = {
-  id: string
-  name: string
+```go
+type Topic struct {
+	ID   string
+	Name string
 }
 
-type Queue = {
-  id: string
-  name: string
-  visibilityTimeout: Duration
-  delaySeconds: Duration
-  dlq?: string
-  fifo: boolean
+type Queue struct {
+	ID                string
+	Name              string
+	VisibilityTimeout time.Duration
+	Delay             time.Duration
+	DLQ               string
+	FIFO              bool
 }
 
-type Subscription = {
-  id: string
-  topic: string
-  ackDeadline: Duration
-  mode: "pull" | "push"
+type SubscriptionMode string
+
+const (
+	SubscriptionModePull SubscriptionMode = "pull"
+	SubscriptionModePush SubscriptionMode = "push"
+)
+
+type Subscription struct {
+	ID          string
+	Topic       string
+	AckDeadline time.Duration
+	Mode        SubscriptionMode
 }
 
-type Message = {
-  id: string
-  body: bytes
-  attributes: Record<string, string>
-  publishTime: Time
-  availableAt: Time
-  deliveryCount: number
-  orderingKey?: string
-  deduplicationId?: string
+type Message struct {
+	ID              string
+	Body            []byte
+	Attributes      map[string]string
+	PublishTime     time.Time
+	AvailableAt     time.Time
+	DeliveryCount   int
+	OrderingKey     string
+	DeduplicationID string
 }
 ```
 
@@ -769,15 +791,32 @@ JSON
 BigQuery は同期クエリだけではありません。
 `jobs.insert` して、あとから `jobs.get` / `jobs.getQueryResults` する必要があります。
 
-```ts
-type Job = {
-  id: string
-  projectId: string
-  type: "query" | "load" | "extract" | "copy"
-  status: "PENDING" | "RUNNING" | "DONE"
-  error?: ErrorProto
-  statistics: JobStatistics
-  resultTable?: TableRef
+```go
+type JobType string
+
+const (
+	JobTypeQuery   JobType = "query"
+	JobTypeLoad    JobType = "load"
+	JobTypeExtract JobType = "extract"
+	JobTypeCopy    JobType = "copy"
+)
+
+type JobStatus string
+
+const (
+	JobStatusPending JobStatus = "PENDING"
+	JobStatusRunning JobStatus = "RUNNING"
+	JobStatusDone    JobStatus = "DONE"
+)
+
+type Job struct {
+	ID          string
+	ProjectID   string
+	Type        JobType
+	Status      JobStatus
+	Error       *ErrorProto
+	Statistics  JobStatistics
+	ResultTable *TableRef
 }
 ```
 
@@ -877,32 +916,32 @@ CDN proxy
 
 ### CloudFront Core
 
-```ts
-type Distribution = {
-  id: string
-  domainName: string
-  origins: Origin[]
-  defaultCacheBehavior: CacheBehavior
-  cacheBehaviors: CacheBehavior[]
-  enabled: boolean
+```go
+type Distribution struct {
+	ID                   string
+	DomainName           string
+	Origins              []Origin
+	DefaultCacheBehavior CacheBehavior
+	CacheBehaviors       []CacheBehavior
+	Enabled              bool
 }
 
-type CacheBehavior = {
-  pathPattern?: string
-  targetOriginId: string
-  viewerProtocolPolicy: string
-  allowedMethods: string[]
-  cachedMethods: string[]
-  cachePolicy: CachePolicy
+type CacheBehavior struct {
+	PathPattern          string
+	TargetOriginID       string
+	ViewerProtocolPolicy string
+	AllowedMethods       []string
+	CachedMethods        []string
+	CachePolicy          CachePolicy
 }
 
-type CacheEntry = {
-  cacheKey: string
-  status: number
-  headers: HeaderMap
-  body: BlobID
-  expiresAt: Time
-  etag?: string
+type CacheEntry struct {
+	CacheKey  string
+	Status    int
+	Headers   HeaderMap
+	Body      BlobID
+	ExpiresAt time.Time
+	ETag      string
 }
 ```
 
@@ -1676,66 +1715,66 @@ Rust も良いですが、開発速度とチーム拡大を考えると Go の�
 
 ## Object Core
 
-```ts
-interface ObjectCore {
-  createBucket(input: CreateBucketInput): Bucket
-  deleteBucket(name: string): void
-  listBuckets(): Bucket[]
+```go
+type ObjectCore interface {
+	CreateBucket(ctx context.Context, input CreateBucketInput) (Bucket, error)
+	DeleteBucket(ctx context.Context, name string) error
+	ListBuckets(ctx context.Context) ([]Bucket, error)
 
-  putObject(input: PutObjectInput): ObjectVersion
-  getObject(bucket: string, key: string, options?: GetObjectOptions): ObjectData
-  headObject bucket: string, key: string): ObjectMetadata
-  deleteObject(bucket: string, key: string): void
-  listObjects(input: ListObjectsInput): ListObjectsResult
+	PutObject(ctx context.Context, input PutObjectInput) (ObjectVersion, error)
+	GetObject(ctx context.Context, bucket string, key string, options GetObjectOptions) (ObjectData, error)
+	HeadObject(ctx context.Context, bucket string, key string) (ObjectMetadata, error)
+	DeleteObject(ctx context.Context, bucket string, key string) error
+	ListObjects(ctx context.Context, input ListObjectsInput) (ListObjectsResult, error)
 
-  createMultipartUpload(input: CreateMultipartUploadInput): UploadID
-  uploadPart(input: UploadPartInput): PartETag
-  completeMultipartUpload(input: CompleteMultipartUploadInput): ObjectVersion
+	CreateMultipartUpload(ctx context.Context, input CreateMultipartUploadInput) (UploadID, error)
+	UploadPart(ctx context.Context, input UploadPartInput) (PartETag, error)
+	CompleteMultipartUpload(ctx context.Context, input CompleteMultipartUploadInput) (ObjectVersion, error)
 }
 ```
 
 ## Message Core
 
-```ts
-interface MessageCore {
-  createQueue(input: CreateQueueInput): Queue
-  deleteQueue(name: string): void
+```go
+type MessageCore interface {
+	CreateQueue(ctx context.Context, input CreateQueueInput) (Queue, error)
+	DeleteQueue(ctx context.Context, name string) error
 
-  send(input: SendMessageInput): MessageID
-  receive(input: ReceiveInput): ReceivedMessage[]
-  ack(input: AckInput): void
-  changeVisibility(input: ChangeVisibilityInput): void
-  purge(queue: string): void
+	Send(ctx context.Context, input SendMessageInput) (MessageID, error)
+	Receive(ctx context.Context, input ReceiveInput) ([]ReceivedMessage, error)
+	Ack(ctx context.Context, input AckInput) error
+	ChangeVisibility(ctx context.Context, input ChangeVisibilityInput) error
+	Purge(ctx context.Context, queue string) error
 
-  createTopic(input: CreateTopicInput): Topic
-  publish(input: PublishInput): MessageID
-  createSubscription(input: CreateSubscriptionInput): Subscription
+	CreateTopic(ctx context.Context, input CreateTopicInput) (Topic, error)
+	Publish(ctx context.Context, input PublishInput) (MessageID, error)
+	CreateSubscription(ctx context.Context, input CreateSubscriptionInput) (Subscription, error)
 }
 ```
 
 ## KV Core
 
-```ts
-interface KvTableCore {
-  createTable(input: CreateTableInput): Table
-  putItem(input: PutItemInput): void
-  getItem(input: GetItemInput): Item?
-  updateItem(input: UpdateItemInput): Item?
-  deleteItem(input: DeleteItemInput): Item?
-  query(input: QueryInput): QueryResult
-  scan(input: ScanInput): ScanResult
+```go
+type KVTableCore interface {
+	CreateTable(ctx context.Context, input CreateTableInput) (Table, error)
+	PutItem(ctx context.Context, input PutItemInput) error
+	GetItem(ctx context.Context, input GetItemInput) (Item, bool, error)
+	UpdateItem(ctx context.Context, input UpdateItemInput) (Item, bool, error)
+	DeleteItem(ctx context.Context, input DeleteItemInput) (Item, bool, error)
+	Query(ctx context.Context, input QueryInput) (QueryResult, error)
+	Scan(ctx context.Context, input ScanInput) (ScanResult, error)
 }
 ```
 
 ## Query Core
 
-```ts
-interface QueryCore {
-  createDatabase(name: string): void
-  createSchema(name: string): void
-  createTable(input: CreateSqlTableInput): void
-  insert(input: InsertInput): void
-  query(sql: string, params?: Value[]): QueryResult
+```go
+type QueryCore interface {
+	CreateDatabase(ctx context.Context, name string) error
+	CreateSchema(ctx context.Context, name string) error
+	CreateTable(ctx context.Context, input CreateSQLTableInput) error
+	Insert(ctx context.Context, input InsertInput) error
+	Query(ctx context.Context, sql string, params ...Value) (QueryResult, error)
 }
 ```
 
@@ -1948,5 +1987,3 @@ devcloud up
   AWS SDK 接続
   互換性 matrix
 ```
-
-
