@@ -44,6 +44,12 @@ Run the Mail MVP acceptance gate:
 VERIFY_STAGE=full bash scripts/mail-autoloop/verify.sh
 ```
 
+Run the S3 implementation loop foundation gate:
+
+```bash
+VERIFY_STAGE=foundation bash scripts/s3-autoloop/verify.sh
+```
+
 Run the E2E smoke test:
 
 ```bash
@@ -66,4 +72,6 @@ E2E_INTERACTIVE=true E2E_SMTP_PORT=1125 E2E_DASHBOARD_PORT=8125 scripts/mail-e2e
 
 - Runtime data is stored under `.devcloud/`.
 - `scripts/mail-autoloop/` contains the Codex-driven implementation loop and final verification gate.
+- `scripts/s3-autoloop/` contains the Codex-driven implementation loop for the S3-compatible server.
 - `mock/mail/` contains the design mock used as the Web UI reference.
+- `mock/s3/` contains the S3 Object Explorer design mock.

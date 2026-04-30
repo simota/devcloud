@@ -7,3 +7,12 @@ scripts/mail-autoloop/runner.jsonl
 scripts/mail-autoloop/runner.log
 scripts/mail-autoloop/state.env
 scripts/mail-autoloop/prompt-*.*
+scripts/s3-autoloop/.run-loop.lock
+scripts/s3-autoloop/.circuit-state
+scripts/s3-autoloop/runner.jsonl
+scripts/s3-autoloop/runner.log
+scripts/s3-autoloop/state.env
+scripts/s3-autoloop/progress.md
+scripts/s3-autoloop/done.md
+scripts/s3-autoloop/iteration-*.out
+scripts/s3-autoloop/prompt-*.*
