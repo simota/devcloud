@@ -350,6 +350,8 @@ Body is the raw RFC 5322 message.
 ## Dashboard
 
 v0 は静的 HTML + small JavaScript でよい。
+詳細な UI / UX 方針は [Mail Web UI Design](./design-mail-ui.md) に従う。
+デザインモックは `mock/mail` を参照する。ただし、本実装では React 依存を前提にせず、静的 HTML/CSS/JavaScript に移植する。
 
 ```txt
 left pane:
