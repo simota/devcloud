@@ -30,6 +30,12 @@ func TestInitWorkspaceCreatesDefaultsWithoutOverwritingConfig(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(cfg.Storage.Path, "gcs", "upload_sessions")); err != nil {
 		t.Fatalf("gcs upload session storage not created: %v", err)
 	}
+	if _, err := os.Stat(filepath.Join(cfg.Storage.Path, "dynamodb")); err != nil {
+		t.Fatalf("dynamodb storage not created: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(cfg.Storage.Path, "kv")); err != nil {
+		t.Fatalf("kv storage not created: %v", err)
+	}
 
 	custom := []byte("project: custom\n")
 	if err := os.WriteFile(configPath, custom, 0o644); err != nil {
@@ -57,6 +63,7 @@ server:
   dashboardPort: 8825
   s3Port: 4567
   gcsPort: 4444
+  dynamodbPort: 8100
 
 auth:
   smtp:
@@ -69,6 +76,10 @@ auth:
     mode: bearer-dev
     project: custom-gcs-project
     bearerToken: local-token
+  dynamodb:
+    mode: strict
+    accessKeyId: local-dynamo
+    secretAccessKey: dynamo-secret
 
 storage:
   path: .devcloud/custom-data
@@ -89,6 +100,16 @@ services:
     enabled: true
     project: custom-gcs-project
     location: ASIA-NORTHEAST1
+  dynamodb:
+    enabled: true
+    region: ap-northeast-1
+    billingMode: PAY_PER_REQUEST
+    maxItemBytes: 2048
+    maxTables: 32
+    streams:
+      enabled: true
+    ttl:
+      schedulerIntervalSeconds: 30
 `)
 	if err := os.WriteFile(path, data, 0o644); err != nil {
 		t.Fatalf("write config: %v", err)
@@ -101,7 +122,7 @@ services:
 	if cfg.Project != "custom" {
 		t.Fatalf("Project = %q", cfg.Project)
 	}
-	if cfg.Server.SMTPPort != 2525 || cfg.Server.DashboardPort != 8825 || cfg.Server.S3Port != 4567 || cfg.Server.GCSPort != 4444 {
+	if cfg.Server.SMTPPort != 2525 || cfg.Server.DashboardPort != 8825 || cfg.Server.S3Port != 4567 || cfg.Server.GCSPort != 4444 || cfg.Server.DynamoDBPort != 8100 {
 		t.Fatalf("Server = %#v", cfg.Server)
 	}
 	if cfg.Auth.S3.AccessKeyID != "local" || cfg.Auth.S3.SecretAccessKey != "secret" {
@@ -109,6 +130,9 @@ services:
 	}
 	if cfg.Auth.GCS.Mode != "bearer-dev" || cfg.Auth.GCS.Project != "custom-gcs-project" || cfg.Auth.GCS.BearerToken != "local-token" {
 		t.Fatalf("Auth.GCS = %#v", cfg.Auth.GCS)
+	}
+	if cfg.Auth.DynamoDB.Mode != "strict" || cfg.Auth.DynamoDB.AccessKeyID != "local-dynamo" || cfg.Auth.DynamoDB.SecretAccessKey != "dynamo-secret" {
+		t.Fatalf("Auth.DynamoDB = %#v", cfg.Auth.DynamoDB)
 	}
 	if cfg.Storage.Path != ".devcloud/custom-data" {
 		t.Fatalf("Storage.Path = %q", cfg.Storage.Path)
@@ -125,15 +149,24 @@ services:
 	if !cfg.Services.GCS.Enabled || cfg.Services.GCS.Project != "custom-gcs-project" || cfg.Services.GCS.Location != "ASIA-NORTHEAST1" {
 		t.Fatalf("Services.GCS = %#v", cfg.Services.GCS)
 	}
+	if !cfg.Services.DynamoDB.Enabled || cfg.Services.DynamoDB.Region != "ap-northeast-1" || cfg.Services.DynamoDB.BillingMode != "PAY_PER_REQUEST" {
+		t.Fatalf("Services.DynamoDB = %#v", cfg.Services.DynamoDB)
+	}
+	if cfg.Services.DynamoDB.MaxItemBytes != 2048 || cfg.Services.DynamoDB.MaxTables != 32 || !cfg.Services.DynamoDB.Streams.Enabled || cfg.Services.DynamoDB.TTL.SchedulerIntervalSeconds != 30 {
+		t.Fatalf("Services.DynamoDB limits = %#v", cfg.Services.DynamoDB)
+	}
 }
 
-func TestDefaultConfigIncludesS3AndGCSDefaults(t *testing.T) {
+func TestDefaultConfigIncludesS3GCSAndDynamoDBDefaults(t *testing.T) {
 	cfg := DefaultConfig()
 	if cfg.Server.S3Port != 4566 {
 		t.Fatalf("Server.S3Port = %d", cfg.Server.S3Port)
 	}
 	if cfg.Server.GCSPort != 4443 {
 		t.Fatalf("Server.GCSPort = %d", cfg.Server.GCSPort)
+	}
+	if cfg.Server.DynamoDBPort != 8000 {
+		t.Fatalf("Server.DynamoDBPort = %d", cfg.Server.DynamoDBPort)
 	}
 	if cfg.Auth.S3.Mode != "relaxed" || cfg.Auth.S3.AccessKeyID != "dev" || cfg.Auth.S3.SecretAccessKey != "dev" {
 		t.Fatalf("Auth.S3 = %#v", cfg.Auth.S3)
@@ -155,6 +188,15 @@ func TestDefaultConfigIncludesS3AndGCSDefaults(t *testing.T) {
 	}
 	if !cfg.Services.GCS.Enabled || cfg.Services.GCS.Project != "devcloud" || cfg.Services.GCS.Location != "US" {
 		t.Fatalf("Services.GCS = %#v", cfg.Services.GCS)
+	}
+	if cfg.Auth.DynamoDB.Mode != "relaxed" || cfg.Auth.DynamoDB.AccessKeyID != "dev" || cfg.Auth.DynamoDB.SecretAccessKey != "dev" {
+		t.Fatalf("Auth.DynamoDB = %#v", cfg.Auth.DynamoDB)
+	}
+	if !cfg.Services.DynamoDB.Enabled || cfg.Services.DynamoDB.Region != "us-east-1" || cfg.Services.DynamoDB.BillingMode != "PAY_PER_REQUEST" {
+		t.Fatalf("Services.DynamoDB = %#v", cfg.Services.DynamoDB)
+	}
+	if cfg.Services.DynamoDB.MaxItemBytes != 400000 || cfg.Services.DynamoDB.MaxTables != 256 || cfg.Services.DynamoDB.Streams.Enabled || cfg.Services.DynamoDB.TTL.SchedulerIntervalSeconds != 60 {
+		t.Fatalf("Services.DynamoDB limits = %#v", cfg.Services.DynamoDB)
 	}
 }
 
@@ -191,6 +233,12 @@ func TestWorkspaceStoragePathMustStayUnderDevcloud(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(".devcloud", "custom-data", "gcs", "upload_sessions")); err != nil {
 		t.Fatalf("custom gcs upload session storage not created: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(".devcloud", "custom-data", "dynamodb")); err != nil {
+		t.Fatalf("custom dynamodb storage not created: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(".devcloud", "custom-data", "kv")); err != nil {
+		t.Fatalf("custom kv storage not created: %v", err)
 	}
 }
 

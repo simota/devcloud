@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 
 	"devcloud/internal/dashboard"
+	dynamodbsvc "devcloud/internal/services/dynamodb"
 	gcssvc "devcloud/internal/services/gcs"
 	"devcloud/internal/services/mail"
 	s3svc "devcloud/internal/services/s3"
@@ -60,6 +61,16 @@ func (d *Daemon) Run(ctx context.Context) error {
 		BearerToken:       d.config.Auth.GCS.BearerToken,
 		UploadSessionPath: filepath.Join(d.config.Storage.Path, "gcs", "upload_sessions"),
 	}, objectStore)
+	dynamoDBServer := dynamodbsvc.NewServer(dynamodbsvc.Config{
+		Addr:            loopbackAddr(d.config.Server.DynamoDBPort),
+		Region:          d.config.Services.DynamoDB.Region,
+		AuthMode:        d.config.Auth.DynamoDB.Mode,
+		AccessKeyID:     d.config.Auth.DynamoDB.AccessKeyID,
+		SecretAccessKey: d.config.Auth.DynamoDB.SecretAccessKey,
+		StoragePath:     filepath.Join(d.config.Storage.Path, "dynamodb"),
+		MaxItemBytes:    d.config.Services.DynamoDB.MaxItemBytes,
+		MaxTables:       d.config.Services.DynamoDB.MaxTables,
+	})
 	dashboardConfig := dashboard.Config{
 		Addr:                 loopbackAddr(d.config.Server.DashboardPort),
 		MailDisabled:         !d.config.Services.Mail.Enabled,
@@ -73,10 +84,16 @@ func (d *Daemon) Run(ctx context.Context) error {
 		GCSProject:           defaultString(d.config.Services.GCS.Project, d.config.Auth.GCS.Project),
 		GCSStoragePath:       filepath.Join(d.config.Storage.Path, "s3"),
 		GCSUploadSessionPath: filepath.Join(d.config.Storage.Path, "gcs", "upload_sessions"),
+		DynamoDBEndpoint:     "http://" + loopbackAddr(d.config.Server.DynamoDBPort),
+		DynamoDBRegion:       d.config.Services.DynamoDB.Region,
+		DynamoDBStoragePath:  filepath.Join(d.config.Storage.Path, "dynamodb"),
 	}
 	dashboardServer := dashboard.NewServer(dashboardConfig, store, s3Store, objectStoreForDashboard(d.config.Services.GCS.Enabled, objectStore))
+	if d.config.Services.DynamoDB.Enabled {
+		dashboardServer.SetDynamoDB(dynamoDBServer)
+	}
 
-	errCh := make(chan error, 4)
+	errCh := make(chan error, 5)
 	if d.config.Services.Mail.Enabled {
 		go func() { errCh <- smtpServer.Run(ctx) }()
 	}
@@ -85,6 +102,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	}
 	if d.config.Services.GCS.Enabled {
 		go func() { errCh <- gcsServer.Run(ctx) }()
+	}
+	if d.config.Services.DynamoDB.Enabled {
+		go func() { errCh <- dynamoDBServer.Run(ctx) }()
 	}
 	go func() { errCh <- dashboardServer.Run(ctx) }()
 

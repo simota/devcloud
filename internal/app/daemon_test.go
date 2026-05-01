@@ -18,6 +18,7 @@ func TestDaemonDoesNotExposeS3DashboardAPIWhenS3Disabled(t *testing.T) {
 	cfg.Services.Mail.Enabled = false
 	cfg.Services.S3.Enabled = false
 	cfg.Services.GCS.Enabled = false
+	cfg.Services.DynamoDB.Enabled = false
 	cfg.Server.DashboardPort = freeTCPPort(t)
 	cfg.Server.S3Port = freeTCPPort(t)
 
