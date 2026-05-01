@@ -27,6 +27,9 @@ func TestInitWorkspaceCreatesDefaultsWithoutOverwritingConfig(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(cfg.Storage.Path, "s3", "multipart")); err != nil {
 		t.Fatalf("s3 multipart storage not created: %v", err)
 	}
+	if _, err := os.Stat(filepath.Join(cfg.Storage.Path, "gcs", "upload_sessions")); err != nil {
+		t.Fatalf("gcs upload session storage not created: %v", err)
+	}
 
 	custom := []byte("project: custom\n")
 	if err := os.WriteFile(configPath, custom, 0o644); err != nil {
@@ -53,6 +56,7 @@ server:
   smtpPort: 2525
   dashboardPort: 8825
   s3Port: 4567
+  gcsPort: 4444
 
 auth:
   smtp:
@@ -61,6 +65,10 @@ auth:
     mode: relaxed
     accessKeyId: local
     secretAccessKey: secret
+  gcs:
+    mode: bearer-dev
+    project: custom-gcs-project
+    bearerToken: local-token
 
 storage:
   path: .devcloud/custom-data
@@ -77,6 +85,10 @@ services:
     maxObjectBytes: 1024
     multipart:
       minPartBytes: 128
+  gcs:
+    enabled: true
+    project: custom-gcs-project
+    location: ASIA-NORTHEAST1
 `)
 	if err := os.WriteFile(path, data, 0o644); err != nil {
 		t.Fatalf("write config: %v", err)
@@ -89,11 +101,14 @@ services:
 	if cfg.Project != "custom" {
 		t.Fatalf("Project = %q", cfg.Project)
 	}
-	if cfg.Server.SMTPPort != 2525 || cfg.Server.DashboardPort != 8825 || cfg.Server.S3Port != 4567 {
+	if cfg.Server.SMTPPort != 2525 || cfg.Server.DashboardPort != 8825 || cfg.Server.S3Port != 4567 || cfg.Server.GCSPort != 4444 {
 		t.Fatalf("Server = %#v", cfg.Server)
 	}
 	if cfg.Auth.S3.AccessKeyID != "local" || cfg.Auth.S3.SecretAccessKey != "secret" {
 		t.Fatalf("Auth.S3 = %#v", cfg.Auth.S3)
+	}
+	if cfg.Auth.GCS.Mode != "bearer-dev" || cfg.Auth.GCS.Project != "custom-gcs-project" || cfg.Auth.GCS.BearerToken != "local-token" {
+		t.Fatalf("Auth.GCS = %#v", cfg.Auth.GCS)
 	}
 	if cfg.Storage.Path != ".devcloud/custom-data" {
 		t.Fatalf("Storage.Path = %q", cfg.Storage.Path)
@@ -107,12 +122,18 @@ services:
 	if cfg.Services.S3.MaxObjectBytes != 1024 || cfg.Services.S3.Multipart.MinPartBytes != 128 {
 		t.Fatalf("Services.S3 sizing = %#v", cfg.Services.S3)
 	}
+	if !cfg.Services.GCS.Enabled || cfg.Services.GCS.Project != "custom-gcs-project" || cfg.Services.GCS.Location != "ASIA-NORTHEAST1" {
+		t.Fatalf("Services.GCS = %#v", cfg.Services.GCS)
+	}
 }
 
-func TestDefaultConfigIncludesS3Defaults(t *testing.T) {
+func TestDefaultConfigIncludesS3AndGCSDefaults(t *testing.T) {
 	cfg := DefaultConfig()
 	if cfg.Server.S3Port != 4566 {
 		t.Fatalf("Server.S3Port = %d", cfg.Server.S3Port)
+	}
+	if cfg.Server.GCSPort != 4443 {
+		t.Fatalf("Server.GCSPort = %d", cfg.Server.GCSPort)
 	}
 	if cfg.Auth.S3.Mode != "relaxed" || cfg.Auth.S3.AccessKeyID != "dev" || cfg.Auth.S3.SecretAccessKey != "dev" {
 		t.Fatalf("Auth.S3 = %#v", cfg.Auth.S3)
@@ -128,6 +149,12 @@ func TestDefaultConfigIncludesS3Defaults(t *testing.T) {
 	}
 	if cfg.Services.S3.Multipart.MinPartBytes != 5*1024*1024 {
 		t.Fatalf("Multipart.MinPartBytes = %d", cfg.Services.S3.Multipart.MinPartBytes)
+	}
+	if cfg.Auth.GCS.Mode != "relaxed" || cfg.Auth.GCS.Project != "devcloud" {
+		t.Fatalf("Auth.GCS = %#v", cfg.Auth.GCS)
+	}
+	if !cfg.Services.GCS.Enabled || cfg.Services.GCS.Project != "devcloud" || cfg.Services.GCS.Location != "US" {
+		t.Fatalf("Services.GCS = %#v", cfg.Services.GCS)
 	}
 }
 
@@ -161,6 +188,9 @@ func TestWorkspaceStoragePathMustStayUnderDevcloud(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(".devcloud", "custom-data", "s3", "buckets")); err != nil {
 		t.Fatalf("custom s3 bucket storage not created: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(".devcloud", "custom-data", "gcs", "upload_sessions")); err != nil {
+		t.Fatalf("custom gcs upload session storage not created: %v", err)
 	}
 }
 

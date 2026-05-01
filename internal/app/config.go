@@ -21,11 +21,13 @@ type ServerConfig struct {
 	SMTPPort      int
 	DashboardPort int
 	S3Port        int
+	GCSPort       int
 }
 
 type AuthConfig struct {
 	SMTP SMTPAuthConfig
 	S3   S3AuthConfig
+	GCS  GCSAuthConfig
 }
 
 type SMTPAuthConfig struct {
@@ -38,6 +40,12 @@ type S3AuthConfig struct {
 	SecretAccessKey string
 }
 
+type GCSAuthConfig struct {
+	Mode        string
+	Project     string
+	BearerToken string
+}
+
 type StorageConfig struct {
 	Path string
 }
@@ -45,6 +53,7 @@ type StorageConfig struct {
 type ServicesConfig struct {
 	Mail MailServiceConfig
 	S3   S3ServiceConfig
+	GCS  GCSServiceConfig
 }
 
 type MailServiceConfig struct {
@@ -61,6 +70,12 @@ type S3ServiceConfig struct {
 	Multipart        S3MultipartConfig
 }
 
+type GCSServiceConfig struct {
+	Enabled  bool
+	Project  string
+	Location string
+}
+
 type S3MultipartConfig struct {
 	MinPartBytes int64
 }
@@ -72,6 +87,7 @@ func DefaultConfig() Config {
 			SMTPPort:      1025,
 			DashboardPort: 8025,
 			S3Port:        4566,
+			GCSPort:       4443,
 		},
 		Auth: AuthConfig{
 			SMTP: SMTPAuthConfig{Mode: "off"},
@@ -79,6 +95,10 @@ func DefaultConfig() Config {
 				Mode:            "relaxed",
 				AccessKeyID:     "dev",
 				SecretAccessKey: "dev",
+			},
+			GCS: GCSAuthConfig{
+				Mode:    "relaxed",
+				Project: "devcloud",
 			},
 		},
 		Storage: StorageConfig{Path: ".devcloud/data"},
@@ -96,6 +116,11 @@ func DefaultConfig() Config {
 				Multipart: S3MultipartConfig{
 					MinPartBytes: 5 * 1024 * 1024,
 				},
+			},
+			GCS: GCSServiceConfig{
+				Enabled:  true,
+				Project:  "devcloud",
+				Location: "US",
 			},
 		},
 	}
@@ -167,6 +192,9 @@ func InitWorkspace(cfg Config) error {
 	if err := os.MkdirAll(filepath.Join(cfg.Storage.Path, "s3", "multipart"), 0o755); err != nil {
 		return fmt.Errorf("create s3 multipart storage: %w", err)
 	}
+	if err := os.MkdirAll(filepath.Join(cfg.Storage.Path, "gcs", "upload_sessions"), 0o755); err != nil {
+		return fmt.Errorf("create gcs upload session storage: %w", err)
+	}
 	if err := os.MkdirAll(".devcloud/logs", 0o755); err != nil {
 		return fmt.Errorf("create log directory: %w", err)
 	}
@@ -198,6 +226,7 @@ server:
   smtpPort: %d
   dashboardPort: %d
   s3Port: %d
+  gcsPort: %d
 
 auth:
   smtp:
@@ -206,6 +235,9 @@ auth:
     mode: %s
     accessKeyId: %s
     secretAccessKey: %s
+  gcs:
+    mode: %s
+    project: %s
 
 storage:
   path: %s
@@ -222,7 +254,11 @@ services:
     maxObjectBytes: %d
     multipart:
       minPartBytes: %d
-`, cfg.Project, cfg.Server.SMTPPort, cfg.Server.DashboardPort, cfg.Server.S3Port, cfg.Auth.SMTP.Mode, cfg.Auth.S3.Mode, cfg.Auth.S3.AccessKeyID, cfg.Auth.S3.SecretAccessKey, cfg.Storage.Path, cfg.Services.Mail.Enabled, cfg.Services.Mail.MaxMessageBytes, cfg.Services.S3.Enabled, cfg.Services.S3.Region, cfg.Services.S3.PathStyle, cfg.Services.S3.VirtualHostStyle, cfg.Services.S3.MaxObjectBytes, cfg.Services.S3.Multipart.MinPartBytes)
+  gcs:
+    enabled: %t
+    project: %s
+    location: %s
+`, cfg.Project, cfg.Server.SMTPPort, cfg.Server.DashboardPort, cfg.Server.S3Port, cfg.Server.GCSPort, cfg.Auth.SMTP.Mode, cfg.Auth.S3.Mode, cfg.Auth.S3.AccessKeyID, cfg.Auth.S3.SecretAccessKey, cfg.Auth.GCS.Mode, cfg.Auth.GCS.Project, cfg.Storage.Path, cfg.Services.Mail.Enabled, cfg.Services.Mail.MaxMessageBytes, cfg.Services.S3.Enabled, cfg.Services.S3.Region, cfg.Services.S3.PathStyle, cfg.Services.S3.VirtualHostStyle, cfg.Services.S3.MaxObjectBytes, cfg.Services.S3.Multipart.MinPartBytes, cfg.Services.GCS.Enabled, cfg.Services.GCS.Project, cfg.Services.GCS.Location)
 }
 
 func ensureFile(path string, data []byte) error {
@@ -256,6 +292,12 @@ func applyConfigValue(cfg *Config, path []string, value string) error {
 			return fmt.Errorf("parse server.s3Port: %w", err)
 		}
 		cfg.Server.S3Port = port
+	case "server.gcsPort":
+		port, err := strconv.Atoi(value)
+		if err != nil {
+			return fmt.Errorf("parse server.gcsPort: %w", err)
+		}
+		cfg.Server.GCSPort = port
 	case "auth.smtp.mode":
 		cfg.Auth.SMTP.Mode = value
 	case "auth.s3.mode":
@@ -264,6 +306,12 @@ func applyConfigValue(cfg *Config, path []string, value string) error {
 		cfg.Auth.S3.AccessKeyID = value
 	case "auth.s3.secretAccessKey":
 		cfg.Auth.S3.SecretAccessKey = value
+	case "auth.gcs.mode":
+		cfg.Auth.GCS.Mode = value
+	case "auth.gcs.project":
+		cfg.Auth.GCS.Project = value
+	case "auth.gcs.bearerToken":
+		cfg.Auth.GCS.BearerToken = value
 	case "storage.path":
 		cfg.Storage.Path = value
 	case "services.mail.enabled":
@@ -319,6 +367,16 @@ func applyConfigValue(cfg *Config, path []string, value string) error {
 			return fmt.Errorf("parse services.s3.multipart.minPartBytes: must be positive")
 		}
 		cfg.Services.S3.Multipart.MinPartBytes = minBytes
+	case "services.gcs.enabled":
+		enabled, err := strconv.ParseBool(value)
+		if err != nil {
+			return fmt.Errorf("parse services.gcs.enabled: %w", err)
+		}
+		cfg.Services.GCS.Enabled = enabled
+	case "services.gcs.project":
+		cfg.Services.GCS.Project = value
+	case "services.gcs.location":
+		cfg.Services.GCS.Location = value
 	default:
 		return nil
 	}
