@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	dynamodbsvc "devcloud/internal/services/dynamodb"
 	"devcloud/internal/services/mail"
 	s3svc "devcloud/internal/services/s3"
 )
@@ -121,6 +122,7 @@ func TestIndexServesServiceLinks(t *testing.T) {
 		`href="/mail"`,
 		`href="/s3"`,
 		`href="/gcs"`,
+		`href="/dynamodb"`,
 		"Local service dashboards",
 	} {
 		if !strings.Contains(body, want) {
@@ -132,13 +134,16 @@ func TestIndexServesServiceLinks(t *testing.T) {
 func TestDashboardServicesAPIListsServiceRegistry(t *testing.T) {
 	s3Store := s3svc.NewFileBucketStore(t.TempDir())
 	server := NewServer(Config{
-		MailEndpoint:    "smtp://127.0.0.1:2525",
-		MailStoragePath: ".devcloud/test/mail",
-		S3Endpoint:      "http://127.0.0.1:4567",
-		S3StoragePath:   ".devcloud/test/s3",
-		GCSEndpoint:     "http://127.0.0.1:4444",
-		GCSStoragePath:  ".devcloud/test/s3",
+		MailEndpoint:        "smtp://127.0.0.1:2525",
+		MailStoragePath:     ".devcloud/test/mail",
+		S3Endpoint:          "http://127.0.0.1:4567",
+		S3StoragePath:       ".devcloud/test/s3",
+		GCSEndpoint:         "http://127.0.0.1:4444",
+		GCSStoragePath:      ".devcloud/test/s3",
+		DynamoDBEndpoint:    "http://127.0.0.1:8001",
+		DynamoDBStoragePath: ".devcloud/test/dynamodb",
 	}, newDashboardStore(nil, nil), s3Store, s3Store)
+	server.SetDynamoDB(dynamodbsvc.NewServer(dynamodbsvc.Config{}))
 
 	rec := performRequest(server.routes(), http.MethodGet, "/api/dashboard/services")
 
@@ -152,8 +157,8 @@ func TestDashboardServicesAPIListsServiceRegistry(t *testing.T) {
 	if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
 		t.Fatalf("decode services response: %v", err)
 	}
-	if len(response.Services) != 3 {
-		t.Fatalf("services len = %d, want 3: %#v", len(response.Services), response.Services)
+	if len(response.Services) != 4 {
+		t.Fatalf("services len = %d, want 4: %#v", len(response.Services), response.Services)
 	}
 	assertService(t, response.Services[0], DashboardService{
 		ID:          "mail",
@@ -179,6 +184,14 @@ func TestDashboardServicesAPIListsServiceRegistry(t *testing.T) {
 		Endpoint:    "http://127.0.0.1:4444",
 		StoragePath: ".devcloud/test/s3",
 	})
+	assertService(t, response.Services[3], DashboardService{
+		ID:          "dynamodb",
+		Name:        "DynamoDB",
+		Path:        "/dynamodb",
+		Status:      "running",
+		Endpoint:    "http://127.0.0.1:8001",
+		StoragePath: ".devcloud/test/dynamodb",
+	})
 }
 
 func TestDashboardServicesAPIMarksDisabledServices(t *testing.T) {
@@ -193,8 +206,8 @@ func TestDashboardServicesAPIMarksDisabledServices(t *testing.T) {
 	if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
 		t.Fatalf("decode services response: %v", err)
 	}
-	if len(response.Services) != 3 {
-		t.Fatalf("services len = %d, want 3: %#v", len(response.Services), response.Services)
+	if len(response.Services) != 4 {
+		t.Fatalf("services len = %d, want 4: %#v", len(response.Services), response.Services)
 	}
 	if response.Services[0].ID != "mail" || response.Services[0].Status != "disabled" {
 		t.Fatalf("mail service = %#v, want disabled mail", response.Services[0])
@@ -204,6 +217,9 @@ func TestDashboardServicesAPIMarksDisabledServices(t *testing.T) {
 	}
 	if response.Services[2].ID != "gcs" || response.Services[2].Status != "disabled" {
 		t.Fatalf("gcs service = %#v, want disabled gcs", response.Services[2])
+	}
+	if response.Services[3].ID != "dynamodb" || response.Services[3].Status != "disabled" {
+		t.Fatalf("dynamodb service = %#v, want disabled dynamodb", response.Services[3])
 	}
 }
 
@@ -269,6 +285,110 @@ func TestReactDashboardAssetsServeWithoutInterceptingCompatibilityRoutes(t *test
 	}
 	if got := registry.Header().Get("Content-Type"); !strings.HasPrefix(got, "application/json") {
 		t.Fatalf("registry Content-Type = %q, want application/json", got)
+	}
+}
+
+func TestDynamoDBDashboardPageAndAPIExposeTables(t *testing.T) {
+	dynamo := dynamodbsvc.NewServer(dynamodbsvc.Config{Region: "us-east-1"})
+	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{
+		"TableName":"Demo",
+		"AttributeDefinitions":[
+			{"AttributeName":"pk","AttributeType":"S"},
+			{"AttributeName":"gpk","AttributeType":"S"}
+		],
+		"KeySchema":[{"AttributeName":"pk","KeyType":"HASH"}],
+		"GlobalSecondaryIndexes":[{
+			"IndexName":"gsi1",
+			"KeySchema":[{"AttributeName":"gpk","KeyType":"HASH"}],
+			"Projection":{"ProjectionType":"ALL"}
+		}]
+	}`))
+	req.Header.Set("Content-Type", "application/x-amz-json-1.0")
+	req.Header.Set("X-Amz-Target", "DynamoDB_20120810.CreateTable")
+	rec := httptest.NewRecorder()
+	dynamo.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("CreateTable status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	req = httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{
+		"TableName":"Demo",
+		"Item":{"pk":{"S":"user#1"},"gpk":{"S":"group#1"},"name":{"S":"Ada"}}
+	}`))
+	req.Header.Set("Content-Type", "application/x-amz-json-1.0")
+	req.Header.Set("X-Amz-Target", "DynamoDB_20120810.PutItem")
+	rec = httptest.NewRecorder()
+	dynamo.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("PutItem status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	req = httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{
+		"TableName":"Demo",
+		"TimeToLiveSpecification":{"Enabled":true,"AttributeName":"expiresAt"}
+	}`))
+	req.Header.Set("Content-Type", "application/x-amz-json-1.0")
+	req.Header.Set("X-Amz-Target", "DynamoDB_20120810.UpdateTimeToLive")
+	rec = httptest.NewRecorder()
+	dynamo.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("UpdateTimeToLive status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+
+	server := NewServer(Config{
+		DynamoDBEndpoint:    "http://127.0.0.1:8000",
+		DynamoDBRegion:      "us-east-1",
+		DynamoDBStoragePath: ".devcloud/test/dynamodb",
+	}, newDashboardStore(nil, nil))
+	server.SetDynamoDB(dynamo)
+	routes := server.routes()
+
+	page := performRequest(routes, http.MethodGet, "/dynamodb")
+	if page.Code != http.StatusOK || !strings.Contains(page.Body.String(), "devcloud Dashboard") {
+		t.Fatalf("DynamoDB page changed: status=%d body=%s", page.Code, page.Body.String())
+	}
+
+	dashboardPage := performRequest(routes, http.MethodGet, "/dashboard/dynamodb")
+	if dashboardPage.Code != http.StatusOK || !strings.Contains(dashboardPage.Body.String(), "devcloud Dashboard") {
+		t.Fatalf("DynamoDB dashboard route changed: status=%d body=%s", dashboardPage.Code, dashboardPage.Body.String())
+	}
+
+	status := performRequest(routes, http.MethodGet, "/api/dynamodb/status")
+	if status.Code != http.StatusOK || !strings.Contains(status.Body.String(), `"running":true`) {
+		t.Fatalf("DynamoDB status = %d body=%s", status.Code, status.Body.String())
+	}
+
+	tables := performRequest(routes, http.MethodGet, "/api/dynamodb/tables")
+	if tables.Code != http.StatusOK || !strings.Contains(tables.Body.String(), `"tableName":"Demo"`) {
+		t.Fatalf("DynamoDB tables = %d body=%s", tables.Code, tables.Body.String())
+	}
+
+	items := performRequest(routes, http.MethodGet, "/api/dynamodb/tables/Demo/items?limit=1")
+	if items.Code != http.StatusOK || !strings.Contains(items.Body.String(), `"tableName":"Demo"`) || !strings.Contains(items.Body.String(), `"Ada"`) {
+		t.Fatalf("DynamoDB table items = %d body=%s", items.Code, items.Body.String())
+	}
+
+	detail := performRequest(routes, http.MethodGet, "/api/dynamodb/tables/Demo")
+	if detail.Code != http.StatusOK || !strings.Contains(detail.Body.String(), `"tableName":"Demo"`) {
+		t.Fatalf("DynamoDB table detail = %d body=%s", detail.Code, detail.Body.String())
+	}
+
+	indexes := performRequest(routes, http.MethodGet, "/api/dynamodb/tables/Demo/indexes")
+	if indexes.Code != http.StatusOK || !strings.Contains(indexes.Body.String(), `"IndexName":"gsi1"`) {
+		t.Fatalf("DynamoDB table indexes = %d body=%s", indexes.Code, indexes.Body.String())
+	}
+
+	ttl := performRequest(routes, http.MethodGet, "/api/dynamodb/tables/Demo/ttl")
+	if ttl.Code != http.StatusOK || !strings.Contains(ttl.Body.String(), `"TimeToLiveStatus":"ENABLED"`) {
+		t.Fatalf("DynamoDB table ttl = %d body=%s", ttl.Code, ttl.Body.String())
+	}
+
+	streams := performRequest(routes, http.MethodGet, "/api/dynamodb/tables/Demo/streams")
+	if streams.Code != http.StatusOK || !strings.Contains(streams.Body.String(), `"streamEnabled":false`) {
+		t.Fatalf("DynamoDB table streams = %d body=%s", streams.Code, streams.Body.String())
+	}
+
+	missing := performRequest(routes, http.MethodGet, "/api/dynamodb/tables/Missing/items")
+	if missing.Code != http.StatusNotFound {
+		t.Fatalf("missing DynamoDB table items status = %d, want %d", missing.Code, http.StatusNotFound)
 	}
 }
 

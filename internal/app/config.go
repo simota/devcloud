@@ -22,12 +22,14 @@ type ServerConfig struct {
 	DashboardPort int
 	S3Port        int
 	GCSPort       int
+	DynamoDBPort  int
 }
 
 type AuthConfig struct {
-	SMTP SMTPAuthConfig
-	S3   S3AuthConfig
-	GCS  GCSAuthConfig
+	SMTP     SMTPAuthConfig
+	S3       S3AuthConfig
+	GCS      GCSAuthConfig
+	DynamoDB DynamoDBAuthConfig
 }
 
 type SMTPAuthConfig struct {
@@ -46,14 +48,21 @@ type GCSAuthConfig struct {
 	BearerToken string
 }
 
+type DynamoDBAuthConfig struct {
+	Mode            string
+	AccessKeyID     string
+	SecretAccessKey string
+}
+
 type StorageConfig struct {
 	Path string
 }
 
 type ServicesConfig struct {
-	Mail MailServiceConfig
-	S3   S3ServiceConfig
-	GCS  GCSServiceConfig
+	Mail     MailServiceConfig
+	S3       S3ServiceConfig
+	GCS      GCSServiceConfig
+	DynamoDB DynamoDBServiceConfig
 }
 
 type MailServiceConfig struct {
@@ -76,6 +85,24 @@ type GCSServiceConfig struct {
 	Location string
 }
 
+type DynamoDBServiceConfig struct {
+	Enabled      bool
+	Region       string
+	BillingMode  string
+	MaxItemBytes int64
+	MaxTables    int
+	Streams      DynamoDBStreamsConfig
+	TTL          DynamoDBTTLConfig
+}
+
+type DynamoDBStreamsConfig struct {
+	Enabled bool
+}
+
+type DynamoDBTTLConfig struct {
+	SchedulerIntervalSeconds int
+}
+
 type S3MultipartConfig struct {
 	MinPartBytes int64
 }
@@ -88,6 +115,7 @@ func DefaultConfig() Config {
 			DashboardPort: 8025,
 			S3Port:        4566,
 			GCSPort:       4443,
+			DynamoDBPort:  8000,
 		},
 		Auth: AuthConfig{
 			SMTP: SMTPAuthConfig{Mode: "off"},
@@ -99,6 +127,11 @@ func DefaultConfig() Config {
 			GCS: GCSAuthConfig{
 				Mode:    "relaxed",
 				Project: "devcloud",
+			},
+			DynamoDB: DynamoDBAuthConfig{
+				Mode:            "relaxed",
+				AccessKeyID:     "dev",
+				SecretAccessKey: "dev",
 			},
 		},
 		Storage: StorageConfig{Path: ".devcloud/data"},
@@ -121,6 +154,19 @@ func DefaultConfig() Config {
 				Enabled:  true,
 				Project:  "devcloud",
 				Location: "US",
+			},
+			DynamoDB: DynamoDBServiceConfig{
+				Enabled:      true,
+				Region:       "us-east-1",
+				BillingMode:  "PAY_PER_REQUEST",
+				MaxItemBytes: 400000,
+				MaxTables:    256,
+				Streams: DynamoDBStreamsConfig{
+					Enabled: false,
+				},
+				TTL: DynamoDBTTLConfig{
+					SchedulerIntervalSeconds: 60,
+				},
 			},
 		},
 	}
@@ -195,6 +241,12 @@ func InitWorkspace(cfg Config) error {
 	if err := os.MkdirAll(filepath.Join(cfg.Storage.Path, "gcs", "upload_sessions"), 0o755); err != nil {
 		return fmt.Errorf("create gcs upload session storage: %w", err)
 	}
+	if err := os.MkdirAll(filepath.Join(cfg.Storage.Path, "dynamodb"), 0o755); err != nil {
+		return fmt.Errorf("create dynamodb storage: %w", err)
+	}
+	if err := os.MkdirAll(filepath.Join(cfg.Storage.Path, "kv"), 0o755); err != nil {
+		return fmt.Errorf("create kv storage: %w", err)
+	}
 	if err := os.MkdirAll(".devcloud/logs", 0o755); err != nil {
 		return fmt.Errorf("create log directory: %w", err)
 	}
@@ -227,6 +279,7 @@ server:
   dashboardPort: %d
   s3Port: %d
   gcsPort: %d
+  dynamodbPort: %d
 
 auth:
   smtp:
@@ -238,6 +291,10 @@ auth:
   gcs:
     mode: %s
     project: %s
+  dynamodb:
+    mode: %s
+    accessKeyId: %s
+    secretAccessKey: %s
 
 storage:
   path: %s
@@ -258,7 +315,17 @@ services:
     enabled: %t
     project: %s
     location: %s
-`, cfg.Project, cfg.Server.SMTPPort, cfg.Server.DashboardPort, cfg.Server.S3Port, cfg.Server.GCSPort, cfg.Auth.SMTP.Mode, cfg.Auth.S3.Mode, cfg.Auth.S3.AccessKeyID, cfg.Auth.S3.SecretAccessKey, cfg.Auth.GCS.Mode, cfg.Auth.GCS.Project, cfg.Storage.Path, cfg.Services.Mail.Enabled, cfg.Services.Mail.MaxMessageBytes, cfg.Services.S3.Enabled, cfg.Services.S3.Region, cfg.Services.S3.PathStyle, cfg.Services.S3.VirtualHostStyle, cfg.Services.S3.MaxObjectBytes, cfg.Services.S3.Multipart.MinPartBytes, cfg.Services.GCS.Enabled, cfg.Services.GCS.Project, cfg.Services.GCS.Location)
+  dynamodb:
+    enabled: %t
+    region: %s
+    billingMode: %s
+    maxItemBytes: %d
+    maxTables: %d
+    streams:
+      enabled: %t
+    ttl:
+      schedulerIntervalSeconds: %d
+`, cfg.Project, cfg.Server.SMTPPort, cfg.Server.DashboardPort, cfg.Server.S3Port, cfg.Server.GCSPort, cfg.Server.DynamoDBPort, cfg.Auth.SMTP.Mode, cfg.Auth.S3.Mode, cfg.Auth.S3.AccessKeyID, cfg.Auth.S3.SecretAccessKey, cfg.Auth.GCS.Mode, cfg.Auth.GCS.Project, cfg.Auth.DynamoDB.Mode, cfg.Auth.DynamoDB.AccessKeyID, cfg.Auth.DynamoDB.SecretAccessKey, cfg.Storage.Path, cfg.Services.Mail.Enabled, cfg.Services.Mail.MaxMessageBytes, cfg.Services.S3.Enabled, cfg.Services.S3.Region, cfg.Services.S3.PathStyle, cfg.Services.S3.VirtualHostStyle, cfg.Services.S3.MaxObjectBytes, cfg.Services.S3.Multipart.MinPartBytes, cfg.Services.GCS.Enabled, cfg.Services.GCS.Project, cfg.Services.GCS.Location, cfg.Services.DynamoDB.Enabled, cfg.Services.DynamoDB.Region, cfg.Services.DynamoDB.BillingMode, cfg.Services.DynamoDB.MaxItemBytes, cfg.Services.DynamoDB.MaxTables, cfg.Services.DynamoDB.Streams.Enabled, cfg.Services.DynamoDB.TTL.SchedulerIntervalSeconds)
 }
 
 func ensureFile(path string, data []byte) error {
@@ -298,6 +365,12 @@ func applyConfigValue(cfg *Config, path []string, value string) error {
 			return fmt.Errorf("parse server.gcsPort: %w", err)
 		}
 		cfg.Server.GCSPort = port
+	case "server.dynamodbPort":
+		port, err := strconv.Atoi(value)
+		if err != nil {
+			return fmt.Errorf("parse server.dynamodbPort: %w", err)
+		}
+		cfg.Server.DynamoDBPort = port
 	case "auth.smtp.mode":
 		cfg.Auth.SMTP.Mode = value
 	case "auth.s3.mode":
@@ -312,6 +385,12 @@ func applyConfigValue(cfg *Config, path []string, value string) error {
 		cfg.Auth.GCS.Project = value
 	case "auth.gcs.bearerToken":
 		cfg.Auth.GCS.BearerToken = value
+	case "auth.dynamodb.mode":
+		cfg.Auth.DynamoDB.Mode = value
+	case "auth.dynamodb.accessKeyId":
+		cfg.Auth.DynamoDB.AccessKeyID = value
+	case "auth.dynamodb.secretAccessKey":
+		cfg.Auth.DynamoDB.SecretAccessKey = value
 	case "storage.path":
 		cfg.Storage.Path = value
 	case "services.mail.enabled":
@@ -377,6 +456,49 @@ func applyConfigValue(cfg *Config, path []string, value string) error {
 		cfg.Services.GCS.Project = value
 	case "services.gcs.location":
 		cfg.Services.GCS.Location = value
+	case "services.dynamodb.enabled":
+		enabled, err := strconv.ParseBool(value)
+		if err != nil {
+			return fmt.Errorf("parse services.dynamodb.enabled: %w", err)
+		}
+		cfg.Services.DynamoDB.Enabled = enabled
+	case "services.dynamodb.region":
+		cfg.Services.DynamoDB.Region = value
+	case "services.dynamodb.billingMode":
+		cfg.Services.DynamoDB.BillingMode = value
+	case "services.dynamodb.maxItemBytes":
+		maxBytes, err := strconv.ParseInt(value, 10, 64)
+		if err != nil {
+			return fmt.Errorf("parse services.dynamodb.maxItemBytes: %w", err)
+		}
+		if maxBytes <= 0 {
+			return fmt.Errorf("parse services.dynamodb.maxItemBytes: must be positive")
+		}
+		cfg.Services.DynamoDB.MaxItemBytes = maxBytes
+	case "services.dynamodb.maxTables":
+		maxTables, err := strconv.Atoi(value)
+		if err != nil {
+			return fmt.Errorf("parse services.dynamodb.maxTables: %w", err)
+		}
+		if maxTables <= 0 {
+			return fmt.Errorf("parse services.dynamodb.maxTables: must be positive")
+		}
+		cfg.Services.DynamoDB.MaxTables = maxTables
+	case "services.dynamodb.streams.enabled":
+		enabled, err := strconv.ParseBool(value)
+		if err != nil {
+			return fmt.Errorf("parse services.dynamodb.streams.enabled: %w", err)
+		}
+		cfg.Services.DynamoDB.Streams.Enabled = enabled
+	case "services.dynamodb.ttl.schedulerIntervalSeconds":
+		seconds, err := strconv.Atoi(value)
+		if err != nil {
+			return fmt.Errorf("parse services.dynamodb.ttl.schedulerIntervalSeconds: %w", err)
+		}
+		if seconds <= 0 {
+			return fmt.Errorf("parse services.dynamodb.ttl.schedulerIntervalSeconds: must be positive")
+		}
+		cfg.Services.DynamoDB.TTL.SchedulerIntervalSeconds = seconds
 	default:
 		return nil
 	}

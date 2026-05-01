@@ -25,6 +25,16 @@ scripts/gcs-autoloop/progress.md
 scripts/gcs-autoloop/done.md
 scripts/gcs-autoloop/iteration-*.out
 scripts/gcs-autoloop/prompt-*.*
+scripts/dynamodb-autoloop/.run-loop.lock
+scripts/dynamodb-autoloop/.circuit-state
+scripts/dynamodb-autoloop/runner.jsonl
+scripts/dynamodb-autoloop/runner.log
+scripts/dynamodb-autoloop/state.env
+scripts/dynamodb-autoloop/state.env.sha256
+scripts/dynamodb-autoloop/progress.md
+scripts/dynamodb-autoloop/done.md
+scripts/dynamodb-autoloop/iteration-*.out
+scripts/dynamodb-autoloop/prompt-*.*
 scripts/dashboard-design-renewal-autoloop/.run-loop.lock
 scripts/dashboard-design-renewal-autoloop/.circuit-state
 scripts/dashboard-design-renewal-autoloop/runner.jsonl

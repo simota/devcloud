@@ -110,6 +110,11 @@ const serviceIndexHTML = `<!doctype html>
         <p>Browse buckets, objects, metadata, and local GCS activity.</p>
         <span class="meta">GCS <code>127.0.0.1:4443</code></span>
       </a>
+      <a class="service" href="/dynamodb">
+        <h2>DynamoDB</h2>
+        <p>Inspect local DynamoDB tables, indexes, and item counts.</p>
+        <span class="meta">DynamoDB <code>127.0.0.1:8000</code></span>
+      </a>
     </section>
   </main>
 </body>

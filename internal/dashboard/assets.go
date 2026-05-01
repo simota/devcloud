@@ -67,3 +67,16 @@ func serveReactDashboardIndex(w http.ResponseWriter, r *http.Request, assetFS fs
 	}
 	w.Write(index)
 }
+
+func serveReactDashboardApp(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		methodNotAllowed(w, "GET, HEAD")
+		return
+	}
+	assetFS, err := fs.Sub(reactAssets, "assets/react")
+	if err != nil {
+		http.Error(w, "dashboard assets unavailable", http.StatusInternalServerError)
+		return
+	}
+	serveReactDashboardIndex(w, r, assetFS)
+}
