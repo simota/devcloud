@@ -6,9 +6,11 @@ import (
 	"crypto/md5"
 	"crypto/rand"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"os"
 	"path/filepath"
@@ -27,9 +29,13 @@ type Object struct {
 	Key                string            `json:"key"`
 	ETag               string            `json:"etag"`
 	Size               int64             `json:"size"`
+	CreatedAt          time.Time         `json:"createdAt,omitempty"`
 	LastModified       time.Time         `json:"lastModified"`
+	UpdatedAt          time.Time         `json:"updatedAt,omitempty"`
+	Metageneration     int64             `json:"metageneration,omitempty"`
 	ContentType        string            `json:"contentType,omitempty"`
 	ContentEncoding    string            `json:"contentEncoding,omitempty"`
+	CRC32C             string            `json:"crc32c,omitempty"`
 	CacheControl       string            `json:"cacheControl,omitempty"`
 	ContentDisposition string            `json:"contentDisposition,omitempty"`
 	Metadata           map[string]string `json:"metadata,omitempty"`
@@ -66,6 +72,16 @@ type PutObjectInput struct {
 	Metadata           map[string]string
 }
 
+type UpdateObjectMetadataInput struct {
+	Bucket             string
+	Key                string
+	ContentType        string
+	ContentEncoding    string
+	CacheControl       string
+	ContentDisposition string
+	Metadata           map[string]string
+}
+
 type CreateMultipartUploadInput struct {
 	Bucket             string
 	Key                string
@@ -82,6 +98,7 @@ type BucketStore interface {
 	ListBuckets(ctx context.Context) ([]Bucket, error)
 	DeleteBucket(ctx context.Context, name string) (bool, error)
 	PutObject(ctx context.Context, input PutObjectInput) (Object, error)
+	UpdateObjectMetadata(ctx context.Context, input UpdateObjectMetadataInput) (Object, bool, error)
 	GetObject(ctx context.Context, bucket string, key string) (Object, []byte, bool, error)
 	DeleteObject(ctx context.Context, bucket string, key string) (bool, error)
 	ListObjects(ctx context.Context, bucket string, prefix string) ([]Object, bool, error)
@@ -237,14 +254,19 @@ func (s *FileBucketStore) PutObject(ctx context.Context, input PutObjectInput) (
 		return Object{}, err
 	}
 	sum := md5.Sum(body)
+	now := time.Now().UTC()
 	object := Object{
 		Bucket:             input.Bucket,
 		Key:                input.Key,
 		ETag:               `"` + hex.EncodeToString(sum[:]) + `"`,
 		Size:               int64(len(body)),
-		LastModified:       time.Now().UTC(),
+		CreatedAt:          now,
+		LastModified:       now,
+		UpdatedAt:          now,
+		Metageneration:     1,
 		ContentType:        input.ContentType,
 		ContentEncoding:    input.ContentEncoding,
+		CRC32C:             crc32cBase64(body),
 		CacheControl:       input.CacheControl,
 		ContentDisposition: input.ContentDisposition,
 		Metadata:           cleanMetadata(input.Metadata),
@@ -264,6 +286,59 @@ func (s *FileBucketStore) PutObject(ctx context.Context, input PutObjectInput) (
 		return Object{}, err
 	}
 	return object, nil
+}
+
+func (s *FileBucketStore) UpdateObjectMetadata(ctx context.Context, input UpdateObjectMetadataInput) (Object, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return Object{}, false, err
+	}
+	if err := validateBucketName(input.Bucket); err != nil {
+		return Object{}, false, err
+	}
+	if err := validateObjectKey(input.Key); err != nil {
+		return Object{}, false, err
+	}
+	if _, ok, err := s.GetBucket(ctx, input.Bucket); err != nil {
+		return Object{}, false, err
+	} else if !ok {
+		return Object{}, false, fmt.Errorf("bucket does not exist")
+	}
+
+	path := s.objectPath(input.Bucket, input.Key)
+	var object Object
+	if err := readJSONFile(filepath.Join(path, "object.json"), &object); err != nil {
+		if os.IsNotExist(err) {
+			return Object{}, false, nil
+		}
+		return Object{}, false, fmt.Errorf("read object metadata: %w", err)
+	}
+	if input.ContentType != "" {
+		object.ContentType = input.ContentType
+	}
+	if input.ContentEncoding != "" {
+		object.ContentEncoding = input.ContentEncoding
+	}
+	if input.CacheControl != "" {
+		object.CacheControl = input.CacheControl
+	}
+	if input.ContentDisposition != "" {
+		object.ContentDisposition = input.ContentDisposition
+	}
+	if input.Metadata != nil {
+		object.Metadata = cleanMetadata(input.Metadata)
+	}
+	if object.CreatedAt.IsZero() {
+		object.CreatedAt = object.LastModified
+	}
+	if object.Metageneration < 1 {
+		object.Metageneration = 1
+	}
+	object.Metageneration++
+	object.UpdatedAt = time.Now().UTC()
+	if err := writeObjectMetadata(filepath.Join(path, "object.json"), object); err != nil {
+		return Object{}, true, err
+	}
+	return object, true, nil
 }
 
 func (s *FileBucketStore) GetObject(ctx context.Context, bucket string, key string) (Object, []byte, bool, error) {
@@ -701,6 +776,13 @@ func multipartETag(partETags []string) string {
 	}
 	sum := md5.Sum(hashes)
 	return `"` + hex.EncodeToString(sum[:]) + "-" + fmt.Sprintf("%d", len(partETags)) + `"`
+}
+
+func crc32cBase64(data []byte) string {
+	checksum := crc32.Checksum(data, crc32.MakeTable(crc32.Castagnoli))
+	var buf [4]byte
+	binary.BigEndian.PutUint32(buf[:], checksum)
+	return base64.StdEncoding.EncodeToString(buf[:])
 }
 
 func validateBucketName(name string) error {

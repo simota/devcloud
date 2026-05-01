@@ -6,6 +6,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -118,6 +120,7 @@ func TestIndexServesServiceLinks(t *testing.T) {
 		"devcloud Services",
 		`href="/mail"`,
 		`href="/s3"`,
+		`href="/gcs"`,
 		"Local service dashboards",
 	} {
 		if !strings.Contains(body, want) {
@@ -133,7 +136,9 @@ func TestDashboardServicesAPIListsServiceRegistry(t *testing.T) {
 		MailStoragePath: ".devcloud/test/mail",
 		S3Endpoint:      "http://127.0.0.1:4567",
 		S3StoragePath:   ".devcloud/test/s3",
-	}, newDashboardStore(nil, nil), s3Store)
+		GCSEndpoint:     "http://127.0.0.1:4444",
+		GCSStoragePath:  ".devcloud/test/s3",
+	}, newDashboardStore(nil, nil), s3Store, s3Store)
 
 	rec := performRequest(server.routes(), http.MethodGet, "/api/dashboard/services")
 
@@ -147,8 +152,8 @@ func TestDashboardServicesAPIListsServiceRegistry(t *testing.T) {
 	if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
 		t.Fatalf("decode services response: %v", err)
 	}
-	if len(response.Services) != 2 {
-		t.Fatalf("services len = %d, want 2: %#v", len(response.Services), response.Services)
+	if len(response.Services) != 3 {
+		t.Fatalf("services len = %d, want 3: %#v", len(response.Services), response.Services)
 	}
 	assertService(t, response.Services[0], DashboardService{
 		ID:          "mail",
@@ -166,6 +171,14 @@ func TestDashboardServicesAPIListsServiceRegistry(t *testing.T) {
 		Endpoint:    "http://127.0.0.1:4567",
 		StoragePath: ".devcloud/test/s3",
 	})
+	assertService(t, response.Services[2], DashboardService{
+		ID:          "gcs",
+		Name:        "GCS",
+		Path:        "/gcs",
+		Status:      "running",
+		Endpoint:    "http://127.0.0.1:4444",
+		StoragePath: ".devcloud/test/s3",
+	})
 }
 
 func TestDashboardServicesAPIMarksDisabledServices(t *testing.T) {
@@ -180,14 +193,17 @@ func TestDashboardServicesAPIMarksDisabledServices(t *testing.T) {
 	if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
 		t.Fatalf("decode services response: %v", err)
 	}
-	if len(response.Services) != 2 {
-		t.Fatalf("services len = %d, want 2: %#v", len(response.Services), response.Services)
+	if len(response.Services) != 3 {
+		t.Fatalf("services len = %d, want 3: %#v", len(response.Services), response.Services)
 	}
 	if response.Services[0].ID != "mail" || response.Services[0].Status != "disabled" {
 		t.Fatalf("mail service = %#v, want disabled mail", response.Services[0])
 	}
 	if response.Services[1].ID != "s3" || response.Services[1].Status != "disabled" {
 		t.Fatalf("s3 service = %#v, want disabled s3", response.Services[1])
+	}
+	if response.Services[2].ID != "gcs" || response.Services[2].Status != "disabled" {
+		t.Fatalf("gcs service = %#v, want disabled gcs", response.Services[2])
 	}
 }
 
@@ -415,6 +431,154 @@ func TestS3DashboardPageAndAPIExposeObjects(t *testing.T) {
 	}
 }
 
+func TestGCSDashboardPageAndAPIExposeObjects(t *testing.T) {
+	gcsStore := s3svc.NewFileBucketStore(t.TempDir())
+	sessionDir := t.TempDir()
+	sessionID := "session-test"
+	if err := os.MkdirAll(filepath.Join(sessionDir, sessionID), 0o755); err != nil {
+		t.Fatalf("create upload session dir: %v", err)
+	}
+	sessionCreatedAt := time.Date(2026, 5, 1, 10, 30, 0, 0, time.UTC)
+	sessionJSON := `{"Bucket":"demo-bucket","Name":"docs/resumable.txt","ContentType":"text/plain","CreatedAt":"` + sessionCreatedAt.Format(time.RFC3339Nano) + `","ReceivedBytes":9}` + "\n"
+	if err := os.WriteFile(filepath.Join(sessionDir, sessionID, "session.json"), []byte(sessionJSON), 0o644); err != nil {
+		t.Fatalf("write upload session: %v", err)
+	}
+	if _, created, err := gcsStore.CreateBucket(context.Background(), "demo-bucket"); err != nil || !created {
+		t.Fatalf("create bucket created=%t err=%v", created, err)
+	}
+	if _, err := gcsStore.PutObject(context.Background(), s3svc.PutObjectInput{
+		Bucket:      "demo-bucket",
+		Key:         "docs/readme.txt",
+		Body:        strings.NewReader("hello from gcs dashboard\n"),
+		ContentType: "text/plain",
+		Metadata:    map[string]string{"source": "gcs-dashboard-test"},
+	}); err != nil {
+		t.Fatalf("put object: %v", err)
+	}
+	if _, found, err := gcsStore.UpdateObjectMetadata(context.Background(), s3svc.UpdateObjectMetadataInput{
+		Bucket:      "demo-bucket",
+		Key:         "docs/readme.txt",
+		ContentType: "text/markdown",
+		Metadata:    map[string]string{"source": "gcs-dashboard-test", "owner": "dashboard"},
+	}); err != nil || !found {
+		t.Fatalf("update object metadata found=%t err=%v", found, err)
+	}
+	routes := NewServer(Config{
+		GCSEndpoint:          "http://127.0.0.1:4443",
+		GCSProject:           "devcloud",
+		GCSStoragePath:       ".devcloud/data/s3",
+		GCSUploadSessionPath: sessionDir,
+	}, newDashboardStore(nil, nil), nil, gcsStore).routes()
+
+	page := performRequest(routes, http.MethodGet, "/gcs")
+	if page.Code != http.StatusOK {
+		t.Fatalf("gcs page status = %d, want %d", page.Code, http.StatusOK)
+	}
+	if body := page.Body.String(); !strings.Contains(body, "devcloud GCS") || !strings.Contains(body, "/api/gcs/buckets") {
+		t.Fatalf("gcs page missing expected shell: %s", body)
+	}
+
+	status := performRequest(routes, http.MethodGet, "/api/gcs/status")
+	if status.Code != http.StatusOK {
+		t.Fatalf("gcs status code = %d, want %d", status.Code, http.StatusOK)
+	}
+	if !strings.Contains(status.Body.String(), `"running"`) || !strings.Contains(status.Body.String(), `"project":"devcloud"`) {
+		t.Fatalf("gcs status missing running project: %s", status.Body.String())
+	}
+
+	buckets := performRequest(routes, http.MethodGet, "/api/gcs/buckets")
+	if buckets.Code != http.StatusOK {
+		t.Fatalf("gcs buckets code = %d, want %d", buckets.Code, http.StatusOK)
+	}
+	if !strings.Contains(buckets.Body.String(), "demo-bucket") || !strings.Contains(buckets.Body.String(), "gs://demo-bucket") {
+		t.Fatalf("gcs buckets missing bucket: %s", buckets.Body.String())
+	}
+
+	objects := performRequest(routes, http.MethodGet, "/api/gcs/buckets/demo-bucket/objects?prefix=docs/")
+	if objects.Code != http.StatusOK {
+		t.Fatalf("gcs objects code = %d, want %d", objects.Code, http.StatusOK)
+	}
+	body := objects.Body.String()
+	for _, want := range []string{"docs/readme.txt", `"contentType":"text/markdown"`, `"source":"gcs-dashboard-test"`, `"owner":"dashboard"`, "gs://demo-bucket/docs/readme.txt", `"generation"`, `"metageneration":"2"`, `"crc32c"`, `"storageClass":"STANDARD"`} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("gcs objects missing %q: %s", want, body)
+		}
+	}
+
+	detail := performRequest(routes, http.MethodGet, "/api/gcs/buckets/demo-bucket/objects/docs/readme.txt")
+	if detail.Code != http.StatusOK {
+		t.Fatalf("gcs object detail code = %d, want %d; body=%s", detail.Code, http.StatusOK, detail.Body.String())
+	}
+	for _, want := range []string{"docs/readme.txt", `"contentType":"text/markdown"`, `"storageClass":"STANDARD"`, `"metageneration":"2"`} {
+		if !strings.Contains(detail.Body.String(), want) {
+			t.Fatalf("gcs object detail missing %q: %s", want, detail.Body.String())
+		}
+	}
+
+	download := performRequest(routes, http.MethodGet, "/api/gcs/buckets/demo-bucket/objects/docs/readme.txt/download")
+	if download.Code != http.StatusOK {
+		t.Fatalf("gcs download code = %d, want %d", download.Code, http.StatusOK)
+	}
+	if got := download.Body.String(); got != "hello from gcs dashboard\n" {
+		t.Fatalf("gcs download body = %q", got)
+	}
+	if got := download.Header().Get("x-goog-meta-source"); got != "gcs-dashboard-test" {
+		t.Fatalf("gcs download metadata = %q, want gcs-dashboard-test", got)
+	}
+
+	deleteObject := performRequest(routes, http.MethodDelete, "/api/gcs/buckets/demo-bucket/objects/docs/readme.txt")
+	if deleteObject.Code != http.StatusNoContent {
+		t.Fatalf("gcs object delete code = %d, want %d; body=%s", deleteObject.Code, http.StatusNoContent, deleteObject.Body.String())
+	}
+	deletedObject := performRequest(routes, http.MethodGet, "/api/gcs/buckets/demo-bucket/objects/docs/readme.txt")
+	if deletedObject.Code != http.StatusNotFound {
+		t.Fatalf("deleted gcs object code = %d, want %d; body=%s", deletedObject.Code, http.StatusNotFound, deletedObject.Body.String())
+	}
+
+	createBucket := performRequestWithBody(routes, http.MethodPost, "/api/gcs/buckets", `{"name":"dashboard-created"}`)
+	if createBucket.Code != http.StatusCreated {
+		t.Fatalf("gcs bucket create code = %d, want %d; body=%s", createBucket.Code, http.StatusCreated, createBucket.Body.String())
+	}
+	if !strings.Contains(createBucket.Body.String(), `"name":"dashboard-created"`) {
+		t.Fatalf("gcs bucket create missing name: %s", createBucket.Body.String())
+	}
+	deleteBucket := performRequest(routes, http.MethodDelete, "/api/gcs/buckets/dashboard-created")
+	if deleteBucket.Code != http.StatusNoContent {
+		t.Fatalf("gcs bucket delete code = %d, want %d; body=%s", deleteBucket.Code, http.StatusNoContent, deleteBucket.Body.String())
+	}
+
+	sessions := performRequest(routes, http.MethodGet, "/api/gcs/upload-sessions")
+	if sessions.Code != http.StatusOK {
+		t.Fatalf("gcs upload sessions code = %d, want %d", sessions.Code, http.StatusOK)
+	}
+	for _, want := range []string{`"id":"session-test"`, `"bucket":"demo-bucket"`, `"name":"docs/resumable.txt"`, `"receivedBytes":9`} {
+		if !strings.Contains(sessions.Body.String(), want) {
+			t.Fatalf("gcs upload sessions missing %q: %s", want, sessions.Body.String())
+		}
+	}
+
+	uploads := performRequest(routes, http.MethodGet, "/api/gcs/uploads")
+	if uploads.Code != http.StatusOK {
+		t.Fatalf("gcs uploads alias code = %d, want %d", uploads.Code, http.StatusOK)
+	}
+	if !strings.Contains(uploads.Body.String(), `"id":"session-test"`) {
+		t.Fatalf("gcs uploads alias missing session: %s", uploads.Body.String())
+	}
+
+	deleteSession := performRequest(routes, http.MethodDelete, "/api/gcs/uploads/session-test")
+	if deleteSession.Code != http.StatusNoContent {
+		t.Fatalf("gcs upload session delete code = %d, want %d", deleteSession.Code, http.StatusNoContent)
+	}
+	if _, err := os.Stat(filepath.Join(sessionDir, sessionID)); !os.IsNotExist(err) {
+		t.Fatalf("upload session dir still exists or stat failed: %v", err)
+	}
+
+	rejectTraversal := performRequest(routes, http.MethodDelete, "/api/gcs/uploads/..%2Foutside")
+	if rejectTraversal.Code != http.StatusNotFound {
+		t.Fatalf("gcs upload session traversal code = %d, want %d", rejectTraversal.Code, http.StatusNotFound)
+	}
+}
+
 func TestS3DashboardEscapesDynamicObjectValues(t *testing.T) {
 	for _, want := range []string{
 		"function escapeHTML(value)",
@@ -565,6 +729,14 @@ func TestMessagesAPIHandlesMissingRawAndUnsupportedMethods(t *testing.T) {
 
 func performRequest(handler http.Handler, method string, target string) *httptest.ResponseRecorder {
 	req := httptest.NewRequest(method, target, nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	return rec
+}
+
+func performRequestWithBody(handler http.Handler, method string, target string, body string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(method, target, strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
 	return rec

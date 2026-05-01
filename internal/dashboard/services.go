@@ -37,6 +37,16 @@ func (s *Server) dashboardServices() []DashboardService {
 		Description: "Browse buckets, objects, metadata, and local S3 activity.",
 	})
 
+	services = append(services, DashboardService{
+		ID:          "gcs",
+		Name:        "GCS",
+		Path:        "/gcs",
+		Status:      objectServiceStatus(s.gcs != nil),
+		Endpoint:    defaultString(s.config.GCSEndpoint, "http://127.0.0.1:4443"),
+		StoragePath: defaultString(s.config.GCSStoragePath, ".devcloud/data/s3"),
+		Description: "Browse buckets, objects, metadata, and local GCS activity.",
+	})
+
 	return services
 }
 
@@ -48,6 +58,10 @@ func mailServiceStatus(disabled bool) string {
 }
 
 func s3ServiceStatus(running bool) string {
+	return objectServiceStatus(running)
+}
+
+func objectServiceStatus(running bool) string {
 	if running {
 		return "running"
 	}

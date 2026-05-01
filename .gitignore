@@ -16,6 +16,15 @@ scripts/s3-autoloop/progress.md
 scripts/s3-autoloop/done.md
 scripts/s3-autoloop/iteration-*.out
 scripts/s3-autoloop/prompt-*.*
+scripts/gcs-autoloop/.run-loop.lock
+scripts/gcs-autoloop/.circuit-state
+scripts/gcs-autoloop/runner.jsonl
+scripts/gcs-autoloop/runner.log
+scripts/gcs-autoloop/state.env
+scripts/gcs-autoloop/progress.md
+scripts/gcs-autoloop/done.md
+scripts/gcs-autoloop/iteration-*.out
+scripts/gcs-autoloop/prompt-*.*
 scripts/dashboard-design-renewal-autoloop/.run-loop.lock
 scripts/dashboard-design-renewal-autoloop/.circuit-state
 scripts/dashboard-design-renewal-autoloop/runner.jsonl

@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 
 	"devcloud/internal/dashboard"
+	gcssvc "devcloud/internal/services/gcs"
 	"devcloud/internal/services/mail"
 	s3svc "devcloud/internal/services/s3"
 	"devcloud/internal/storage/blob"
@@ -30,8 +31,13 @@ func (d *Daemon) Run(ctx context.Context) error {
 	store := mailstore.NewFileStore(filepath.Join(d.config.Storage.Path, "mail"), blobStore)
 	mailService := mail.NewService(store)
 	var s3Store s3svc.BucketStore
+	var objectStore s3svc.BucketStore
 	if d.config.Services.S3.Enabled {
 		s3Store = s3svc.NewFileBucketStore(filepath.Join(d.config.Storage.Path, "s3", "buckets"))
+		objectStore = s3Store
+	}
+	if objectStore == nil && d.config.Services.GCS.Enabled {
+		objectStore = s3svc.NewFileBucketStore(filepath.Join(d.config.Storage.Path, "s3", "buckets"))
 	}
 
 	smtpServer := mail.NewSMTPServer(mail.SMTPConfig{
@@ -46,29 +52,39 @@ func (d *Daemon) Run(ctx context.Context) error {
 		AccessKeyID:     d.config.Auth.S3.AccessKeyID,
 		SecretAccessKey: d.config.Auth.S3.SecretAccessKey,
 	}, s3Store)
+	gcsServer := gcssvc.NewServer(gcssvc.Config{
+		Addr:              loopbackAddr(d.config.Server.GCSPort),
+		Project:           defaultString(d.config.Services.GCS.Project, d.config.Auth.GCS.Project),
+		Location:          d.config.Services.GCS.Location,
+		AuthMode:          d.config.Auth.GCS.Mode,
+		BearerToken:       d.config.Auth.GCS.BearerToken,
+		UploadSessionPath: filepath.Join(d.config.Storage.Path, "gcs", "upload_sessions"),
+	}, objectStore)
 	dashboardConfig := dashboard.Config{
-		Addr:            loopbackAddr(d.config.Server.DashboardPort),
-		MailDisabled:    !d.config.Services.Mail.Enabled,
-		MailEndpoint:    "smtp://" + loopbackAddr(d.config.Server.SMTPPort),
-		MailStoragePath: filepath.Join(d.config.Storage.Path, "mail"),
-		S3Endpoint:      "http://" + loopbackAddr(d.config.Server.S3Port),
-		S3Region:        d.config.Services.S3.Region,
-		S3AuthMode:      d.config.Auth.S3.Mode,
-		S3StoragePath:   filepath.Join(d.config.Storage.Path, "s3"),
+		Addr:                 loopbackAddr(d.config.Server.DashboardPort),
+		MailDisabled:         !d.config.Services.Mail.Enabled,
+		MailEndpoint:         "smtp://" + loopbackAddr(d.config.Server.SMTPPort),
+		MailStoragePath:      filepath.Join(d.config.Storage.Path, "mail"),
+		S3Endpoint:           "http://" + loopbackAddr(d.config.Server.S3Port),
+		S3Region:             d.config.Services.S3.Region,
+		S3AuthMode:           d.config.Auth.S3.Mode,
+		S3StoragePath:        filepath.Join(d.config.Storage.Path, "s3"),
+		GCSEndpoint:          "http://" + loopbackAddr(d.config.Server.GCSPort),
+		GCSProject:           defaultString(d.config.Services.GCS.Project, d.config.Auth.GCS.Project),
+		GCSStoragePath:       filepath.Join(d.config.Storage.Path, "s3"),
+		GCSUploadSessionPath: filepath.Join(d.config.Storage.Path, "gcs", "upload_sessions"),
 	}
-	var dashboardServer *dashboard.Server
-	if d.config.Services.S3.Enabled {
-		dashboardServer = dashboard.NewServer(dashboardConfig, store, s3Store)
-	} else {
-		dashboardServer = dashboard.NewServer(dashboardConfig, store)
-	}
+	dashboardServer := dashboard.NewServer(dashboardConfig, store, s3Store, objectStoreForDashboard(d.config.Services.GCS.Enabled, objectStore))
 
-	errCh := make(chan error, 3)
+	errCh := make(chan error, 4)
 	if d.config.Services.Mail.Enabled {
 		go func() { errCh <- smtpServer.Run(ctx) }()
 	}
 	if d.config.Services.S3.Enabled {
 		go func() { errCh <- s3Server.Run(ctx) }()
+	}
+	if d.config.Services.GCS.Enabled {
+		go func() { errCh <- gcsServer.Run(ctx) }()
 	}
 	go func() { errCh <- dashboardServer.Run(ctx) }()
 
@@ -85,4 +101,18 @@ func (d *Daemon) Run(ctx context.Context) error {
 
 func loopbackAddr(port int) string {
 	return fmt.Sprintf("127.0.0.1:%d", port)
+}
+
+func defaultString(value string, fallback string) string {
+	if value == "" {
+		return fallback
+	}
+	return value
+}
+
+func objectStoreForDashboard(enabled bool, store s3svc.BucketStore) s3svc.BucketStore {
+	if !enabled {
+		return nil
+	}
+	return store
 }
