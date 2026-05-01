@@ -47,6 +47,16 @@ func (s *Server) dashboardServices() []DashboardService {
 		Description: "Browse buckets, objects, metadata, and local GCS activity.",
 	})
 
+	services = append(services, DashboardService{
+		ID:          "dynamodb",
+		Name:        "DynamoDB",
+		Path:        "/dynamodb",
+		Status:      objectServiceStatus(s.dynamo != nil),
+		Endpoint:    defaultString(s.config.DynamoDBEndpoint, "http://127.0.0.1:8000"),
+		StoragePath: defaultString(s.config.DynamoDBStoragePath, ".devcloud/data/dynamodb"),
+		Description: "Inspect local DynamoDB tables, indexes, and item counts.",
+	})
+
 	return services
 }
 

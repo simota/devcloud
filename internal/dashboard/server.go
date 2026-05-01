@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	dynamodbsvc "devcloud/internal/services/dynamodb"
 	"devcloud/internal/services/mail"
 	s3svc "devcloud/internal/services/s3"
 	"devcloud/internal/storage/mailstore"
@@ -32,6 +33,9 @@ type Config struct {
 	GCSProject           string
 	GCSStoragePath       string
 	GCSUploadSessionPath string
+	DynamoDBEndpoint     string
+	DynamoDBRegion       string
+	DynamoDBStoragePath  string
 }
 
 type Server struct {
@@ -39,6 +43,7 @@ type Server struct {
 	store  mailstore.Store
 	s3     s3svc.BucketStore
 	gcs    s3svc.BucketStore
+	dynamo *dynamodbsvc.Server
 }
 
 func NewServer(cfg Config, store mailstore.Store, objectStores ...s3svc.BucketStore) *Server {
@@ -50,6 +55,10 @@ func NewServer(cfg Config, store mailstore.Store, objectStores ...s3svc.BucketSt
 		server.gcs = objectStores[1]
 	}
 	return server
+}
+
+func (s *Server) SetDynamoDB(server *dynamodbsvc.Server) {
+	s.dynamo = server
 }
 
 func (s *Server) Run(ctx context.Context) error {
@@ -80,6 +89,7 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("/mail", s.handleMailIndex)
 	mux.HandleFunc("/s3", s.handleS3Index)
 	mux.HandleFunc("/gcs", s.handleGCSIndex)
+	mux.HandleFunc("/dynamodb", s.handleDynamoDBIndex)
 	mux.HandleFunc("/api/dashboard/services", s.handleDashboardServices)
 	mux.HandleFunc("/api/messages", s.handleMessages)
 	mux.HandleFunc("/api/messages/", s.handleMessage)
@@ -92,6 +102,9 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("/api/gcs/uploads", s.handleGCSUploadSessions)
 	mux.HandleFunc("/api/gcs/uploads/", s.handleGCSUploadSession)
 	mux.HandleFunc("/api/gcs/upload-sessions", s.handleGCSUploadSessions)
+	mux.HandleFunc("/api/dynamodb/status", s.handleDynamoDBStatus)
+	mux.HandleFunc("/api/dynamodb/tables", s.handleDynamoDBTables)
+	mux.HandleFunc("/api/dynamodb/tables/", s.handleDynamoDBTable)
 	return mux
 }
 
@@ -117,6 +130,10 @@ func (s *Server) handleS3Index(w http.ResponseWriter, _ *http.Request) {
 func (s *Server) handleGCSIndex(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	io.WriteString(w, gcsIndexHTML)
+}
+
+func (s *Server) handleDynamoDBIndex(w http.ResponseWriter, r *http.Request) {
+	serveReactDashboardApp(w, r)
 }
 
 func (s *Server) handleDashboardServices(w http.ResponseWriter, r *http.Request) {
@@ -387,6 +404,125 @@ func (s *Server) handleGCSStatus(w http.ResponseWriter, r *http.Request) {
 		"project":           defaultString(s.config.GCSProject, "devcloud"),
 		"storagePath":       defaultString(s.config.GCSStoragePath, ".devcloud/data/s3"),
 		"uploadSessionPath": defaultString(s.config.GCSUploadSessionPath, ".devcloud/data/gcs/upload_sessions"),
+	})
+}
+
+func (s *Server) handleDynamoDBStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w, "GET")
+		return
+	}
+	status := "disabled"
+	running := false
+	tableCount := 0
+	if s.dynamo != nil {
+		snapshot := s.dynamo.Snapshot()
+		status = snapshot.Status
+		running = snapshot.Running
+		tableCount = len(snapshot.Tables)
+	}
+	writeJSON(w, map[string]any{
+		"status":      status,
+		"running":     running,
+		"endpoint":    defaultString(s.config.DynamoDBEndpoint, "http://127.0.0.1:8000"),
+		"region":      defaultString(s.config.DynamoDBRegion, "us-east-1"),
+		"storagePath": defaultString(s.config.DynamoDBStoragePath, ".devcloud/data/dynamodb"),
+		"tableCount":  tableCount,
+	})
+}
+
+func (s *Server) handleDynamoDBTables(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w, "GET")
+		return
+	}
+	if s.dynamo == nil {
+		http.Error(w, "dynamodb service is disabled", http.StatusServiceUnavailable)
+		return
+	}
+	snapshot := s.dynamo.Snapshot()
+	writeJSON(w, map[string]any{
+		"tables": snapshot.Tables,
+	})
+}
+
+func (s *Server) handleDynamoDBTable(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w, "GET")
+		return
+	}
+	if s.dynamo == nil {
+		http.Error(w, "dynamodb service is disabled", http.StatusServiceUnavailable)
+		return
+	}
+	tablePath := strings.TrimPrefix(r.URL.EscapedPath(), "/api/dynamodb/tables/")
+	escapedTable, suffix, hasSuffix := strings.Cut(tablePath, "/")
+	tableName, err := url.PathUnescape(escapedTable)
+	if err != nil {
+		http.Error(w, "invalid table path", http.StatusBadRequest)
+		return
+	}
+	if tableName == "" {
+		http.NotFound(w, r)
+		return
+	}
+	table, found := s.dynamo.TableSnapshot(tableName)
+	if !found {
+		http.NotFound(w, r)
+		return
+	}
+	if !hasSuffix {
+		writeJSON(w, map[string]any{
+			"table": table,
+		})
+		return
+	}
+	switch suffix {
+	case "indexes":
+		writeJSON(w, map[string]any{
+			"tableName":              tableName,
+			"globalSecondaryIndexes": table.GlobalSecondaryIndexes,
+			"localSecondaryIndexes":  table.LocalSecondaryIndexes,
+		})
+		return
+	case "ttl":
+		writeJSON(w, map[string]any{
+			"tableName":             tableName,
+			"timeToLiveDescription": table.TimeToLiveDescription,
+		})
+		return
+	case "streams":
+		streamEnabled := table.StreamSpecification != nil && table.StreamSpecification.StreamEnabled
+		writeJSON(w, map[string]any{
+			"tableName":           tableName,
+			"streamEnabled":       streamEnabled,
+			"latestStreamArn":     table.LatestStreamArn,
+			"latestStreamLabel":   table.LatestStreamLabel,
+			"streamSpecification": table.StreamSpecification,
+		})
+		return
+	case "items":
+	default:
+		http.NotFound(w, r)
+		return
+	}
+	limit := 100
+	if rawLimit := r.URL.Query().Get("limit"); rawLimit != "" {
+		parsed, err := strconv.Atoi(rawLimit)
+		if err != nil || parsed <= 0 {
+			http.Error(w, "limit must be a positive integer", http.StatusBadRequest)
+			return
+		}
+		limit = parsed
+	}
+	items, found := s.dynamo.TableItems(tableName, limit)
+	if !found {
+		http.NotFound(w, r)
+		return
+	}
+	writeJSON(w, map[string]any{
+		"tableName": tableName,
+		"items":     items,
 	})
 }
 
