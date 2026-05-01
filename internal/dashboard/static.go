@@ -105,6 +105,11 @@ const serviceIndexHTML = `<!doctype html>
         <p>Browse buckets, objects, metadata, and local S3 activity.</p>
         <span class="meta">S3 <code>127.0.0.1:4566</code></span>
       </a>
+      <a class="service" href="/gcs">
+        <h2>GCS</h2>
+        <p>Browse buckets, objects, metadata, and local GCS activity.</p>
+        <span class="meta">GCS <code>127.0.0.1:4443</code></span>
+      </a>
     </section>
   </main>
 </body>
