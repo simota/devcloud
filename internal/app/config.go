@@ -24,6 +24,7 @@ type ServerConfig struct {
 	GCSPort       int
 	DynamoDBPort  int
 	BigQueryPort  int
+	SQSPort       int
 }
 
 type AuthConfig struct {
@@ -32,6 +33,7 @@ type AuthConfig struct {
 	GCS      GCSAuthConfig
 	DynamoDB DynamoDBAuthConfig
 	BigQuery BigQueryAuthConfig
+	SQS      SQSAuthConfig
 }
 
 type SMTPAuthConfig struct {
@@ -62,6 +64,13 @@ type BigQueryAuthConfig struct {
 	BearerToken string
 }
 
+type SQSAuthConfig struct {
+	Mode            string
+	AccessKeyID     string
+	SecretAccessKey string
+	AccountID       string
+}
+
 type StorageConfig struct {
 	Path string
 }
@@ -72,6 +81,7 @@ type ServicesConfig struct {
 	GCS      GCSServiceConfig
 	DynamoDB DynamoDBServiceConfig
 	BigQuery BigQueryServiceConfig
+	SQS      SQSServiceConfig
 }
 
 type MailServiceConfig struct {
@@ -127,6 +137,20 @@ type BigQueryQueryConfig struct {
 	DefaultUseLegacySQL bool
 }
 
+type SQSServiceConfig struct {
+	Enabled                         bool
+	Region                          string
+	QueueURLHost                    string
+	MaxQueues                       int
+	MaxMessageBytes                 int64
+	MaxReceiveBatchSize             int
+	DefaultVisibilityTimeoutSeconds int
+	DefaultDelaySeconds             int
+	DefaultMessageRetentionSeconds  int
+	DefaultReceiveWaitTimeSeconds   int
+	SchedulerIntervalSeconds        int
+}
+
 type S3MultipartConfig struct {
 	MinPartBytes int64
 }
@@ -141,6 +165,7 @@ func DefaultConfig() Config {
 			GCSPort:       4443,
 			DynamoDBPort:  8000,
 			BigQueryPort:  9050,
+			SQSPort:       9324,
 		},
 		Auth: AuthConfig{
 			SMTP: SMTPAuthConfig{Mode: "off"},
@@ -162,6 +187,12 @@ func DefaultConfig() Config {
 				Mode:        "relaxed",
 				Project:     "devcloud",
 				BearerToken: "dev",
+			},
+			SQS: SQSAuthConfig{
+				Mode:            "relaxed",
+				AccessKeyID:     "dev",
+				SecretAccessKey: "dev",
+				AccountID:       "000000000000",
 			},
 		},
 		Storage: StorageConfig{Path: ".devcloud/data"},
@@ -209,6 +240,19 @@ func DefaultConfig() Config {
 					MaxExecutionSeconds: 30,
 					DefaultUseLegacySQL: false,
 				},
+			},
+			SQS: SQSServiceConfig{
+				Enabled:                         true,
+				Region:                          "us-east-1",
+				QueueURLHost:                    "127.0.0.1",
+				MaxQueues:                       256,
+				MaxMessageBytes:                 1024 * 1024,
+				MaxReceiveBatchSize:             10,
+				DefaultVisibilityTimeoutSeconds: 30,
+				DefaultDelaySeconds:             0,
+				DefaultMessageRetentionSeconds:  345600,
+				DefaultReceiveWaitTimeSeconds:   0,
+				SchedulerIntervalSeconds:        1,
 			},
 		},
 	}
@@ -289,6 +333,9 @@ func InitWorkspace(cfg Config) error {
 	if err := os.MkdirAll(filepath.Join(cfg.Storage.Path, "bigquery"), 0o755); err != nil {
 		return fmt.Errorf("create bigquery storage: %w", err)
 	}
+	if err := os.MkdirAll(filepath.Join(cfg.Storage.Path, "sqs"), 0o755); err != nil {
+		return fmt.Errorf("create sqs storage: %w", err)
+	}
 	if err := os.MkdirAll(filepath.Join(cfg.Storage.Path, "kv"), 0o755); err != nil {
 		return fmt.Errorf("create kv storage: %w", err)
 	}
@@ -326,6 +373,7 @@ server:
   gcsPort: %d
   dynamodbPort: %d
   bigqueryPort: %d
+  sqsPort: %d
 
 auth:
   smtp:
@@ -345,6 +393,11 @@ auth:
     mode: %s
     project: %s
     bearerToken: %s
+  sqs:
+    mode: %s
+    accessKeyId: %s
+    secretAccessKey: %s
+    accountId: "%s"
 
 storage:
   path: %s
@@ -385,7 +438,19 @@ services:
       maxResultRows: %d
       maxExecutionSeconds: %d
       defaultUseLegacySql: %t
-`, cfg.Project, cfg.Server.SMTPPort, cfg.Server.DashboardPort, cfg.Server.S3Port, cfg.Server.GCSPort, cfg.Server.DynamoDBPort, cfg.Server.BigQueryPort, cfg.Auth.SMTP.Mode, cfg.Auth.S3.Mode, cfg.Auth.S3.AccessKeyID, cfg.Auth.S3.SecretAccessKey, cfg.Auth.GCS.Mode, cfg.Auth.GCS.Project, cfg.Auth.DynamoDB.Mode, cfg.Auth.DynamoDB.AccessKeyID, cfg.Auth.DynamoDB.SecretAccessKey, cfg.Auth.BigQuery.Mode, cfg.Auth.BigQuery.Project, cfg.Auth.BigQuery.BearerToken, cfg.Storage.Path, cfg.Services.Mail.Enabled, cfg.Services.Mail.MaxMessageBytes, cfg.Services.S3.Enabled, cfg.Services.S3.Region, cfg.Services.S3.PathStyle, cfg.Services.S3.VirtualHostStyle, cfg.Services.S3.MaxObjectBytes, cfg.Services.S3.Multipart.MinPartBytes, cfg.Services.GCS.Enabled, cfg.Services.GCS.Project, cfg.Services.GCS.Location, cfg.Services.DynamoDB.Enabled, cfg.Services.DynamoDB.Region, cfg.Services.DynamoDB.BillingMode, cfg.Services.DynamoDB.MaxItemBytes, cfg.Services.DynamoDB.MaxTables, cfg.Services.DynamoDB.Streams.Enabled, cfg.Services.DynamoDB.TTL.SchedulerIntervalSeconds, cfg.Services.BigQuery.Enabled, cfg.Services.BigQuery.Project, cfg.Services.BigQuery.Location, cfg.Services.BigQuery.MaxRowsPerTable, cfg.Services.BigQuery.MaxRequestBytes, cfg.Services.BigQuery.Query.MaxResultRows, cfg.Services.BigQuery.Query.MaxExecutionSeconds, cfg.Services.BigQuery.Query.DefaultUseLegacySQL)
+  sqs:
+    enabled: %t
+    region: %s
+    queueUrlHost: %s
+    maxQueues: %d
+    maxMessageBytes: %d
+    maxReceiveBatchSize: %d
+    defaultVisibilityTimeoutSeconds: %d
+    defaultDelaySeconds: %d
+    defaultMessageRetentionSeconds: %d
+    defaultReceiveWaitTimeSeconds: %d
+    schedulerIntervalSeconds: %d
+`, cfg.Project, cfg.Server.SMTPPort, cfg.Server.DashboardPort, cfg.Server.S3Port, cfg.Server.GCSPort, cfg.Server.DynamoDBPort, cfg.Server.BigQueryPort, cfg.Server.SQSPort, cfg.Auth.SMTP.Mode, cfg.Auth.S3.Mode, cfg.Auth.S3.AccessKeyID, cfg.Auth.S3.SecretAccessKey, cfg.Auth.GCS.Mode, cfg.Auth.GCS.Project, cfg.Auth.DynamoDB.Mode, cfg.Auth.DynamoDB.AccessKeyID, cfg.Auth.DynamoDB.SecretAccessKey, cfg.Auth.BigQuery.Mode, cfg.Auth.BigQuery.Project, cfg.Auth.BigQuery.BearerToken, cfg.Auth.SQS.Mode, cfg.Auth.SQS.AccessKeyID, cfg.Auth.SQS.SecretAccessKey, cfg.Auth.SQS.AccountID, cfg.Storage.Path, cfg.Services.Mail.Enabled, cfg.Services.Mail.MaxMessageBytes, cfg.Services.S3.Enabled, cfg.Services.S3.Region, cfg.Services.S3.PathStyle, cfg.Services.S3.VirtualHostStyle, cfg.Services.S3.MaxObjectBytes, cfg.Services.S3.Multipart.MinPartBytes, cfg.Services.GCS.Enabled, cfg.Services.GCS.Project, cfg.Services.GCS.Location, cfg.Services.DynamoDB.Enabled, cfg.Services.DynamoDB.Region, cfg.Services.DynamoDB.BillingMode, cfg.Services.DynamoDB.MaxItemBytes, cfg.Services.DynamoDB.MaxTables, cfg.Services.DynamoDB.Streams.Enabled, cfg.Services.DynamoDB.TTL.SchedulerIntervalSeconds, cfg.Services.BigQuery.Enabled, cfg.Services.BigQuery.Project, cfg.Services.BigQuery.Location, cfg.Services.BigQuery.MaxRowsPerTable, cfg.Services.BigQuery.MaxRequestBytes, cfg.Services.BigQuery.Query.MaxResultRows, cfg.Services.BigQuery.Query.MaxExecutionSeconds, cfg.Services.BigQuery.Query.DefaultUseLegacySQL, cfg.Services.SQS.Enabled, cfg.Services.SQS.Region, cfg.Services.SQS.QueueURLHost, cfg.Services.SQS.MaxQueues, cfg.Services.SQS.MaxMessageBytes, cfg.Services.SQS.MaxReceiveBatchSize, cfg.Services.SQS.DefaultVisibilityTimeoutSeconds, cfg.Services.SQS.DefaultDelaySeconds, cfg.Services.SQS.DefaultMessageRetentionSeconds, cfg.Services.SQS.DefaultReceiveWaitTimeSeconds, cfg.Services.SQS.SchedulerIntervalSeconds)
 }
 
 func ensureFile(path string, data []byte) error {
@@ -431,12 +496,18 @@ func applyConfigValue(cfg *Config, path []string, value string) error {
 			return fmt.Errorf("parse server.dynamodbPort: %w", err)
 		}
 		cfg.Server.DynamoDBPort = port
-	case "server.bigqueryPort":
+	case "server.bigqueryPort", "server.bigQueryPort":
 		port, err := strconv.Atoi(value)
 		if err != nil {
-			return fmt.Errorf("parse server.bigqueryPort: %w", err)
+			return fmt.Errorf("parse server.bigQueryPort: %w", err)
 		}
 		cfg.Server.BigQueryPort = port
+	case "server.sqsPort":
+		port, err := strconv.Atoi(value)
+		if err != nil {
+			return fmt.Errorf("parse server.sqsPort: %w", err)
+		}
+		cfg.Server.SQSPort = port
 	case "auth.smtp.mode":
 		cfg.Auth.SMTP.Mode = value
 	case "auth.s3.mode":
@@ -463,6 +534,14 @@ func applyConfigValue(cfg *Config, path []string, value string) error {
 		cfg.Auth.BigQuery.Project = value
 	case "auth.bigquery.bearerToken":
 		cfg.Auth.BigQuery.BearerToken = value
+	case "auth.sqs.mode":
+		cfg.Auth.SQS.Mode = value
+	case "auth.sqs.accessKeyId":
+		cfg.Auth.SQS.AccessKeyID = value
+	case "auth.sqs.secretAccessKey":
+		cfg.Auth.SQS.SecretAccessKey = value
+	case "auth.sqs.accountId":
+		cfg.Auth.SQS.AccountID = strings.Trim(value, `"`)
 	case "storage.path":
 		cfg.Storage.Path = value
 	case "services.mail.enabled":
@@ -623,6 +702,88 @@ func applyConfigValue(cfg *Config, path []string, value string) error {
 			return fmt.Errorf("parse services.bigquery.query.defaultUseLegacySql: %w", err)
 		}
 		cfg.Services.BigQuery.Query.DefaultUseLegacySQL = useLegacySQL
+	case "services.sqs.enabled":
+		enabled, err := strconv.ParseBool(value)
+		if err != nil {
+			return fmt.Errorf("parse services.sqs.enabled: %w", err)
+		}
+		cfg.Services.SQS.Enabled = enabled
+	case "services.sqs.region":
+		cfg.Services.SQS.Region = value
+	case "services.sqs.queueUrlHost":
+		cfg.Services.SQS.QueueURLHost = value
+	case "services.sqs.maxQueues":
+		maxQueues, err := strconv.Atoi(value)
+		if err != nil {
+			return fmt.Errorf("parse services.sqs.maxQueues: %w", err)
+		}
+		if maxQueues <= 0 {
+			return fmt.Errorf("parse services.sqs.maxQueues: must be positive")
+		}
+		cfg.Services.SQS.MaxQueues = maxQueues
+	case "services.sqs.maxMessageBytes":
+		maxBytes, err := strconv.ParseInt(value, 10, 64)
+		if err != nil {
+			return fmt.Errorf("parse services.sqs.maxMessageBytes: %w", err)
+		}
+		if maxBytes <= 0 {
+			return fmt.Errorf("parse services.sqs.maxMessageBytes: must be positive")
+		}
+		cfg.Services.SQS.MaxMessageBytes = maxBytes
+	case "services.sqs.maxReceiveBatchSize":
+		maxBatch, err := strconv.Atoi(value)
+		if err != nil {
+			return fmt.Errorf("parse services.sqs.maxReceiveBatchSize: %w", err)
+		}
+		if maxBatch <= 0 {
+			return fmt.Errorf("parse services.sqs.maxReceiveBatchSize: must be positive")
+		}
+		cfg.Services.SQS.MaxReceiveBatchSize = maxBatch
+	case "services.sqs.defaultVisibilityTimeoutSeconds":
+		seconds, err := strconv.Atoi(value)
+		if err != nil {
+			return fmt.Errorf("parse services.sqs.defaultVisibilityTimeoutSeconds: %w", err)
+		}
+		if seconds < 0 {
+			return fmt.Errorf("parse services.sqs.defaultVisibilityTimeoutSeconds: must be non-negative")
+		}
+		cfg.Services.SQS.DefaultVisibilityTimeoutSeconds = seconds
+	case "services.sqs.defaultDelaySeconds":
+		seconds, err := strconv.Atoi(value)
+		if err != nil {
+			return fmt.Errorf("parse services.sqs.defaultDelaySeconds: %w", err)
+		}
+		if seconds < 0 {
+			return fmt.Errorf("parse services.sqs.defaultDelaySeconds: must be non-negative")
+		}
+		cfg.Services.SQS.DefaultDelaySeconds = seconds
+	case "services.sqs.defaultMessageRetentionSeconds":
+		seconds, err := strconv.Atoi(value)
+		if err != nil {
+			return fmt.Errorf("parse services.sqs.defaultMessageRetentionSeconds: %w", err)
+		}
+		if seconds <= 0 {
+			return fmt.Errorf("parse services.sqs.defaultMessageRetentionSeconds: must be positive")
+		}
+		cfg.Services.SQS.DefaultMessageRetentionSeconds = seconds
+	case "services.sqs.defaultReceiveWaitTimeSeconds":
+		seconds, err := strconv.Atoi(value)
+		if err != nil {
+			return fmt.Errorf("parse services.sqs.defaultReceiveWaitTimeSeconds: %w", err)
+		}
+		if seconds < 0 {
+			return fmt.Errorf("parse services.sqs.defaultReceiveWaitTimeSeconds: must be non-negative")
+		}
+		cfg.Services.SQS.DefaultReceiveWaitTimeSeconds = seconds
+	case "services.sqs.schedulerIntervalSeconds":
+		seconds, err := strconv.Atoi(value)
+		if err != nil {
+			return fmt.Errorf("parse services.sqs.schedulerIntervalSeconds: %w", err)
+		}
+		if seconds <= 0 {
+			return fmt.Errorf("parse services.sqs.schedulerIntervalSeconds: must be positive")
+		}
+		cfg.Services.SQS.SchedulerIntervalSeconds = seconds
 	default:
 		return nil
 	}

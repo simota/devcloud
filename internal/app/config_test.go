@@ -36,6 +36,9 @@ func TestInitWorkspaceCreatesDefaultsWithoutOverwritingConfig(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(cfg.Storage.Path, "bigquery")); err != nil {
 		t.Fatalf("bigquery storage not created: %v", err)
 	}
+	if _, err := os.Stat(filepath.Join(cfg.Storage.Path, "sqs")); err != nil {
+		t.Fatalf("sqs storage not created: %v", err)
+	}
 	if _, err := os.Stat(filepath.Join(cfg.Storage.Path, "kv")); err != nil {
 		t.Fatalf("kv storage not created: %v", err)
 	}
@@ -68,6 +71,7 @@ server:
   gcsPort: 4444
   dynamodbPort: 8100
   bigqueryPort: 9051
+  sqsPort: 9325
 
 auth:
   smtp:
@@ -88,6 +92,11 @@ auth:
     mode: bearer-dev
     project: custom-bigquery-project
     bearerToken: bigquery-token
+  sqs:
+    mode: strict
+    accessKeyId: local-sqs
+    secretAccessKey: sqs-secret
+    accountId: "123456789012"
 
 storage:
   path: .devcloud/custom-data
@@ -128,6 +137,18 @@ services:
       maxResultRows: 500
       maxExecutionSeconds: 7
       defaultUseLegacySql: true
+  sqs:
+    enabled: true
+    region: ap-northeast-1
+    queueUrlHost: localhost
+    maxQueues: 64
+    maxMessageBytes: 2048
+    maxReceiveBatchSize: 5
+    defaultVisibilityTimeoutSeconds: 9
+    defaultDelaySeconds: 1
+    defaultMessageRetentionSeconds: 600
+    defaultReceiveWaitTimeSeconds: 2
+    schedulerIntervalSeconds: 3
 `)
 	if err := os.WriteFile(path, data, 0o644); err != nil {
 		t.Fatalf("write config: %v", err)
@@ -140,7 +161,7 @@ services:
 	if cfg.Project != "custom" {
 		t.Fatalf("Project = %q", cfg.Project)
 	}
-	if cfg.Server.SMTPPort != 2525 || cfg.Server.DashboardPort != 8825 || cfg.Server.S3Port != 4567 || cfg.Server.GCSPort != 4444 || cfg.Server.DynamoDBPort != 8100 || cfg.Server.BigQueryPort != 9051 {
+	if cfg.Server.SMTPPort != 2525 || cfg.Server.DashboardPort != 8825 || cfg.Server.S3Port != 4567 || cfg.Server.GCSPort != 4444 || cfg.Server.DynamoDBPort != 8100 || cfg.Server.BigQueryPort != 9051 || cfg.Server.SQSPort != 9325 {
 		t.Fatalf("Server = %#v", cfg.Server)
 	}
 	if cfg.Auth.S3.AccessKeyID != "local" || cfg.Auth.S3.SecretAccessKey != "secret" {
@@ -154,6 +175,9 @@ services:
 	}
 	if cfg.Auth.BigQuery.Mode != "bearer-dev" || cfg.Auth.BigQuery.Project != "custom-bigquery-project" || cfg.Auth.BigQuery.BearerToken != "bigquery-token" {
 		t.Fatalf("Auth.BigQuery = %#v", cfg.Auth.BigQuery)
+	}
+	if cfg.Auth.SQS.Mode != "strict" || cfg.Auth.SQS.AccessKeyID != "local-sqs" || cfg.Auth.SQS.SecretAccessKey != "sqs-secret" || cfg.Auth.SQS.AccountID != "123456789012" {
+		t.Fatalf("Auth.SQS = %#v", cfg.Auth.SQS)
 	}
 	if cfg.Storage.Path != ".devcloud/custom-data" {
 		t.Fatalf("Storage.Path = %q", cfg.Storage.Path)
@@ -185,6 +209,31 @@ services:
 	if cfg.Services.BigQuery.Query.MaxResultRows != 500 || cfg.Services.BigQuery.Query.MaxExecutionSeconds != 7 || !cfg.Services.BigQuery.Query.DefaultUseLegacySQL {
 		t.Fatalf("Services.BigQuery.Query = %#v", cfg.Services.BigQuery.Query)
 	}
+	if !cfg.Services.SQS.Enabled || cfg.Services.SQS.Region != "ap-northeast-1" || cfg.Services.SQS.QueueURLHost != "localhost" {
+		t.Fatalf("Services.SQS = %#v", cfg.Services.SQS)
+	}
+	if cfg.Services.SQS.MaxQueues != 64 || cfg.Services.SQS.MaxMessageBytes != 2048 || cfg.Services.SQS.MaxReceiveBatchSize != 5 {
+		t.Fatalf("Services.SQS limits = %#v", cfg.Services.SQS)
+	}
+	if cfg.Services.SQS.DefaultVisibilityTimeoutSeconds != 9 || cfg.Services.SQS.DefaultDelaySeconds != 1 || cfg.Services.SQS.DefaultMessageRetentionSeconds != 600 || cfg.Services.SQS.DefaultReceiveWaitTimeSeconds != 2 || cfg.Services.SQS.SchedulerIntervalSeconds != 3 {
+		t.Fatalf("Services.SQS timings = %#v", cfg.Services.SQS)
+	}
+}
+
+func TestLoadConfigAcceptsBigQueryPortAlias(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(path, []byte("server:\n  bigQueryPort: 19050\n"), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig() error = %v", err)
+	}
+	if cfg.Server.BigQueryPort != 19050 {
+		t.Fatalf("Server.BigQueryPort = %d", cfg.Server.BigQueryPort)
+	}
 }
 
 func TestDefaultConfigIncludesS3GCSAndDynamoDBDefaults(t *testing.T) {
@@ -200,6 +249,9 @@ func TestDefaultConfigIncludesS3GCSAndDynamoDBDefaults(t *testing.T) {
 	}
 	if cfg.Server.BigQueryPort != 9050 {
 		t.Fatalf("Server.BigQueryPort = %d", cfg.Server.BigQueryPort)
+	}
+	if cfg.Server.SQSPort != 9324 {
+		t.Fatalf("Server.SQSPort = %d", cfg.Server.SQSPort)
 	}
 	if cfg.Auth.S3.Mode != "relaxed" || cfg.Auth.S3.AccessKeyID != "dev" || cfg.Auth.S3.SecretAccessKey != "dev" {
 		t.Fatalf("Auth.S3 = %#v", cfg.Auth.S3)
@@ -242,6 +294,18 @@ func TestDefaultConfigIncludesS3GCSAndDynamoDBDefaults(t *testing.T) {
 	}
 	if cfg.Services.BigQuery.Query.MaxResultRows != 10000 || cfg.Services.BigQuery.Query.MaxExecutionSeconds != 30 || cfg.Services.BigQuery.Query.DefaultUseLegacySQL {
 		t.Fatalf("Services.BigQuery.Query = %#v", cfg.Services.BigQuery.Query)
+	}
+	if cfg.Auth.SQS.Mode != "relaxed" || cfg.Auth.SQS.AccessKeyID != "dev" || cfg.Auth.SQS.SecretAccessKey != "dev" || cfg.Auth.SQS.AccountID != "000000000000" {
+		t.Fatalf("Auth.SQS = %#v", cfg.Auth.SQS)
+	}
+	if !cfg.Services.SQS.Enabled || cfg.Services.SQS.Region != "us-east-1" || cfg.Services.SQS.QueueURLHost != "127.0.0.1" {
+		t.Fatalf("Services.SQS = %#v", cfg.Services.SQS)
+	}
+	if cfg.Services.SQS.MaxQueues != 256 || cfg.Services.SQS.MaxMessageBytes != 1024*1024 || cfg.Services.SQS.MaxReceiveBatchSize != 10 {
+		t.Fatalf("Services.SQS limits = %#v", cfg.Services.SQS)
+	}
+	if cfg.Services.SQS.DefaultVisibilityTimeoutSeconds != 30 || cfg.Services.SQS.DefaultDelaySeconds != 0 || cfg.Services.SQS.DefaultMessageRetentionSeconds != 345600 || cfg.Services.SQS.DefaultReceiveWaitTimeSeconds != 0 || cfg.Services.SQS.SchedulerIntervalSeconds != 1 {
+		t.Fatalf("Services.SQS timings = %#v", cfg.Services.SQS)
 	}
 }
 

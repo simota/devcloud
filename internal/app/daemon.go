@@ -12,6 +12,7 @@ import (
 	gcssvc "devcloud/internal/services/gcs"
 	"devcloud/internal/services/mail"
 	s3svc "devcloud/internal/services/s3"
+	sqssvc "devcloud/internal/services/sqs"
 	"devcloud/internal/storage/blob"
 	"devcloud/internal/storage/mailstore"
 )
@@ -85,6 +86,23 @@ func (d *Daemon) Run(ctx context.Context) error {
 		DefaultLegacySQL: d.config.Services.BigQuery.Query.DefaultUseLegacySQL,
 		ObjectStore:      objectStore,
 	})
+	sqsServer := sqssvc.NewServer(sqssvc.Config{
+		Addr:                            loopbackAddr(d.config.Server.SQSPort),
+		Region:                          d.config.Services.SQS.Region,
+		AccountID:                       d.config.Auth.SQS.AccountID,
+		QueueURLHost:                    d.config.Services.SQS.QueueURLHost,
+		AuthMode:                        d.config.Auth.SQS.Mode,
+		AccessKeyID:                     d.config.Auth.SQS.AccessKeyID,
+		SecretAccessKey:                 d.config.Auth.SQS.SecretAccessKey,
+		StoragePath:                     filepath.Join(d.config.Storage.Path, "sqs"),
+		MaxQueues:                       d.config.Services.SQS.MaxQueues,
+		MaxMessageBytes:                 d.config.Services.SQS.MaxMessageBytes,
+		MaxReceiveBatchSize:             d.config.Services.SQS.MaxReceiveBatchSize,
+		DefaultVisibilityTimeoutSeconds: d.config.Services.SQS.DefaultVisibilityTimeoutSeconds,
+		DefaultDelaySeconds:             d.config.Services.SQS.DefaultDelaySeconds,
+		DefaultMessageRetentionSeconds:  d.config.Services.SQS.DefaultMessageRetentionSeconds,
+		DefaultReceiveWaitTimeSeconds:   d.config.Services.SQS.DefaultReceiveWaitTimeSeconds,
+	})
 	dashboardConfig := dashboard.Config{
 		Addr:                 loopbackAddr(d.config.Server.DashboardPort),
 		MailDisabled:         !d.config.Services.Mail.Enabled,
@@ -106,6 +124,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 		BigQueryLocation:     d.config.Services.BigQuery.Location,
 		BigQueryAuthMode:     d.config.Auth.BigQuery.Mode,
 		BigQueryStoragePath:  filepath.Join(d.config.Storage.Path, "bigquery"),
+		SQSEndpoint:          "http://" + loopbackAddr(d.config.Server.SQSPort),
+		SQSRegion:            d.config.Services.SQS.Region,
+		SQSAuthMode:          d.config.Auth.SQS.Mode,
+		SQSStoragePath:       filepath.Join(d.config.Storage.Path, "sqs"),
 	}
 	dashboardServer := dashboard.NewServer(dashboardConfig, store, s3Store, objectStoreForDashboard(d.config.Services.GCS.Enabled, objectStore))
 	if d.config.Services.DynamoDB.Enabled {
@@ -114,8 +136,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 	if d.config.Services.BigQuery.Enabled {
 		dashboardServer.SetBigQuery(bigQueryServer)
 	}
+	if d.config.Services.SQS.Enabled {
+		dashboardServer.SetSQS(sqsServer)
+	}
 
-	errCh := make(chan error, 6)
+	errCh := make(chan error, 7)
 	if d.config.Services.Mail.Enabled {
 		go func() { errCh <- smtpServer.Run(ctx) }()
 	}
@@ -130,6 +155,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	}
 	if d.config.Services.BigQuery.Enabled {
 		go func() { errCh <- bigQueryServer.Run(ctx) }()
+	}
+	if d.config.Services.SQS.Enabled {
+		go func() { errCh <- sqsServer.Run(ctx) }()
 	}
 	go func() { errCh <- dashboardServer.Run(ctx) }()
 
