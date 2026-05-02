@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	bigquerysvc "devcloud/internal/services/bigquery"
 	dynamodbsvc "devcloud/internal/services/dynamodb"
 	"devcloud/internal/services/mail"
 	s3svc "devcloud/internal/services/s3"
@@ -36,6 +37,11 @@ type Config struct {
 	DynamoDBEndpoint     string
 	DynamoDBRegion       string
 	DynamoDBStoragePath  string
+	BigQueryEndpoint     string
+	BigQueryProject      string
+	BigQueryLocation     string
+	BigQueryAuthMode     string
+	BigQueryStoragePath  string
 }
 
 type Server struct {
@@ -44,6 +50,7 @@ type Server struct {
 	s3     s3svc.BucketStore
 	gcs    s3svc.BucketStore
 	dynamo *dynamodbsvc.Server
+	bq     *bigquerysvc.Server
 }
 
 func NewServer(cfg Config, store mailstore.Store, objectStores ...s3svc.BucketStore) *Server {
@@ -59,6 +66,10 @@ func NewServer(cfg Config, store mailstore.Store, objectStores ...s3svc.BucketSt
 
 func (s *Server) SetDynamoDB(server *dynamodbsvc.Server) {
 	s.dynamo = server
+}
+
+func (s *Server) SetBigQuery(server *bigquerysvc.Server) {
+	s.bq = server
 }
 
 func (s *Server) Run(ctx context.Context) error {
@@ -90,6 +101,8 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("/s3", s.handleS3Index)
 	mux.HandleFunc("/gcs", s.handleGCSIndex)
 	mux.HandleFunc("/dynamodb", s.handleDynamoDBIndex)
+	mux.HandleFunc("/bigquery", s.handleBigQueryIndex)
+	mux.HandleFunc("/api/services", s.handleDashboardServices)
 	mux.HandleFunc("/api/dashboard/services", s.handleDashboardServices)
 	mux.HandleFunc("/api/messages", s.handleMessages)
 	mux.HandleFunc("/api/messages/", s.handleMessage)
@@ -105,6 +118,9 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("/api/dynamodb/status", s.handleDynamoDBStatus)
 	mux.HandleFunc("/api/dynamodb/tables", s.handleDynamoDBTables)
 	mux.HandleFunc("/api/dynamodb/tables/", s.handleDynamoDBTable)
+	mux.HandleFunc("/api/bigquery/status", s.handleBigQueryStatus)
+	mux.HandleFunc("/api/bigquery/projects", s.handleBigQueryProjects)
+	mux.HandleFunc("/api/bigquery/projects/", s.handleBigQueryProjectResource)
 	return mux
 }
 
@@ -136,12 +152,168 @@ func (s *Server) handleDynamoDBIndex(w http.ResponseWriter, r *http.Request) {
 	serveReactDashboardApp(w, r)
 }
 
+func (s *Server) handleBigQueryIndex(w http.ResponseWriter, r *http.Request) {
+	serveReactDashboardApp(w, r)
+}
+
 func (s *Server) handleDashboardServices(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		methodNotAllowed(w, "GET")
 		return
 	}
 	writeJSON(w, dashboardServicesResponse{Services: s.dashboardServices()})
+}
+
+func (s *Server) handleBigQueryStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w, "GET")
+		return
+	}
+	status := "disabled"
+	running := false
+	project := defaultString(s.config.BigQueryProject, "devcloud")
+	location := defaultString(s.config.BigQueryLocation, "US")
+	datasetCount := 0
+	jobCount := 0
+	if s.bq != nil {
+		snapshot := s.bq.Snapshot()
+		status = snapshot.Status
+		running = snapshot.Running
+		project = snapshot.Project
+		location = snapshot.Location
+		datasetCount = len(snapshot.Datasets)
+		jobCount = len(snapshot.Jobs)
+	}
+	writeJSON(w, map[string]any{
+		"service":      "bigquery",
+		"status":       status,
+		"running":      running,
+		"endpoint":     defaultString(s.config.BigQueryEndpoint, "http://127.0.0.1:9050"),
+		"project":      project,
+		"location":     location,
+		"authMode":     defaultString(s.config.BigQueryAuthMode, "relaxed"),
+		"storagePath":  defaultString(s.config.BigQueryStoragePath, ".devcloud/data/bigquery"),
+		"datasetCount": datasetCount,
+		"jobCount":     jobCount,
+	})
+}
+
+func (s *Server) handleBigQueryProjects(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w, "GET")
+		return
+	}
+	if s.bq == nil {
+		http.Error(w, "bigquery service is disabled", http.StatusServiceUnavailable)
+		return
+	}
+	snapshot := s.bq.Snapshot()
+	writeJSON(w, map[string]any{
+		"projects": []map[string]any{{
+			"projectId":    snapshot.Project,
+			"location":     snapshot.Location,
+			"datasetCount": len(snapshot.Datasets),
+			"jobCount":     len(snapshot.Jobs),
+			"datasets":     snapshot.Datasets,
+			"jobs":         snapshot.Jobs,
+		}},
+	})
+}
+
+func (s *Server) handleBigQueryProjectResource(w http.ResponseWriter, r *http.Request) {
+	if s.bq == nil {
+		http.Error(w, "bigquery service is disabled", http.StatusServiceUnavailable)
+		return
+	}
+	parts, err := dashboardPathParts(r.URL.EscapedPath(), "/api/bigquery/projects/")
+	if err != nil || len(parts) == 0 {
+		http.Error(w, "invalid bigquery path", http.StatusBadRequest)
+		return
+	}
+	projectID := parts[0]
+	if len(parts) == 2 && parts[1] == "queries" {
+		if r.Method != http.MethodPost {
+			methodNotAllowed(w, "POST")
+			return
+		}
+		s.forwardBigQueryQuery(w, r, projectID)
+		return
+	}
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w, "GET")
+		return
+	}
+	switch {
+	case len(parts) == 2 && parts[1] == "datasets":
+		snapshot := s.bq.Snapshot()
+		if snapshot.Project != projectID {
+			http.NotFound(w, r)
+			return
+		}
+		writeJSON(w, map[string]any{"projectId": projectID, "datasets": snapshot.Datasets})
+	case len(parts) == 4 && parts[1] == "datasets" && parts[3] == "tables":
+		dataset, found := s.bq.DatasetSnapshot(projectID, parts[2])
+		if !found {
+			http.NotFound(w, r)
+			return
+		}
+		writeJSON(w, map[string]any{"projectId": projectID, "datasetId": parts[2], "tables": dataset.Tables})
+	case len(parts) == 5 && parts[1] == "datasets" && parts[3] == "tables":
+		table, found := s.bq.TableSnapshot(projectID, parts[2], parts[4], 0)
+		if !found {
+			http.NotFound(w, r)
+			return
+		}
+		writeJSON(w, map[string]any{"projectId": projectID, "datasetId": parts[2], "tableId": parts[4], "table": table})
+	case len(parts) == 6 && parts[1] == "datasets" && parts[3] == "tables" && parts[5] == "schema":
+		table, found := s.bq.TableSnapshot(projectID, parts[2], parts[4], 0)
+		if !found {
+			http.NotFound(w, r)
+			return
+		}
+		writeJSON(w, map[string]any{"projectId": projectID, "datasetId": parts[2], "tableId": parts[4], "schema": table.Schema})
+	case len(parts) == 6 && parts[1] == "datasets" && parts[3] == "tables" && parts[5] == "rows":
+		limit, ok := positiveLimitFromRequest(w, r, 100)
+		if !ok {
+			return
+		}
+		table, found := s.bq.TableSnapshot(projectID, parts[2], parts[4], limit)
+		if !found {
+			http.NotFound(w, r)
+			return
+		}
+		writeJSON(w, map[string]any{"projectId": projectID, "datasetId": parts[2], "tableId": parts[4], "rows": table.Rows})
+	case len(parts) == 2 && parts[1] == "jobs":
+		snapshot := s.bq.Snapshot()
+		if snapshot.Project != projectID {
+			http.NotFound(w, r)
+			return
+		}
+		writeJSON(w, map[string]any{"projectId": projectID, "jobs": snapshot.Jobs})
+	case len(parts) == 3 && parts[1] == "jobs":
+		job, found := s.bq.JobSnapshot(projectID, parts[2])
+		if !found {
+			http.NotFound(w, r)
+			return
+		}
+		writeJSON(w, map[string]any{"projectId": projectID, "jobId": parts[2], "job": job})
+	default:
+		http.NotFound(w, r)
+	}
+}
+
+func (s *Server) forwardBigQueryQuery(w http.ResponseWriter, r *http.Request, projectID string) {
+	queryURL := &url.URL{
+		Path:     "/bigquery/v2/projects/" + url.PathEscape(projectID) + "/queries",
+		RawQuery: r.URL.RawQuery,
+	}
+	req := r.Clone(r.Context())
+	req.Method = http.MethodPost
+	req.URL = queryURL
+	req.RequestURI = ""
+	req.Body = r.Body
+	req.Header = r.Header.Clone()
+	s.bq.ServeHTTP(w, req)
 }
 
 func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
@@ -862,6 +1034,42 @@ func parseMessagePath(path string) (id string, raw bool, ok bool) {
 		return id, suffix == "raw", found && suffix == "raw"
 	}
 	return path, false, true
+}
+
+func dashboardPathParts(escapedPath string, prefix string) ([]string, error) {
+	suffix := strings.TrimPrefix(escapedPath, prefix)
+	if suffix == escapedPath {
+		return nil, nil
+	}
+	rawParts := strings.Split(strings.Trim(suffix, "/"), "/")
+	parts := make([]string, 0, len(rawParts))
+	for _, raw := range rawParts {
+		if raw == "" {
+			continue
+		}
+		part, err := url.PathUnescape(raw)
+		if err != nil {
+			return nil, err
+		}
+		if part == "." || part == ".." || strings.ContainsAny(part, `/\`) {
+			return nil, errors.New("invalid path segment")
+		}
+		parts = append(parts, part)
+	}
+	return parts, nil
+}
+
+func positiveLimitFromRequest(w http.ResponseWriter, r *http.Request, fallback int) (int, bool) {
+	limit := fallback
+	if rawLimit := r.URL.Query().Get("limit"); rawLimit != "" {
+		parsed, err := strconv.Atoi(rawLimit)
+		if err != nil || parsed <= 0 {
+			http.Error(w, "limit must be a positive integer", http.StatusBadRequest)
+			return 0, false
+		}
+		limit = parsed
+	}
+	return limit, true
 }
 
 func methodNotAllowed(w http.ResponseWriter, allow string) {

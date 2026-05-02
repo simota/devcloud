@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	bigquerysvc "devcloud/internal/services/bigquery"
 	dynamodbsvc "devcloud/internal/services/dynamodb"
 	"devcloud/internal/services/mail"
 	s3svc "devcloud/internal/services/s3"
@@ -123,6 +124,7 @@ func TestIndexServesServiceLinks(t *testing.T) {
 		`href="/s3"`,
 		`href="/gcs"`,
 		`href="/dynamodb"`,
+		`href="/bigquery"`,
 		"Local service dashboards",
 	} {
 		if !strings.Contains(body, want) {
@@ -142,8 +144,11 @@ func TestDashboardServicesAPIListsServiceRegistry(t *testing.T) {
 		GCSStoragePath:      ".devcloud/test/s3",
 		DynamoDBEndpoint:    "http://127.0.0.1:8001",
 		DynamoDBStoragePath: ".devcloud/test/dynamodb",
+		BigQueryEndpoint:    "http://127.0.0.1:9051",
+		BigQueryStoragePath: ".devcloud/test/bigquery",
 	}, newDashboardStore(nil, nil), s3Store, s3Store)
 	server.SetDynamoDB(dynamodbsvc.NewServer(dynamodbsvc.Config{}))
+	server.SetBigQuery(bigquerysvc.NewServer(bigquerysvc.Config{Project: "devcloud"}))
 
 	rec := performRequest(server.routes(), http.MethodGet, "/api/dashboard/services")
 
@@ -157,8 +162,8 @@ func TestDashboardServicesAPIListsServiceRegistry(t *testing.T) {
 	if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
 		t.Fatalf("decode services response: %v", err)
 	}
-	if len(response.Services) != 4 {
-		t.Fatalf("services len = %d, want 4: %#v", len(response.Services), response.Services)
+	if len(response.Services) != 5 {
+		t.Fatalf("services len = %d, want 5: %#v", len(response.Services), response.Services)
 	}
 	assertService(t, response.Services[0], DashboardService{
 		ID:          "mail",
@@ -192,6 +197,14 @@ func TestDashboardServicesAPIListsServiceRegistry(t *testing.T) {
 		Endpoint:    "http://127.0.0.1:8001",
 		StoragePath: ".devcloud/test/dynamodb",
 	})
+	assertService(t, response.Services[4], DashboardService{
+		ID:          "bigquery",
+		Name:        "BigQuery",
+		Path:        "/bigquery",
+		Status:      "running",
+		Endpoint:    "http://127.0.0.1:9051",
+		StoragePath: ".devcloud/test/bigquery",
+	})
 }
 
 func TestDashboardServicesAPIMarksDisabledServices(t *testing.T) {
@@ -206,8 +219,8 @@ func TestDashboardServicesAPIMarksDisabledServices(t *testing.T) {
 	if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
 		t.Fatalf("decode services response: %v", err)
 	}
-	if len(response.Services) != 4 {
-		t.Fatalf("services len = %d, want 4: %#v", len(response.Services), response.Services)
+	if len(response.Services) != 5 {
+		t.Fatalf("services len = %d, want 5: %#v", len(response.Services), response.Services)
 	}
 	if response.Services[0].ID != "mail" || response.Services[0].Status != "disabled" {
 		t.Fatalf("mail service = %#v, want disabled mail", response.Services[0])
@@ -220,6 +233,9 @@ func TestDashboardServicesAPIMarksDisabledServices(t *testing.T) {
 	}
 	if response.Services[3].ID != "dynamodb" || response.Services[3].Status != "disabled" {
 		t.Fatalf("dynamodb service = %#v, want disabled dynamodb", response.Services[3])
+	}
+	if response.Services[4].ID != "bigquery" || response.Services[4].Status != "disabled" {
+		t.Fatalf("bigquery service = %#v, want disabled bigquery", response.Services[4])
 	}
 }
 
@@ -389,6 +405,89 @@ func TestDynamoDBDashboardPageAndAPIExposeTables(t *testing.T) {
 	missing := performRequest(routes, http.MethodGet, "/api/dynamodb/tables/Missing/items")
 	if missing.Code != http.StatusNotFound {
 		t.Fatalf("missing DynamoDB table items status = %d, want %d", missing.Code, http.StatusNotFound)
+	}
+}
+
+func TestBigQueryDashboardPageAndAPIExposeCatalog(t *testing.T) {
+	bq := bigquerysvc.NewServer(bigquerysvc.Config{
+		Project:     "devcloud",
+		Location:    "US",
+		StoragePath: t.TempDir(),
+	})
+	performBigQueryRequest(t, bq, http.MethodPost, "/bigquery/v2/projects/devcloud/datasets", `{"datasetReference":{"datasetId":"analytics"}}`)
+	performBigQueryRequest(t, bq, http.MethodPost, "/bigquery/v2/projects/devcloud/datasets/analytics/tables", `{
+		"tableReference":{"tableId":"people"},
+		"schema":{"fields":[{"name":"id","type":"STRING","mode":"REQUIRED"},{"name":"name","type":"STRING"},{"name":"age","type":"INTEGER"}]}
+	}`)
+	performBigQueryRequest(t, bq, http.MethodPost, "/bigquery/v2/projects/devcloud/datasets/analytics/tables/people/insertAll", `{
+		"rows":[{"insertId":"row-1","json":{"id":"1","name":"Ada","age":37}}]
+	}`)
+	performBigQueryRequest(t, bq, http.MethodPost, "/bigquery/v2/projects/devcloud/queries", `{
+		"query":"SELECT id, name FROM `+"`devcloud.analytics.people`"+` WHERE age >= 30",
+		"useLegacySql":false
+	}`)
+
+	server := NewServer(Config{
+		BigQueryEndpoint:    "http://127.0.0.1:9050",
+		BigQueryProject:     "devcloud",
+		BigQueryLocation:    "US",
+		BigQueryAuthMode:    "bearer-dev",
+		BigQueryStoragePath: ".devcloud/test/bigquery",
+	}, newDashboardStore(nil, nil))
+	server.SetBigQuery(bq)
+	routes := server.routes()
+
+	page := performRequest(routes, http.MethodGet, "/dashboard/bigquery")
+	if page.Code != http.StatusOK || !strings.Contains(page.Body.String(), "devcloud Dashboard") {
+		t.Fatalf("BigQuery dashboard route changed: status=%d body=%s", page.Code, page.Body.String())
+	}
+	compatPage := performRequest(routes, http.MethodGet, "/bigquery")
+	if compatPage.Code != http.StatusOK || !strings.Contains(compatPage.Body.String(), "devcloud Dashboard") {
+		t.Fatalf("BigQuery compat route changed: status=%d body=%s", compatPage.Code, compatPage.Body.String())
+	}
+
+	status := performRequest(routes, http.MethodGet, "/api/bigquery/status")
+	if status.Code != http.StatusOK || !strings.Contains(status.Body.String(), `"service":"bigquery"`) || !strings.Contains(status.Body.String(), `"running":true`) || !strings.Contains(status.Body.String(), `"authMode":"bearer-dev"`) {
+		t.Fatalf("BigQuery status = %d body=%s", status.Code, status.Body.String())
+	}
+	projects := performRequest(routes, http.MethodGet, "/api/services")
+	if projects.Code != http.StatusOK || !strings.Contains(projects.Body.String(), `"id":"bigquery"`) {
+		t.Fatalf("service alias = %d body=%s", projects.Code, projects.Body.String())
+	}
+	projectList := performRequest(routes, http.MethodGet, "/api/bigquery/projects")
+	if projectList.Code != http.StatusOK || !strings.Contains(projectList.Body.String(), `"projectId":"devcloud"`) {
+		t.Fatalf("BigQuery projects = %d body=%s", projectList.Code, projectList.Body.String())
+	}
+	datasets := performRequest(routes, http.MethodGet, "/api/bigquery/projects/devcloud/datasets")
+	if datasets.Code != http.StatusOK || !strings.Contains(datasets.Body.String(), `"datasetId":"analytics"`) {
+		t.Fatalf("BigQuery datasets = %d body=%s", datasets.Code, datasets.Body.String())
+	}
+	tables := performRequest(routes, http.MethodGet, "/api/bigquery/projects/devcloud/datasets/analytics/tables")
+	if tables.Code != http.StatusOK || !strings.Contains(tables.Body.String(), `"tableId":"people"`) {
+		t.Fatalf("BigQuery tables = %d body=%s", tables.Code, tables.Body.String())
+	}
+	table := performRequest(routes, http.MethodGet, "/api/bigquery/projects/devcloud/datasets/analytics/tables/people")
+	if table.Code != http.StatusOK || !strings.Contains(table.Body.String(), `"tableId":"people"`) || !strings.Contains(table.Body.String(), `"numRows":"1"`) {
+		t.Fatalf("BigQuery table detail = %d body=%s", table.Code, table.Body.String())
+	}
+	schema := performRequest(routes, http.MethodGet, "/api/bigquery/projects/devcloud/datasets/analytics/tables/people/schema")
+	if schema.Code != http.StatusOK || !strings.Contains(schema.Body.String(), `"name":"age"`) || !strings.Contains(schema.Body.String(), `"type":"INTEGER"`) {
+		t.Fatalf("BigQuery schema = %d body=%s", schema.Code, schema.Body.String())
+	}
+	rows := performRequest(routes, http.MethodGet, "/api/bigquery/projects/devcloud/datasets/analytics/tables/people/rows?limit=1")
+	if rows.Code != http.StatusOK || !strings.Contains(rows.Body.String(), `"name":"Ada"`) {
+		t.Fatalf("BigQuery rows = %d body=%s", rows.Code, rows.Body.String())
+	}
+	jobs := performRequest(routes, http.MethodGet, "/api/bigquery/projects/devcloud/jobs")
+	if jobs.Code != http.StatusOK || !strings.Contains(jobs.Body.String(), `"state":"DONE"`) {
+		t.Fatalf("BigQuery jobs = %d body=%s", jobs.Code, jobs.Body.String())
+	}
+	query := performRequestWithBody(routes, http.MethodPost, "/api/bigquery/projects/devcloud/queries", `{
+		"query":"SELECT id, name FROM `+"`devcloud.analytics.people`"+` WHERE age >= 30",
+		"useLegacySql":false
+	}`)
+	if query.Code != http.StatusOK || !strings.Contains(query.Body.String(), `"kind":"bigquery#queryResponse"`) || !strings.Contains(query.Body.String(), `"totalRows":"1"`) {
+		t.Fatalf("BigQuery dashboard query = %d body=%s", query.Code, query.Body.String())
 	}
 }
 
@@ -860,6 +959,17 @@ func performRequestWithBody(handler http.Handler, method string, target string, 
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
 	return rec
+}
+
+func performBigQueryRequest(t *testing.T, server *bigquerysvc.Server, method string, target string, body string) {
+	t.Helper()
+	req := httptest.NewRequest(method, target, strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	server.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("%s %s status = %d, body = %s", method, target, rec.Code, rec.Body.String())
+	}
 }
 
 func assertService(t *testing.T, got DashboardService, want DashboardService) {

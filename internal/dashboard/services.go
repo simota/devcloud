@@ -57,6 +57,16 @@ func (s *Server) dashboardServices() []DashboardService {
 		Description: "Inspect local DynamoDB tables, indexes, and item counts.",
 	})
 
+	services = append(services, DashboardService{
+		ID:          "bigquery",
+		Name:        "BigQuery",
+		Path:        "/bigquery",
+		Status:      objectServiceStatus(s.bq != nil),
+		Endpoint:    defaultString(s.config.BigQueryEndpoint, "http://127.0.0.1:9050"),
+		StoragePath: defaultString(s.config.BigQueryStoragePath, ".devcloud/data/bigquery"),
+		Description: "Inspect local BigQuery projects, datasets, tables, rows, and jobs.",
+	})
+
 	return services
 }
 
