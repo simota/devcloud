@@ -45,6 +45,16 @@ scripts/bigquery-autoloop/progress.md
 scripts/bigquery-autoloop/done.md
 scripts/bigquery-autoloop/iteration-*.out
 scripts/bigquery-autoloop/prompt-*.*
+scripts/sqs-autoloop/.run-loop.lock
+scripts/sqs-autoloop/.circuit-state
+scripts/sqs-autoloop/runner.jsonl
+scripts/sqs-autoloop/runner.log
+scripts/sqs-autoloop/state.env
+scripts/sqs-autoloop/state.env.sha256
+scripts/sqs-autoloop/progress.md
+scripts/sqs-autoloop/done.md
+scripts/sqs-autoloop/iteration-*.out
+scripts/sqs-autoloop/prompt-*.*
 scripts/dashboard-design-renewal-autoloop/.run-loop.lock
 scripts/dashboard-design-renewal-autoloop/.circuit-state
 scripts/dashboard-design-renewal-autoloop/runner.jsonl

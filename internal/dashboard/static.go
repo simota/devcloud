@@ -120,6 +120,11 @@ const serviceIndexHTML = `<!doctype html>
         <p>Inspect local BigQuery projects, datasets, tables, rows, and jobs.</p>
         <span class="meta">BigQuery <code>127.0.0.1:9050</code></span>
       </a>
+      <a class="service" href="/dashboard/sqs">
+        <h2>SQS</h2>
+        <p>Inspect local SQS queues, messages, leases, and attributes.</p>
+        <span class="meta">SQS <code>127.0.0.1:9324</code></span>
+      </a>
     </section>
   </main>
 </body>

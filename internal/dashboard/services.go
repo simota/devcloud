@@ -67,6 +67,16 @@ func (s *Server) dashboardServices() []DashboardService {
 		Description: "Inspect local BigQuery projects, datasets, tables, rows, and jobs.",
 	})
 
+	services = append(services, DashboardService{
+		ID:          "sqs",
+		Name:        "SQS",
+		Path:        "/dashboard/sqs",
+		Status:      objectServiceStatus(s.sqs != nil),
+		Endpoint:    defaultString(s.config.SQSEndpoint, "http://127.0.0.1:9324"),
+		StoragePath: defaultString(s.config.SQSStoragePath, ".devcloud/data/sqs"),
+		Description: "Inspect local SQS queues, messages, leases, and attributes.",
+	})
+
 	return services
 }
 

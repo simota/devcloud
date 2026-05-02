@@ -4,6 +4,7 @@ import { MailDashboard } from './services/mail/MailDashboard'
 import { S3Dashboard } from './services/s3/S3Dashboard'
 import { DynamoDBDashboard } from './services/dynamodb/DynamoDBDashboard'
 import { BigQueryDashboard } from './services/bigquery/BigQueryDashboard'
+import { SQSDashboard } from './services/sqs/SQSDashboard'
 
 type RouteProps = {
   services: DashboardService[]
@@ -22,6 +23,9 @@ export function renderRoute({ services, path }: RouteProps): JSX.Element {
   }
   if (path === '/bigquery') {
     return <BigQueryDashboard service={services.find((service) => service.id === 'bigquery')} />
+  }
+  if (path === '/sqs') {
+    return <SQSDashboard service={services.find((service) => service.id === 'sqs')} />
   }
   return <ServiceIndex services={services} />
 }

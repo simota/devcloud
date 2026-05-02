@@ -18,6 +18,7 @@ import (
 	dynamodbsvc "devcloud/internal/services/dynamodb"
 	"devcloud/internal/services/mail"
 	s3svc "devcloud/internal/services/s3"
+	sqssvc "devcloud/internal/services/sqs"
 	"devcloud/internal/storage/mailstore"
 )
 
@@ -42,6 +43,10 @@ type Config struct {
 	BigQueryLocation     string
 	BigQueryAuthMode     string
 	BigQueryStoragePath  string
+	SQSEndpoint          string
+	SQSRegion            string
+	SQSAuthMode          string
+	SQSStoragePath       string
 }
 
 type Server struct {
@@ -51,6 +56,7 @@ type Server struct {
 	gcs    s3svc.BucketStore
 	dynamo *dynamodbsvc.Server
 	bq     *bigquerysvc.Server
+	sqs    *sqssvc.Server
 }
 
 func NewServer(cfg Config, store mailstore.Store, objectStores ...s3svc.BucketStore) *Server {
@@ -70,6 +76,10 @@ func (s *Server) SetDynamoDB(server *dynamodbsvc.Server) {
 
 func (s *Server) SetBigQuery(server *bigquerysvc.Server) {
 	s.bq = server
+}
+
+func (s *Server) SetSQS(server *sqssvc.Server) {
+	s.sqs = server
 }
 
 func (s *Server) Run(ctx context.Context) error {
@@ -121,6 +131,9 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("/api/bigquery/status", s.handleBigQueryStatus)
 	mux.HandleFunc("/api/bigquery/projects", s.handleBigQueryProjects)
 	mux.HandleFunc("/api/bigquery/projects/", s.handleBigQueryProjectResource)
+	mux.HandleFunc("/api/sqs/status", s.handleSQSStatus)
+	mux.HandleFunc("/api/sqs/queues", s.handleSQSQueues)
+	mux.HandleFunc("/api/sqs/queues/", s.handleSQSQueue)
 	return mux
 }
 
@@ -314,6 +327,128 @@ func (s *Server) forwardBigQueryQuery(w http.ResponseWriter, r *http.Request, pr
 	req.Body = r.Body
 	req.Header = r.Header.Clone()
 	s.bq.ServeHTTP(w, req)
+}
+
+func (s *Server) handleSQSStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w, "GET")
+		return
+	}
+	status := "disabled"
+	running := false
+	region := defaultString(s.config.SQSRegion, "us-east-1")
+	queueCount := 0
+	if s.sqs != nil {
+		snapshot := s.sqs.Snapshot()
+		status = snapshot.Status
+		running = snapshot.Running
+		region = snapshot.Region
+		queueCount = len(snapshot.Queues)
+	}
+	writeJSON(w, map[string]any{
+		"service":     "sqs",
+		"status":      status,
+		"running":     running,
+		"endpoint":    defaultString(s.config.SQSEndpoint, "http://127.0.0.1:9324"),
+		"region":      region,
+		"authMode":    defaultString(s.config.SQSAuthMode, "relaxed"),
+		"storagePath": defaultString(s.config.SQSStoragePath, ".devcloud/data/sqs"),
+		"queueCount":  queueCount,
+	})
+}
+
+func (s *Server) handleSQSQueues(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w, "GET")
+		return
+	}
+	if s.sqs == nil {
+		http.Error(w, "sqs service is disabled", http.StatusServiceUnavailable)
+		return
+	}
+	snapshot := s.sqs.Snapshot()
+	writeJSON(w, map[string]any{
+		"queues": snapshot.Queues,
+	})
+}
+
+func (s *Server) handleSQSQueue(w http.ResponseWriter, r *http.Request) {
+	if s.sqs == nil {
+		http.Error(w, "sqs service is disabled", http.StatusServiceUnavailable)
+		return
+	}
+	parts, err := dashboardPathParts(r.URL.EscapedPath(), "/api/sqs/queues/")
+	if err != nil {
+		http.Error(w, "invalid sqs queue path", http.StatusBadRequest)
+		return
+	}
+	if len(parts) == 0 {
+		http.NotFound(w, r)
+		return
+	}
+	queueName := parts[0]
+	detail, found := s.sqs.QueueDetailSnapshot(queueName)
+	if !found {
+		http.NotFound(w, r)
+		return
+	}
+	if len(parts) == 1 {
+		if r.Method != http.MethodGet {
+			methodNotAllowed(w, "GET")
+			return
+		}
+		writeJSON(w, map[string]any{
+			"queue": detail.Queue,
+		})
+		return
+	}
+	switch parts[1] {
+	case "messages":
+		if r.Method != http.MethodGet {
+			methodNotAllowed(w, "GET")
+			return
+		}
+		writeJSON(w, map[string]any{
+			"queueName": queueName,
+			"messages":  detail.Messages,
+		})
+	case "leases":
+		if r.Method != http.MethodGet {
+			methodNotAllowed(w, "GET")
+			return
+		}
+		writeJSON(w, map[string]any{
+			"queueName": queueName,
+			"leases":    detail.Leases,
+		})
+	case "dlq":
+		if r.Method != http.MethodGet {
+			methodNotAllowed(w, "GET")
+			return
+		}
+		dlq, found := s.sqs.DeadLetterSnapshot(queueName)
+		if !found {
+			http.NotFound(w, r)
+			return
+		}
+		writeJSON(w, map[string]any{
+			"queueName":              queueName,
+			"deadLetterQueue":        dlq.DeadLetterQueue,
+			"deadLetterSourceQueues": dlq.DeadLetterSourceQueues,
+		})
+	case "purge":
+		if r.Method != http.MethodPost {
+			methodNotAllowed(w, "POST")
+			return
+		}
+		if !s.sqs.PurgeQueueByName(queueName) {
+			http.NotFound(w, r)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	default:
+		http.NotFound(w, r)
+	}
 }
 
 func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
