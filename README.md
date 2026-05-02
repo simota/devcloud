@@ -2,7 +2,7 @@
 
 Local cloud service emulator for development and E2E inspection.
 
-`devcloud` runs a local dashboard plus compatible development endpoints for Mail, S3, GCS, and DynamoDB. It is designed for deterministic local tests and manual inspection, not for production workloads or full cloud-provider parity.
+`devcloud` runs a local dashboard plus compatible development endpoints for Mail, S3, GCS, DynamoDB, and BigQuery. It is designed for deterministic local tests and manual inspection, not for production workloads or full cloud-provider parity.
 
 ## Quick Start
 
@@ -28,6 +28,7 @@ Default local endpoints:
 | S3 | `http://127.0.0.1:4566` | `http://127.0.0.1:8025/s3` |
 | GCS | `http://127.0.0.1:4443` | `http://127.0.0.1:8025/gcs` |
 | DynamoDB | `http://127.0.0.1:8000` | `http://127.0.0.1:8025/dashboard/dynamodb` |
+| BigQuery | `http://127.0.0.1:9050` | `http://127.0.0.1:8025/dashboard/bigquery` |
 
 Useful commands:
 
@@ -52,6 +53,7 @@ server:
   s3Port: 4566
   gcsPort: 4443
   dynamodbPort: 8000
+  bigqueryPort: 9050
 
 auth:
   smtp:
@@ -67,6 +69,10 @@ auth:
     mode: relaxed
     accessKeyId: dev
     secretAccessKey: dev
+  bigquery:
+    mode: relaxed
+    project: devcloud
+    bearerToken: dev
 
 storage:
   path: .devcloud/data
@@ -93,6 +99,16 @@ services:
     billingMode: PAY_PER_REQUEST
     maxItemBytes: 400000
     maxTables: 256
+  bigquery:
+    enabled: true
+    project: devcloud
+    location: US
+    maxRowsPerTable: 1000000
+    maxRequestBytes: 10485760
+    query:
+      maxResultRows: 10000
+      maxExecutionSeconds: 30
+      defaultUseLegacySql: false
 ```
 
 ## Support Matrix
@@ -224,6 +240,7 @@ VERIFY_STAGE=full bash scripts/mail-autoloop/verify.sh
 VERIFY_STAGE=full bash scripts/s3-autoloop/verify.sh
 VERIFY_STAGE=full bash scripts/gcs-autoloop/verify.sh
 VERIFY_STAGE=full bash scripts/dynamodb-autoloop/verify.sh
+VERIFY_STAGE=full bash scripts/bigquery-autoloop/verify.sh
 ```
 
 Run E2E smoke tests:
@@ -233,6 +250,7 @@ scripts/mail-e2e.sh
 scripts/s3-e2e.sh
 scripts/gcs-e2e.sh
 scripts/dynamodb-e2e.sh
+scripts/bigquery-e2e.sh
 ```
 
 Keep a service running after the E2E journey for browser/API inspection:
@@ -242,6 +260,7 @@ E2E_INTERACTIVE=true scripts/mail-e2e.sh
 E2E_INTERACTIVE=true scripts/s3-e2e.sh
 E2E_INTERACTIVE=true scripts/gcs-e2e.sh
 E2E_INTERACTIVE=true E2E_DELETE_DATA=false scripts/dynamodb-e2e.sh
+E2E_INTERACTIVE=true E2E_DELETE_DATA=false scripts/bigquery-e2e.sh
 ```
 
 Override ports when defaults are already in use:
@@ -251,6 +270,7 @@ E2E_INTERACTIVE=true E2E_SMTP_PORT=1125 E2E_DASHBOARD_PORT=8125 scripts/mail-e2e
 E2E_INTERACTIVE=true E2E_S3_PORT=14566 E2E_DASHBOARD_PORT=18025 E2E_SMTP_PORT=11025 scripts/s3-e2e.sh
 E2E_INTERACTIVE=true E2E_GCS_PORT=14443 E2E_DASHBOARD_PORT=18025 scripts/gcs-e2e.sh
 E2E_INTERACTIVE=true E2E_DYNAMODB_PORT=18000 E2E_DASHBOARD_PORT=18025 scripts/dynamodb-e2e.sh
+E2E_INTERACTIVE=true E2E_BIGQUERY_PORT=19050 E2E_DASHBOARD_PORT=18025 scripts/bigquery-e2e.sh
 ```
 
 ## Project Structure
@@ -265,6 +285,7 @@ E2E_INTERACTIVE=true E2E_DYNAMODB_PORT=18000 E2E_DASHBOARD_PORT=18025 scripts/dy
 | `internal/services/s3` | S3-compatible HTTP service and filesystem-backed object store. |
 | `internal/services/gcs` | GCS JSON API-compatible HTTP service. |
 | `internal/services/dynamodb` | DynamoDB-compatible JSON API service. |
+| `internal/services/bigquery` | BigQuery-compatible REST API service. |
 | `docs/` | Product and compatibility designs. |
 | `mock/` | UI design mocks. |
 | `scripts/*-autoloop/` | Bounded implementation-loop and verification scripts. |

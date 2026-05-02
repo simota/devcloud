@@ -115,6 +115,11 @@ const serviceIndexHTML = `<!doctype html>
         <p>Inspect local DynamoDB tables, indexes, and item counts.</p>
         <span class="meta">DynamoDB <code>127.0.0.1:8000</code></span>
       </a>
+      <a class="service" href="/bigquery">
+        <h2>BigQuery</h2>
+        <p>Inspect local BigQuery projects, datasets, tables, rows, and jobs.</p>
+        <span class="meta">BigQuery <code>127.0.0.1:9050</code></span>
+      </a>
     </section>
   </main>
 </body>

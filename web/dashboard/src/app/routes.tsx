@@ -3,6 +3,7 @@ import { ServiceIndex } from './shell/ServiceIndex'
 import { MailDashboard } from './services/mail/MailDashboard'
 import { S3Dashboard } from './services/s3/S3Dashboard'
 import { DynamoDBDashboard } from './services/dynamodb/DynamoDBDashboard'
+import { BigQueryDashboard } from './services/bigquery/BigQueryDashboard'
 
 type RouteProps = {
   services: DashboardService[]
@@ -18,6 +19,9 @@ export function renderRoute({ services, path }: RouteProps): JSX.Element {
   }
   if (path === '/dynamodb') {
     return <DynamoDBDashboard service={services.find((service) => service.id === 'dynamodb')} />
+  }
+  if (path === '/bigquery') {
+    return <BigQueryDashboard service={services.find((service) => service.id === 'bigquery')} />
   }
   return <ServiceIndex services={services} />
 }

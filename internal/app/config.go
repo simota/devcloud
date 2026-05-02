@@ -23,6 +23,7 @@ type ServerConfig struct {
 	S3Port        int
 	GCSPort       int
 	DynamoDBPort  int
+	BigQueryPort  int
 }
 
 type AuthConfig struct {
@@ -30,6 +31,7 @@ type AuthConfig struct {
 	S3       S3AuthConfig
 	GCS      GCSAuthConfig
 	DynamoDB DynamoDBAuthConfig
+	BigQuery BigQueryAuthConfig
 }
 
 type SMTPAuthConfig struct {
@@ -54,6 +56,12 @@ type DynamoDBAuthConfig struct {
 	SecretAccessKey string
 }
 
+type BigQueryAuthConfig struct {
+	Mode        string
+	Project     string
+	BearerToken string
+}
+
 type StorageConfig struct {
 	Path string
 }
@@ -63,6 +71,7 @@ type ServicesConfig struct {
 	S3       S3ServiceConfig
 	GCS      GCSServiceConfig
 	DynamoDB DynamoDBServiceConfig
+	BigQuery BigQueryServiceConfig
 }
 
 type MailServiceConfig struct {
@@ -103,6 +112,21 @@ type DynamoDBTTLConfig struct {
 	SchedulerIntervalSeconds int
 }
 
+type BigQueryServiceConfig struct {
+	Enabled         bool
+	Project         string
+	Location        string
+	MaxRowsPerTable int64
+	MaxRequestBytes int64
+	Query           BigQueryQueryConfig
+}
+
+type BigQueryQueryConfig struct {
+	MaxResultRows       int
+	MaxExecutionSeconds int
+	DefaultUseLegacySQL bool
+}
+
 type S3MultipartConfig struct {
 	MinPartBytes int64
 }
@@ -116,6 +140,7 @@ func DefaultConfig() Config {
 			S3Port:        4566,
 			GCSPort:       4443,
 			DynamoDBPort:  8000,
+			BigQueryPort:  9050,
 		},
 		Auth: AuthConfig{
 			SMTP: SMTPAuthConfig{Mode: "off"},
@@ -132,6 +157,11 @@ func DefaultConfig() Config {
 				Mode:            "relaxed",
 				AccessKeyID:     "dev",
 				SecretAccessKey: "dev",
+			},
+			BigQuery: BigQueryAuthConfig{
+				Mode:        "relaxed",
+				Project:     "devcloud",
+				BearerToken: "dev",
 			},
 		},
 		Storage: StorageConfig{Path: ".devcloud/data"},
@@ -166,6 +196,18 @@ func DefaultConfig() Config {
 				},
 				TTL: DynamoDBTTLConfig{
 					SchedulerIntervalSeconds: 60,
+				},
+			},
+			BigQuery: BigQueryServiceConfig{
+				Enabled:         true,
+				Project:         "devcloud",
+				Location:        "US",
+				MaxRowsPerTable: 1000000,
+				MaxRequestBytes: 10 * 1024 * 1024,
+				Query: BigQueryQueryConfig{
+					MaxResultRows:       10000,
+					MaxExecutionSeconds: 30,
+					DefaultUseLegacySQL: false,
 				},
 			},
 		},
@@ -244,6 +286,9 @@ func InitWorkspace(cfg Config) error {
 	if err := os.MkdirAll(filepath.Join(cfg.Storage.Path, "dynamodb"), 0o755); err != nil {
 		return fmt.Errorf("create dynamodb storage: %w", err)
 	}
+	if err := os.MkdirAll(filepath.Join(cfg.Storage.Path, "bigquery"), 0o755); err != nil {
+		return fmt.Errorf("create bigquery storage: %w", err)
+	}
 	if err := os.MkdirAll(filepath.Join(cfg.Storage.Path, "kv"), 0o755); err != nil {
 		return fmt.Errorf("create kv storage: %w", err)
 	}
@@ -280,6 +325,7 @@ server:
   s3Port: %d
   gcsPort: %d
   dynamodbPort: %d
+  bigqueryPort: %d
 
 auth:
   smtp:
@@ -295,6 +341,10 @@ auth:
     mode: %s
     accessKeyId: %s
     secretAccessKey: %s
+  bigquery:
+    mode: %s
+    project: %s
+    bearerToken: %s
 
 storage:
   path: %s
@@ -325,7 +375,17 @@ services:
       enabled: %t
     ttl:
       schedulerIntervalSeconds: %d
-`, cfg.Project, cfg.Server.SMTPPort, cfg.Server.DashboardPort, cfg.Server.S3Port, cfg.Server.GCSPort, cfg.Server.DynamoDBPort, cfg.Auth.SMTP.Mode, cfg.Auth.S3.Mode, cfg.Auth.S3.AccessKeyID, cfg.Auth.S3.SecretAccessKey, cfg.Auth.GCS.Mode, cfg.Auth.GCS.Project, cfg.Auth.DynamoDB.Mode, cfg.Auth.DynamoDB.AccessKeyID, cfg.Auth.DynamoDB.SecretAccessKey, cfg.Storage.Path, cfg.Services.Mail.Enabled, cfg.Services.Mail.MaxMessageBytes, cfg.Services.S3.Enabled, cfg.Services.S3.Region, cfg.Services.S3.PathStyle, cfg.Services.S3.VirtualHostStyle, cfg.Services.S3.MaxObjectBytes, cfg.Services.S3.Multipart.MinPartBytes, cfg.Services.GCS.Enabled, cfg.Services.GCS.Project, cfg.Services.GCS.Location, cfg.Services.DynamoDB.Enabled, cfg.Services.DynamoDB.Region, cfg.Services.DynamoDB.BillingMode, cfg.Services.DynamoDB.MaxItemBytes, cfg.Services.DynamoDB.MaxTables, cfg.Services.DynamoDB.Streams.Enabled, cfg.Services.DynamoDB.TTL.SchedulerIntervalSeconds)
+  bigquery:
+    enabled: %t
+    project: %s
+    location: %s
+    maxRowsPerTable: %d
+    maxRequestBytes: %d
+    query:
+      maxResultRows: %d
+      maxExecutionSeconds: %d
+      defaultUseLegacySql: %t
+`, cfg.Project, cfg.Server.SMTPPort, cfg.Server.DashboardPort, cfg.Server.S3Port, cfg.Server.GCSPort, cfg.Server.DynamoDBPort, cfg.Server.BigQueryPort, cfg.Auth.SMTP.Mode, cfg.Auth.S3.Mode, cfg.Auth.S3.AccessKeyID, cfg.Auth.S3.SecretAccessKey, cfg.Auth.GCS.Mode, cfg.Auth.GCS.Project, cfg.Auth.DynamoDB.Mode, cfg.Auth.DynamoDB.AccessKeyID, cfg.Auth.DynamoDB.SecretAccessKey, cfg.Auth.BigQuery.Mode, cfg.Auth.BigQuery.Project, cfg.Auth.BigQuery.BearerToken, cfg.Storage.Path, cfg.Services.Mail.Enabled, cfg.Services.Mail.MaxMessageBytes, cfg.Services.S3.Enabled, cfg.Services.S3.Region, cfg.Services.S3.PathStyle, cfg.Services.S3.VirtualHostStyle, cfg.Services.S3.MaxObjectBytes, cfg.Services.S3.Multipart.MinPartBytes, cfg.Services.GCS.Enabled, cfg.Services.GCS.Project, cfg.Services.GCS.Location, cfg.Services.DynamoDB.Enabled, cfg.Services.DynamoDB.Region, cfg.Services.DynamoDB.BillingMode, cfg.Services.DynamoDB.MaxItemBytes, cfg.Services.DynamoDB.MaxTables, cfg.Services.DynamoDB.Streams.Enabled, cfg.Services.DynamoDB.TTL.SchedulerIntervalSeconds, cfg.Services.BigQuery.Enabled, cfg.Services.BigQuery.Project, cfg.Services.BigQuery.Location, cfg.Services.BigQuery.MaxRowsPerTable, cfg.Services.BigQuery.MaxRequestBytes, cfg.Services.BigQuery.Query.MaxResultRows, cfg.Services.BigQuery.Query.MaxExecutionSeconds, cfg.Services.BigQuery.Query.DefaultUseLegacySQL)
 }
 
 func ensureFile(path string, data []byte) error {
@@ -371,6 +431,12 @@ func applyConfigValue(cfg *Config, path []string, value string) error {
 			return fmt.Errorf("parse server.dynamodbPort: %w", err)
 		}
 		cfg.Server.DynamoDBPort = port
+	case "server.bigqueryPort":
+		port, err := strconv.Atoi(value)
+		if err != nil {
+			return fmt.Errorf("parse server.bigqueryPort: %w", err)
+		}
+		cfg.Server.BigQueryPort = port
 	case "auth.smtp.mode":
 		cfg.Auth.SMTP.Mode = value
 	case "auth.s3.mode":
@@ -391,6 +457,12 @@ func applyConfigValue(cfg *Config, path []string, value string) error {
 		cfg.Auth.DynamoDB.AccessKeyID = value
 	case "auth.dynamodb.secretAccessKey":
 		cfg.Auth.DynamoDB.SecretAccessKey = value
+	case "auth.bigquery.mode":
+		cfg.Auth.BigQuery.Mode = value
+	case "auth.bigquery.project":
+		cfg.Auth.BigQuery.Project = value
+	case "auth.bigquery.bearerToken":
+		cfg.Auth.BigQuery.BearerToken = value
 	case "storage.path":
 		cfg.Storage.Path = value
 	case "services.mail.enabled":
@@ -499,6 +571,58 @@ func applyConfigValue(cfg *Config, path []string, value string) error {
 			return fmt.Errorf("parse services.dynamodb.ttl.schedulerIntervalSeconds: must be positive")
 		}
 		cfg.Services.DynamoDB.TTL.SchedulerIntervalSeconds = seconds
+	case "services.bigquery.enabled":
+		enabled, err := strconv.ParseBool(value)
+		if err != nil {
+			return fmt.Errorf("parse services.bigquery.enabled: %w", err)
+		}
+		cfg.Services.BigQuery.Enabled = enabled
+	case "services.bigquery.project":
+		cfg.Services.BigQuery.Project = value
+	case "services.bigquery.location":
+		cfg.Services.BigQuery.Location = value
+	case "services.bigquery.maxRowsPerTable":
+		maxRows, err := strconv.ParseInt(value, 10, 64)
+		if err != nil {
+			return fmt.Errorf("parse services.bigquery.maxRowsPerTable: %w", err)
+		}
+		if maxRows <= 0 {
+			return fmt.Errorf("parse services.bigquery.maxRowsPerTable: must be positive")
+		}
+		cfg.Services.BigQuery.MaxRowsPerTable = maxRows
+	case "services.bigquery.maxRequestBytes":
+		maxBytes, err := strconv.ParseInt(value, 10, 64)
+		if err != nil {
+			return fmt.Errorf("parse services.bigquery.maxRequestBytes: %w", err)
+		}
+		if maxBytes <= 0 {
+			return fmt.Errorf("parse services.bigquery.maxRequestBytes: must be positive")
+		}
+		cfg.Services.BigQuery.MaxRequestBytes = maxBytes
+	case "services.bigquery.query.maxResultRows":
+		maxRows, err := strconv.Atoi(value)
+		if err != nil {
+			return fmt.Errorf("parse services.bigquery.query.maxResultRows: %w", err)
+		}
+		if maxRows <= 0 {
+			return fmt.Errorf("parse services.bigquery.query.maxResultRows: must be positive")
+		}
+		cfg.Services.BigQuery.Query.MaxResultRows = maxRows
+	case "services.bigquery.query.maxExecutionSeconds":
+		seconds, err := strconv.Atoi(value)
+		if err != nil {
+			return fmt.Errorf("parse services.bigquery.query.maxExecutionSeconds: %w", err)
+		}
+		if seconds <= 0 {
+			return fmt.Errorf("parse services.bigquery.query.maxExecutionSeconds: must be positive")
+		}
+		cfg.Services.BigQuery.Query.MaxExecutionSeconds = seconds
+	case "services.bigquery.query.defaultUseLegacySql":
+		useLegacySQL, err := strconv.ParseBool(value)
+		if err != nil {
+			return fmt.Errorf("parse services.bigquery.query.defaultUseLegacySql: %w", err)
+		}
+		cfg.Services.BigQuery.Query.DefaultUseLegacySQL = useLegacySQL
 	default:
 		return nil
 	}

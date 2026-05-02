@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 
 	"devcloud/internal/dashboard"
+	bigquerysvc "devcloud/internal/services/bigquery"
 	dynamodbsvc "devcloud/internal/services/dynamodb"
 	gcssvc "devcloud/internal/services/gcs"
 	"devcloud/internal/services/mail"
@@ -71,6 +72,19 @@ func (d *Daemon) Run(ctx context.Context) error {
 		MaxItemBytes:    d.config.Services.DynamoDB.MaxItemBytes,
 		MaxTables:       d.config.Services.DynamoDB.MaxTables,
 	})
+	bigQueryServer := bigquerysvc.NewServer(bigquerysvc.Config{
+		Addr:             loopbackAddr(d.config.Server.BigQueryPort),
+		Project:          defaultString(d.config.Services.BigQuery.Project, d.config.Auth.BigQuery.Project),
+		Location:         d.config.Services.BigQuery.Location,
+		AuthMode:         d.config.Auth.BigQuery.Mode,
+		BearerToken:      d.config.Auth.BigQuery.BearerToken,
+		StoragePath:      filepath.Join(d.config.Storage.Path, "bigquery"),
+		MaxRowsPerTable:  d.config.Services.BigQuery.MaxRowsPerTable,
+		MaxRequestBytes:  d.config.Services.BigQuery.MaxRequestBytes,
+		MaxResultRows:    d.config.Services.BigQuery.Query.MaxResultRows,
+		DefaultLegacySQL: d.config.Services.BigQuery.Query.DefaultUseLegacySQL,
+		ObjectStore:      objectStore,
+	})
 	dashboardConfig := dashboard.Config{
 		Addr:                 loopbackAddr(d.config.Server.DashboardPort),
 		MailDisabled:         !d.config.Services.Mail.Enabled,
@@ -87,13 +101,21 @@ func (d *Daemon) Run(ctx context.Context) error {
 		DynamoDBEndpoint:     "http://" + loopbackAddr(d.config.Server.DynamoDBPort),
 		DynamoDBRegion:       d.config.Services.DynamoDB.Region,
 		DynamoDBStoragePath:  filepath.Join(d.config.Storage.Path, "dynamodb"),
+		BigQueryEndpoint:     "http://" + loopbackAddr(d.config.Server.BigQueryPort),
+		BigQueryProject:      defaultString(d.config.Services.BigQuery.Project, d.config.Auth.BigQuery.Project),
+		BigQueryLocation:     d.config.Services.BigQuery.Location,
+		BigQueryAuthMode:     d.config.Auth.BigQuery.Mode,
+		BigQueryStoragePath:  filepath.Join(d.config.Storage.Path, "bigquery"),
 	}
 	dashboardServer := dashboard.NewServer(dashboardConfig, store, s3Store, objectStoreForDashboard(d.config.Services.GCS.Enabled, objectStore))
 	if d.config.Services.DynamoDB.Enabled {
 		dashboardServer.SetDynamoDB(dynamoDBServer)
 	}
+	if d.config.Services.BigQuery.Enabled {
+		dashboardServer.SetBigQuery(bigQueryServer)
+	}
 
-	errCh := make(chan error, 5)
+	errCh := make(chan error, 6)
 	if d.config.Services.Mail.Enabled {
 		go func() { errCh <- smtpServer.Run(ctx) }()
 	}
@@ -105,6 +127,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	}
 	if d.config.Services.DynamoDB.Enabled {
 		go func() { errCh <- dynamoDBServer.Run(ctx) }()
+	}
+	if d.config.Services.BigQuery.Enabled {
+		go func() { errCh <- bigQueryServer.Run(ctx) }()
 	}
 	go func() { errCh <- dashboardServer.Run(ctx) }()
 
