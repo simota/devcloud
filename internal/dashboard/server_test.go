@@ -17,6 +17,7 @@ import (
 	dynamodbsvc "devcloud/internal/services/dynamodb"
 	"devcloud/internal/services/mail"
 	s3svc "devcloud/internal/services/s3"
+	sqssvc "devcloud/internal/services/sqs"
 )
 
 type dashboardStore struct {
@@ -125,6 +126,7 @@ func TestIndexServesServiceLinks(t *testing.T) {
 		`href="/gcs"`,
 		`href="/dynamodb"`,
 		`href="/bigquery"`,
+		`href="/dashboard/sqs"`,
 		"Local service dashboards",
 	} {
 		if !strings.Contains(body, want) {
@@ -146,9 +148,12 @@ func TestDashboardServicesAPIListsServiceRegistry(t *testing.T) {
 		DynamoDBStoragePath: ".devcloud/test/dynamodb",
 		BigQueryEndpoint:    "http://127.0.0.1:9051",
 		BigQueryStoragePath: ".devcloud/test/bigquery",
+		SQSEndpoint:         "http://127.0.0.1:9325",
+		SQSStoragePath:      ".devcloud/test/sqs",
 	}, newDashboardStore(nil, nil), s3Store, s3Store)
 	server.SetDynamoDB(dynamodbsvc.NewServer(dynamodbsvc.Config{}))
 	server.SetBigQuery(bigquerysvc.NewServer(bigquerysvc.Config{Project: "devcloud"}))
+	server.SetSQS(sqssvc.NewServer(sqssvc.Config{}))
 
 	rec := performRequest(server.routes(), http.MethodGet, "/api/dashboard/services")
 
@@ -162,8 +167,8 @@ func TestDashboardServicesAPIListsServiceRegistry(t *testing.T) {
 	if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
 		t.Fatalf("decode services response: %v", err)
 	}
-	if len(response.Services) != 5 {
-		t.Fatalf("services len = %d, want 5: %#v", len(response.Services), response.Services)
+	if len(response.Services) != 6 {
+		t.Fatalf("services len = %d, want 6: %#v", len(response.Services), response.Services)
 	}
 	assertService(t, response.Services[0], DashboardService{
 		ID:          "mail",
@@ -205,6 +210,109 @@ func TestDashboardServicesAPIListsServiceRegistry(t *testing.T) {
 		Endpoint:    "http://127.0.0.1:9051",
 		StoragePath: ".devcloud/test/bigquery",
 	})
+	assertService(t, response.Services[5], DashboardService{
+		ID:          "sqs",
+		Name:        "SQS",
+		Path:        "/dashboard/sqs",
+		Status:      "running",
+		Endpoint:    "http://127.0.0.1:9325",
+		StoragePath: ".devcloud/test/sqs",
+	})
+}
+
+func TestSQSQueuesAPIListsQueueSnapshots(t *testing.T) {
+	sqsServer := sqssvc.NewServer(sqssvc.Config{Addr: "127.0.0.1:9324"})
+	createRec := sqsJSONRequest(t, sqsServer, "CreateQueue", `{"QueueName":"dashboard-queue"}`)
+	if createRec.Code != http.StatusOK {
+		t.Fatalf("create status = %d, body = %s", createRec.Code, createRec.Body.String())
+	}
+	server := NewServer(Config{}, newDashboardStore(nil, nil))
+	server.SetSQS(sqsServer)
+
+	rec := performRequest(server.routes(), http.MethodGet, "/api/sqs/queues")
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d, body = %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"name":"dashboard-queue"`) {
+		t.Fatalf("body = %s", rec.Body.String())
+	}
+}
+
+func TestSQSQueueDetailAPIsExposeMessagesLeasesAndPurge(t *testing.T) {
+	sqsServer := sqssvc.NewServer(sqssvc.Config{
+		Addr:                            "127.0.0.1:9324",
+		DefaultVisibilityTimeoutSeconds: 30,
+	})
+	createRec := sqsJSONRequest(t, sqsServer, "CreateQueue", `{"QueueName":"dashboard-detail"}`)
+	if createRec.Code != http.StatusOK {
+		t.Fatalf("create status = %d, body = %s", createRec.Code, createRec.Body.String())
+	}
+	var createBody struct {
+		QueueURL string `json:"QueueUrl"`
+	}
+	if err := json.NewDecoder(createRec.Body).Decode(&createBody); err != nil {
+		t.Fatalf("decode create response: %v", err)
+	}
+	sendRec := sqsJSONRequest(t, sqsServer, "SendMessage", `{"QueueUrl":"`+createBody.QueueURL+`","MessageBody":"dashboard body"}`)
+	if sendRec.Code != http.StatusOK {
+		t.Fatalf("send status = %d, body = %s", sendRec.Code, sendRec.Body.String())
+	}
+	receiveRec := sqsJSONRequest(t, sqsServer, "ReceiveMessage", `{"QueueUrl":"`+createBody.QueueURL+`","MaxNumberOfMessages":1}`)
+	if receiveRec.Code != http.StatusOK {
+		t.Fatalf("receive status = %d, body = %s", receiveRec.Code, receiveRec.Body.String())
+	}
+	server := NewServer(Config{}, newDashboardStore(nil, nil))
+	server.SetSQS(sqsServer)
+	routes := server.routes()
+
+	detailRec := performRequest(routes, http.MethodGet, "/api/sqs/queues/dashboard-detail")
+	if detailRec.Code != http.StatusOK {
+		t.Fatalf("detail status = %d, want %d, body = %s", detailRec.Code, http.StatusOK, detailRec.Body.String())
+	}
+	if !strings.Contains(detailRec.Body.String(), `"name":"dashboard-detail"`) {
+		t.Fatalf("detail body = %s", detailRec.Body.String())
+	}
+
+	messagesRec := performRequest(routes, http.MethodGet, "/api/sqs/queues/dashboard-detail/messages")
+	if messagesRec.Code != http.StatusOK {
+		t.Fatalf("messages status = %d, want %d, body = %s", messagesRec.Code, http.StatusOK, messagesRec.Body.String())
+	}
+	if !strings.Contains(messagesRec.Body.String(), `"body":"dashboard body"`) || !strings.Contains(messagesRec.Body.String(), `"state":"in_flight"`) {
+		t.Fatalf("messages body = %s", messagesRec.Body.String())
+	}
+
+	leasesRec := performRequest(routes, http.MethodGet, "/api/sqs/queues/dashboard-detail/leases")
+	if leasesRec.Code != http.StatusOK {
+		t.Fatalf("leases status = %d, want %d, body = %s", leasesRec.Code, http.StatusOK, leasesRec.Body.String())
+	}
+	if !strings.Contains(leasesRec.Body.String(), `"receiptHandlePresent":true`) || strings.Contains(leasesRec.Body.String(), "rct-") {
+		t.Fatalf("leases should expose only redacted receipt state: %s", leasesRec.Body.String())
+	}
+
+	dlqRec := performRequest(routes, http.MethodGet, "/api/sqs/queues/dashboard-detail/dlq")
+	if dlqRec.Code != http.StatusOK {
+		t.Fatalf("dlq status = %d, want %d, body = %s", dlqRec.Code, http.StatusOK, dlqRec.Body.String())
+	}
+
+	purgeRec := performRequest(routes, http.MethodPost, "/api/sqs/queues/dashboard-detail/purge")
+	if purgeRec.Code != http.StatusNoContent {
+		t.Fatalf("purge status = %d, want %d, body = %s", purgeRec.Code, http.StatusNoContent, purgeRec.Body.String())
+	}
+	afterPurgeRec := performRequest(routes, http.MethodGet, "/api/sqs/queues/dashboard-detail/messages")
+	if !strings.Contains(afterPurgeRec.Body.String(), `"messages":[]`) {
+		t.Fatalf("messages after purge = %s", afterPurgeRec.Body.String())
+	}
+}
+
+func TestSQSQueuesAPIMarksDisabled(t *testing.T) {
+	server := NewServer(Config{}, newDashboardStore(nil, nil))
+
+	rec := performRequest(server.routes(), http.MethodGet, "/api/sqs/queues")
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d, body = %s", rec.Code, http.StatusServiceUnavailable, rec.Body.String())
+	}
 }
 
 func TestDashboardServicesAPIMarksDisabledServices(t *testing.T) {
@@ -219,8 +327,8 @@ func TestDashboardServicesAPIMarksDisabledServices(t *testing.T) {
 	if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
 		t.Fatalf("decode services response: %v", err)
 	}
-	if len(response.Services) != 5 {
-		t.Fatalf("services len = %d, want 5: %#v", len(response.Services), response.Services)
+	if len(response.Services) != 6 {
+		t.Fatalf("services len = %d, want 6: %#v", len(response.Services), response.Services)
 	}
 	if response.Services[0].ID != "mail" || response.Services[0].Status != "disabled" {
 		t.Fatalf("mail service = %#v, want disabled mail", response.Services[0])
@@ -236,6 +344,9 @@ func TestDashboardServicesAPIMarksDisabledServices(t *testing.T) {
 	}
 	if response.Services[4].ID != "bigquery" || response.Services[4].Status != "disabled" {
 		t.Fatalf("bigquery service = %#v, want disabled bigquery", response.Services[4])
+	}
+	if response.Services[5].ID != "sqs" || response.Services[5].Status != "disabled" {
+		t.Fatalf("sqs service = %#v, want disabled sqs", response.Services[5])
 	}
 }
 
@@ -970,6 +1081,16 @@ func performBigQueryRequest(t *testing.T, server *bigquerysvc.Server, method str
 	if rec.Code != http.StatusOK {
 		t.Fatalf("%s %s status = %d, body = %s", method, target, rec.Code, rec.Body.String())
 	}
+}
+
+func sqsJSONRequest(t *testing.T, server *sqssvc.Server, operation string, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/x-amz-json-1.0")
+	req.Header.Set("X-Amz-Target", "AmazonSQS."+operation)
+	rec := httptest.NewRecorder()
+	server.ServeHTTP(rec, req)
+	return rec
 }
 
 func assertService(t *testing.T, got DashboardService, want DashboardService) {
