@@ -35,6 +35,16 @@ scripts/dynamodb-autoloop/progress.md
 scripts/dynamodb-autoloop/done.md
 scripts/dynamodb-autoloop/iteration-*.out
 scripts/dynamodb-autoloop/prompt-*.*
+scripts/bigquery-autoloop/.run-loop.lock
+scripts/bigquery-autoloop/.circuit-state
+scripts/bigquery-autoloop/runner.jsonl
+scripts/bigquery-autoloop/runner.log
+scripts/bigquery-autoloop/state.env
+scripts/bigquery-autoloop/state.env.sha256
+scripts/bigquery-autoloop/progress.md
+scripts/bigquery-autoloop/done.md
+scripts/bigquery-autoloop/iteration-*.out
+scripts/bigquery-autoloop/prompt-*.*
 scripts/dashboard-design-renewal-autoloop/.run-loop.lock
 scripts/dashboard-design-renewal-autoloop/.circuit-state
 scripts/dashboard-design-renewal-autoloop/runner.jsonl
