@@ -33,6 +33,9 @@ func TestInitWorkspaceCreatesDefaultsWithoutOverwritingConfig(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(cfg.Storage.Path, "dynamodb")); err != nil {
 		t.Fatalf("dynamodb storage not created: %v", err)
 	}
+	if _, err := os.Stat(filepath.Join(cfg.Storage.Path, "bigquery")); err != nil {
+		t.Fatalf("bigquery storage not created: %v", err)
+	}
 	if _, err := os.Stat(filepath.Join(cfg.Storage.Path, "kv")); err != nil {
 		t.Fatalf("kv storage not created: %v", err)
 	}
@@ -64,6 +67,7 @@ server:
   s3Port: 4567
   gcsPort: 4444
   dynamodbPort: 8100
+  bigqueryPort: 9051
 
 auth:
   smtp:
@@ -80,6 +84,10 @@ auth:
     mode: strict
     accessKeyId: local-dynamo
     secretAccessKey: dynamo-secret
+  bigquery:
+    mode: bearer-dev
+    project: custom-bigquery-project
+    bearerToken: bigquery-token
 
 storage:
   path: .devcloud/custom-data
@@ -110,6 +118,16 @@ services:
       enabled: true
     ttl:
       schedulerIntervalSeconds: 30
+  bigquery:
+    enabled: true
+    project: custom-bigquery-project
+    location: EU
+    maxRowsPerTable: 12345
+    maxRequestBytes: 4096
+    query:
+      maxResultRows: 500
+      maxExecutionSeconds: 7
+      defaultUseLegacySql: true
 `)
 	if err := os.WriteFile(path, data, 0o644); err != nil {
 		t.Fatalf("write config: %v", err)
@@ -122,7 +140,7 @@ services:
 	if cfg.Project != "custom" {
 		t.Fatalf("Project = %q", cfg.Project)
 	}
-	if cfg.Server.SMTPPort != 2525 || cfg.Server.DashboardPort != 8825 || cfg.Server.S3Port != 4567 || cfg.Server.GCSPort != 4444 || cfg.Server.DynamoDBPort != 8100 {
+	if cfg.Server.SMTPPort != 2525 || cfg.Server.DashboardPort != 8825 || cfg.Server.S3Port != 4567 || cfg.Server.GCSPort != 4444 || cfg.Server.DynamoDBPort != 8100 || cfg.Server.BigQueryPort != 9051 {
 		t.Fatalf("Server = %#v", cfg.Server)
 	}
 	if cfg.Auth.S3.AccessKeyID != "local" || cfg.Auth.S3.SecretAccessKey != "secret" {
@@ -133,6 +151,9 @@ services:
 	}
 	if cfg.Auth.DynamoDB.Mode != "strict" || cfg.Auth.DynamoDB.AccessKeyID != "local-dynamo" || cfg.Auth.DynamoDB.SecretAccessKey != "dynamo-secret" {
 		t.Fatalf("Auth.DynamoDB = %#v", cfg.Auth.DynamoDB)
+	}
+	if cfg.Auth.BigQuery.Mode != "bearer-dev" || cfg.Auth.BigQuery.Project != "custom-bigquery-project" || cfg.Auth.BigQuery.BearerToken != "bigquery-token" {
+		t.Fatalf("Auth.BigQuery = %#v", cfg.Auth.BigQuery)
 	}
 	if cfg.Storage.Path != ".devcloud/custom-data" {
 		t.Fatalf("Storage.Path = %q", cfg.Storage.Path)
@@ -155,6 +176,15 @@ services:
 	if cfg.Services.DynamoDB.MaxItemBytes != 2048 || cfg.Services.DynamoDB.MaxTables != 32 || !cfg.Services.DynamoDB.Streams.Enabled || cfg.Services.DynamoDB.TTL.SchedulerIntervalSeconds != 30 {
 		t.Fatalf("Services.DynamoDB limits = %#v", cfg.Services.DynamoDB)
 	}
+	if !cfg.Services.BigQuery.Enabled || cfg.Services.BigQuery.Project != "custom-bigquery-project" || cfg.Services.BigQuery.Location != "EU" {
+		t.Fatalf("Services.BigQuery = %#v", cfg.Services.BigQuery)
+	}
+	if cfg.Services.BigQuery.MaxRowsPerTable != 12345 || cfg.Services.BigQuery.MaxRequestBytes != 4096 {
+		t.Fatalf("Services.BigQuery limits = %#v", cfg.Services.BigQuery)
+	}
+	if cfg.Services.BigQuery.Query.MaxResultRows != 500 || cfg.Services.BigQuery.Query.MaxExecutionSeconds != 7 || !cfg.Services.BigQuery.Query.DefaultUseLegacySQL {
+		t.Fatalf("Services.BigQuery.Query = %#v", cfg.Services.BigQuery.Query)
+	}
 }
 
 func TestDefaultConfigIncludesS3GCSAndDynamoDBDefaults(t *testing.T) {
@@ -167,6 +197,9 @@ func TestDefaultConfigIncludesS3GCSAndDynamoDBDefaults(t *testing.T) {
 	}
 	if cfg.Server.DynamoDBPort != 8000 {
 		t.Fatalf("Server.DynamoDBPort = %d", cfg.Server.DynamoDBPort)
+	}
+	if cfg.Server.BigQueryPort != 9050 {
+		t.Fatalf("Server.BigQueryPort = %d", cfg.Server.BigQueryPort)
 	}
 	if cfg.Auth.S3.Mode != "relaxed" || cfg.Auth.S3.AccessKeyID != "dev" || cfg.Auth.S3.SecretAccessKey != "dev" {
 		t.Fatalf("Auth.S3 = %#v", cfg.Auth.S3)
@@ -197,6 +230,31 @@ func TestDefaultConfigIncludesS3GCSAndDynamoDBDefaults(t *testing.T) {
 	}
 	if cfg.Services.DynamoDB.MaxItemBytes != 400000 || cfg.Services.DynamoDB.MaxTables != 256 || cfg.Services.DynamoDB.Streams.Enabled || cfg.Services.DynamoDB.TTL.SchedulerIntervalSeconds != 60 {
 		t.Fatalf("Services.DynamoDB limits = %#v", cfg.Services.DynamoDB)
+	}
+	if cfg.Auth.BigQuery.Mode != "relaxed" || cfg.Auth.BigQuery.Project != "devcloud" || cfg.Auth.BigQuery.BearerToken != "dev" {
+		t.Fatalf("Auth.BigQuery = %#v", cfg.Auth.BigQuery)
+	}
+	if !cfg.Services.BigQuery.Enabled || cfg.Services.BigQuery.Project != "devcloud" || cfg.Services.BigQuery.Location != "US" {
+		t.Fatalf("Services.BigQuery = %#v", cfg.Services.BigQuery)
+	}
+	if cfg.Services.BigQuery.MaxRowsPerTable != 1000000 || cfg.Services.BigQuery.MaxRequestBytes != 10*1024*1024 {
+		t.Fatalf("Services.BigQuery limits = %#v", cfg.Services.BigQuery)
+	}
+	if cfg.Services.BigQuery.Query.MaxResultRows != 10000 || cfg.Services.BigQuery.Query.MaxExecutionSeconds != 30 || cfg.Services.BigQuery.Query.DefaultUseLegacySQL {
+		t.Fatalf("Services.BigQuery.Query = %#v", cfg.Services.BigQuery.Query)
+	}
+}
+
+func TestDefaultConfigIncludesBigQueryDefaults(t *testing.T) {
+	cfg := DefaultConfig()
+	if cfg.Server.BigQueryPort != 9050 {
+		t.Fatalf("Server.BigQueryPort = %d", cfg.Server.BigQueryPort)
+	}
+	if cfg.Auth.BigQuery.Mode != "relaxed" || cfg.Auth.BigQuery.Project != "devcloud" || cfg.Auth.BigQuery.BearerToken != "dev" {
+		t.Fatalf("Auth.BigQuery = %#v", cfg.Auth.BigQuery)
+	}
+	if !cfg.Services.BigQuery.Enabled || cfg.Services.BigQuery.Project != "devcloud" || cfg.Services.BigQuery.Location != "US" {
+		t.Fatalf("Services.BigQuery = %#v", cfg.Services.BigQuery)
 	}
 }
 
@@ -236,6 +294,9 @@ func TestWorkspaceStoragePathMustStayUnderDevcloud(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(".devcloud", "custom-data", "dynamodb")); err != nil {
 		t.Fatalf("custom dynamodb storage not created: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(".devcloud", "custom-data", "bigquery")); err != nil {
+		t.Fatalf("custom bigquery storage not created: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(".devcloud", "custom-data", "kv")); err != nil {
 		t.Fatalf("custom kv storage not created: %v", err)
@@ -284,6 +345,14 @@ func TestLoadConfigIgnoresUnknownKeysAndRejectsInvalidKnownValues(t *testing.T) 
 	}
 	if _, err := LoadConfig(invalidS3Path); err == nil {
 		t.Fatal("LoadConfig() invalid s3 multipart minPartBytes error = nil")
+	}
+
+	invalidBigQueryPath := filepath.Join(dir, "invalid-bigquery.yaml")
+	if err := os.WriteFile(invalidBigQueryPath, []byte("services:\n  bigquery:\n    maxRequestBytes: 0\n"), 0o644); err != nil {
+		t.Fatalf("write invalid bigquery config: %v", err)
+	}
+	if _, err := LoadConfig(invalidBigQueryPath); err == nil {
+		t.Fatal("LoadConfig() invalid bigquery maxRequestBytes error = nil")
 	}
 }
 
