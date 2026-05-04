@@ -1,6 +1,7 @@
 package app
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -39,6 +40,12 @@ func TestInitWorkspaceCreatesDefaultsWithoutOverwritingConfig(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(cfg.Storage.Path, "sqs")); err != nil {
 		t.Fatalf("sqs storage not created: %v", err)
 	}
+	if _, err := os.Stat(filepath.Join(cfg.Storage.Path, "pubsub")); err != nil {
+		t.Fatalf("pubsub storage not created: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(cfg.Storage.Path, "message")); err != nil {
+		t.Fatalf("message storage not created: %v", err)
+	}
 	if _, err := os.Stat(filepath.Join(cfg.Storage.Path, "kv")); err != nil {
 		t.Fatalf("kv storage not created: %v", err)
 	}
@@ -72,6 +79,8 @@ server:
   dynamodbPort: 8100
   bigqueryPort: 9051
   sqsPort: 9325
+  pubsubGrpcPort: 18085
+  pubsubRestPort: 18086
 
 auth:
   smtp:
@@ -97,6 +106,10 @@ auth:
     accessKeyId: local-sqs
     secretAccessKey: sqs-secret
     accountId: "123456789012"
+  pubsub:
+    mode: bearer-dev
+    projectID: custom-pubsub-project
+    bearerToken: pubsub-token
 
 storage:
   path: .devcloud/custom-data
@@ -149,6 +162,19 @@ services:
     defaultMessageRetentionSeconds: 600
     defaultReceiveWaitTimeSeconds: 2
     schedulerIntervalSeconds: 3
+  pubsub:
+    enabled: true
+    project: custom-pubsub-project
+    dataDir: .devcloud/custom-pubsub
+    messageDataDir: .devcloud/custom-message
+    defaultAckDeadlineSeconds: 11
+    messageRetentionSeconds: 700
+    maxAckDeadlineSeconds: 120
+    maxPullMessages: 50
+    pullWaitTimeoutSeconds: 4
+    enableREST: true
+    enableStreamingPull: false
+    enablePush: true
 `)
 	if err := os.WriteFile(path, data, 0o644); err != nil {
 		t.Fatalf("write config: %v", err)
@@ -161,7 +187,7 @@ services:
 	if cfg.Project != "custom" {
 		t.Fatalf("Project = %q", cfg.Project)
 	}
-	if cfg.Server.SMTPPort != 2525 || cfg.Server.DashboardPort != 8825 || cfg.Server.S3Port != 4567 || cfg.Server.GCSPort != 4444 || cfg.Server.DynamoDBPort != 8100 || cfg.Server.BigQueryPort != 9051 || cfg.Server.SQSPort != 9325 {
+	if cfg.Server.SMTPPort != 2525 || cfg.Server.DashboardPort != 8825 || cfg.Server.S3Port != 4567 || cfg.Server.GCSPort != 4444 || cfg.Server.DynamoDBPort != 8100 || cfg.Server.BigQueryPort != 9051 || cfg.Server.SQSPort != 9325 || cfg.Server.PubSubGRPCPort != 18085 || cfg.Server.PubSubRESTPort != 18086 {
 		t.Fatalf("Server = %#v", cfg.Server)
 	}
 	if cfg.Auth.S3.AccessKeyID != "local" || cfg.Auth.S3.SecretAccessKey != "secret" {
@@ -178,6 +204,9 @@ services:
 	}
 	if cfg.Auth.SQS.Mode != "strict" || cfg.Auth.SQS.AccessKeyID != "local-sqs" || cfg.Auth.SQS.SecretAccessKey != "sqs-secret" || cfg.Auth.SQS.AccountID != "123456789012" {
 		t.Fatalf("Auth.SQS = %#v", cfg.Auth.SQS)
+	}
+	if cfg.Auth.PubSub.Mode != "bearer-dev" || cfg.Auth.PubSub.ProjectID != "custom-pubsub-project" || cfg.Auth.PubSub.BearerToken != "pubsub-token" {
+		t.Fatalf("Auth.PubSub = %#v", cfg.Auth.PubSub)
 	}
 	if cfg.Storage.Path != ".devcloud/custom-data" {
 		t.Fatalf("Storage.Path = %q", cfg.Storage.Path)
@@ -218,6 +247,18 @@ services:
 	if cfg.Services.SQS.DefaultVisibilityTimeoutSeconds != 9 || cfg.Services.SQS.DefaultDelaySeconds != 1 || cfg.Services.SQS.DefaultMessageRetentionSeconds != 600 || cfg.Services.SQS.DefaultReceiveWaitTimeSeconds != 2 || cfg.Services.SQS.SchedulerIntervalSeconds != 3 {
 		t.Fatalf("Services.SQS timings = %#v", cfg.Services.SQS)
 	}
+	if !cfg.Services.PubSub.Enabled || cfg.Services.PubSub.Project != "custom-pubsub-project" {
+		t.Fatalf("Services.PubSub = %#v", cfg.Services.PubSub)
+	}
+	if cfg.Services.PubSub.DataDir != ".devcloud/custom-pubsub" || cfg.Services.PubSub.MessageDataDir != ".devcloud/custom-message" {
+		t.Fatalf("Services.PubSub dirs = %#v", cfg.Services.PubSub)
+	}
+	if cfg.Services.PubSub.DefaultAckDeadlineSeconds != 11 || cfg.Services.PubSub.MessageRetentionSeconds != 700 || cfg.Services.PubSub.MaxAckDeadlineSeconds != 120 || cfg.Services.PubSub.MaxPullMessages != 50 || cfg.Services.PubSub.PullWaitTimeoutSeconds != 4 {
+		t.Fatalf("Services.PubSub limits = %#v", cfg.Services.PubSub)
+	}
+	if !cfg.Services.PubSub.EnableREST || cfg.Services.PubSub.EnableStreamingPull || !cfg.Services.PubSub.EnablePush {
+		t.Fatalf("Services.PubSub feature flags = %#v", cfg.Services.PubSub)
+	}
 }
 
 func TestLoadConfigAcceptsBigQueryPortAlias(t *testing.T) {
@@ -252,6 +293,12 @@ func TestDefaultConfigIncludesS3GCSAndDynamoDBDefaults(t *testing.T) {
 	}
 	if cfg.Server.SQSPort != 9324 {
 		t.Fatalf("Server.SQSPort = %d", cfg.Server.SQSPort)
+	}
+	if cfg.Server.PubSubGRPCPort != 8085 {
+		t.Fatalf("Server.PubSubGRPCPort = %d", cfg.Server.PubSubGRPCPort)
+	}
+	if cfg.Server.PubSubRESTPort != 8086 {
+		t.Fatalf("Server.PubSubRESTPort = %d", cfg.Server.PubSubRESTPort)
 	}
 	if cfg.Auth.S3.Mode != "relaxed" || cfg.Auth.S3.AccessKeyID != "dev" || cfg.Auth.S3.SecretAccessKey != "dev" {
 		t.Fatalf("Auth.S3 = %#v", cfg.Auth.S3)
@@ -306,6 +353,21 @@ func TestDefaultConfigIncludesS3GCSAndDynamoDBDefaults(t *testing.T) {
 	}
 	if cfg.Services.SQS.DefaultVisibilityTimeoutSeconds != 30 || cfg.Services.SQS.DefaultDelaySeconds != 0 || cfg.Services.SQS.DefaultMessageRetentionSeconds != 345600 || cfg.Services.SQS.DefaultReceiveWaitTimeSeconds != 0 || cfg.Services.SQS.SchedulerIntervalSeconds != 1 {
 		t.Fatalf("Services.SQS timings = %#v", cfg.Services.SQS)
+	}
+	if cfg.Auth.PubSub.Mode != "relaxed" || cfg.Auth.PubSub.ProjectID != "devcloud" || cfg.Auth.PubSub.BearerToken != "dev" {
+		t.Fatalf("Auth.PubSub = %#v", cfg.Auth.PubSub)
+	}
+	if !cfg.Services.PubSub.Enabled || cfg.Services.PubSub.Project != "devcloud" {
+		t.Fatalf("Services.PubSub = %#v", cfg.Services.PubSub)
+	}
+	if cfg.Services.PubSub.DataDir != "" || cfg.Services.PubSub.MessageDataDir != "" {
+		t.Fatalf("Services.PubSub dirs = %#v", cfg.Services.PubSub)
+	}
+	if cfg.Services.PubSub.DefaultAckDeadlineSeconds != 10 || cfg.Services.PubSub.MessageRetentionSeconds != 604800 || cfg.Services.PubSub.MaxAckDeadlineSeconds != 600 || cfg.Services.PubSub.MaxPullMessages != 1000 || cfg.Services.PubSub.PullWaitTimeoutSeconds != 1 {
+		t.Fatalf("Services.PubSub limits = %#v", cfg.Services.PubSub)
+	}
+	if !cfg.Services.PubSub.EnableREST || !cfg.Services.PubSub.EnableStreamingPull || cfg.Services.PubSub.EnablePush {
+		t.Fatalf("Services.PubSub feature flags = %#v", cfg.Services.PubSub)
 	}
 }
 
@@ -362,8 +424,84 @@ func TestWorkspaceStoragePathMustStayUnderDevcloud(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(".devcloud", "custom-data", "bigquery")); err != nil {
 		t.Fatalf("custom bigquery storage not created: %v", err)
 	}
+	if _, err := os.Stat(filepath.Join(".devcloud", "custom-data", "pubsub")); err != nil {
+		t.Fatalf("custom pubsub storage not created: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(".devcloud", "custom-data", "message")); err != nil {
+		t.Fatalf("custom message storage not created: %v", err)
+	}
 	if _, err := os.Stat(filepath.Join(".devcloud", "custom-data", "kv")); err != nil {
 		t.Fatalf("custom kv storage not created: %v", err)
+	}
+}
+
+func TestInitWorkspaceUsesPubSubSpecificDataDirs(t *testing.T) {
+	chdir(t, t.TempDir())
+	cfg := DefaultConfig()
+	cfg.Services.PubSub.DataDir = filepath.Join(".devcloud", "pubsub-store")
+	cfg.Services.PubSub.MessageDataDir = filepath.Join(".devcloud", "pubsub-message-store")
+
+	if err := InitWorkspace(cfg); err != nil {
+		t.Fatalf("InitWorkspace() error = %v", err)
+	}
+	if _, err := os.Stat(cfg.Services.PubSub.DataDir); err != nil {
+		t.Fatalf("custom pubsub dataDir not created: %v", err)
+	}
+	if _, err := os.Stat(cfg.Services.PubSub.MessageDataDir); err != nil {
+		t.Fatalf("custom pubsub messageDataDir not created: %v", err)
+	}
+
+	cfg.Services.PubSub.DataDir = "pubsub-outside"
+	if err := InitWorkspace(cfg); err == nil {
+		t.Fatal("InitWorkspace() error = nil for pubsub dataDir outside .devcloud")
+	}
+	cfg.Services.PubSub.DataDir = filepath.Join(".devcloud", "pubsub-store")
+	cfg.Services.PubSub.MessageDataDir = "message-outside"
+	if err := InitWorkspace(cfg); err == nil {
+		t.Fatal("InitWorkspace() error = nil for pubsub messageDataDir outside .devcloud")
+	}
+}
+
+func TestResetWorkspaceRemovesPubSubSpecificDataDirs(t *testing.T) {
+	chdir(t, t.TempDir())
+	cfg := DefaultConfig()
+	cfg.Services.PubSub.DataDir = filepath.Join(".devcloud", "pubsub-store")
+	cfg.Services.PubSub.MessageDataDir = filepath.Join(".devcloud", "pubsub-message-store")
+
+	if err := InitWorkspace(cfg); err != nil {
+		t.Fatalf("InitWorkspace() error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(cfg.Services.PubSub.DataDir, "resources.json"), []byte(`{"topics":[]}`), 0o644); err != nil {
+		t.Fatalf("write pubsub state: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(cfg.Services.PubSub.MessageDataDir, "message.json"), []byte(`{"messageId":"1"}`), 0o644); err != nil {
+		t.Fatalf("write pubsub message state: %v", err)
+	}
+
+	if err := ResetWorkspace(cfg); err != nil {
+		t.Fatalf("ResetWorkspace() error = %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(cfg.Services.PubSub.DataDir, "resources.json")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("pubsub state still exists after reset: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(cfg.Services.PubSub.MessageDataDir, "message.json")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("pubsub message state still exists after reset: %v", err)
+	}
+	if _, err := os.Stat(cfg.Services.PubSub.DataDir); err != nil {
+		t.Fatalf("custom pubsub dataDir not recreated: %v", err)
+	}
+	if _, err := os.Stat(cfg.Services.PubSub.MessageDataDir); err != nil {
+		t.Fatalf("custom pubsub messageDataDir not recreated: %v", err)
+	}
+
+	cfg.Services.PubSub.DataDir = "pubsub-outside"
+	if err := ResetWorkspace(cfg); err == nil {
+		t.Fatal("ResetWorkspace() error = nil for pubsub dataDir outside .devcloud")
+	}
+	cfg.Services.PubSub.DataDir = filepath.Join(".devcloud", "pubsub-store")
+	cfg.Services.PubSub.MessageDataDir = "message-outside"
+	if err := ResetWorkspace(cfg); err == nil {
+		t.Fatal("ResetWorkspace() error = nil for pubsub messageDataDir outside .devcloud")
 	}
 }
 
@@ -417,6 +555,22 @@ func TestLoadConfigIgnoresUnknownKeysAndRejectsInvalidKnownValues(t *testing.T) 
 	}
 	if _, err := LoadConfig(invalidBigQueryPath); err == nil {
 		t.Fatal("LoadConfig() invalid bigquery maxRequestBytes error = nil")
+	}
+
+	invalidPubSubPath := filepath.Join(dir, "invalid-pubsub.yaml")
+	if err := os.WriteFile(invalidPubSubPath, []byte("services:\n  pubsub:\n    maxPullMessages: 0\n"), 0o644); err != nil {
+		t.Fatalf("write invalid pubsub config: %v", err)
+	}
+	if _, err := LoadConfig(invalidPubSubPath); err == nil {
+		t.Fatal("LoadConfig() invalid pubsub maxPullMessages error = nil")
+	}
+
+	invalidPubSubTimeoutPath := filepath.Join(dir, "invalid-pubsub-timeout.yaml")
+	if err := os.WriteFile(invalidPubSubTimeoutPath, []byte("services:\n  pubsub:\n    pullWaitTimeoutSeconds: -1\n"), 0o644); err != nil {
+		t.Fatalf("write invalid pubsub timeout config: %v", err)
+	}
+	if _, err := LoadConfig(invalidPubSubTimeoutPath); err == nil {
+		t.Fatal("LoadConfig() invalid pubsub pullWaitTimeoutSeconds error = nil")
 	}
 }
 

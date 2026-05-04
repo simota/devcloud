@@ -5,6 +5,7 @@ import { S3Dashboard } from './services/s3/S3Dashboard'
 import { DynamoDBDashboard } from './services/dynamodb/DynamoDBDashboard'
 import { BigQueryDashboard } from './services/bigquery/BigQueryDashboard'
 import { SQSDashboard } from './services/sqs/SQSDashboard'
+import { PubSubDashboard } from './services/pubsub/PubSubDashboard'
 
 type RouteProps = {
   services: DashboardService[]
@@ -26,6 +27,9 @@ export function renderRoute({ services, path }: RouteProps): JSX.Element {
   }
   if (path === '/sqs') {
     return <SQSDashboard service={services.find((service) => service.id === 'sqs')} />
+  }
+  if (path === '/pubsub') {
+    return <PubSubDashboard service={services.find((service) => service.id === 'pubsub')} />
   }
   return <ServiceIndex services={services} />
 }

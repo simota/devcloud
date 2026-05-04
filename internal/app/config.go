@@ -18,13 +18,15 @@ type Config struct {
 }
 
 type ServerConfig struct {
-	SMTPPort      int
-	DashboardPort int
-	S3Port        int
-	GCSPort       int
-	DynamoDBPort  int
-	BigQueryPort  int
-	SQSPort       int
+	SMTPPort       int
+	DashboardPort  int
+	S3Port         int
+	GCSPort        int
+	DynamoDBPort   int
+	BigQueryPort   int
+	SQSPort        int
+	PubSubGRPCPort int
+	PubSubRESTPort int
 }
 
 type AuthConfig struct {
@@ -34,6 +36,7 @@ type AuthConfig struct {
 	DynamoDB DynamoDBAuthConfig
 	BigQuery BigQueryAuthConfig
 	SQS      SQSAuthConfig
+	PubSub   PubSubAuthConfig
 }
 
 type SMTPAuthConfig struct {
@@ -71,6 +74,12 @@ type SQSAuthConfig struct {
 	AccountID       string
 }
 
+type PubSubAuthConfig struct {
+	Mode        string
+	ProjectID   string
+	BearerToken string
+}
+
 type StorageConfig struct {
 	Path string
 }
@@ -82,6 +91,7 @@ type ServicesConfig struct {
 	DynamoDB DynamoDBServiceConfig
 	BigQuery BigQueryServiceConfig
 	SQS      SQSServiceConfig
+	PubSub   PubSubServiceConfig
 }
 
 type MailServiceConfig struct {
@@ -151,6 +161,21 @@ type SQSServiceConfig struct {
 	SchedulerIntervalSeconds        int
 }
 
+type PubSubServiceConfig struct {
+	Enabled                   bool
+	Project                   string
+	DataDir                   string
+	MessageDataDir            string
+	DefaultAckDeadlineSeconds int
+	MessageRetentionSeconds   int
+	MaxAckDeadlineSeconds     int
+	MaxPullMessages           int
+	PullWaitTimeoutSeconds    int
+	EnableREST                bool
+	EnableStreamingPull       bool
+	EnablePush                bool
+}
+
 type S3MultipartConfig struct {
 	MinPartBytes int64
 }
@@ -159,13 +184,15 @@ func DefaultConfig() Config {
 	return Config{
 		Project: "dev",
 		Server: ServerConfig{
-			SMTPPort:      1025,
-			DashboardPort: 8025,
-			S3Port:        4566,
-			GCSPort:       4443,
-			DynamoDBPort:  8000,
-			BigQueryPort:  9050,
-			SQSPort:       9324,
+			SMTPPort:       1025,
+			DashboardPort:  8025,
+			S3Port:         4566,
+			GCSPort:        4443,
+			DynamoDBPort:   8000,
+			BigQueryPort:   9050,
+			SQSPort:        9324,
+			PubSubGRPCPort: 8085,
+			PubSubRESTPort: 8086,
 		},
 		Auth: AuthConfig{
 			SMTP: SMTPAuthConfig{Mode: "off"},
@@ -193,6 +220,11 @@ func DefaultConfig() Config {
 				AccessKeyID:     "dev",
 				SecretAccessKey: "dev",
 				AccountID:       "000000000000",
+			},
+			PubSub: PubSubAuthConfig{
+				Mode:        "relaxed",
+				ProjectID:   "devcloud",
+				BearerToken: "dev",
 			},
 		},
 		Storage: StorageConfig{Path: ".devcloud/data"},
@@ -254,6 +286,20 @@ func DefaultConfig() Config {
 				DefaultReceiveWaitTimeSeconds:   0,
 				SchedulerIntervalSeconds:        1,
 			},
+			PubSub: PubSubServiceConfig{
+				Enabled:                   true,
+				Project:                   "devcloud",
+				DataDir:                   "",
+				MessageDataDir:            "",
+				DefaultAckDeadlineSeconds: 10,
+				MessageRetentionSeconds:   604800,
+				MaxAckDeadlineSeconds:     600,
+				MaxPullMessages:           1000,
+				PullWaitTimeoutSeconds:    1,
+				EnableREST:                true,
+				EnableStreamingPull:       true,
+				EnablePush:                false,
+			},
 		},
 	}
 }
@@ -309,6 +355,16 @@ func InitWorkspace(cfg Config) error {
 	if err := validateStoragePath(cfg.Storage.Path); err != nil {
 		return err
 	}
+	if cfg.Services.PubSub.DataDir != "" {
+		if err := validateStoragePath(cfg.Services.PubSub.DataDir); err != nil {
+			return fmt.Errorf("pubsub dataDir: %w", err)
+		}
+	}
+	if cfg.Services.PubSub.MessageDataDir != "" {
+		if err := validateStoragePath(cfg.Services.PubSub.MessageDataDir); err != nil {
+			return fmt.Errorf("pubsub messageDataDir: %w", err)
+		}
+	}
 	if err := os.MkdirAll(filepath.Join(cfg.Storage.Path, "blobs"), 0o755); err != nil {
 		return fmt.Errorf("create blob storage: %w", err)
 	}
@@ -336,6 +392,12 @@ func InitWorkspace(cfg Config) error {
 	if err := os.MkdirAll(filepath.Join(cfg.Storage.Path, "sqs"), 0o755); err != nil {
 		return fmt.Errorf("create sqs storage: %w", err)
 	}
+	if err := os.MkdirAll(pubsubDataDir(cfg), 0o755); err != nil {
+		return fmt.Errorf("create pubsub storage: %w", err)
+	}
+	if err := os.MkdirAll(pubsubMessageDataDir(cfg), 0o755); err != nil {
+		return fmt.Errorf("create message storage: %w", err)
+	}
 	if err := os.MkdirAll(filepath.Join(cfg.Storage.Path, "kv"), 0o755); err != nil {
 		return fmt.Errorf("create kv storage: %w", err)
 	}
@@ -349,8 +411,28 @@ func ResetWorkspace(cfg Config) error {
 	if err := validateStoragePath(cfg.Storage.Path); err != nil {
 		return err
 	}
+	if cfg.Services.PubSub.DataDir != "" {
+		if err := validateStoragePath(cfg.Services.PubSub.DataDir); err != nil {
+			return fmt.Errorf("pubsub dataDir: %w", err)
+		}
+	}
+	if cfg.Services.PubSub.MessageDataDir != "" {
+		if err := validateStoragePath(cfg.Services.PubSub.MessageDataDir); err != nil {
+			return fmt.Errorf("pubsub messageDataDir: %w", err)
+		}
+	}
 	if err := os.RemoveAll(cfg.Storage.Path); err != nil {
 		return fmt.Errorf("remove storage: %w", err)
+	}
+	if cfg.Services.PubSub.DataDir != "" {
+		if err := os.RemoveAll(pubsubDataDir(cfg)); err != nil {
+			return fmt.Errorf("remove pubsub storage: %w", err)
+		}
+	}
+	if cfg.Services.PubSub.MessageDataDir != "" {
+		if err := os.RemoveAll(pubsubMessageDataDir(cfg)); err != nil {
+			return fmt.Errorf("remove pubsub message storage: %w", err)
+		}
 	}
 	return InitWorkspace(cfg)
 }
@@ -374,6 +456,8 @@ server:
   dynamodbPort: %d
   bigqueryPort: %d
   sqsPort: %d
+  pubsubGrpcPort: %d
+  pubsubRestPort: %d
 
 auth:
   smtp:
@@ -398,6 +482,10 @@ auth:
     accessKeyId: %s
     secretAccessKey: %s
     accountId: "%s"
+  pubsub:
+    mode: %s
+    projectID: %s
+    bearerToken: %s
 
 storage:
   path: %s
@@ -450,7 +538,20 @@ services:
     defaultMessageRetentionSeconds: %d
     defaultReceiveWaitTimeSeconds: %d
     schedulerIntervalSeconds: %d
-`, cfg.Project, cfg.Server.SMTPPort, cfg.Server.DashboardPort, cfg.Server.S3Port, cfg.Server.GCSPort, cfg.Server.DynamoDBPort, cfg.Server.BigQueryPort, cfg.Server.SQSPort, cfg.Auth.SMTP.Mode, cfg.Auth.S3.Mode, cfg.Auth.S3.AccessKeyID, cfg.Auth.S3.SecretAccessKey, cfg.Auth.GCS.Mode, cfg.Auth.GCS.Project, cfg.Auth.DynamoDB.Mode, cfg.Auth.DynamoDB.AccessKeyID, cfg.Auth.DynamoDB.SecretAccessKey, cfg.Auth.BigQuery.Mode, cfg.Auth.BigQuery.Project, cfg.Auth.BigQuery.BearerToken, cfg.Auth.SQS.Mode, cfg.Auth.SQS.AccessKeyID, cfg.Auth.SQS.SecretAccessKey, cfg.Auth.SQS.AccountID, cfg.Storage.Path, cfg.Services.Mail.Enabled, cfg.Services.Mail.MaxMessageBytes, cfg.Services.S3.Enabled, cfg.Services.S3.Region, cfg.Services.S3.PathStyle, cfg.Services.S3.VirtualHostStyle, cfg.Services.S3.MaxObjectBytes, cfg.Services.S3.Multipart.MinPartBytes, cfg.Services.GCS.Enabled, cfg.Services.GCS.Project, cfg.Services.GCS.Location, cfg.Services.DynamoDB.Enabled, cfg.Services.DynamoDB.Region, cfg.Services.DynamoDB.BillingMode, cfg.Services.DynamoDB.MaxItemBytes, cfg.Services.DynamoDB.MaxTables, cfg.Services.DynamoDB.Streams.Enabled, cfg.Services.DynamoDB.TTL.SchedulerIntervalSeconds, cfg.Services.BigQuery.Enabled, cfg.Services.BigQuery.Project, cfg.Services.BigQuery.Location, cfg.Services.BigQuery.MaxRowsPerTable, cfg.Services.BigQuery.MaxRequestBytes, cfg.Services.BigQuery.Query.MaxResultRows, cfg.Services.BigQuery.Query.MaxExecutionSeconds, cfg.Services.BigQuery.Query.DefaultUseLegacySQL, cfg.Services.SQS.Enabled, cfg.Services.SQS.Region, cfg.Services.SQS.QueueURLHost, cfg.Services.SQS.MaxQueues, cfg.Services.SQS.MaxMessageBytes, cfg.Services.SQS.MaxReceiveBatchSize, cfg.Services.SQS.DefaultVisibilityTimeoutSeconds, cfg.Services.SQS.DefaultDelaySeconds, cfg.Services.SQS.DefaultMessageRetentionSeconds, cfg.Services.SQS.DefaultReceiveWaitTimeSeconds, cfg.Services.SQS.SchedulerIntervalSeconds)
+  pubsub:
+    enabled: %t
+    project: %s
+    dataDir: %s
+    messageDataDir: %s
+    defaultAckDeadlineSeconds: %d
+    messageRetentionSeconds: %d
+    maxAckDeadlineSeconds: %d
+    maxPullMessages: %d
+    pullWaitTimeoutSeconds: %d
+    enableREST: %t
+    enableStreamingPull: %t
+    enablePush: %t
+`, cfg.Project, cfg.Server.SMTPPort, cfg.Server.DashboardPort, cfg.Server.S3Port, cfg.Server.GCSPort, cfg.Server.DynamoDBPort, cfg.Server.BigQueryPort, cfg.Server.SQSPort, cfg.Server.PubSubGRPCPort, cfg.Server.PubSubRESTPort, cfg.Auth.SMTP.Mode, cfg.Auth.S3.Mode, cfg.Auth.S3.AccessKeyID, cfg.Auth.S3.SecretAccessKey, cfg.Auth.GCS.Mode, cfg.Auth.GCS.Project, cfg.Auth.DynamoDB.Mode, cfg.Auth.DynamoDB.AccessKeyID, cfg.Auth.DynamoDB.SecretAccessKey, cfg.Auth.BigQuery.Mode, cfg.Auth.BigQuery.Project, cfg.Auth.BigQuery.BearerToken, cfg.Auth.SQS.Mode, cfg.Auth.SQS.AccessKeyID, cfg.Auth.SQS.SecretAccessKey, cfg.Auth.SQS.AccountID, cfg.Auth.PubSub.Mode, cfg.Auth.PubSub.ProjectID, cfg.Auth.PubSub.BearerToken, cfg.Storage.Path, cfg.Services.Mail.Enabled, cfg.Services.Mail.MaxMessageBytes, cfg.Services.S3.Enabled, cfg.Services.S3.Region, cfg.Services.S3.PathStyle, cfg.Services.S3.VirtualHostStyle, cfg.Services.S3.MaxObjectBytes, cfg.Services.S3.Multipart.MinPartBytes, cfg.Services.GCS.Enabled, cfg.Services.GCS.Project, cfg.Services.GCS.Location, cfg.Services.DynamoDB.Enabled, cfg.Services.DynamoDB.Region, cfg.Services.DynamoDB.BillingMode, cfg.Services.DynamoDB.MaxItemBytes, cfg.Services.DynamoDB.MaxTables, cfg.Services.DynamoDB.Streams.Enabled, cfg.Services.DynamoDB.TTL.SchedulerIntervalSeconds, cfg.Services.BigQuery.Enabled, cfg.Services.BigQuery.Project, cfg.Services.BigQuery.Location, cfg.Services.BigQuery.MaxRowsPerTable, cfg.Services.BigQuery.MaxRequestBytes, cfg.Services.BigQuery.Query.MaxResultRows, cfg.Services.BigQuery.Query.MaxExecutionSeconds, cfg.Services.BigQuery.Query.DefaultUseLegacySQL, cfg.Services.SQS.Enabled, cfg.Services.SQS.Region, cfg.Services.SQS.QueueURLHost, cfg.Services.SQS.MaxQueues, cfg.Services.SQS.MaxMessageBytes, cfg.Services.SQS.MaxReceiveBatchSize, cfg.Services.SQS.DefaultVisibilityTimeoutSeconds, cfg.Services.SQS.DefaultDelaySeconds, cfg.Services.SQS.DefaultMessageRetentionSeconds, cfg.Services.SQS.DefaultReceiveWaitTimeSeconds, cfg.Services.SQS.SchedulerIntervalSeconds, cfg.Services.PubSub.Enabled, cfg.Services.PubSub.Project, defaultString(cfg.Services.PubSub.DataDir, filepath.Join(cfg.Storage.Path, "pubsub")), defaultString(cfg.Services.PubSub.MessageDataDir, filepath.Join(cfg.Storage.Path, "message")), cfg.Services.PubSub.DefaultAckDeadlineSeconds, cfg.Services.PubSub.MessageRetentionSeconds, cfg.Services.PubSub.MaxAckDeadlineSeconds, cfg.Services.PubSub.MaxPullMessages, cfg.Services.PubSub.PullWaitTimeoutSeconds, cfg.Services.PubSub.EnableREST, cfg.Services.PubSub.EnableStreamingPull, cfg.Services.PubSub.EnablePush)
 }
 
 func ensureFile(path string, data []byte) error {
@@ -508,6 +609,18 @@ func applyConfigValue(cfg *Config, path []string, value string) error {
 			return fmt.Errorf("parse server.sqsPort: %w", err)
 		}
 		cfg.Server.SQSPort = port
+	case "server.pubsubGrpcPort":
+		port, err := strconv.Atoi(value)
+		if err != nil {
+			return fmt.Errorf("parse server.pubsubGrpcPort: %w", err)
+		}
+		cfg.Server.PubSubGRPCPort = port
+	case "server.pubsubRestPort":
+		port, err := strconv.Atoi(value)
+		if err != nil {
+			return fmt.Errorf("parse server.pubsubRestPort: %w", err)
+		}
+		cfg.Server.PubSubRESTPort = port
 	case "auth.smtp.mode":
 		cfg.Auth.SMTP.Mode = value
 	case "auth.s3.mode":
@@ -542,6 +655,12 @@ func applyConfigValue(cfg *Config, path []string, value string) error {
 		cfg.Auth.SQS.SecretAccessKey = value
 	case "auth.sqs.accountId":
 		cfg.Auth.SQS.AccountID = strings.Trim(value, `"`)
+	case "auth.pubsub.mode":
+		cfg.Auth.PubSub.Mode = value
+	case "auth.pubsub.projectID", "auth.pubsub.projectId":
+		cfg.Auth.PubSub.ProjectID = value
+	case "auth.pubsub.bearerToken":
+		cfg.Auth.PubSub.BearerToken = value
 	case "storage.path":
 		cfg.Storage.Path = value
 	case "services.mail.enabled":
@@ -784,6 +903,81 @@ func applyConfigValue(cfg *Config, path []string, value string) error {
 			return fmt.Errorf("parse services.sqs.schedulerIntervalSeconds: must be positive")
 		}
 		cfg.Services.SQS.SchedulerIntervalSeconds = seconds
+	case "services.pubsub.enabled":
+		enabled, err := strconv.ParseBool(value)
+		if err != nil {
+			return fmt.Errorf("parse services.pubsub.enabled: %w", err)
+		}
+		cfg.Services.PubSub.Enabled = enabled
+	case "services.pubsub.project":
+		cfg.Services.PubSub.Project = value
+	case "services.pubsub.dataDir":
+		cfg.Services.PubSub.DataDir = value
+	case "services.pubsub.messageDataDir":
+		cfg.Services.PubSub.MessageDataDir = value
+	case "services.pubsub.defaultAckDeadlineSeconds":
+		seconds, err := strconv.Atoi(value)
+		if err != nil {
+			return fmt.Errorf("parse services.pubsub.defaultAckDeadlineSeconds: %w", err)
+		}
+		if seconds <= 0 {
+			return fmt.Errorf("parse services.pubsub.defaultAckDeadlineSeconds: must be positive")
+		}
+		cfg.Services.PubSub.DefaultAckDeadlineSeconds = seconds
+	case "services.pubsub.messageRetentionSeconds":
+		seconds, err := strconv.Atoi(value)
+		if err != nil {
+			return fmt.Errorf("parse services.pubsub.messageRetentionSeconds: %w", err)
+		}
+		if seconds <= 0 {
+			return fmt.Errorf("parse services.pubsub.messageRetentionSeconds: must be positive")
+		}
+		cfg.Services.PubSub.MessageRetentionSeconds = seconds
+	case "services.pubsub.maxAckDeadlineSeconds":
+		seconds, err := strconv.Atoi(value)
+		if err != nil {
+			return fmt.Errorf("parse services.pubsub.maxAckDeadlineSeconds: %w", err)
+		}
+		if seconds <= 0 {
+			return fmt.Errorf("parse services.pubsub.maxAckDeadlineSeconds: must be positive")
+		}
+		cfg.Services.PubSub.MaxAckDeadlineSeconds = seconds
+	case "services.pubsub.maxPullMessages":
+		maxMessages, err := strconv.Atoi(value)
+		if err != nil {
+			return fmt.Errorf("parse services.pubsub.maxPullMessages: %w", err)
+		}
+		if maxMessages <= 0 {
+			return fmt.Errorf("parse services.pubsub.maxPullMessages: must be positive")
+		}
+		cfg.Services.PubSub.MaxPullMessages = maxMessages
+	case "services.pubsub.pullWaitTimeoutSeconds":
+		seconds, err := strconv.Atoi(value)
+		if err != nil {
+			return fmt.Errorf("parse services.pubsub.pullWaitTimeoutSeconds: %w", err)
+		}
+		if seconds < 0 {
+			return fmt.Errorf("parse services.pubsub.pullWaitTimeoutSeconds: must be non-negative")
+		}
+		cfg.Services.PubSub.PullWaitTimeoutSeconds = seconds
+	case "services.pubsub.enableREST":
+		enabled, err := strconv.ParseBool(value)
+		if err != nil {
+			return fmt.Errorf("parse services.pubsub.enableREST: %w", err)
+		}
+		cfg.Services.PubSub.EnableREST = enabled
+	case "services.pubsub.enableStreamingPull":
+		enabled, err := strconv.ParseBool(value)
+		if err != nil {
+			return fmt.Errorf("parse services.pubsub.enableStreamingPull: %w", err)
+		}
+		cfg.Services.PubSub.EnableStreamingPull = enabled
+	case "services.pubsub.enablePush":
+		enabled, err := strconv.ParseBool(value)
+		if err != nil {
+			return fmt.Errorf("parse services.pubsub.enablePush: %w", err)
+		}
+		cfg.Services.PubSub.EnablePush = enabled
 	default:
 		return nil
 	}

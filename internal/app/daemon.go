@@ -5,12 +5,14 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"time"
 
 	"devcloud/internal/dashboard"
 	bigquerysvc "devcloud/internal/services/bigquery"
 	dynamodbsvc "devcloud/internal/services/dynamodb"
 	gcssvc "devcloud/internal/services/gcs"
 	"devcloud/internal/services/mail"
+	pubsubsvc "devcloud/internal/services/pubsub"
 	s3svc "devcloud/internal/services/s3"
 	sqssvc "devcloud/internal/services/sqs"
 	"devcloud/internal/storage/blob"
@@ -103,6 +105,23 @@ func (d *Daemon) Run(ctx context.Context) error {
 		DefaultMessageRetentionSeconds:  d.config.Services.SQS.DefaultMessageRetentionSeconds,
 		DefaultReceiveWaitTimeSeconds:   d.config.Services.SQS.DefaultReceiveWaitTimeSeconds,
 	})
+	pubSubServer := pubsubsvc.NewServer(pubsubsvc.Config{
+		GRPCAddr:                  loopbackAddr(d.config.Server.PubSubGRPCPort),
+		RESTAddr:                  loopbackAddr(d.config.Server.PubSubRESTPort),
+		Project:                   defaultString(d.config.Services.PubSub.Project, d.config.Auth.PubSub.ProjectID),
+		AuthMode:                  d.config.Auth.PubSub.Mode,
+		BearerToken:               d.config.Auth.PubSub.BearerToken,
+		StoragePath:               pubsubDataDir(d.config),
+		MessageStoragePath:        pubsubMessageDataDir(d.config),
+		RESTEnabled:               d.config.Services.PubSub.EnableREST,
+		DefaultAckDeadlineSeconds: d.config.Services.PubSub.DefaultAckDeadlineSeconds,
+		MessageRetentionSeconds:   d.config.Services.PubSub.MessageRetentionSeconds,
+		MaxAckDeadlineSeconds:     d.config.Services.PubSub.MaxAckDeadlineSeconds,
+		MaxPullMessages:           d.config.Services.PubSub.MaxPullMessages,
+		PullWaitTimeout:           time.Duration(d.config.Services.PubSub.PullWaitTimeoutSeconds) * time.Second,
+		StreamingPullDisabled:     !d.config.Services.PubSub.EnableStreamingPull,
+		EnablePush:                d.config.Services.PubSub.EnablePush,
+	})
 	dashboardConfig := dashboard.Config{
 		Addr:                 loopbackAddr(d.config.Server.DashboardPort),
 		MailDisabled:         !d.config.Services.Mail.Enabled,
@@ -128,6 +147,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 		SQSRegion:            d.config.Services.SQS.Region,
 		SQSAuthMode:          d.config.Auth.SQS.Mode,
 		SQSStoragePath:       filepath.Join(d.config.Storage.Path, "sqs"),
+		PubSubGRPCEndpoint:   loopbackAddr(d.config.Server.PubSubGRPCPort),
+		PubSubRESTEndpoint:   "http://" + loopbackAddr(d.config.Server.PubSubRESTPort),
+		PubSubProject:        defaultString(d.config.Services.PubSub.Project, d.config.Auth.PubSub.ProjectID),
+		PubSubStoragePath:    pubsubDataDir(d.config),
 	}
 	dashboardServer := dashboard.NewServer(dashboardConfig, store, s3Store, objectStoreForDashboard(d.config.Services.GCS.Enabled, objectStore))
 	if d.config.Services.DynamoDB.Enabled {
@@ -139,8 +162,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 	if d.config.Services.SQS.Enabled {
 		dashboardServer.SetSQS(sqsServer)
 	}
+	if d.config.Services.PubSub.Enabled {
+		dashboardServer.SetPubSub(pubSubServer)
+	}
 
-	errCh := make(chan error, 7)
+	errCh := make(chan error, d.enabledServerCount())
 	if d.config.Services.Mail.Enabled {
 		go func() { errCh <- smtpServer.Run(ctx) }()
 	}
@@ -158,6 +184,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	}
 	if d.config.Services.SQS.Enabled {
 		go func() { errCh <- sqsServer.Run(ctx) }()
+	}
+	if d.config.Services.PubSub.Enabled {
+		go func() { errCh <- pubSubServer.Run(ctx) }()
 	}
 	go func() { errCh <- dashboardServer.Run(ctx) }()
 
@@ -188,4 +217,38 @@ func objectStoreForDashboard(enabled bool, store s3svc.BucketStore) s3svc.Bucket
 		return nil
 	}
 	return store
+}
+
+func (d *Daemon) enabledServerCount() int {
+	count := 1 // dashboard
+	if d.config.Services.Mail.Enabled {
+		count++
+	}
+	if d.config.Services.S3.Enabled {
+		count++
+	}
+	if d.config.Services.GCS.Enabled {
+		count++
+	}
+	if d.config.Services.DynamoDB.Enabled {
+		count++
+	}
+	if d.config.Services.BigQuery.Enabled {
+		count++
+	}
+	if d.config.Services.SQS.Enabled {
+		count++
+	}
+	if d.config.Services.PubSub.Enabled {
+		count++
+	}
+	return count
+}
+
+func pubsubDataDir(cfg Config) string {
+	return defaultString(cfg.Services.PubSub.DataDir, filepath.Join(cfg.Storage.Path, "pubsub"))
+}
+
+func pubsubMessageDataDir(cfg Config) string {
+	return defaultString(cfg.Services.PubSub.MessageDataDir, filepath.Join(cfg.Storage.Path, "message"))
 }
