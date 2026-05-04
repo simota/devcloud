@@ -77,6 +77,16 @@ func (s *Server) dashboardServices() []DashboardService {
 		Description: "Inspect local SQS queues, messages, leases, and attributes.",
 	})
 
+	services = append(services, DashboardService{
+		ID:          "pubsub",
+		Name:        "Pub/Sub",
+		Path:        "/dashboard/pubsub",
+		Status:      objectServiceStatus(s.pubsub != nil),
+		Endpoint:    defaultString(s.config.PubSubRESTEndpoint, "http://127.0.0.1:8086"),
+		StoragePath: defaultString(s.config.PubSubStoragePath, ".devcloud/data/pubsub"),
+		Description: "Inspect local Pub/Sub topics, subscriptions, backlog, and leases.",
+	})
+
 	return services
 }
 

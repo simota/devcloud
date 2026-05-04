@@ -125,6 +125,11 @@ const serviceIndexHTML = `<!doctype html>
         <p>Inspect local SQS queues, messages, leases, and attributes.</p>
         <span class="meta">SQS <code>127.0.0.1:9324</code></span>
       </a>
+      <a class="service" href="/dashboard/pubsub">
+        <h2>Pub/Sub</h2>
+        <p>Inspect local Pub/Sub topics, subscriptions, backlog, and leases.</p>
+        <span class="meta">Pub/Sub <code>127.0.0.1:8086</code></span>
+      </a>
     </section>
   </main>
 </body>
