@@ -21,7 +21,8 @@ export class DashboardRequestError extends Error {
 }
 
 type FetchDashboardOptions = {
-  method?: 'GET' | 'DELETE'
+  method?: 'GET' | 'POST' | 'DELETE'
+  body?: unknown
   timeoutMs?: number
 }
 
@@ -66,11 +67,16 @@ async function fetchDashboard<T>(
   const method = options.method ?? 'GET'
   const controller = new AbortController()
   const timeout = window.setTimeout(() => controller.abort(), timeoutMs)
+  const headers: Record<string, string> = { Accept: 'application/json' }
+  if (options.body !== undefined) {
+    headers['Content-Type'] = 'application/json'
+  }
 
   try {
     publishActivity({ path, status: 'pending' })
     const response = await fetch(path, {
-      headers: { Accept: 'application/json' },
+      headers,
+      body: options.body === undefined ? undefined : JSON.stringify(options.body),
       method,
       signal: controller.signal,
     })
