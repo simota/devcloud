@@ -2,7 +2,7 @@
 
 Local cloud service emulator for development and E2E inspection.
 
-`devcloud` runs a local dashboard plus compatible development endpoints for Mail, S3, GCS, DynamoDB, and BigQuery. It is designed for deterministic local tests and manual inspection, not for production workloads or full cloud-provider parity.
+`devcloud` runs a local dashboard plus compatible development endpoints for Mail, S3, GCS, DynamoDB, BigQuery, SQS, and Google Cloud Pub/Sub. It is designed for deterministic local tests and manual inspection, not for production workloads or full cloud-provider parity.
 
 ## Quick Start
 
@@ -29,6 +29,9 @@ Default local endpoints:
 | GCS | `http://127.0.0.1:4443` | `http://127.0.0.1:8025/gcs` |
 | DynamoDB | `http://127.0.0.1:8000` | `http://127.0.0.1:8025/dashboard/dynamodb` |
 | BigQuery | `http://127.0.0.1:9050` | `http://127.0.0.1:8025/dashboard/bigquery` |
+| SQS | `http://127.0.0.1:9324` | `http://127.0.0.1:8025/dashboard/sqs` |
+| Pub/Sub gRPC | `127.0.0.1:8085` | `http://127.0.0.1:8025/dashboard/pubsub` |
+| Pub/Sub REST | `http://127.0.0.1:8086` | `http://127.0.0.1:8025/dashboard/pubsub` |
 
 Useful commands:
 
@@ -54,6 +57,9 @@ server:
   gcsPort: 4443
   dynamodbPort: 8000
   bigqueryPort: 9050
+  sqsPort: 9324
+  pubsubGrpcPort: 8085
+  pubsubRestPort: 8086
 
 auth:
   smtp:
@@ -72,6 +78,15 @@ auth:
   bigquery:
     mode: relaxed
     project: devcloud
+    bearerToken: dev
+  sqs:
+    mode: relaxed
+    accessKeyId: dev
+    secretAccessKey: dev
+    accountId: "000000000000"
+  pubsub:
+    mode: relaxed
+    projectID: devcloud
     bearerToken: dev
 
 storage:
@@ -109,6 +124,31 @@ services:
       maxResultRows: 10000
       maxExecutionSeconds: 30
       defaultUseLegacySql: false
+  sqs:
+    enabled: true
+    region: us-east-1
+    queueUrlHost: 127.0.0.1
+    maxQueues: 256
+    maxMessageBytes: 1048576
+    maxReceiveBatchSize: 10
+    defaultVisibilityTimeoutSeconds: 30
+    defaultDelaySeconds: 0
+    defaultMessageRetentionSeconds: 345600
+    defaultReceiveWaitTimeSeconds: 0
+    schedulerIntervalSeconds: 1
+  pubsub:
+    enabled: true
+    project: devcloud
+    dataDir: .devcloud/data/pubsub
+    messageDataDir: .devcloud/data/message
+    defaultAckDeadlineSeconds: 10
+    messageRetentionSeconds: 604800
+    maxAckDeadlineSeconds: 600
+    maxPullMessages: 1000
+    pullWaitTimeoutSeconds: 1
+    enableREST: true
+    enableStreamingPull: true
+    enablePush: false
 ```
 
 ## Support Matrix
@@ -123,15 +163,16 @@ Legend:
 
 ### Service Availability
 
-| Capability | Mail | S3 | GCS | DynamoDB |
-| --- | --- | --- | --- | --- |
-| Local endpoint | Yes | Yes | Yes | Yes |
-| Dashboard view | Yes | Yes | Yes | Yes |
-| Persistent local storage | Yes | Yes | Yes | Yes |
-| Configurable port | Yes | Yes | Yes | Yes |
-| Enable/disable via config | Yes | Yes | Yes | Yes |
-| Local relaxed auth mode | N/A | Yes | Yes | Yes |
-| Strict cloud-grade auth/IAM | No | Partial | No | Partial |
+| Capability | Mail | S3 | GCS | DynamoDB | BigQuery | SQS | Pub/Sub |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Local endpoint | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
+| Dashboard view | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
+| Dashboard mutation actions | Partial | Partial | Partial | No | No | Partial | Yes |
+| Persistent local storage | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
+| Configurable port | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
+| Enable/disable via config | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
+| Local relaxed auth mode | N/A | Yes | Yes | Yes | Yes | Yes | Yes |
+| Strict cloud-grade auth/IAM | No | Partial | No | Partial | No | Partial | No |
 
 ### Mail
 
@@ -214,6 +255,34 @@ Legend:
 | Real capacity accounting/throttling | No | Local deterministic behavior, not AWS capacity simulation. |
 | IAM condition enforcement | No | Not implemented. |
 
+### Google Cloud Pub/Sub-Compatible API
+
+| Feature | Status | Notes |
+| --- | --- | --- |
+| gRPC emulator endpoint | Yes | Implements local `google.pubsub.v1.Publisher`, `Subscriber`, and `SchemaService` surfaces. |
+| REST v1 endpoint | Yes | Supports topic, subscription, publish, pull, ack, seek, schema, and IAM-compatible local workflows. |
+| Google Cloud Pub/Sub client libraries | Yes | Use `PUBSUB_EMULATOR_HOST=127.0.0.1:8085` and `PUBSUB_PROJECT_ID=devcloud`. |
+| Topic create/get/list/update/delete | Yes | Includes labels, retention, schema settings, and KMS metadata where applicable. |
+| Subscription create/get/list/update/delete | Yes | Includes ack deadline, retain acked messages, filters, retry policy, dead-letter policy, push config, and ordering flags. |
+| Publish / Pull / Acknowledge / ModifyAckDeadline | Yes | Local lease and redelivery behavior is covered by unit and E2E tests. |
+| StreamingPull | Yes | Supports flow control, ack/modack/nack, cancellation, and ordering-key gates. |
+| Ordering keys | Yes | Local ordered delivery gate is implemented for pull and streaming pull flows. |
+| Snapshots and Seek | Yes | Snapshot CRUD and seek-to-time/snapshot flows are implemented. |
+| Schemas | Yes | Schema CRUD, revisions, rollback/delete revision, and validate message are implemented locally. |
+| Push subscriptions | Partial | Local HTTP push worker, retry policy, and OIDC/no-wrapper metadata are supported when push is enabled. |
+| IAM endpoints | Partial | Local policy shape is supported; no real Google IAM enforcement. |
+| Exactly-once delivery | Partial | Metadata is accepted; no real cloud-grade exactly-once guarantee. |
+| Cloud Monitoring, quotas, billing | No | Not implemented. |
+| Production durability / HA | No | Filesystem-backed local emulator only. |
+
+Pub/Sub dashboard actions are available under `/dashboard/pubsub`:
+
+- create topics
+- create subscriptions
+- publish a message to the selected topic
+- pull messages from the selected subscription
+- acknowledge pulled messages
+
 ### Dashboard API
 
 | Feature | Status | Notes |
@@ -223,6 +292,8 @@ Legend:
 | S3 dashboard API | Yes | Bucket/object listing, download links. |
 | GCS dashboard API | Yes | Bucket/object/upload-session inspection. |
 | DynamoDB dashboard API | Yes | Status, tables, table detail, indexes, TTL, streams, items. |
+| SQS dashboard API | Yes | Status, queues, messages, leases, DLQ, and purge. |
+| Pub/Sub dashboard API | Yes | Status, topics, subscriptions, publish, pull, ack, and message metadata. |
 | Common React dashboard shell | Partial | Shared shell is available under `/dashboard/`; some legacy service pages still exist. |
 
 ## Verification
@@ -241,6 +312,9 @@ VERIFY_STAGE=full bash scripts/s3-autoloop/verify.sh
 VERIFY_STAGE=full bash scripts/gcs-autoloop/verify.sh
 VERIFY_STAGE=full bash scripts/dynamodb-autoloop/verify.sh
 VERIFY_STAGE=full bash scripts/bigquery-autoloop/verify.sh
+VERIFY_STAGE=full bash scripts/sqs-autoloop/verify.sh
+VERIFY_STAGE=full bash scripts/pubsub-autoloop/verify.sh
+VERIFY_STAGE=full-compat bash scripts/pubsub-full-compat-autoloop/verify.sh
 ```
 
 Run E2E smoke tests:
@@ -252,6 +326,7 @@ scripts/gcs-e2e.sh
 scripts/dynamodb-e2e.sh
 scripts/bigquery-e2e.sh
 scripts/sqs-e2e.sh
+scripts/pubsub-e2e.sh
 ```
 
 Keep a service running after the E2E journey for browser/API inspection:
@@ -263,6 +338,7 @@ E2E_INTERACTIVE=true scripts/gcs-e2e.sh
 E2E_INTERACTIVE=true E2E_DELETE_DATA=false scripts/dynamodb-e2e.sh
 E2E_INTERACTIVE=true E2E_DELETE_DATA=false scripts/bigquery-e2e.sh
 E2E_INTERACTIVE=true E2E_DELETE_DATA=false scripts/sqs-e2e.sh
+E2E_INTERACTIVE=true scripts/pubsub-e2e.sh
 ```
 
 Override ports when defaults are already in use:
@@ -274,6 +350,7 @@ E2E_INTERACTIVE=true E2E_GCS_PORT=14443 E2E_DASHBOARD_PORT=18025 scripts/gcs-e2e
 E2E_INTERACTIVE=true E2E_DYNAMODB_PORT=18000 E2E_DASHBOARD_PORT=18025 scripts/dynamodb-e2e.sh
 E2E_INTERACTIVE=true E2E_BIGQUERY_PORT=19050 E2E_DASHBOARD_PORT=18025 scripts/bigquery-e2e.sh
 E2E_INTERACTIVE=true E2E_SQS_PORT=19324 E2E_DASHBOARD_PORT=18025 scripts/sqs-e2e.sh
+PUBSUB_GRPC_PORT=18085 PUBSUB_REST_PORT=18086 DASHBOARD_PORT=18025 E2E_INTERACTIVE=true scripts/pubsub-e2e.sh
 ```
 
 ## Project Structure
@@ -289,6 +366,8 @@ E2E_INTERACTIVE=true E2E_SQS_PORT=19324 E2E_DASHBOARD_PORT=18025 scripts/sqs-e2e
 | `internal/services/gcs` | GCS JSON API-compatible HTTP service. |
 | `internal/services/dynamodb` | DynamoDB-compatible JSON API service. |
 | `internal/services/bigquery` | BigQuery-compatible REST API service. |
+| `internal/services/sqs` | SQS-compatible JSON and Query API service. |
+| `internal/services/pubsub` | Google Cloud Pub/Sub-compatible REST and gRPC service. |
 | `docs/` | Product and compatibility designs. |
 | `mock/` | UI design mocks. |
 | `scripts/*-autoloop/` | Bounded implementation-loop and verification scripts. |
