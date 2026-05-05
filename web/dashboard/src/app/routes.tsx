@@ -7,6 +7,7 @@ import { BigQueryDashboard } from './services/bigquery/BigQueryDashboard'
 import { RedshiftDashboard } from './services/redshift/RedshiftDashboard'
 import { SQSDashboard } from './services/sqs/SQSDashboard'
 import { PubSubDashboard } from './services/pubsub/PubSubDashboard'
+import { GCSDashboard } from './services/gcs/GCSDashboard'
 
 type RouteProps = {
   services: DashboardService[]
@@ -19,6 +20,9 @@ export function renderRoute({ services, path }: RouteProps): JSX.Element {
   }
   if (path === '/s3') {
     return <S3Dashboard service={services.find((service) => service.id === 's3')} />
+  }
+  if (path === '/gcs') {
+    return <GCSDashboard service={services.find((service) => service.id === 'gcs')} />
   }
   if (path === '/dynamodb') {
     return <DynamoDBDashboard service={services.find((service) => service.id === 'dynamodb')} />
