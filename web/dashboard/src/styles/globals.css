@@ -17,7 +17,8 @@ body {
 
 button,
 input,
-select {
+select,
+textarea {
   font: inherit;
 }
 
@@ -559,7 +560,8 @@ code {
 
 .mail-filter input,
 .compact-filter input,
-.compact-filter select {
+.compact-filter select,
+.compact-filter textarea {
   width: 100%;
   border: 1px solid var(--border-default);
   border-radius: var(--radius-md);
@@ -570,16 +572,23 @@ code {
 
 .mail-filter input:focus,
 .compact-filter input:focus,
-.compact-filter select:focus {
+.compact-filter select:focus,
+.compact-filter textarea:focus {
   border-color: var(--accent-primary);
   outline: 2px solid #cfe5d9;
   outline-offset: 1px;
 }
 
 .compact-filter input:disabled,
-.compact-filter select:disabled {
+.compact-filter select:disabled,
+.compact-filter textarea:disabled {
   background: var(--surface-subtle);
   color: var(--text-secondary);
+}
+
+.compact-filter textarea {
+  min-height: 86px;
+  resize: vertical;
 }
 
 .compact-filter.small {

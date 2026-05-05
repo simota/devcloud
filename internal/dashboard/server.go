@@ -556,12 +556,16 @@ func (s *Server) handleSQSStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleSQSQueues(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		methodNotAllowed(w, "GET")
+	if r.Method != http.MethodGet && r.Method != http.MethodPost {
+		methodNotAllowed(w, "GET, POST")
 		return
 	}
 	if s.sqs == nil {
 		http.Error(w, "sqs service is disabled", http.StatusServiceUnavailable)
+		return
+	}
+	if r.Method == http.MethodPost {
+		s.forwardSQSDashboardOperation(w, r, "CreateQueue", "", "")
 		return
 	}
 	snapshot := s.sqs.Snapshot()
@@ -602,14 +606,24 @@ func (s *Server) handleSQSQueue(w http.ResponseWriter, r *http.Request) {
 	}
 	switch parts[1] {
 	case "messages":
-		if r.Method != http.MethodGet {
-			methodNotAllowed(w, "GET")
+		if r.Method != http.MethodGet && r.Method != http.MethodPost {
+			methodNotAllowed(w, "GET, POST")
+			return
+		}
+		if r.Method == http.MethodPost {
+			s.forwardSQSDashboardOperation(w, r, "SendMessage", queueName, detail.Queue.URL)
 			return
 		}
 		writeJSON(w, map[string]any{
 			"queueName": queueName,
 			"messages":  detail.Messages,
 		})
+	case "receive":
+		s.forwardSQSDashboardOperation(w, r, "ReceiveMessage", queueName, detail.Queue.URL)
+	case "delete":
+		s.forwardSQSDashboardOperation(w, r, "DeleteMessage", queueName, detail.Queue.URL)
+	case "visibility":
+		s.forwardSQSDashboardOperation(w, r, "ChangeMessageVisibility", queueName, detail.Queue.URL)
 	case "leases":
 		if r.Method != http.MethodGet {
 			methodNotAllowed(w, "GET")
@@ -647,6 +661,71 @@ func (s *Server) handleSQSQueue(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.NotFound(w, r)
 	}
+}
+
+type dashboardSQSOperationRequest struct {
+	Input json.RawMessage `json:"input"`
+}
+
+func (s *Server) forwardSQSDashboardOperation(w http.ResponseWriter, r *http.Request, operation string, queueName string, queueURL string) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w, "POST")
+		return
+	}
+	var request dashboardSQSOperationRequest
+	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+		http.Error(w, "invalid json request", http.StatusBadRequest)
+		return
+	}
+	input, err := normalizeSQSDashboardInput(request.Input, queueName, queueURL)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	req := r.Clone(r.Context())
+	req.Method = http.MethodPost
+	req.URL = &url.URL{Path: "/"}
+	req.RequestURI = ""
+	req.Body = io.NopCloser(bytes.NewReader(input))
+	req.ContentLength = int64(len(input))
+	req.Header = make(http.Header)
+	req.Header.Set("Content-Type", "application/x-amz-json-1.0")
+	req.Header.Set("X-Amz-Target", "AmazonSQS."+operation)
+	s.sqs.ServeHTTP(w, req)
+}
+
+func normalizeSQSDashboardInput(raw json.RawMessage, queueName string, queueURL string) ([]byte, error) {
+	if len(raw) == 0 {
+		return nil, errors.New("input is required")
+	}
+	var input map[string]any
+	if err := json.Unmarshal(raw, &input); err != nil {
+		return nil, errors.New("input must be valid JSON")
+	}
+	if input == nil {
+		return nil, errors.New("input must be a JSON object")
+	}
+	if queueName != "" {
+		if existing, ok := input["QueueName"]; ok {
+			if existingName, ok := existing.(string); !ok || existingName != queueName {
+				return nil, errors.New("input QueueName must match the selected queue")
+			}
+		}
+	}
+	if queueURL != "" {
+		if existing, ok := input["QueueUrl"]; ok {
+			if existingURL, ok := existing.(string); !ok || existingURL != queueURL {
+				return nil, errors.New("input QueueUrl must match the selected queue")
+			}
+		} else {
+			input["QueueUrl"] = queueURL
+		}
+	}
+	encoded, err := json.Marshal(input)
+	if err != nil {
+		return nil, errors.New("input could not be encoded")
+	}
+	return encoded, nil
 }
 
 func (s *Server) handlePubSubStatus(w http.ResponseWriter, r *http.Request) {

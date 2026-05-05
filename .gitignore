@@ -99,6 +99,17 @@ scripts/sqs-autoloop/progress.md
 scripts/sqs-autoloop/done.md
 scripts/sqs-autoloop/iteration-*.out
 scripts/sqs-autoloop/prompt-*.*
+scripts/sqs-dashboard-management-autoloop/.run-loop.lock
+scripts/sqs-dashboard-management-autoloop/.circuit-state
+scripts/sqs-dashboard-management-autoloop/runner.jsonl
+scripts/sqs-dashboard-management-autoloop/runner.log
+scripts/sqs-dashboard-management-autoloop/state.env
+scripts/sqs-dashboard-management-autoloop/state.env.sha256
+scripts/sqs-dashboard-management-autoloop/progress.md
+scripts/sqs-dashboard-management-autoloop/done.md
+scripts/sqs-dashboard-management-autoloop/iteration-*.out
+scripts/sqs-dashboard-management-autoloop/verify-*.out
+scripts/sqs-dashboard-management-autoloop/prompt-*.*
 scripts/pubsub-autoloop/.run-loop.lock
 scripts/pubsub-autoloop/.circuit-state
 scripts/pubsub-autoloop/runner.jsonl
