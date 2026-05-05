@@ -210,6 +210,7 @@ a {
 
 .service-index,
 .s3-workspace,
+.gcs-workspace,
 .dynamodb-workspace,
 .mail-workspace {
   display: grid;
@@ -224,6 +225,11 @@ a {
 
 .s3-workspace {
   grid-template-columns: minmax(220px, 280px) minmax(320px, 1fr) minmax(240px, 320px);
+  align-items: start;
+}
+
+.gcs-workspace {
+  grid-template-columns: minmax(240px, 320px) minmax(360px, 1fr) minmax(260px, 340px);
   align-items: start;
 }
 
@@ -358,6 +364,25 @@ code {
   color: var(--text-secondary);
   font-size: 12px;
   font-weight: 800;
+}
+
+.gcs-sidebar,
+.gcs-create-bucket {
+  display: grid;
+  gap: 12px;
+}
+
+.gcs-create-bucket {
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: end;
+}
+
+.gcs-bucket-row {
+  grid-template-columns: minmax(0, 1fr) auto auto;
+}
+
+.gcs-message {
+  grid-column: 1 / -1;
 }
 
 .object-table-wrap {
@@ -1131,8 +1156,14 @@ code {
   }
 
   .s3-workspace,
+  .gcs-workspace,
   .dynamodb-workspace,
   .mail-workspace {
+    grid-template-columns: 1fr;
+  }
+
+  .gcs-create-bucket,
+  .gcs-bucket-row {
     grid-template-columns: 1fr;
   }
 
