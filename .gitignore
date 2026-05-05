@@ -46,6 +46,17 @@ scripts/dynamodb-dashboard-management-autoloop/done.md
 scripts/dynamodb-dashboard-management-autoloop/iteration-*.out
 scripts/dynamodb-dashboard-management-autoloop/verify-*.out
 scripts/dynamodb-dashboard-management-autoloop/prompt-*.*
+scripts/dynamodb-dashboard-advanced-autoloop/.run-loop.lock
+scripts/dynamodb-dashboard-advanced-autoloop/.circuit-state
+scripts/dynamodb-dashboard-advanced-autoloop/runner.jsonl
+scripts/dynamodb-dashboard-advanced-autoloop/runner.log
+scripts/dynamodb-dashboard-advanced-autoloop/state.env
+scripts/dynamodb-dashboard-advanced-autoloop/state.env.sha256
+scripts/dynamodb-dashboard-advanced-autoloop/progress.md
+scripts/dynamodb-dashboard-advanced-autoloop/done.md
+scripts/dynamodb-dashboard-advanced-autoloop/iteration-*.out
+scripts/dynamodb-dashboard-advanced-autoloop/verify-*.out
+scripts/dynamodb-dashboard-advanced-autoloop/prompt-*.*
 scripts/bigquery-autoloop/.run-loop.lock
 scripts/bigquery-autoloop/.circuit-state
 scripts/bigquery-autoloop/runner.jsonl

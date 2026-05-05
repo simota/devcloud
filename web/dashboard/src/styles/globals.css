@@ -811,6 +811,23 @@ code {
   min-height: 118px;
 }
 
+.destructive-confirmation {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  border: 1px solid #e0b4ab;
+  border-radius: var(--radius-md);
+  padding: 9px 10px;
+  background: #fff8f6;
+  color: var(--accent-danger);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.destructive-confirmation input {
+  margin-top: 2px;
+}
+
 .dynamodb-query-scan {
   display: grid;
   gap: 12px;
@@ -830,6 +847,20 @@ code {
 
 .dynamodb-query-scan-form textarea {
   min-height: 92px;
+}
+
+.dynamodb-query-result-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(280px, 0.9fr);
+  gap: 12px;
+  align-items: start;
+}
+
+.dynamodb-recent-operations {
+  display: grid;
+  gap: 10px;
+  border-top: 1px solid var(--border-default);
+  padding-top: 12px;
 }
 
 .inspector-heading {
@@ -1106,6 +1137,10 @@ code {
   }
 
   .mail-toolbar {
+    grid-template-columns: 1fr;
+  }
+
+  .dynamodb-query-result-grid {
     grid-template-columns: 1fr;
   }
 }

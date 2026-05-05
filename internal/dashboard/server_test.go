@@ -1080,6 +1080,77 @@ func TestDynamoDBDashboardQueryScanAPIsForwardThroughService(t *testing.T) {
 	}
 }
 
+func TestDynamoDBDashboardQueryPaginationForwardsExclusiveStartKey(t *testing.T) {
+	dynamo := dynamodbsvc.NewServer(dynamodbsvc.Config{Region: "us-east-1"})
+	server := NewServer(Config{
+		DynamoDBEndpoint:    "http://127.0.0.1:8000",
+		DynamoDBRegion:      "us-east-1",
+		DynamoDBStoragePath: ".devcloud/test/dynamodb",
+	}, newDashboardStore(nil, nil))
+	server.SetDynamoDB(dynamo)
+	routes := server.routes()
+
+	create := performRequestWithBody(routes, http.MethodPost, "/api/dynamodb/tables", `{"input":{
+		"TableName":"Paginated",
+		"AttributeDefinitions":[
+			{"AttributeName":"pk","AttributeType":"S"},
+			{"AttributeName":"sk","AttributeType":"S"}
+		],
+		"KeySchema":[
+			{"AttributeName":"pk","KeyType":"HASH"},
+			{"AttributeName":"sk","KeyType":"RANGE"}
+		],
+		"BillingMode":"PAY_PER_REQUEST"
+	}}`)
+	if create.Code != http.StatusOK {
+		t.Fatalf("dashboard CreateTable for pagination = %d body=%s", create.Code, create.Body.String())
+	}
+	for _, body := range []string{
+		`{"input":{"Item":{"pk":{"S":"user#1"},"sk":{"S":"001"},"name":{"S":"Ada"}}}}`,
+		`{"input":{"Item":{"pk":{"S":"user#1"},"sk":{"S":"002"},"name":{"S":"Grace"}}}}`,
+	} {
+		put := performRequestWithBody(routes, http.MethodPost, "/api/dynamodb/tables/Paginated/items", body)
+		if put.Code != http.StatusOK {
+			t.Fatalf("dashboard PutItem for pagination = %d body=%s", put.Code, put.Body.String())
+		}
+	}
+
+	firstPage := performRequestWithBody(routes, http.MethodPost, "/api/dynamodb/tables/Paginated/query", `{"input":{
+		"KeyConditionExpression":"pk = :pk",
+		"ExpressionAttributeValues":{":pk":{"S":"user#1"}},
+		"Limit":1
+	}}`)
+	if firstPage.Code != http.StatusOK || !strings.Contains(firstPage.Body.String(), `"Count":1`) || !strings.Contains(firstPage.Body.String(), `"LastEvaluatedKey"`) {
+		t.Fatalf("dashboard Query first page = %d body=%s", firstPage.Code, firstPage.Body.String())
+	}
+	var firstPayload struct {
+		LastEvaluatedKey map[string]any `json:"LastEvaluatedKey"`
+	}
+	if err := json.Unmarshal(firstPage.Body.Bytes(), &firstPayload); err != nil {
+		t.Fatalf("decode first page: %v", err)
+	}
+	if len(firstPayload.LastEvaluatedKey) == 0 {
+		t.Fatalf("first page did not include LastEvaluatedKey: %s", firstPage.Body.String())
+	}
+
+	secondInput := map[string]any{
+		"input": map[string]any{
+			"KeyConditionExpression":    "pk = :pk",
+			"ExpressionAttributeValues": map[string]any{":pk": map[string]any{"S": "user#1"}},
+			"ExclusiveStartKey":         firstPayload.LastEvaluatedKey,
+			"Limit":                     float64(1),
+		},
+	}
+	secondBody, err := json.Marshal(secondInput)
+	if err != nil {
+		t.Fatalf("encode second page: %v", err)
+	}
+	secondPage := performRequestWithBody(routes, http.MethodPost, "/api/dynamodb/tables/Paginated/query", string(secondBody))
+	if secondPage.Code != http.StatusOK || !strings.Contains(secondPage.Body.String(), `"Count":1`) || !strings.Contains(secondPage.Body.String(), `"Grace"`) {
+		t.Fatalf("dashboard Query second page = %d body=%s", secondPage.Code, secondPage.Body.String())
+	}
+}
+
 func TestBigQueryDashboardPageAndAPIExposeCatalog(t *testing.T) {
 	bq := bigquerysvc.NewServer(bigquerysvc.Config{
 		Project:     "devcloud",

@@ -54,6 +54,26 @@ type TableDetailState =
     }
   | { status: 'error'; message: string }
 
+type QueryScanPageState = {
+  pageHistory: Array<Record<string, unknown> | undefined>
+  pageIndex: number
+  selectedItemIndex: number
+}
+
+type RecentDynamoDBOperation = {
+  id: string
+  operation: 'Query' | 'Scan'
+  tableName: string
+  indexName?: string
+  limit: number
+  expressionSummary: string
+  count: number
+  scannedCount: number
+  page: number
+  hasMore: boolean
+  createdAt: string
+}
+
 type DynamoDBDashboardProps = {
   service?: DashboardService
 }
@@ -77,6 +97,8 @@ export function DynamoDBDashboard({ service }: DynamoDBDashboardProps): JSX.Elem
   const [deleteTableJSON, setDeleteTableJSON] = useState('{}')
   const [deleteItemConfirmation, setDeleteItemConfirmation] = useState('')
   const [deleteTableConfirmation, setDeleteTableConfirmation] = useState('')
+  const [deleteItemAcknowledged, setDeleteItemAcknowledged] = useState(false)
+  const [deleteTableAcknowledged, setDeleteTableAcknowledged] = useState(false)
   const [operationMessage, setOperationMessage] = useState('')
   const [operationError, setOperationError] = useState('')
   const [busyOperation, setBusyOperation] = useState<string>()
@@ -89,7 +111,17 @@ export function DynamoDBDashboard({ service }: DynamoDBDashboardProps): JSX.Elem
   const [queryScanMessage, setQueryScanMessage] = useState('')
   const [queryScanError, setQueryScanError] = useState('')
   const [queryScanResult, setQueryScanResult] = useState<DynamoDBQueryScanResponse>()
+  const [queryScanPageState, setQueryScanPageState] = useState<QueryScanPageState>({
+    pageHistory: [undefined],
+    pageIndex: 0,
+    selectedItemIndex: 0,
+  })
+  const [recentOperations, setRecentOperations] = useState<RecentDynamoDBOperation[]>(readRecentDynamoDBOperations)
   const isDisabled = service?.status === 'disabled'
+
+  useEffect(() => {
+    writeRecentDynamoDBOperations(recentOperations)
+  }, [recentOperations])
 
   const refreshTables = useCallback(() => {
     if (isDisabled) {
@@ -207,6 +239,10 @@ export function DynamoDBDashboard({ service }: DynamoDBDashboardProps): JSX.Elem
     setItemFilter('')
     setKeyLookupValues({})
     setKeyLookupMessage('')
+    setDeleteItemAcknowledged(false)
+    setDeleteTableAcknowledged(false)
+    setDeleteItemConfirmation('')
+    setDeleteTableConfirmation('')
   }
 
   function updateKeyLookupValue(attributeName: string, value: string): void {
@@ -315,6 +351,10 @@ export function DynamoDBDashboard({ service }: DynamoDBDashboardProps): JSX.Elem
       setOperationError('Select a table before deleting an item.')
       return
     }
+    if (!deleteItemAcknowledged) {
+      setOperationError('Acknowledge the DeleteItem destructive action before confirming the table name.')
+      return
+    }
     if (deleteItemConfirmation !== activeTableName) {
       setOperationError('DeleteItem confirmation must match the selected table name.')
       return
@@ -327,6 +367,7 @@ export function DynamoDBDashboard({ service }: DynamoDBDashboardProps): JSX.Elem
     void runOperation('delete-item', async () => {
       await deleteDynamoDBItem(activeTableName, input.value, deleteItemConfirmation)
       setDeleteItemConfirmation('')
+      setDeleteItemAcknowledged(false)
       return `Deleted item from ${activeTableName}.`
     })
   }
@@ -354,6 +395,10 @@ export function DynamoDBDashboard({ service }: DynamoDBDashboardProps): JSX.Elem
       setOperationError('Select a table before deleting it.')
       return
     }
+    if (!deleteTableAcknowledged) {
+      setOperationError('Acknowledge the DeleteTable destructive action before confirming the table name.')
+      return
+    }
     if (deleteTableConfirmation !== activeTableName) {
       setOperationError('DeleteTable confirmation must match the selected table name.')
       return
@@ -366,22 +411,20 @@ export function DynamoDBDashboard({ service }: DynamoDBDashboardProps): JSX.Elem
     void runOperation('delete-table', async () => {
       await deleteDynamoDBTable(activeTableName, input.value, deleteTableConfirmation)
       setDeleteTableConfirmation('')
+      setDeleteTableAcknowledged(false)
       setActiveTableName(undefined)
       return `Deleted table ${activeTableName}.`
     })
   }
 
-  async function handleQueryScan(event: FormEvent<HTMLFormElement>): Promise<void> {
-    event.preventDefault()
+  function buildQueryScanInput(startKey?: Record<string, unknown>): { ok: true; value: Record<string, unknown> } | { ok: false; message: string } {
     if (!activeTableName) {
-      setQueryScanError('Select a table before running Query or Scan.')
-      return
+      return { ok: false, message: 'Select a table before running Query or Scan.' }
     }
     const limit = normalizedItemLimit(queryScanLimit)
     const expressionAttributeValues = parseOptionalJSONForm(queryScanExpressionAttributeValues)
     if (!expressionAttributeValues.ok) {
-      setQueryScanError(expressionAttributeValues.message)
-      return
+      return { ok: false, message: expressionAttributeValues.message }
     }
     const input: Record<string, unknown> = { Limit: limit }
     const indexName = queryScanIndexName.trim()
@@ -394,8 +437,7 @@ export function DynamoDBDashboard({ service }: DynamoDBDashboardProps): JSX.Elem
     if (queryScanMode === 'Query') {
       const keyCondition = queryKeyCondition.trim()
       if (keyCondition === '') {
-        setQueryScanError('Query requires KeyConditionExpression.')
-        return
+        return { ok: false, message: 'Query requires KeyConditionExpression.' }
       }
       input.KeyConditionExpression = keyCondition
     } else {
@@ -404,6 +446,22 @@ export function DynamoDBDashboard({ service }: DynamoDBDashboardProps): JSX.Elem
         input.FilterExpression = filterExpression
       }
     }
+    if (startKey) {
+      input.ExclusiveStartKey = startKey
+    }
+    return { ok: true, value: input }
+  }
+
+  async function runQueryScanPage(startKey: Record<string, unknown> | undefined, pageIndex: number, pageHistory: Array<Record<string, unknown> | undefined>): Promise<void> {
+    if (!activeTableName) {
+      setQueryScanError('Select a table before running Query or Scan.')
+      return
+    }
+    const input = buildQueryScanInput(startKey)
+    if (!input.ok) {
+      setQueryScanError(input.message)
+      return
+    }
     setBusyOperation(queryScanMode.toLowerCase())
     setQueryScanError('')
     setQueryScanMessage('')
@@ -411,15 +469,56 @@ export function DynamoDBDashboard({ service }: DynamoDBDashboardProps): JSX.Elem
     try {
       const result =
         queryScanMode === 'Query'
-          ? await queryDynamoDBItems(activeTableName, input)
-          : await scanDynamoDBItems(activeTableName, input)
+          ? await queryDynamoDBItems(activeTableName, input.value)
+          : await scanDynamoDBItems(activeTableName, input.value)
       setQueryScanResult(result)
-      setQueryScanMessage(`${queryScanMode} returned ${result.Count ?? result.Items?.length ?? 0} item(s).`)
+      setQueryScanPageState({ pageHistory, pageIndex, selectedItemIndex: 0 })
+      setRecentOperations((current) =>
+        [
+          buildRecentDynamoDBOperation({
+            count: result.Count ?? result.Items?.length ?? 0,
+            hasMore: Boolean(result.LastEvaluatedKey),
+            indexName: queryScanIndexName,
+            limit: normalizedItemLimit(queryScanLimit),
+            mode: queryScanMode,
+            page: pageIndex + 1,
+            scannedCount: result.ScannedCount ?? 0,
+            tableName: activeTableName,
+            usesExpressionAttributeValues: Boolean(input.value.ExpressionAttributeValues),
+          }),
+          ...current,
+        ].slice(0, maxRecentDynamoDBOperations),
+      )
+      setQueryScanMessage(`${queryScanMode} page ${pageIndex + 1} returned ${result.Count ?? result.Items?.length ?? 0} item(s).`)
     } catch (error) {
       setQueryScanError(error instanceof Error ? error.message : `${queryScanMode} failed`)
     } finally {
       setBusyOperation(undefined)
     }
+  }
+
+  async function handleQueryScan(event: FormEvent<HTMLFormElement>): Promise<void> {
+    event.preventDefault()
+    await runQueryScanPage(undefined, 0, [undefined])
+  }
+
+  function nextPage(): void {
+    if (!queryScanResult?.LastEvaluatedKey) {
+      return
+    }
+    const pageIndex = queryScanPageState.pageIndex + 1
+    const pageHistory = queryScanPageState.pageHistory.slice(0, pageIndex)
+    pageHistory[pageIndex] = queryScanResult.LastEvaluatedKey
+    void runQueryScanPage(queryScanResult.LastEvaluatedKey, pageIndex, pageHistory)
+  }
+
+  function previousPage(): void {
+    if (queryScanPageState.pageIndex <= 0) {
+      return
+    }
+    const pageIndex = queryScanPageState.pageIndex - 1
+    const startKey = queryScanPageState.pageHistory[pageIndex]
+    void runQueryScanPage(startKey, pageIndex, queryScanPageState.pageHistory)
   }
 
   return (
@@ -511,8 +610,10 @@ export function DynamoDBDashboard({ service }: DynamoDBDashboardProps): JSX.Elem
           busyOperation={busyOperation}
           createTableJSON={createTableJSON}
           deleteItemConfirmation={deleteItemConfirmation}
+          deleteItemAcknowledged={deleteItemAcknowledged}
           deleteItemJSON={deleteItemJSON}
           deleteTableConfirmation={deleteTableConfirmation}
+          deleteTableAcknowledged={deleteTableAcknowledged}
           deleteTableJSON={deleteTableJSON}
           onCreateTable={handleCreateTable}
           onDeleteItem={handleDeleteItem}
@@ -523,8 +624,10 @@ export function DynamoDBDashboard({ service }: DynamoDBDashboardProps): JSX.Elem
           putItemJSON={putItemJSON}
           setCreateTableJSON={setCreateTableJSON}
           setDeleteItemConfirmation={setDeleteItemConfirmation}
+          setDeleteItemAcknowledged={setDeleteItemAcknowledged}
           setDeleteItemJSON={setDeleteItemJSON}
           setDeleteTableConfirmation={setDeleteTableConfirmation}
+          setDeleteTableAcknowledged={setDeleteTableAcknowledged}
           setDeleteTableJSON={setDeleteTableJSON}
           setPutItemJSON={setPutItemJSON}
           setTTLJSON={setTTLJSON}
@@ -545,17 +648,28 @@ export function DynamoDBDashboard({ service }: DynamoDBDashboardProps): JSX.Elem
           limit={queryScanLimit}
           message={queryScanMessage}
           mode={queryScanMode}
+          onNextPage={nextPage}
+          onPreviousPage={previousPage}
           onSubmit={(event) => {
             void handleQueryScan(event)
           }}
+          pageIndex={queryScanPageState.pageIndex}
           result={queryScanResult}
+          selectedItemIndex={queryScanPageState.selectedItemIndex}
           setExpressionAttributeValues={setQueryScanExpressionAttributeValues}
           setFilterExpression={setScanFilterExpression}
           setIndexName={setQueryScanIndexName}
           setKeyConditionExpression={setQueryKeyCondition}
           setLimit={setQueryScanLimit}
           setMode={setQueryScanMode}
+          setSelectedItemIndex={(selectedItemIndex) =>
+            setQueryScanPageState((current) => ({ ...current, selectedItemIndex }))
+          }
           error={queryScanError}
+        />
+        <RecentOperationHistory
+          operations={recentOperations}
+          onClear={() => setRecentOperations([])}
         />
       </Panel>
 
@@ -569,6 +683,69 @@ export function DynamoDBDashboard({ service }: DynamoDBDashboardProps): JSX.Elem
         />
       </Panel>
     </div>
+  )
+}
+
+type RecentOperationHistoryProps = {
+  operations: RecentDynamoDBOperation[]
+  onClear: () => void
+}
+
+function RecentOperationHistory({ operations, onClear }: RecentOperationHistoryProps): JSX.Element {
+  return (
+    <section className="dynamodb-recent-operations">
+      <div className="inspector-heading">
+        <div>
+          <span className="inspector-label">Recent operation history</span>
+          <p className="inspector-muted">Stored locally without item payloads, credentials, or pagination keys.</p>
+        </div>
+        <Button disabled={operations.length === 0} onClick={onClear} type="button">
+          Clear
+        </Button>
+      </div>
+      {operations.length === 0 ? (
+        <p className="inspector-muted">Run Query or Scan to record local operation metadata.</p>
+      ) : (
+        <div className="dynamodb-item-table-wrap">
+          <table className="dynamodb-item-table compact">
+            <thead>
+              <tr>
+                <th scope="col">When</th>
+                <th scope="col">Operation</th>
+                <th scope="col">Table</th>
+                <th scope="col">Result</th>
+              </tr>
+            </thead>
+            <tbody>
+              {operations.map((operation) => (
+                <tr key={operation.id}>
+                  <td>{formatRecentOperationTime(operation.createdAt)}</td>
+                  <td>
+                    <span className="attribute-preview">
+                      <span className="attribute-chip">{operation.operation}</span>
+                      <span className="attribute-chip">page {operation.page}</span>
+                      {operation.indexName ? <span className="attribute-chip">index: {operation.indexName}</span> : null}
+                    </span>
+                  </td>
+                  <td>
+                    <code>{operation.tableName}</code>
+                  </td>
+                  <td>
+                    <span className="attribute-preview">
+                      <span className="attribute-chip">count: {operation.count}</span>
+                      <span className="attribute-chip">scanned: {operation.scannedCount}</span>
+                      <span className="attribute-chip">limit: {operation.limit}</span>
+                      <span className="attribute-chip">{operation.hasMore ? 'has next page' : 'last page'}</span>
+                      <span className="attribute-chip">{operation.expressionSummary}</span>
+                    </span>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </section>
   )
 }
 
@@ -620,6 +797,8 @@ type DynamoDBOperationFormsProps = {
   deleteTableJSON: string
   deleteItemConfirmation: string
   deleteTableConfirmation: string
+  deleteItemAcknowledged: boolean
+  deleteTableAcknowledged: boolean
   onCreateTable: (event: FormEvent<HTMLFormElement>) => void
   onPutItem: (event: FormEvent<HTMLFormElement>) => void
   onUpdateItem: (event: FormEvent<HTMLFormElement>) => void
@@ -634,6 +813,8 @@ type DynamoDBOperationFormsProps = {
   setDeleteTableJSON: (value: string) => void
   setDeleteItemConfirmation: (value: string) => void
   setDeleteTableConfirmation: (value: string) => void
+  setDeleteItemAcknowledged: (value: boolean) => void
+  setDeleteTableAcknowledged: (value: boolean) => void
 }
 
 function DynamoDBOperationForms({
@@ -647,6 +828,8 @@ function DynamoDBOperationForms({
   deleteTableJSON,
   deleteItemConfirmation,
   deleteTableConfirmation,
+  deleteItemAcknowledged,
+  deleteTableAcknowledged,
   onCreateTable,
   onPutItem,
   onUpdateItem,
@@ -661,6 +844,8 @@ function DynamoDBOperationForms({
   setDeleteTableJSON,
   setDeleteItemConfirmation,
   setDeleteTableConfirmation,
+  setDeleteItemAcknowledged,
+  setDeleteTableAcknowledged,
 }: DynamoDBOperationFormsProps): JSX.Element {
   const tableActionDisabled = !activeTableName
 
@@ -702,13 +887,19 @@ function DynamoDBOperationForms({
         buttonClassName="danger"
         buttonLabel="Delete item"
         confirmation={deleteItemConfirmation}
+        destructiveAcknowledgement={deleteItemAcknowledged}
+        destructiveAcknowledgementLabel="Step 1: I understand this deletes the item identified by the JSON key."
         confirmationLabel={`Type ${activeTableName ?? 'table name'} to delete item`}
         disabled={
-          tableActionDisabled || deleteItemConfirmation !== activeTableName || busyOperation === 'delete-item'
+          tableActionDisabled ||
+          !deleteItemAcknowledged ||
+          deleteItemConfirmation !== activeTableName ||
+          busyOperation === 'delete-item'
         }
         json={deleteItemJSON}
         label="DeleteItem input"
         onChange={setDeleteItemJSON}
+        onDestructiveAcknowledgementChange={setDeleteItemAcknowledged}
         onConfirmationChange={setDeleteItemConfirmation}
         onSubmit={onDeleteItem}
       />
@@ -716,13 +907,19 @@ function DynamoDBOperationForms({
         buttonClassName="danger"
         buttonLabel="Delete table"
         confirmation={deleteTableConfirmation}
+        destructiveAcknowledgement={deleteTableAcknowledged}
+        destructiveAcknowledgementLabel="Step 1: I understand this deletes the selected table and its local items."
         confirmationLabel={`Type ${activeTableName ?? 'table name'} to delete table`}
         disabled={
-          tableActionDisabled || deleteTableConfirmation !== activeTableName || busyOperation === 'delete-table'
+          tableActionDisabled ||
+          !deleteTableAcknowledged ||
+          deleteTableConfirmation !== activeTableName ||
+          busyOperation === 'delete-table'
         }
         json={deleteTableJSON}
         label="DeleteTable input"
         onChange={setDeleteTableJSON}
+        onDestructiveAcknowledgementChange={setDeleteTableAcknowledged}
         onConfirmationChange={setDeleteTableConfirmation}
         onSubmit={onDeleteTable}
       />
@@ -741,7 +938,11 @@ type DynamoDBQueryScanFormProps = {
   limit: string
   message: string
   mode: 'Query' | 'Scan'
+  pageIndex: number
   result?: DynamoDBQueryScanResponse
+  selectedItemIndex: number
+  onNextPage: () => void
+  onPreviousPage: () => void
   onSubmit: (event: FormEvent<HTMLFormElement>) => void
   setExpressionAttributeValues: (value: string) => void
   setFilterExpression: (value: string) => void
@@ -749,6 +950,7 @@ type DynamoDBQueryScanFormProps = {
   setKeyConditionExpression: (value: string) => void
   setLimit: (value: string) => void
   setMode: (value: 'Query' | 'Scan') => void
+  setSelectedItemIndex: (value: number) => void
 }
 
 function DynamoDBQueryScanForm({
@@ -762,17 +964,25 @@ function DynamoDBQueryScanForm({
   limit,
   message,
   mode,
+  onNextPage,
+  onPreviousPage,
   onSubmit,
+  pageIndex,
   result,
+  selectedItemIndex,
   setExpressionAttributeValues,
   setFilterExpression,
   setIndexName,
   setKeyConditionExpression,
   setLimit,
   setMode,
+  setSelectedItemIndex,
 }: DynamoDBQueryScanFormProps): JSX.Element {
   const disabled = !activeTableName || busyOperation === 'query' || busyOperation === 'scan'
   const items = result?.Items ?? []
+  const hasPreviousPage = pageIndex > 0
+  const hasNextPage = Boolean(result?.LastEvaluatedKey)
+  const selectedResultItem = items[Math.min(selectedItemIndex, Math.max(items.length - 1, 0))]
 
   return (
     <div className="dynamodb-query-scan">
@@ -851,12 +1061,51 @@ function DynamoDBQueryScanForm({
         <div className="redshift-query-result">
           <div className="dynamodb-toolbar">
             <span className="toolbar-count">
-              Count {result.Count ?? items.length} / Scanned {result.ScannedCount ?? 0}
+              Page {pageIndex + 1} / Count {result.Count ?? items.length} / Scanned {result.ScannedCount ?? 0}
             </span>
-            {result.LastEvaluatedKey ? <span className="toolbar-count">More results available</span> : null}
+            <span className="toolbar-count">
+              {hasNextPage ? 'More results available' : 'End of results'}
+            </span>
+            <div className="pubsub-action-row">
+              <Button disabled={disabled || !hasPreviousPage} onClick={onPreviousPage} type="button">
+                Previous page
+              </Button>
+              <Button disabled={disabled || !hasNextPage} onClick={onNextPage} type="button">
+                Next page
+              </Button>
+            </div>
           </div>
           {items.length > 0 ? (
-            <pre className="mail-preview">{JSON.stringify(items, null, 2)}</pre>
+            <div className="dynamodb-query-result-grid">
+              <div className="dynamodb-item-table-wrap">
+                <table className="dynamodb-item-table compact">
+                  <thead>
+                    <tr>
+                      <th scope="col">#</th>
+                      <th scope="col">Item preview</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {items.map((item, index) => (
+                      <tr
+                        className={index === selectedItemIndex ? 'item-row active' : 'item-row'}
+                        key={`${pageIndex}-${index}-${JSON.stringify(item).length}`}
+                        onClick={() => setSelectedItemIndex(index)}
+                      >
+                        <td>{index + 1}</td>
+                        <td>
+                          <AttributePreview item={item} />
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+              <section>
+                <span className="inspector-label">Selected result item JSON</span>
+                <pre className="mail-preview">{JSON.stringify(selectedResultItem, null, 2)}</pre>
+              </section>
+            </div>
           ) : (
             <p className="inspector-muted">No items returned.</p>
           )}
@@ -871,11 +1120,14 @@ type JSONOperationFormProps = {
   buttonLabel: string
   confirmation?: string
   confirmationLabel?: string
+  destructiveAcknowledgement?: boolean
+  destructiveAcknowledgementLabel?: string
   disabled: boolean
   json: string
   label: string
   onChange: (value: string) => void
   onConfirmationChange?: (value: string) => void
+  onDestructiveAcknowledgementChange?: (value: boolean) => void
   onSubmit: (event: FormEvent<HTMLFormElement>) => void
 }
 
@@ -884,11 +1136,14 @@ function JSONOperationForm({
   buttonLabel,
   confirmation,
   confirmationLabel,
+  destructiveAcknowledgement,
+  destructiveAcknowledgementLabel,
   disabled,
   json,
   label,
   onChange,
   onConfirmationChange,
+  onDestructiveAcknowledgementChange,
   onSubmit,
 }: JSONOperationFormProps): JSX.Element {
   return (
@@ -902,9 +1157,20 @@ function JSONOperationForm({
           value={json}
         />
       </label>
+      {onDestructiveAcknowledgementChange ? (
+        <label className="destructive-confirmation">
+          <input
+            aria-label={destructiveAcknowledgementLabel}
+            checked={Boolean(destructiveAcknowledgement)}
+            onChange={(event) => onDestructiveAcknowledgementChange(event.target.checked)}
+            type="checkbox"
+          />
+          <span>{destructiveAcknowledgementLabel}</span>
+        </label>
+      ) : null}
       {onConfirmationChange ? (
         <label className="compact-filter">
-          <span>{confirmationLabel}</span>
+          <span>Step 2: {confirmationLabel}</span>
           <input
             aria-label={confirmationLabel}
             onChange={(event) => onConfirmationChange(event.target.value)}
@@ -1288,6 +1554,96 @@ function formatBytes(size: number): string {
     return `${size} B`
   }
   return `${(size / 1024).toFixed(1)} KB`
+}
+
+const recentDynamoDBOperationsStorageKey = 'devcloud.dynamodb.recentOperations.v1'
+const maxRecentDynamoDBOperations = 10
+
+function readRecentDynamoDBOperations(): RecentDynamoDBOperation[] {
+  if (typeof window === 'undefined') {
+    return []
+  }
+  try {
+    const raw = window.localStorage.getItem(recentDynamoDBOperationsStorageKey)
+    if (!raw) {
+      return []
+    }
+    const parsed = JSON.parse(raw) as unknown
+    if (!Array.isArray(parsed)) {
+      return []
+    }
+    return parsed.filter(isRecentDynamoDBOperation).slice(0, maxRecentDynamoDBOperations)
+  } catch {
+    return []
+  }
+}
+
+function writeRecentDynamoDBOperations(operations: RecentDynamoDBOperation[]): void {
+  if (typeof window === 'undefined') {
+    return
+  }
+  try {
+    if (operations.length === 0) {
+      window.localStorage.removeItem(recentDynamoDBOperationsStorageKey)
+      return
+    }
+    window.localStorage.setItem(recentDynamoDBOperationsStorageKey, JSON.stringify(operations.slice(0, maxRecentDynamoDBOperations)))
+  } catch {
+    // Best-effort UI history only; dashboard operations must not fail because localStorage is unavailable.
+  }
+}
+
+function isRecentDynamoDBOperation(value: unknown): value is RecentDynamoDBOperation {
+  if (!value || Array.isArray(value) || typeof value !== 'object') {
+    return false
+  }
+  const candidate = value as Partial<RecentDynamoDBOperation>
+  return (
+    (candidate.operation === 'Query' || candidate.operation === 'Scan') &&
+    typeof candidate.id === 'string' &&
+    typeof candidate.tableName === 'string' &&
+    typeof candidate.limit === 'number' &&
+    typeof candidate.expressionSummary === 'string' &&
+    typeof candidate.count === 'number' &&
+    typeof candidate.scannedCount === 'number' &&
+    typeof candidate.page === 'number' &&
+    typeof candidate.hasMore === 'boolean' &&
+    typeof candidate.createdAt === 'string'
+  )
+}
+
+function buildRecentDynamoDBOperation(input: {
+  count: number
+  hasMore: boolean
+  indexName: string
+  limit: number
+  mode: 'Query' | 'Scan'
+  page: number
+  scannedCount: number
+  tableName: string
+  usesExpressionAttributeValues: boolean
+}): RecentDynamoDBOperation {
+  return {
+    id: `${Date.now()}-${input.mode}-${input.tableName}-${input.page}`,
+    operation: input.mode,
+    tableName: input.tableName,
+    indexName: input.indexName.trim() || undefined,
+    limit: input.limit,
+    expressionSummary: input.usesExpressionAttributeValues ? 'expression values present' : 'no expression values',
+    count: input.count,
+    scannedCount: input.scannedCount,
+    page: input.page,
+    hasMore: input.hasMore,
+    createdAt: new Date().toISOString(),
+  }
+}
+
+function formatRecentOperationTime(value: string): string {
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) {
+    return 'unknown'
+  }
+  return date.toLocaleString()
 }
 
 const defaultCreateTableJSON = `{
