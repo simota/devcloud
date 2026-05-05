@@ -436,7 +436,19 @@ func (s *Server) handleBigQueryProjectResource(w http.ResponseWriter, r *http.Re
 			methodNotAllowed(w, "POST")
 			return
 		}
-		s.forwardBigQueryQuery(w, r, projectID)
+		s.forwardBigQueryRequest(w, r, "/bigquery/v2/projects/"+url.PathEscape(projectID)+"/queries")
+		return
+	}
+	if len(parts) == 2 && parts[1] == "datasets" && r.Method == http.MethodPost {
+		s.forwardBigQueryRequest(w, r, "/bigquery/v2/projects/"+url.PathEscape(projectID)+"/datasets")
+		return
+	}
+	if len(parts) == 4 && parts[1] == "datasets" && parts[3] == "tables" && r.Method == http.MethodPost {
+		s.forwardBigQueryRequest(w, r, "/bigquery/v2/projects/"+url.PathEscape(projectID)+"/datasets/"+url.PathEscape(parts[2])+"/tables")
+		return
+	}
+	if len(parts) == 6 && parts[1] == "datasets" && parts[3] == "tables" && parts[5] == "insertAll" && r.Method == http.MethodPost {
+		s.forwardBigQueryRequest(w, r, "/bigquery/v2/projects/"+url.PathEscape(projectID)+"/datasets/"+url.PathEscape(parts[2])+"/tables/"+url.PathEscape(parts[4])+"/insertAll")
 		return
 	}
 	if r.Method != http.MethodGet {
@@ -502,14 +514,13 @@ func (s *Server) handleBigQueryProjectResource(w http.ResponseWriter, r *http.Re
 	}
 }
 
-func (s *Server) forwardBigQueryQuery(w http.ResponseWriter, r *http.Request, projectID string) {
-	queryURL := &url.URL{
-		Path:     "/bigquery/v2/projects/" + url.PathEscape(projectID) + "/queries",
+func (s *Server) forwardBigQueryRequest(w http.ResponseWriter, r *http.Request, path string) {
+	forwardURL := &url.URL{
+		Path:     path,
 		RawQuery: r.URL.RawQuery,
 	}
 	req := r.Clone(r.Context())
-	req.Method = http.MethodPost
-	req.URL = queryURL
+	req.URL = forwardURL
 	req.RequestURI = ""
 	req.Body = r.Body
 	req.Header = r.Header.Clone()

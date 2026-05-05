@@ -158,6 +158,12 @@ services:
     enabled: true
     project: ${PROJECT}
     location: ${LOCATION}
+  redshift:
+    enabled: false
+  sqs:
+    enabled: false
+  pubsub:
+    enabled: false
 EOF
 
   run_check "devcloud binary builds" go build -o "${TMP_DIR}/devcloud" ./cmd/devcloud

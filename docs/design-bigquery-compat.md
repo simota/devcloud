@@ -706,6 +706,9 @@ GET /api/bigquery/projects/{project}/datasets/{dataset}/tables/{table}/rows?limi
 GET /api/bigquery/projects/{project}/jobs
 GET /api/bigquery/projects/{project}/jobs/{job}
 POST /api/bigquery/projects/{project}/queries
+POST /api/bigquery/projects/{project}/datasets
+POST /api/bigquery/projects/{project}/datasets/{dataset}/tables
+POST /api/bigquery/projects/{project}/datasets/{dataset}/tables/{table}/insertAll
 ```
 
 ### UI Surface
@@ -713,10 +716,19 @@ POST /api/bigquery/projects/{project}/queries
 - Project/dataset/table navigator.
 - Schema inspector.
 - Row preview table.
-- Job list and job detail.
-- Query editor for local GoogleSQL subset.
-- Query results table.
+- SQL query runner for the local GoogleSQL subset with `useLegacySql=false`, dry run, max results, result table, selected result JSON, and job reference.
+- Guarded BigQuery dashboard management controls for `datasets.insert`, `tables.insert`, and `tabledata.insertAll`.
+- Guided create dataset/table fields plus raw JSON mode for local request shapes.
+- Insert row JSON editor with client-side validation and partial insert error display.
+- Job list, recent query metadata, selected job JSON, and job detail.
 - Error panel showing BigQuery-style `reason`, `location`, and `message`.
+- Disabled BigQuery state keeps mutation and query controls unavailable.
+
+Dashboard safety boundaries:
+
+- All mutations go through `/api/bigquery/*` or the local BigQuery REST API path; dashboard code does not call storage directly.
+- Row payloads, credentials, Authorization headers, bearer tokens, and full request bodies are not persisted or logged by dashboard management flows.
+- Selected job JSON shown in the dashboard redacts query parameter values from the UI detail view.
 
 ## Implementation Plan
 

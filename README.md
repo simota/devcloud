@@ -45,6 +45,14 @@ go run ./cmd/devcloud dashboard
 go run ./cmd/devcloud reset
 ```
 
+## BigQuery Dashboard Management
+
+`/dashboard/bigquery` includes a compact local management console for BigQuery development workflows. It keeps the existing catalog browser for projects, datasets, tables, rows, schemas, and jobs, and adds a SQL query runner with `useLegacySql=false`, dry run, max results, result table, selected result JSON, and job reference.
+
+The dashboard can create local datasets and tables and insert local table rows through guarded `datasets.insert`, `tables.insert`, and `tabledata.insertAll` flows. Guided forms cover common fields, raw JSON mode is available for request-shape testing, and the row editor validates JSON before calling insertAll while showing partial insert errors.
+
+Safety boundaries: dashboard mutations go through `/api/bigquery/*` or the local BigQuery REST API path, never direct storage calls. The UI does not persist or log row payloads, credentials, Authorization headers, bearer tokens, or full request bodies. When BigQuery is disabled, query and mutation controls remain unavailable.
+
 ## Configuration
 
 Configuration lives at `.devcloud/config.yaml`. Runtime data is stored under `.devcloud/data` by default.

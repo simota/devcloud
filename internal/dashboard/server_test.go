@@ -1225,12 +1225,54 @@ func TestBigQueryDashboardPageAndAPIExposeCatalog(t *testing.T) {
 	if jobs.Code != http.StatusOK || !strings.Contains(jobs.Body.String(), `"state":"DONE"`) {
 		t.Fatalf("BigQuery jobs = %d body=%s", jobs.Code, jobs.Body.String())
 	}
+	jobDetail := performRequest(routes, http.MethodGet, "/api/bigquery/projects/devcloud/jobs/devcloud_query_")
+	if jobDetail.Code != http.StatusNotFound {
+		t.Fatalf("BigQuery unknown job detail = %d body=%s", jobDetail.Code, jobDetail.Body.String())
+	}
 	query := performRequestWithBody(routes, http.MethodPost, "/api/bigquery/projects/devcloud/queries", `{
 		"query":"SELECT id, name FROM `+"`devcloud.analytics.people`"+` WHERE age >= 30",
 		"useLegacySql":false
 	}`)
 	if query.Code != http.StatusOK || !strings.Contains(query.Body.String(), `"kind":"bigquery#queryResponse"`) || !strings.Contains(query.Body.String(), `"totalRows":"1"`) {
 		t.Fatalf("BigQuery dashboard query = %d body=%s", query.Code, query.Body.String())
+	}
+	var queryPayload struct {
+		JobReference struct {
+			JobID string `json:"jobId"`
+		} `json:"jobReference"`
+	}
+	if err := json.Unmarshal(query.Body.Bytes(), &queryPayload); err != nil {
+		t.Fatalf("decode BigQuery dashboard query response: %v", err)
+	}
+	queryJobDetail := performRequest(routes, http.MethodGet, "/api/bigquery/projects/devcloud/jobs/"+queryPayload.JobReference.JobID)
+	if queryJobDetail.Code != http.StatusOK || !strings.Contains(queryJobDetail.Body.String(), `"jobId":"`+queryPayload.JobReference.JobID+`"`) || !strings.Contains(queryJobDetail.Body.String(), `"state":"DONE"`) {
+		t.Fatalf("BigQuery query job detail = %d body=%s", queryJobDetail.Code, queryJobDetail.Body.String())
+	}
+	managementDataset := performRequestWithBody(routes, http.MethodPost, "/api/bigquery/projects/devcloud/datasets", `{
+		"datasetReference":{"datasetId":"dashboard_ops"},
+		"location":"US",
+		"friendlyName":"Dashboard Ops"
+	}`)
+	if managementDataset.Code != http.StatusOK || !strings.Contains(managementDataset.Body.String(), `"datasetId":"dashboard_ops"`) {
+		t.Fatalf("BigQuery dashboard dataset create = %d body=%s", managementDataset.Code, managementDataset.Body.String())
+	}
+	managementTable := performRequestWithBody(routes, http.MethodPost, "/api/bigquery/projects/devcloud/datasets/dashboard_ops/tables", `{
+		"tableReference":{"tableId":"events"},
+		"schema":{"fields":[{"name":"event_id","type":"STRING","mode":"REQUIRED"},{"name":"count","type":"INTEGER"}]}
+	}`)
+	if managementTable.Code != http.StatusOK || !strings.Contains(managementTable.Body.String(), `"tableId":"events"`) {
+		t.Fatalf("BigQuery dashboard table create = %d body=%s", managementTable.Code, managementTable.Body.String())
+	}
+	managementInsert := performRequestWithBody(routes, http.MethodPost, "/api/bigquery/projects/devcloud/datasets/dashboard_ops/tables/events/insertAll", `{
+		"skipInvalidRows":true,
+		"rows":[{"insertId":"event-1","json":{"event_id":"signup","count":1}}]
+	}`)
+	if managementInsert.Code != http.StatusOK || !strings.Contains(managementInsert.Body.String(), `"kind":"bigquery#tableDataInsertAllResponse"`) {
+		t.Fatalf("BigQuery dashboard insertAll = %d body=%s", managementInsert.Code, managementInsert.Body.String())
+	}
+	managementRows := performRequest(routes, http.MethodGet, "/api/bigquery/projects/devcloud/datasets/dashboard_ops/tables/events/rows?limit=1")
+	if managementRows.Code != http.StatusOK || !strings.Contains(managementRows.Body.String(), `"event_id":"signup"`) {
+		t.Fatalf("BigQuery dashboard inserted rows = %d body=%s", managementRows.Code, managementRows.Body.String())
 	}
 }
 
