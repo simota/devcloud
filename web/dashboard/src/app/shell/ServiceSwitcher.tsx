@@ -19,9 +19,9 @@ export function ServiceSwitcher({ services }: ServiceSwitcherProps): JSX.Element
       </a>
       {services.map((service) => (
         <a
-          aria-current={path === service.path ? 'page' : undefined}
+          aria-current={path === normalizeDashboardPath(service.path) ? 'page' : undefined}
           aria-label={`${service.name}: ${service.status}`}
-          className={path === service.path ? 'active' : undefined}
+          className={path === normalizeDashboardPath(service.path) ? 'active' : undefined}
           href={dashboardLink(service.path)}
           key={service.id}
         >

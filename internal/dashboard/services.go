@@ -68,6 +68,16 @@ func (s *Server) dashboardServices() []DashboardService {
 	})
 
 	services = append(services, DashboardService{
+		ID:          "redshift",
+		Name:        "Redshift",
+		Path:        "/dashboard/redshift",
+		Status:      objectServiceStatus(s.redshift != nil),
+		Endpoint:    defaultString(s.config.RedshiftAPIEndpoint, "http://127.0.0.1:9099"),
+		StoragePath: defaultString(s.config.RedshiftStoragePath, ".devcloud/data/redshift"),
+		Description: "Inspect local Redshift clusters, catalog metadata, and statement history.",
+	})
+
+	services = append(services, DashboardService{
 		ID:          "sqs",
 		Name:        "SQS",
 		Path:        "/dashboard/sqs",

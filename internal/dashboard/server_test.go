@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -17,6 +18,7 @@ import (
 	dynamodbsvc "devcloud/internal/services/dynamodb"
 	"devcloud/internal/services/mail"
 	pubsubsvc "devcloud/internal/services/pubsub"
+	redshiftsvc "devcloud/internal/services/redshift"
 	s3svc "devcloud/internal/services/s3"
 	sqssvc "devcloud/internal/services/sqs"
 )
@@ -150,6 +152,8 @@ func TestDashboardServicesAPIListsServiceRegistry(t *testing.T) {
 		DynamoDBStoragePath: ".devcloud/test/dynamodb",
 		BigQueryEndpoint:    "http://127.0.0.1:9051",
 		BigQueryStoragePath: ".devcloud/test/bigquery",
+		RedshiftAPIEndpoint: "http://127.0.0.1:19099",
+		RedshiftStoragePath: ".devcloud/test/redshift",
 		SQSEndpoint:         "http://127.0.0.1:9325",
 		SQSStoragePath:      ".devcloud/test/sqs",
 		PubSubRESTEndpoint:  "http://127.0.0.1:18086",
@@ -159,6 +163,7 @@ func TestDashboardServicesAPIListsServiceRegistry(t *testing.T) {
 	server.SetBigQuery(bigquerysvc.NewServer(bigquerysvc.Config{Project: "devcloud"}))
 	server.SetSQS(sqssvc.NewServer(sqssvc.Config{}))
 	server.SetPubSub(pubsubsvc.NewServer(pubsubsvc.Config{Project: "devcloud"}))
+	server.SetRedshift(redshiftsvc.NewServer(redshiftsvc.Config{ClusterIdentifier: "devcloud"}))
 
 	rec := performRequest(server.routes(), http.MethodGet, "/api/dashboard/services")
 
@@ -172,8 +177,8 @@ func TestDashboardServicesAPIListsServiceRegistry(t *testing.T) {
 	if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
 		t.Fatalf("decode services response: %v", err)
 	}
-	if len(response.Services) != 7 {
-		t.Fatalf("services len = %d, want 7: %#v", len(response.Services), response.Services)
+	if len(response.Services) != 8 {
+		t.Fatalf("services len = %d, want 8: %#v", len(response.Services), response.Services)
 	}
 	assertService(t, response.Services[0], DashboardService{
 		ID:          "mail",
@@ -216,6 +221,14 @@ func TestDashboardServicesAPIListsServiceRegistry(t *testing.T) {
 		StoragePath: ".devcloud/test/bigquery",
 	})
 	assertService(t, response.Services[5], DashboardService{
+		ID:          "redshift",
+		Name:        "Redshift",
+		Path:        "/dashboard/redshift",
+		Status:      "running",
+		Endpoint:    "http://127.0.0.1:19099",
+		StoragePath: ".devcloud/test/redshift",
+	})
+	assertService(t, response.Services[6], DashboardService{
 		ID:          "sqs",
 		Name:        "SQS",
 		Path:        "/dashboard/sqs",
@@ -223,7 +236,7 @@ func TestDashboardServicesAPIListsServiceRegistry(t *testing.T) {
 		Endpoint:    "http://127.0.0.1:9325",
 		StoragePath: ".devcloud/test/sqs",
 	})
-	assertService(t, response.Services[6], DashboardService{
+	assertService(t, response.Services[7], DashboardService{
 		ID:          "pubsub",
 		Name:        "Pub/Sub",
 		Path:        "/dashboard/pubsub",
@@ -565,8 +578,8 @@ func TestDashboardServicesAPIMarksDisabledServices(t *testing.T) {
 	if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
 		t.Fatalf("decode services response: %v", err)
 	}
-	if len(response.Services) != 7 {
-		t.Fatalf("services len = %d, want 7: %#v", len(response.Services), response.Services)
+	if len(response.Services) != 8 {
+		t.Fatalf("services len = %d, want 8: %#v", len(response.Services), response.Services)
 	}
 	if response.Services[0].ID != "mail" || response.Services[0].Status != "disabled" {
 		t.Fatalf("mail service = %#v, want disabled mail", response.Services[0])
@@ -583,11 +596,14 @@ func TestDashboardServicesAPIMarksDisabledServices(t *testing.T) {
 	if response.Services[4].ID != "bigquery" || response.Services[4].Status != "disabled" {
 		t.Fatalf("bigquery service = %#v, want disabled bigquery", response.Services[4])
 	}
-	if response.Services[5].ID != "sqs" || response.Services[5].Status != "disabled" {
-		t.Fatalf("sqs service = %#v, want disabled sqs", response.Services[5])
+	if response.Services[5].ID != "redshift" || response.Services[5].Status != "disabled" {
+		t.Fatalf("redshift service = %#v, want disabled redshift", response.Services[5])
 	}
-	if response.Services[6].ID != "pubsub" || response.Services[6].Status != "disabled" {
-		t.Fatalf("pubsub service = %#v, want disabled pubsub", response.Services[6])
+	if response.Services[6].ID != "sqs" || response.Services[6].Status != "disabled" {
+		t.Fatalf("sqs service = %#v, want disabled sqs", response.Services[6])
+	}
+	if response.Services[7].ID != "pubsub" || response.Services[7].Status != "disabled" {
+		t.Fatalf("pubsub service = %#v, want disabled pubsub", response.Services[7])
 	}
 }
 
@@ -601,6 +617,162 @@ func TestDashboardServicesAPIRejectsUnsupportedMethods(t *testing.T) {
 	}
 	if got := rec.Header().Get("Allow"); got != "GET" {
 		t.Fatalf("Allow = %q, want GET", got)
+	}
+}
+
+func TestRedshiftDashboardAPIListsClusters(t *testing.T) {
+	redshiftServer := redshiftsvc.NewServer(redshiftsvc.Config{
+		SQLAddr:           "127.0.0.1:15439",
+		Region:            "us-east-1",
+		ClusterIdentifier: "devcloud",
+		Database:          "dev",
+		User:              "dev",
+	})
+	server := NewServer(Config{
+		RedshiftSQLEndpoint: "127.0.0.1:15439",
+		RedshiftAPIEndpoint: "http://127.0.0.1:19099",
+		RedshiftRegion:      "us-east-1",
+	}, newDashboardStore(nil, nil))
+	server.SetRedshift(redshiftServer)
+
+	status := performRequest(server.routes(), http.MethodGet, "/api/redshift/status")
+	if status.Code != http.StatusOK || !strings.Contains(status.Body.String(), `"running":true`) || !strings.Contains(status.Body.String(), `"clusterCount":1`) {
+		t.Fatalf("status = %d body=%s", status.Code, status.Body.String())
+	}
+
+	clusters := performRequest(server.routes(), http.MethodGet, "/api/redshift/clusters")
+	if clusters.Code != http.StatusOK || !strings.Contains(clusters.Body.String(), `"clusterIdentifier":"devcloud"`) || !strings.Contains(clusters.Body.String(), `"port":15439`) {
+		t.Fatalf("clusters = %d body=%s", clusters.Code, clusters.Body.String())
+	}
+}
+
+func TestRedshiftDashboardAPIExposesBackendMode(t *testing.T) {
+	redshiftServer := redshiftsvc.NewServer(redshiftsvc.Config{
+		ClusterIdentifier: "devcloud",
+		BackendKind:       "postgres",
+		BackendMode:       "external",
+	})
+	server := NewServer(Config{}, newDashboardStore(nil, nil))
+	server.SetRedshift(redshiftServer)
+
+	status := performRequest(server.routes(), http.MethodGet, "/api/redshift/status")
+	if status.Code != http.StatusOK || !strings.Contains(status.Body.String(), `"backendKind":"postgres"`) || !strings.Contains(status.Body.String(), `"backendMode":"external"`) {
+		t.Fatalf("status = %d body=%s", status.Code, status.Body.String())
+	}
+	if strings.Contains(status.Body.String(), "postgres://") || strings.Contains(status.Body.String(), "secret") {
+		t.Fatalf("status leaked backend credentials: %s", status.Body.String())
+	}
+}
+
+func TestRedshiftDashboardAPIExposesCatalogAndStatementMetadata(t *testing.T) {
+	redshiftServer := redshiftsvc.NewServer(redshiftsvc.Config{
+		SQLAddr:           "127.0.0.1:15439",
+		ClusterIdentifier: "devcloud",
+		Database:          "dev",
+		User:              "dev",
+	})
+	for _, sql := range []string{
+		"create schema if not exists loop",
+		"create table loop.events(id integer encode raw, payload varchar(64)) distkey(id)",
+		"insert into loop.events values (1, 'created')",
+		"select id from loop.events where id = 1",
+	} {
+		req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{"Sql":`+strconv.Quote(sql)+`}`))
+		req.Header.Set("Content-Type", "application/x-amz-json-1.1")
+		req.Header.Set("X-Amz-Target", "RedshiftData.ExecuteStatement")
+		redshiftServer.ServeHTTP(httptest.NewRecorder(), req)
+	}
+	server := NewServer(Config{}, newDashboardStore(nil, nil))
+	server.SetRedshift(redshiftServer)
+
+	catalog := performRequest(server.routes(), http.MethodGet, "/api/redshift/catalog")
+	if catalog.Code != http.StatusOK || !strings.Contains(catalog.Body.String(), `"database":"dev"`) || !strings.Contains(catalog.Body.String(), `"name":"events"`) || !strings.Contains(catalog.Body.String(), `"encoding":"raw"`) {
+		t.Fatalf("catalog = %d body=%s", catalog.Code, catalog.Body.String())
+	}
+
+	statements := performRequest(server.routes(), http.MethodGet, "/api/redshift/statements")
+	if statements.Code != http.StatusOK || !strings.Contains(statements.Body.String(), `"status":"FINISHED"`) || !strings.Contains(statements.Body.String(), `"queryPreview":"select id from loop.events where id = 1"`) {
+		t.Fatalf("statements = %d body=%s", statements.Code, statements.Body.String())
+	}
+	if strings.Contains(statements.Body.String(), `"created"`) {
+		t.Fatalf("statements response leaked statement result value: %s", statements.Body.String())
+	}
+}
+
+func TestRedshiftDashboardAPITableDetailAndQueryRunner(t *testing.T) {
+	redshiftServer := redshiftsvc.NewServer(redshiftsvc.Config{
+		SQLAddr:           "127.0.0.1:15439",
+		ClusterIdentifier: "devcloud",
+		Database:          "dev",
+		User:              "dev",
+	})
+	for _, sql := range []string{
+		"create schema if not exists loop",
+		"create table loop.events(id integer encode raw, payload varchar(64)) distkey(id) sortkey(id)",
+		"insert into loop.events values (1, 'created')",
+		"insert into loop.events values (2, 'queued')",
+	} {
+		req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{"Sql":`+strconv.Quote(sql)+`}`))
+		req.Header.Set("Content-Type", "application/x-amz-json-1.1")
+		req.Header.Set("X-Amz-Target", "RedshiftData.ExecuteStatement")
+		redshiftServer.ServeHTTP(httptest.NewRecorder(), req)
+	}
+	server := NewServer(Config{}, newDashboardStore(nil, nil))
+	server.SetRedshift(redshiftServer)
+
+	table := performRequest(server.routes(), http.MethodGet, "/api/redshift/tables/loop/events?limit=1")
+	if table.Code != http.StatusOK || !strings.Contains(table.Body.String(), `"rowCount":2`) || !strings.Contains(table.Body.String(), `"rows":[["1","created"]]`) || !strings.Contains(table.Body.String(), `"encoding":"raw"`) {
+		t.Fatalf("redshift table detail = %d body=%s", table.Code, table.Body.String())
+	}
+
+	query := performRequestWithBody(server.routes(), http.MethodPost, "/api/redshift/query", `{"sql":"select id, payload from loop.events where id = 2","maxRows":5}`)
+	if query.Code != http.StatusOK || !strings.Contains(query.Body.String(), `"rowCount":1`) || !strings.Contains(query.Body.String(), `"rows":[["2","queued"]]`) || !strings.Contains(query.Body.String(), `"typeName":"int4"`) {
+		t.Fatalf("redshift dashboard query = %d body=%s", query.Code, query.Body.String())
+	}
+
+	statements := performRequest(server.routes(), http.MethodGet, "/api/redshift/statements")
+	if statements.Code != http.StatusOK || !strings.Contains(statements.Body.String(), `"queryPreview":"select id, payload from loop.events where id = 2"`) {
+		t.Fatalf("redshift statements after query = %d body=%s", statements.Code, statements.Body.String())
+	}
+}
+
+func TestRedshiftDashboardQueryErrorIsSafe(t *testing.T) {
+	redshiftServer := redshiftsvc.NewServer(redshiftsvc.Config{
+		SQLAddr:           "127.0.0.1:15439",
+		ClusterIdentifier: "devcloud",
+		Database:          "dev",
+		User:              "dev",
+	})
+	server := NewServer(Config{}, newDashboardStore(nil, nil))
+	server.SetRedshift(redshiftServer)
+
+	query := performRequestWithBody(server.routes(), http.MethodPost, "/api/redshift/query", `{"sql":"select * from missing where token = 'secret-token'","maxRows":5}`)
+	if query.Code != http.StatusBadRequest || !strings.Contains(query.Body.String(), `"error":"redshift query failed"`) {
+		t.Fatalf("redshift dashboard query error = %d body=%s", query.Code, query.Body.String())
+	}
+	if strings.Contains(query.Body.String(), "secret-token") || strings.Contains(query.Body.String(), "queryPreview") || strings.Contains(query.Body.String(), "statement") {
+		t.Fatalf("redshift dashboard query error leaked SQL details: %s", query.Body.String())
+	}
+}
+
+func TestRedshiftDashboardAPIMarksDisabled(t *testing.T) {
+	server := NewServer(Config{}, newDashboardStore(nil, nil))
+
+	status := performRequest(server.routes(), http.MethodGet, "/api/redshift/status")
+	if status.Code != http.StatusOK || !strings.Contains(status.Body.String(), `"running":false`) {
+		t.Fatalf("disabled status = %d body=%s", status.Code, status.Body.String())
+	}
+	clusters := performRequest(server.routes(), http.MethodGet, "/api/redshift/clusters")
+	if clusters.Code != http.StatusServiceUnavailable {
+		t.Fatalf("disabled clusters status = %d body=%s", clusters.Code, clusters.Body.String())
+	}
+	catalog := performRequest(server.routes(), http.MethodGet, "/api/redshift/catalog")
+	if catalog.Code != http.StatusServiceUnavailable {
+		t.Fatalf("disabled catalog status = %d body=%s", catalog.Code, catalog.Body.String())
+	}
+	statements := performRequest(server.routes(), http.MethodGet, "/api/redshift/statements")
+	if statements.Code != http.StatusServiceUnavailable {
+		t.Fatalf("disabled statements status = %d body=%s", statements.Code, statements.Body.String())
 	}
 }
 

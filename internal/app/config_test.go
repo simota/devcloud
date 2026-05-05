@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -37,6 +38,9 @@ func TestInitWorkspaceCreatesDefaultsWithoutOverwritingConfig(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(cfg.Storage.Path, "bigquery")); err != nil {
 		t.Fatalf("bigquery storage not created: %v", err)
 	}
+	if _, err := os.Stat(filepath.Join(cfg.Storage.Path, "redshift")); err != nil {
+		t.Fatalf("redshift storage not created: %v", err)
+	}
 	if _, err := os.Stat(filepath.Join(cfg.Storage.Path, "sqs")); err != nil {
 		t.Fatalf("sqs storage not created: %v", err)
 	}
@@ -66,6 +70,134 @@ func TestInitWorkspaceCreatesDefaultsWithoutOverwritingConfig(t *testing.T) {
 	}
 }
 
+func TestGenerateDefaultConfigUsesRedshiftManagedPostgresBackend(t *testing.T) {
+	chdir(t, t.TempDir())
+	cfg := DefaultConfig()
+
+	if err := InitWorkspace(cfg); err != nil {
+		t.Fatalf("InitWorkspace() error = %v", err)
+	}
+
+	configPath := filepath.Join(".devcloud", "config.yaml")
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("read generated config: %v", err)
+	}
+	generated := string(data)
+	for _, want := range []string{
+		"backend:\n      kind: postgres\n      mode: managed",
+		"externalDsn: ",
+		"managed: true",
+	} {
+		if !strings.Contains(generated, want) {
+			t.Fatalf("generated config missing %q:\n%s", want, generated)
+		}
+	}
+
+	loaded, err := LoadConfig(configPath)
+	if err != nil {
+		t.Fatalf("LoadConfig(generated) error = %v", err)
+	}
+	if loaded.Services.Redshift.Backend.Kind != "postgres" || loaded.Services.Redshift.Backend.Mode != "managed" || loaded.Services.Redshift.Backend.ExternalDSN != "" || !loaded.Services.Redshift.Backend.Managed {
+		t.Fatalf("generated Redshift backend = %#v", loaded.Services.Redshift.Backend)
+	}
+}
+
+func TestLoadConfigPreservesExplicitRedshiftMemoryFallback(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	data := []byte(`project: dev
+
+services:
+  redshift:
+    backend:
+      kind: memory
+`)
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig() error = %v", err)
+	}
+	if cfg.Services.Redshift.Backend.Kind != "memory" {
+		t.Fatalf("Services.Redshift.Backend.Kind = %q, want memory", cfg.Services.Redshift.Backend.Kind)
+	}
+}
+
+func TestGenerateDefaultConfigPreservesExplicitRedshiftMemoryFallback(t *testing.T) {
+	chdir(t, t.TempDir())
+	cfg := DefaultConfig()
+	cfg.Services.Redshift.Backend.Kind = "memory"
+	cfg.Services.Redshift.Backend.Mode = ""
+	cfg.Services.Redshift.Backend.ExternalDSN = ""
+	cfg.Services.Redshift.Backend.Managed = true
+
+	if err := InitWorkspace(cfg); err != nil {
+		t.Fatalf("InitWorkspace() error = %v", err)
+	}
+
+	configPath := filepath.Join(".devcloud", "config.yaml")
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("read generated config: %v", err)
+	}
+	generated := string(data)
+	for _, want := range []string{
+		"backend:\n      kind: memory\n      mode: memory",
+		"managed: false",
+	} {
+		if !strings.Contains(generated, want) {
+			t.Fatalf("generated config missing %q:\n%s", want, generated)
+		}
+	}
+
+	loaded, err := LoadConfig(configPath)
+	if err != nil {
+		t.Fatalf("LoadConfig(generated) error = %v", err)
+	}
+	if loaded.Services.Redshift.Backend.Kind != "memory" || loaded.Services.Redshift.Backend.Mode != "memory" || loaded.Services.Redshift.Backend.Managed {
+		t.Fatalf("generated Redshift memory fallback = %#v", loaded.Services.Redshift.Backend)
+	}
+}
+
+func TestGenerateDefaultConfigInfersExternalRedshiftBackendMode(t *testing.T) {
+	chdir(t, t.TempDir())
+	cfg := DefaultConfig()
+	cfg.Services.Redshift.Backend.Mode = ""
+	cfg.Services.Redshift.Backend.ExternalDSN = "postgres://dev:secret@127.0.0.1:5432/dev?sslmode=disable"
+	cfg.Services.Redshift.Backend.Managed = true
+
+	if err := InitWorkspace(cfg); err != nil {
+		t.Fatalf("InitWorkspace() error = %v", err)
+	}
+
+	configPath := filepath.Join(".devcloud", "config.yaml")
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("read generated config: %v", err)
+	}
+	generated := string(data)
+	for _, want := range []string{
+		"backend:\n      kind: postgres\n      mode: external",
+		"externalDsn: postgres://dev:secret@127.0.0.1:5432/dev?sslmode=disable",
+		"managed: false",
+	} {
+		if !strings.Contains(generated, want) {
+			t.Fatalf("generated config missing %q:\n%s", want, generated)
+		}
+	}
+
+	loaded, err := LoadConfig(configPath)
+	if err != nil {
+		t.Fatalf("LoadConfig(generated) error = %v", err)
+	}
+	if loaded.Services.Redshift.Backend.Kind != "postgres" || loaded.Services.Redshift.Backend.Mode != "external" || loaded.Services.Redshift.Backend.ExternalDSN == "" || loaded.Services.Redshift.Backend.Managed {
+		t.Fatalf("generated Redshift external backend = %#v", loaded.Services.Redshift.Backend)
+	}
+}
+
 func TestLoadConfigReadsGeneratedConfigValues(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.yaml")
@@ -78,6 +210,8 @@ server:
   gcsPort: 4444
   dynamodbPort: 8100
   bigqueryPort: 9051
+  redshiftPort: 15439
+  redshiftAPIPort: 19099
   sqsPort: 9325
   pubsubGrpcPort: 18085
   pubsubRestPort: 18086
@@ -101,6 +235,13 @@ auth:
     mode: bearer-dev
     project: custom-bigquery-project
     bearerToken: bigquery-token
+  redshift:
+    mode: strict
+    user: analyst
+    password: local-password
+    accessKeyId: local-redshift
+    secretAccessKey: redshift-secret
+    accountId: "210987654321"
   sqs:
     mode: strict
     accessKeyId: local-sqs
@@ -150,6 +291,33 @@ services:
       maxResultRows: 500
       maxExecutionSeconds: 7
       defaultUseLegacySql: true
+  redshift:
+    enabled: true
+    region: ap-northeast-1
+    clusterIdentifier: local-cluster
+    database: warehouse
+    dataDir: custom-redshift
+    nodeType: ra3.xlplus
+    numberOfNodes: 2
+    maxStatementBytes: 2048
+    backend:
+      kind: postgres
+      mode: external
+      externalDsn: postgres://dev:secret@127.0.0.1:5432/dev?sslmode=disable
+      managed: false
+    dataApi:
+      enabled: true
+      maxResultBytes: 4096
+      maxResultRows: 50
+      statementRetentionSeconds: 60
+      sessionRetentionSeconds: 120
+    sql:
+      enableExtendedProtocol: true
+      maxResultRows: 75
+      defaultSearchPath: analytics
+    copyUnload:
+      enableLocalS3: false
+      maxInputRowBytes: 1024
   sqs:
     enabled: true
     region: ap-northeast-1
@@ -187,7 +355,7 @@ services:
 	if cfg.Project != "custom" {
 		t.Fatalf("Project = %q", cfg.Project)
 	}
-	if cfg.Server.SMTPPort != 2525 || cfg.Server.DashboardPort != 8825 || cfg.Server.S3Port != 4567 || cfg.Server.GCSPort != 4444 || cfg.Server.DynamoDBPort != 8100 || cfg.Server.BigQueryPort != 9051 || cfg.Server.SQSPort != 9325 || cfg.Server.PubSubGRPCPort != 18085 || cfg.Server.PubSubRESTPort != 18086 {
+	if cfg.Server.SMTPPort != 2525 || cfg.Server.DashboardPort != 8825 || cfg.Server.S3Port != 4567 || cfg.Server.GCSPort != 4444 || cfg.Server.DynamoDBPort != 8100 || cfg.Server.BigQueryPort != 9051 || cfg.Server.RedshiftPort != 15439 || cfg.Server.RedshiftAPIPort != 19099 || cfg.Server.SQSPort != 9325 || cfg.Server.PubSubGRPCPort != 18085 || cfg.Server.PubSubRESTPort != 18086 {
 		t.Fatalf("Server = %#v", cfg.Server)
 	}
 	if cfg.Auth.S3.AccessKeyID != "local" || cfg.Auth.S3.SecretAccessKey != "secret" {
@@ -201,6 +369,9 @@ services:
 	}
 	if cfg.Auth.BigQuery.Mode != "bearer-dev" || cfg.Auth.BigQuery.Project != "custom-bigquery-project" || cfg.Auth.BigQuery.BearerToken != "bigquery-token" {
 		t.Fatalf("Auth.BigQuery = %#v", cfg.Auth.BigQuery)
+	}
+	if cfg.Auth.Redshift.Mode != "strict" || cfg.Auth.Redshift.User != "analyst" || cfg.Auth.Redshift.Password != "local-password" || cfg.Auth.Redshift.AccessKeyID != "local-redshift" || cfg.Auth.Redshift.SecretAccessKey != "redshift-secret" || cfg.Auth.Redshift.AccountID != "210987654321" {
+		t.Fatalf("Auth.Redshift = %#v", cfg.Auth.Redshift)
 	}
 	if cfg.Auth.SQS.Mode != "strict" || cfg.Auth.SQS.AccessKeyID != "local-sqs" || cfg.Auth.SQS.SecretAccessKey != "sqs-secret" || cfg.Auth.SQS.AccountID != "123456789012" {
 		t.Fatalf("Auth.SQS = %#v", cfg.Auth.SQS)
@@ -237,6 +408,24 @@ services:
 	}
 	if cfg.Services.BigQuery.Query.MaxResultRows != 500 || cfg.Services.BigQuery.Query.MaxExecutionSeconds != 7 || !cfg.Services.BigQuery.Query.DefaultUseLegacySQL {
 		t.Fatalf("Services.BigQuery.Query = %#v", cfg.Services.BigQuery.Query)
+	}
+	if !cfg.Services.Redshift.Enabled || cfg.Services.Redshift.Region != "ap-northeast-1" || cfg.Services.Redshift.ClusterIdentifier != "local-cluster" || cfg.Services.Redshift.Database != "warehouse" {
+		t.Fatalf("Services.Redshift = %#v", cfg.Services.Redshift)
+	}
+	if cfg.Services.Redshift.DataDir != "custom-redshift" || cfg.Services.Redshift.NodeType != "ra3.xlplus" || cfg.Services.Redshift.NumberOfNodes != 2 || cfg.Services.Redshift.MaxStatementBytes != 2048 {
+		t.Fatalf("Services.Redshift metadata = %#v", cfg.Services.Redshift)
+	}
+	if cfg.Services.Redshift.Backend.Kind != "postgres" || cfg.Services.Redshift.Backend.Mode != "external" || cfg.Services.Redshift.Backend.ExternalDSN != "postgres://dev:secret@127.0.0.1:5432/dev?sslmode=disable" || cfg.Services.Redshift.Backend.Managed {
+		t.Fatalf("Services.Redshift.Backend = %#v", cfg.Services.Redshift.Backend)
+	}
+	if !cfg.Services.Redshift.DataAPI.Enabled || cfg.Services.Redshift.DataAPI.MaxResultBytes != 4096 || cfg.Services.Redshift.DataAPI.MaxResultRows != 50 || cfg.Services.Redshift.DataAPI.StatementRetentionSeconds != 60 || cfg.Services.Redshift.DataAPI.SessionRetentionSeconds != 120 {
+		t.Fatalf("Services.Redshift.DataAPI = %#v", cfg.Services.Redshift.DataAPI)
+	}
+	if !cfg.Services.Redshift.SQL.EnableExtendedProtocol || cfg.Services.Redshift.SQL.MaxResultRows != 75 || cfg.Services.Redshift.SQL.DefaultSearchPath != "analytics" {
+		t.Fatalf("Services.Redshift.SQL = %#v", cfg.Services.Redshift.SQL)
+	}
+	if cfg.Services.Redshift.CopyUnload.EnableLocalS3 || cfg.Services.Redshift.CopyUnload.MaxInputRowBytes != 1024 {
+		t.Fatalf("Services.Redshift.CopyUnload = %#v", cfg.Services.Redshift.CopyUnload)
 	}
 	if !cfg.Services.SQS.Enabled || cfg.Services.SQS.Region != "ap-northeast-1" || cfg.Services.SQS.QueueURLHost != "localhost" {
 		t.Fatalf("Services.SQS = %#v", cfg.Services.SQS)
@@ -291,6 +480,12 @@ func TestDefaultConfigIncludesS3GCSAndDynamoDBDefaults(t *testing.T) {
 	if cfg.Server.BigQueryPort != 9050 {
 		t.Fatalf("Server.BigQueryPort = %d", cfg.Server.BigQueryPort)
 	}
+	if cfg.Server.RedshiftPort != 5439 {
+		t.Fatalf("Server.RedshiftPort = %d", cfg.Server.RedshiftPort)
+	}
+	if cfg.Server.RedshiftAPIPort != 9099 {
+		t.Fatalf("Server.RedshiftAPIPort = %d", cfg.Server.RedshiftAPIPort)
+	}
 	if cfg.Server.SQSPort != 9324 {
 		t.Fatalf("Server.SQSPort = %d", cfg.Server.SQSPort)
 	}
@@ -341,6 +536,27 @@ func TestDefaultConfigIncludesS3GCSAndDynamoDBDefaults(t *testing.T) {
 	}
 	if cfg.Services.BigQuery.Query.MaxResultRows != 10000 || cfg.Services.BigQuery.Query.MaxExecutionSeconds != 30 || cfg.Services.BigQuery.Query.DefaultUseLegacySQL {
 		t.Fatalf("Services.BigQuery.Query = %#v", cfg.Services.BigQuery.Query)
+	}
+	if cfg.Auth.Redshift.Mode != "relaxed" || cfg.Auth.Redshift.User != "dev" || cfg.Auth.Redshift.Password != "dev" || cfg.Auth.Redshift.AccessKeyID != "dev" || cfg.Auth.Redshift.SecretAccessKey != "dev" || cfg.Auth.Redshift.AccountID != "000000000000" {
+		t.Fatalf("Auth.Redshift = %#v", cfg.Auth.Redshift)
+	}
+	if !cfg.Services.Redshift.Enabled || cfg.Services.Redshift.Region != "us-east-1" || cfg.Services.Redshift.ClusterIdentifier != "devcloud" || cfg.Services.Redshift.Database != "dev" {
+		t.Fatalf("Services.Redshift = %#v", cfg.Services.Redshift)
+	}
+	if cfg.Services.Redshift.DataDir != "redshift" || cfg.Services.Redshift.NodeType != "dc2.large" || cfg.Services.Redshift.NumberOfNodes != 1 || cfg.Services.Redshift.MaxStatementBytes != 16*1024*1024 {
+		t.Fatalf("Services.Redshift metadata = %#v", cfg.Services.Redshift)
+	}
+	if cfg.Services.Redshift.Backend.Kind != "postgres" || cfg.Services.Redshift.Backend.Mode != "managed" || cfg.Services.Redshift.Backend.ExternalDSN != "" || !cfg.Services.Redshift.Backend.Managed {
+		t.Fatalf("Services.Redshift.Backend = %#v", cfg.Services.Redshift.Backend)
+	}
+	if !cfg.Services.Redshift.DataAPI.Enabled || cfg.Services.Redshift.DataAPI.MaxResultBytes != 500*1024*1024 || cfg.Services.Redshift.DataAPI.MaxResultRows != 10000 || cfg.Services.Redshift.DataAPI.StatementRetentionSeconds != 86400 || cfg.Services.Redshift.DataAPI.SessionRetentionSeconds != 86400 {
+		t.Fatalf("Services.Redshift.DataAPI = %#v", cfg.Services.Redshift.DataAPI)
+	}
+	if cfg.Services.Redshift.SQL.EnableExtendedProtocol || cfg.Services.Redshift.SQL.MaxResultRows != 10000 || cfg.Services.Redshift.SQL.DefaultSearchPath != "public" {
+		t.Fatalf("Services.Redshift.SQL = %#v", cfg.Services.Redshift.SQL)
+	}
+	if !cfg.Services.Redshift.CopyUnload.EnableLocalS3 || cfg.Services.Redshift.CopyUnload.MaxInputRowBytes != 4*1024*1024 {
+		t.Fatalf("Services.Redshift.CopyUnload = %#v", cfg.Services.Redshift.CopyUnload)
 	}
 	if cfg.Auth.SQS.Mode != "relaxed" || cfg.Auth.SQS.AccessKeyID != "dev" || cfg.Auth.SQS.SecretAccessKey != "dev" || cfg.Auth.SQS.AccountID != "000000000000" {
 		t.Fatalf("Auth.SQS = %#v", cfg.Auth.SQS)
@@ -424,6 +640,9 @@ func TestWorkspaceStoragePathMustStayUnderDevcloud(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(".devcloud", "custom-data", "bigquery")); err != nil {
 		t.Fatalf("custom bigquery storage not created: %v", err)
 	}
+	if _, err := os.Stat(filepath.Join(".devcloud", "custom-data", "redshift")); err != nil {
+		t.Fatalf("custom redshift storage not created: %v", err)
+	}
 	if _, err := os.Stat(filepath.Join(".devcloud", "custom-data", "pubsub")); err != nil {
 		t.Fatalf("custom pubsub storage not created: %v", err)
 	}
@@ -459,6 +678,32 @@ func TestInitWorkspaceUsesPubSubSpecificDataDirs(t *testing.T) {
 	cfg.Services.PubSub.MessageDataDir = "message-outside"
 	if err := InitWorkspace(cfg); err == nil {
 		t.Fatal("InitWorkspace() error = nil for pubsub messageDataDir outside .devcloud")
+	}
+}
+
+func TestInitWorkspaceUsesRedshiftDataDirUnderDevcloud(t *testing.T) {
+	chdir(t, t.TempDir())
+	cfg := DefaultConfig()
+	cfg.Services.Redshift.DataDir = filepath.Join(".devcloud", "redshift-store")
+
+	if err := InitWorkspace(cfg); err != nil {
+		t.Fatalf("InitWorkspace() error = %v", err)
+	}
+	if _, err := os.Stat(cfg.Services.Redshift.DataDir); err != nil {
+		t.Fatalf("custom redshift dataDir not created: %v", err)
+	}
+
+	cfg.Services.Redshift.DataDir = "redshift-outside"
+	if err := InitWorkspace(cfg); err != nil {
+		t.Fatalf("relative redshift dataDir should stay under storage path: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(cfg.Storage.Path, "redshift-outside")); err != nil {
+		t.Fatalf("relative redshift dataDir not created under storage path: %v", err)
+	}
+
+	cfg.Services.Redshift.DataDir = filepath.Join("..", "..", "redshift-outside")
+	if err := InitWorkspace(cfg); err == nil {
+		t.Fatal("InitWorkspace() error = nil for redshift dataDir outside .devcloud")
 	}
 }
 

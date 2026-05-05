@@ -2,6 +2,8 @@ package app
 
 import (
 	"context"
+	"database/sql"
+	"database/sql/driver"
 	"errors"
 	"io"
 	"net"
@@ -16,6 +18,14 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 )
 
+const fakeRedshiftPostgresDriverName = "devcloud_app_redshift_postgres_backend_test"
+const failingRedshiftPostgresDriverName = "devcloud_app_redshift_postgres_backend_failure_test"
+
+func init() {
+	sql.Register(fakeRedshiftPostgresDriverName, fakeRedshiftPostgresDriver{})
+	sql.Register(failingRedshiftPostgresDriverName, failingRedshiftPostgresDriver{})
+}
+
 func TestDaemonDoesNotExposeS3DashboardAPIWhenS3Disabled(t *testing.T) {
 	chdir(t, t.TempDir())
 	cfg := DefaultConfig()
@@ -26,6 +36,7 @@ func TestDaemonDoesNotExposeS3DashboardAPIWhenS3Disabled(t *testing.T) {
 	cfg.Services.BigQuery.Enabled = false
 	cfg.Services.SQS.Enabled = false
 	cfg.Services.PubSub.Enabled = false
+	cfg.Services.Redshift.Enabled = false
 	cfg.Server.DashboardPort = freeTCPPort(t)
 	cfg.Server.S3Port = freeTCPPort(t)
 
@@ -80,6 +91,7 @@ func TestDaemonStartsPubSubEndpointsAndDashboardRegistry(t *testing.T) {
 	cfg.Services.DynamoDB.Enabled = false
 	cfg.Services.BigQuery.Enabled = false
 	cfg.Services.SQS.Enabled = false
+	cfg.Services.Redshift.Enabled = false
 	cfg.Services.PubSub.Enabled = true
 	cfg.Services.PubSub.EnableREST = true
 	cfg.Server.DashboardPort = freeTCPPort(t)
@@ -146,7 +158,7 @@ func waitForPubSubGRPC(t *testing.T, addr string, project string) {
 	t.Fatalf("timed out waiting for Pub/Sub gRPC %s: %v", addr, lastErr)
 }
 
-func TestDaemonEnabledServerCountIncludesPubSubAndDashboard(t *testing.T) {
+func TestDaemonEnabledServerCountIncludesPubSubRedshiftAndDashboard(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.Services.Mail.Enabled = true
 	cfg.Services.S3.Enabled = true
@@ -155,14 +167,209 @@ func TestDaemonEnabledServerCountIncludesPubSubAndDashboard(t *testing.T) {
 	cfg.Services.BigQuery.Enabled = true
 	cfg.Services.SQS.Enabled = true
 	cfg.Services.PubSub.Enabled = true
+	cfg.Services.Redshift.Enabled = true
 
-	if got := NewDaemon(cfg).enabledServerCount(); got != 8 {
-		t.Fatalf("enabledServerCount() = %d, want 8", got)
+	if got := NewDaemon(cfg).enabledServerCount(); got != 9 {
+		t.Fatalf("enabledServerCount() = %d, want 9", got)
 	}
 
 	cfg.Services.PubSub.Enabled = false
+	if got := NewDaemon(cfg).enabledServerCount(); got != 8 {
+		t.Fatalf("enabledServerCount() without Pub/Sub = %d, want 8", got)
+	}
+
+	cfg.Services.Redshift.Enabled = false
 	if got := NewDaemon(cfg).enabledServerCount(); got != 7 {
-		t.Fatalf("enabledServerCount() without Pub/Sub = %d, want 7", got)
+		t.Fatalf("enabledServerCount() without Pub/Sub and Redshift = %d, want 7", got)
+	}
+}
+
+func TestRedshiftSQLBackendUsesManagedPostgresByDefault(t *testing.T) {
+	managed := &fakeManagedPostgresLifecycle{dsn: "postgres://dev:secret@127.0.0.1:15439/dev?sslmode=disable"}
+	originalStart := startManagedRedshiftPostgres
+	startManagedRedshiftPostgres = func(ctx context.Context, cfg Config) (managedPostgresLifecycle, error) {
+		return managed, nil
+	}
+	t.Cleanup(func() {
+		startManagedRedshiftPostgres = originalStart
+	})
+
+	backend, err := redshiftSQLBackendWithDriver(context.Background(), DefaultConfig(), fakeRedshiftPostgresDriverName)
+	if err != nil {
+		t.Fatalf("redshiftSQLBackendWithDriver() error = %v", err)
+	}
+	if backend == nil {
+		t.Fatal("redshiftSQLBackendWithDriver() = nil")
+	}
+	if err := backend.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	if !managed.closed {
+		t.Fatal("managed lifecycle was not closed")
+	}
+}
+
+func TestRedshiftSQLBackendUsesMemoryFallbackWhenExplicit(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Services.Redshift.Backend.Kind = "memory"
+
+	backend, err := redshiftSQLBackend(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("redshiftSQLBackend() error = %v", err)
+	}
+	if backend != nil {
+		t.Fatalf("redshiftSQLBackend() = %#v, want nil memory fallback", backend)
+	}
+}
+
+func TestRedshiftSQLBackendOpensPostgresExternalDSN(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Services.Redshift.Backend.Kind = "postgres"
+	cfg.Services.Redshift.Backend.Mode = "external"
+	cfg.Services.Redshift.Backend.ExternalDSN = "postgres://dev:secret@127.0.0.1:5432/dev?sslmode=disable"
+	cfg.Services.Redshift.Backend.Managed = false
+
+	backend, err := redshiftSQLBackendWithDriver(context.Background(), cfg, fakeRedshiftPostgresDriverName)
+	if err != nil {
+		t.Fatalf("redshiftSQLBackendWithDriver() error = %v", err)
+	}
+	if backend == nil {
+		t.Fatal("redshiftSQLBackendWithDriver() = nil")
+	}
+	if err := backend.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+}
+
+func TestRedshiftSQLBackendInfersExternalModeWhenDSNConfigured(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Services.Redshift.Backend.Kind = "postgres"
+	cfg.Services.Redshift.Backend.Mode = ""
+	cfg.Services.Redshift.Backend.ExternalDSN = "postgres://dev:secret@127.0.0.1:5432/dev?sslmode=disable"
+	cfg.Services.Redshift.Backend.Managed = false
+
+	originalStart := startManagedRedshiftPostgres
+	startManagedRedshiftPostgres = func(ctx context.Context, cfg Config) (managedPostgresLifecycle, error) {
+		t.Fatal("external DSN mode should not start managed PostgreSQL")
+		return nil, nil
+	}
+	t.Cleanup(func() {
+		startManagedRedshiftPostgres = originalStart
+	})
+
+	backend, err := redshiftSQLBackendWithDriver(context.Background(), cfg, fakeRedshiftPostgresDriverName)
+	if err != nil {
+		t.Fatalf("redshiftSQLBackendWithDriver() error = %v", err)
+	}
+	if backend == nil {
+		t.Fatal("redshiftSQLBackendWithDriver() = nil")
+	}
+	if err := backend.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	if got := redshiftBackendMode(cfg.Services.Redshift.Backend); got != "external" {
+		t.Fatalf("redshiftBackendMode() = %q, want external", got)
+	}
+}
+
+func TestRedshiftSQLBackendOpensManagedPostgresAndClosesLifecycle(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Services.Redshift.Backend.Kind = "postgres"
+	cfg.Services.Redshift.Backend.Mode = "managed"
+	cfg.Services.Redshift.Backend.Managed = true
+
+	managed := &fakeManagedPostgresLifecycle{dsn: "postgres://dev:secret@127.0.0.1:15439/dev?sslmode=disable"}
+	originalStart := startManagedRedshiftPostgres
+	startManagedRedshiftPostgres = func(ctx context.Context, cfg Config) (managedPostgresLifecycle, error) {
+		return managed, nil
+	}
+	t.Cleanup(func() {
+		startManagedRedshiftPostgres = originalStart
+	})
+
+	backend, err := redshiftSQLBackendWithDriver(context.Background(), cfg, fakeRedshiftPostgresDriverName)
+	if err != nil {
+		t.Fatalf("redshiftSQLBackendWithDriver() error = %v", err)
+	}
+	if backend == nil {
+		t.Fatal("redshiftSQLBackendWithDriver() = nil")
+	}
+	if err := backend.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	if !managed.closed {
+		t.Fatal("managed lifecycle was not closed")
+	}
+}
+
+func TestRedshiftBackendModeDefaultsManagedWithoutExternalDSN(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Services.Redshift.Backend.Mode = ""
+	cfg.Services.Redshift.Backend.ExternalDSN = ""
+
+	if got := redshiftBackendMode(cfg.Services.Redshift.Backend); got != "managed" {
+		t.Fatalf("redshiftBackendMode() = %q, want managed", got)
+	}
+}
+
+func TestRedshiftBackendModeReportsMemoryFallbackWhenExplicit(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Services.Redshift.Backend.Kind = "memory"
+	cfg.Services.Redshift.Backend.Mode = ""
+
+	if got := redshiftBackendMode(cfg.Services.Redshift.Backend); got != "memory" {
+		t.Fatalf("redshiftBackendMode() = %q, want memory", got)
+	}
+}
+
+func TestRedshiftSQLBackendManagedOpenFailureRedactsDSN(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Services.Redshift.Backend.Kind = "postgres"
+	cfg.Services.Redshift.Backend.Mode = "managed"
+	cfg.Services.Redshift.Backend.Managed = true
+
+	managed := &fakeManagedPostgresLifecycle{dsn: "postgres://dev:secret@127.0.0.1:15439/dev?sslmode=disable"}
+	originalStart := startManagedRedshiftPostgres
+	startManagedRedshiftPostgres = func(ctx context.Context, cfg Config) (managedPostgresLifecycle, error) {
+		return managed, nil
+	}
+	t.Cleanup(func() {
+		startManagedRedshiftPostgres = originalStart
+	})
+
+	_, err := redshiftSQLBackendWithDriver(context.Background(), cfg, "missing-redshift-postgres-driver")
+	if err == nil {
+		t.Fatal("redshiftSQLBackendWithDriver() error = nil")
+	}
+	if strings.Contains(err.Error(), "secret") {
+		t.Fatalf("managed backend open error leaked password: %v", err)
+	}
+	if !strings.Contains(err.Error(), "redacted") {
+		t.Fatalf("managed backend open error should include redacted DSN: %v", err)
+	}
+	if !managed.closed {
+		t.Fatal("managed lifecycle was not closed after backend open failure")
+	}
+}
+
+func TestRedshiftSQLBackendExternalOpenFailureRedactsDSN(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Services.Redshift.Backend.Kind = "postgres"
+	cfg.Services.Redshift.Backend.Mode = "external"
+	cfg.Services.Redshift.Backend.ExternalDSN = "postgres://dev:secret@127.0.0.1:5432/dev?sslmode=disable"
+	cfg.Services.Redshift.Backend.Managed = false
+
+	_, err := redshiftSQLBackendWithDriver(context.Background(), cfg, failingRedshiftPostgresDriverName)
+	if err == nil {
+		t.Fatal("redshiftSQLBackendWithDriver() error = nil")
+	}
+	for _, leaked := range []string{"secret", cfg.Services.Redshift.Backend.ExternalDSN} {
+		if strings.Contains(err.Error(), leaked) {
+			t.Fatalf("external backend open error leaked %q: %v", leaked, err)
+		}
+	}
+	if !strings.Contains(err.Error(), "postgres://dev:redacted@127.0.0.1:5432/dev?sslmode=disable") {
+		t.Fatalf("external backend open error should include redacted DSN: %v", err)
 	}
 }
 
@@ -205,4 +412,71 @@ func getBody(t *testing.T, url string) string {
 		t.Fatalf("read response body: %v", err)
 	}
 	return string(body)
+}
+
+type fakeRedshiftPostgresDriver struct{}
+
+func (fakeRedshiftPostgresDriver) Open(name string) (driver.Conn, error) {
+	return fakeRedshiftPostgresConn{}, nil
+}
+
+type fakeRedshiftPostgresConn struct{}
+
+func (fakeRedshiftPostgresConn) Prepare(query string) (driver.Stmt, error) {
+	return nil, errors.New("prepare is not implemented in fake redshift postgres driver")
+}
+
+func (fakeRedshiftPostgresConn) Close() error {
+	return nil
+}
+
+func (fakeRedshiftPostgresConn) Begin() (driver.Tx, error) {
+	return nil, errors.New("transactions are not implemented in fake redshift postgres driver")
+}
+
+func (fakeRedshiftPostgresConn) Ping(ctx context.Context) error {
+	return ctx.Err()
+}
+
+type failingRedshiftPostgresDriver struct{}
+
+func (failingRedshiftPostgresDriver) Open(name string) (driver.Conn, error) {
+	return failingRedshiftPostgresConn{name: name}, nil
+}
+
+type failingRedshiftPostgresConn struct {
+	name string
+}
+
+func (failingRedshiftPostgresConn) Prepare(query string) (driver.Stmt, error) {
+	return nil, errors.New("prepare is not implemented in failing redshift postgres driver")
+}
+
+func (failingRedshiftPostgresConn) Close() error {
+	return nil
+}
+
+func (failingRedshiftPostgresConn) Begin() (driver.Tx, error) {
+	return nil, errors.New("transactions are not implemented in failing redshift postgres driver")
+}
+
+func (c failingRedshiftPostgresConn) Ping(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return errors.New("could not connect to " + c.name)
+}
+
+type fakeManagedPostgresLifecycle struct {
+	dsn    string
+	closed bool
+}
+
+func (l *fakeManagedPostgresLifecycle) DSN() string {
+	return l.dsn
+}
+
+func (l *fakeManagedPostgresLifecycle) Close() error {
+	l.closed = true
+	return nil
 }

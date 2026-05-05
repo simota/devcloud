@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"devcloud/internal/dashboard"
@@ -13,6 +14,10 @@ import (
 	gcssvc "devcloud/internal/services/gcs"
 	"devcloud/internal/services/mail"
 	pubsubsvc "devcloud/internal/services/pubsub"
+	redshiftsvc "devcloud/internal/services/redshift"
+	"devcloud/internal/services/redshift/backend"
+	redshiftpostgres "devcloud/internal/services/redshift/backend/postgres"
+	"devcloud/internal/services/redshift/translator"
 	s3svc "devcloud/internal/services/s3"
 	sqssvc "devcloud/internal/services/sqs"
 	"devcloud/internal/storage/blob"
@@ -122,6 +127,38 @@ func (d *Daemon) Run(ctx context.Context) error {
 		StreamingPullDisabled:     !d.config.Services.PubSub.EnableStreamingPull,
 		EnablePush:                d.config.Services.PubSub.EnablePush,
 	})
+	var redshiftBackend backend.SQLBackend
+	if d.config.Services.Redshift.Enabled {
+		var err error
+		redshiftBackend, err = redshiftSQLBackend(ctx, d.config)
+		if err != nil {
+			return err
+		}
+	}
+	if redshiftBackend != nil {
+		defer redshiftBackend.Close()
+	}
+	redshiftServer := redshiftsvc.NewServer(redshiftsvc.Config{
+		SQLAddr:           loopbackAddr(d.config.Server.RedshiftPort),
+		APIAddr:           loopbackAddr(d.config.Server.RedshiftAPIPort),
+		Region:            d.config.Services.Redshift.Region,
+		ClusterIdentifier: d.config.Services.Redshift.ClusterIdentifier,
+		Database:          d.config.Services.Redshift.Database,
+		NodeType:          d.config.Services.Redshift.NodeType,
+		NumberOfNodes:     d.config.Services.Redshift.NumberOfNodes,
+		StoragePath:       redshiftDataDir(d.config),
+		MaxStatementBytes: d.config.Services.Redshift.MaxStatementBytes,
+		MaxCopyInputBytes: d.config.Services.Redshift.CopyUnload.MaxInputRowBytes,
+		AuthMode:          d.config.Auth.Redshift.Mode,
+		User:              d.config.Auth.Redshift.User,
+		Password:          d.config.Auth.Redshift.Password,
+		AccountID:         d.config.Auth.Redshift.AccountID,
+		ObjectStore:       objectStore,
+		SQLBackend:        redshiftBackend,
+		BackendKind:       redshiftBackendKind(d.config.Services.Redshift.Backend),
+		BackendMode:       redshiftBackendMode(d.config.Services.Redshift.Backend),
+		Translator:        redshiftTranslator(d.config),
+	})
 	dashboardConfig := dashboard.Config{
 		Addr:                 loopbackAddr(d.config.Server.DashboardPort),
 		MailDisabled:         !d.config.Services.Mail.Enabled,
@@ -143,6 +180,12 @@ func (d *Daemon) Run(ctx context.Context) error {
 		BigQueryLocation:     d.config.Services.BigQuery.Location,
 		BigQueryAuthMode:     d.config.Auth.BigQuery.Mode,
 		BigQueryStoragePath:  filepath.Join(d.config.Storage.Path, "bigquery"),
+		RedshiftSQLEndpoint:  loopbackAddr(d.config.Server.RedshiftPort),
+		RedshiftAPIEndpoint:  "http://" + loopbackAddr(d.config.Server.RedshiftAPIPort),
+		RedshiftRegion:       d.config.Services.Redshift.Region,
+		RedshiftCluster:      d.config.Services.Redshift.ClusterIdentifier,
+		RedshiftDatabase:     d.config.Services.Redshift.Database,
+		RedshiftStoragePath:  redshiftDataDir(d.config),
 		SQSEndpoint:          "http://" + loopbackAddr(d.config.Server.SQSPort),
 		SQSRegion:            d.config.Services.SQS.Region,
 		SQSAuthMode:          d.config.Auth.SQS.Mode,
@@ -164,6 +207,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	}
 	if d.config.Services.PubSub.Enabled {
 		dashboardServer.SetPubSub(pubSubServer)
+	}
+	if d.config.Services.Redshift.Enabled {
+		dashboardServer.SetRedshift(redshiftServer)
 	}
 
 	errCh := make(chan error, d.enabledServerCount())
@@ -187,6 +233,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	}
 	if d.config.Services.PubSub.Enabled {
 		go func() { errCh <- pubSubServer.Run(ctx) }()
+	}
+	if d.config.Services.Redshift.Enabled {
+		go func() { errCh <- redshiftServer.Run(ctx) }()
 	}
 	go func() { errCh <- dashboardServer.Run(ctx) }()
 
@@ -242,7 +291,99 @@ func (d *Daemon) enabledServerCount() int {
 	if d.config.Services.PubSub.Enabled {
 		count++
 	}
+	if d.config.Services.Redshift.Enabled {
+		count++
+	}
 	return count
+}
+
+func redshiftSQLBackend(ctx context.Context, cfg Config) (backend.SQLBackend, error) {
+	return redshiftSQLBackendWithDriver(ctx, cfg, "")
+}
+
+func redshiftSQLBackendWithDriver(ctx context.Context, cfg Config, driverName string) (backend.SQLBackend, error) {
+	backendCfg := cfg.Services.Redshift.Backend
+	kind := redshiftBackendKind(backendCfg)
+	switch kind {
+	case "", "memory":
+		return nil, nil
+	case "postgres", "postgresql":
+		mode := redshiftBackendMode(backendCfg)
+		if mode == "managed" || (backendCfg.Managed && backendCfg.Mode == "" && backendCfg.ExternalDSN == "") {
+			managed, err := startManagedRedshiftPostgres(ctx, cfg)
+			if err != nil {
+				return nil, err
+			}
+			pgBackend, err := redshiftpostgres.Open(ctx, redshiftpostgres.Config{
+				DriverName: driverName,
+				DSN:        managed.DSN(),
+			})
+			if err != nil {
+				_ = managed.Close()
+				return nil, fmt.Errorf("open redshift postgres backend with managed dsn %s: %s", redactedManagedPostgresDSN(managed.DSN()), redactPostgresConnectionError(err, managed.DSN()))
+			}
+			return &managedRedshiftPostgresBackend{SQLBackend: pgBackend, managed: managed}, nil
+		}
+		if mode != "external" {
+			return nil, fmt.Errorf("unsupported redshift postgres backend mode: %s", backendCfg.Mode)
+		}
+		pgBackend, err := redshiftpostgres.Open(ctx, redshiftpostgres.Config{
+			DriverName: driverName,
+			DSN:        backendCfg.ExternalDSN,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("open redshift postgres backend with external dsn %s: %s", redactedManagedPostgresDSN(backendCfg.ExternalDSN), redactPostgresConnectionError(err, backendCfg.ExternalDSN))
+		}
+		return pgBackend, nil
+	default:
+		return nil, fmt.Errorf("unsupported redshift backend kind: %s", backendCfg.Kind)
+	}
+}
+
+type managedRedshiftPostgresBackend struct {
+	backend.SQLBackend
+	managed managedPostgresLifecycle
+}
+
+func (b *managedRedshiftPostgresBackend) Close() error {
+	var closeErr error
+	if b.SQLBackend != nil {
+		closeErr = b.SQLBackend.Close()
+	}
+	if b.managed != nil {
+		if err := b.managed.Close(); err != nil && closeErr == nil {
+			closeErr = err
+		}
+	}
+	return closeErr
+}
+
+func redshiftTranslator(cfg Config) translator.RedshiftTranslator {
+	kind := redshiftBackendKind(cfg.Services.Redshift.Backend)
+	switch kind {
+	case "postgres", "postgresql":
+		return translator.NewRedshiftToPostgres()
+	default:
+		return nil
+	}
+}
+
+func redshiftBackendKind(cfg RedshiftBackendConfig) string {
+	return strings.ToLower(defaultString(cfg.Kind, "postgres"))
+}
+
+func redshiftBackendMode(cfg RedshiftBackendConfig) string {
+	mode := strings.ToLower(strings.TrimSpace(cfg.Mode))
+	if mode != "" {
+		return mode
+	}
+	if strings.TrimSpace(cfg.ExternalDSN) != "" {
+		return "external"
+	}
+	if redshiftBackendKind(cfg) == "memory" {
+		return "memory"
+	}
+	return "managed"
 }
 
 func pubsubDataDir(cfg Config) string {
@@ -251,4 +392,16 @@ func pubsubDataDir(cfg Config) string {
 
 func pubsubMessageDataDir(cfg Config) string {
 	return defaultString(cfg.Services.PubSub.MessageDataDir, filepath.Join(cfg.Storage.Path, "message"))
+}
+
+func redshiftDataDir(cfg Config) string {
+	dataDir := cfg.Services.Redshift.DataDir
+	if dataDir == "" {
+		return filepath.Join(cfg.Storage.Path, "redshift")
+	}
+	clean := filepath.Clean(dataDir)
+	if clean == ".devcloud" || strings.HasPrefix(clean, ".devcloud"+string(filepath.Separator)) {
+		return clean
+	}
+	return filepath.Join(cfg.Storage.Path, clean)
 }
