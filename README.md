@@ -2,7 +2,7 @@
 
 Local cloud service emulator for development and E2E inspection.
 
-`devcloud` runs a local dashboard plus compatible development endpoints for Mail, S3, GCS, DynamoDB, BigQuery, SQS, and Google Cloud Pub/Sub. It is designed for deterministic local tests and manual inspection, not for production workloads or full cloud-provider parity.
+`devcloud` runs a local dashboard plus compatible development endpoints for Mail, S3, GCS, DynamoDB, BigQuery, SQS, Google Cloud Pub/Sub, and Redshift. It is designed for deterministic local tests and manual inspection, not for production workloads or full cloud-provider parity.
 
 ## Quick Start
 
@@ -32,6 +32,8 @@ Default local endpoints:
 | SQS | `http://127.0.0.1:9324` | `http://127.0.0.1:8025/dashboard/sqs` |
 | Pub/Sub gRPC | `127.0.0.1:8085` | `http://127.0.0.1:8025/dashboard/pubsub` |
 | Pub/Sub REST | `http://127.0.0.1:8086` | `http://127.0.0.1:8025/dashboard/pubsub` |
+| Redshift SQL | `127.0.0.1:5439` | `http://127.0.0.1:8025/dashboard/redshift` |
+| Redshift API | `http://127.0.0.1:9099` | `http://127.0.0.1:8025/dashboard/redshift` |
 
 Useful commands:
 
@@ -60,6 +62,8 @@ server:
   sqsPort: 9324
   pubsubGrpcPort: 8085
   pubsubRestPort: 8086
+  redshiftPort: 5439
+  redshiftAPIPort: 9099
 
 auth:
   smtp:
@@ -88,6 +92,13 @@ auth:
     mode: relaxed
     projectID: devcloud
     bearerToken: dev
+  redshift:
+    mode: relaxed
+    user: dev
+    password: dev
+    accessKeyId: dev
+    secretAccessKey: dev
+    accountId: "000000000000"
 
 storage:
   path: .devcloud/data
@@ -149,6 +160,33 @@ services:
     enableREST: true
     enableStreamingPull: true
     enablePush: false
+  redshift:
+    enabled: true
+    region: us-east-1
+    clusterIdentifier: devcloud
+    database: dev
+    dataDir: redshift
+    nodeType: dc2.large
+    numberOfNodes: 1
+    maxStatementBytes: 16777216
+    backend:
+      kind: postgres
+      mode: managed
+      managed: true
+      externalDsn: ""
+    dataAPI:
+      enabled: true
+      maxResultBytes: 524288000
+      maxResultRows: 10000
+      statementRetentionSeconds: 86400
+      sessionRetentionSeconds: 86400
+    sql:
+      enableExtendedProtocol: false
+      maxResultRows: 10000
+      defaultSearchPath: public
+    copyUnload:
+      enableLocalS3: true
+      maxInputRowBytes: 4194304
 ```
 
 ## Support Matrix
@@ -163,16 +201,16 @@ Legend:
 
 ### Service Availability
 
-| Capability | Mail | S3 | GCS | DynamoDB | BigQuery | SQS | Pub/Sub |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| Local endpoint | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
-| Dashboard view | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
-| Dashboard mutation actions | Partial | Partial | Partial | No | No | Partial | Yes |
-| Persistent local storage | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
-| Configurable port | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
-| Enable/disable via config | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
-| Local relaxed auth mode | N/A | Yes | Yes | Yes | Yes | Yes | Yes |
-| Strict cloud-grade auth/IAM | No | Partial | No | Partial | No | Partial | No |
+| Capability | Mail | S3 | GCS | DynamoDB | BigQuery | SQS | Pub/Sub | Redshift |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Local endpoint | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
+| Dashboard view | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
+| Dashboard mutation actions | Partial | Partial | Partial | No | No | Partial | Yes | Yes |
+| Persistent local storage | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
+| Configurable port | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
+| Enable/disable via config | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
+| Local relaxed auth mode | N/A | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
+| Strict cloud-grade auth/IAM | No | Partial | No | Partial | No | Partial | No | Partial |
 
 ### Mail
 
@@ -283,6 +321,26 @@ Pub/Sub dashboard actions are available under `/dashboard/pubsub`:
 - pull messages from the selected subscription
 - acknowledge pulled messages
 
+### Redshift-Compatible API
+
+| Feature | Status | Notes |
+| --- | --- | --- |
+| PostgreSQL wire endpoint | Yes | Listens on `127.0.0.1:5439` by default for local Redshift-style SQL clients. |
+| PostgreSQL simple query protocol | Yes | Covers `psql` smoke workflows. |
+| PostgreSQL extended query protocol | Partial | Supports Parse, Bind, Describe, Execute, Sync, Close, text bind parameters, portal resume, and safe unsupported errors for binary formats. |
+| PostgreSQL execution backend | Yes | Default backend is managed local PostgreSQL; explicit memory fallback remains available for development continuity. |
+| Redshift SQL translation | Partial | Handles local subsets for DDL/DML, Redshift table attributes, CTAS/views/materialized-view metadata, function rewrites, COPY, and UNLOAD. |
+| COPY from local S3 | Yes | Local S3 side effect imports into the PostgreSQL-backed table path. |
+| UNLOAD to local S3 | Yes | Query results can be exported through local S3 side effects. |
+| Redshift Data API | Yes | Execute/describe/get-result/list workflows are covered by local gates. |
+| Redshift management API | Partial | Cluster, parameter group, tags, credentials, and snapshot metadata workflows are local metadata. |
+| Redshift Serverless API | Partial | Namespace and workgroup metadata are local compatibility responses. |
+| Snapshot restore | Yes | Restores cluster metadata from local snapshot metadata without copying real AWS data. |
+| System catalog / BI introspection | Partial | Provides representative `pg_catalog`, `information_schema`, Redshift system views, and workload metadata for common probes. |
+| Dashboard query runner | Yes | Redshift dashboard supports status, catalog, table detail, statement history, and SQL query execution. |
+| Real AWS Redshift / IAM / KMS / CloudWatch | No | Not implemented; devcloud does not make real AWS calls. |
+| MPP / columnar execution / Spectrum / datashare | No | Out of local compatibility scope. |
+
 ### Dashboard API
 
 | Feature | Status | Notes |
@@ -294,6 +352,7 @@ Pub/Sub dashboard actions are available under `/dashboard/pubsub`:
 | DynamoDB dashboard API | Yes | Status, tables, table detail, indexes, TTL, streams, items. |
 | SQS dashboard API | Yes | Status, queues, messages, leases, DLQ, and purge. |
 | Pub/Sub dashboard API | Yes | Status, topics, subscriptions, publish, pull, ack, and message metadata. |
+| Redshift dashboard API | Yes | Status, clusters, catalog, table detail, query runner, and statement history. |
 | Common React dashboard shell | Partial | Shared shell is available under `/dashboard/`; some legacy service pages still exist. |
 
 ## Verification
@@ -315,6 +374,7 @@ VERIFY_STAGE=full bash scripts/bigquery-autoloop/verify.sh
 VERIFY_STAGE=full bash scripts/sqs-autoloop/verify.sh
 VERIFY_STAGE=full bash scripts/pubsub-autoloop/verify.sh
 VERIFY_STAGE=full-compat bash scripts/pubsub-full-compat-autoloop/verify.sh
+VERIFY_STAGE=full-advanced bash scripts/redshift-advanced-compat-autoloop/verify.sh
 ```
 
 Run E2E smoke tests:
@@ -327,6 +387,7 @@ scripts/dynamodb-e2e.sh
 scripts/bigquery-e2e.sh
 scripts/sqs-e2e.sh
 scripts/pubsub-e2e.sh
+scripts/redshift-e2e.sh
 ```
 
 Keep a service running after the E2E journey for browser/API inspection:
