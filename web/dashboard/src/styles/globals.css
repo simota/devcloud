@@ -698,6 +698,10 @@ code {
   border-collapse: collapse;
 }
 
+.dynamodb-item-table.compact {
+  min-width: 520px;
+}
+
 .dynamodb-item-table th,
 .dynamodb-item-table td {
   padding: 10px;
@@ -745,6 +749,25 @@ code {
 .dynamodb-inspector {
   display: grid;
   gap: 14px;
+}
+
+.dynamodb-key-lookup {
+  display: grid;
+  gap: 8px;
+  margin-top: 12px;
+  border-top: 1px solid var(--border-default);
+  padding-top: 12px;
+}
+
+.inspector-heading {
+  display: flex;
+  align-items: start;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.inspector-heading h3 {
+  margin: 0;
 }
 
 .redshift-query-runner {

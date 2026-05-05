@@ -3,8 +3,23 @@ import { EmptyState } from '../../../ui/EmptyState'
 import { Panel } from '../../../ui/Panel'
 import { Button } from '../../../ui/Button'
 import type { DashboardService } from '../dashboard/types'
-import { getDynamoDBStatus, listDynamoDBItems, listDynamoDBTables } from './api'
-import type { DynamoDBItemSnapshot, DynamoDBStatus, DynamoDBTableSummary } from './types'
+import {
+  getDynamoDBIndexes,
+  getDynamoDBStatus,
+  getDynamoDBStreams,
+  getDynamoDBTable,
+  getDynamoDBTTL,
+  listDynamoDBItems,
+  listDynamoDBTables,
+} from './api'
+import type {
+  DynamoDBIndex,
+  DynamoDBItemSnapshot,
+  DynamoDBStatus,
+  DynamoDBStreamsResponse,
+  DynamoDBTableSummary,
+  DynamoDBTimeToLiveDescription,
+} from './types'
 
 type TablesState =
   | { status: 'loading' }
@@ -17,6 +32,19 @@ type ItemsState =
   | { status: 'success'; items: DynamoDBItemSnapshot[] }
   | { status: 'error'; message: string }
 
+type TableDetailState =
+  | { status: 'idle' }
+  | { status: 'loading' }
+  | {
+      status: 'success'
+      table: DynamoDBTableSummary
+      globalSecondaryIndexes: DynamoDBIndex[]
+      localSecondaryIndexes: DynamoDBIndex[]
+      ttl?: DynamoDBTimeToLiveDescription
+      streams: DynamoDBStreamsResponse
+    }
+  | { status: 'error'; message: string }
+
 type DynamoDBDashboardProps = {
   service?: DashboardService
 }
@@ -24,16 +52,21 @@ type DynamoDBDashboardProps = {
 export function DynamoDBDashboard({ service }: DynamoDBDashboardProps): JSX.Element {
   const [tablesState, setTablesState] = useState<TablesState>({ status: 'loading' })
   const [itemsState, setItemsState] = useState<ItemsState>({ status: 'idle' })
+  const [tableDetailState, setTableDetailState] = useState<TableDetailState>({ status: 'idle' })
   const [activeTableName, setActiveTableName] = useState<string>()
   const [activeItemIndex, setActiveItemIndex] = useState(0)
   const [tableFilter, setTableFilter] = useState('')
   const [itemFilter, setItemFilter] = useState('')
+  const [itemLimit, setItemLimit] = useState('100')
+  const [keyLookupValues, setKeyLookupValues] = useState<Record<string, string>>({})
+  const [keyLookupMessage, setKeyLookupMessage] = useState('')
   const isDisabled = service?.status === 'disabled'
 
   const refreshTables = useCallback(() => {
     if (isDisabled) {
       setTablesState({ status: 'success', statusPayload: disabledStatus(service), tables: [] })
       setItemsState({ status: 'idle' })
+      setTableDetailState({ status: 'idle' })
       setActiveTableName(undefined)
       return
     }
@@ -64,7 +97,7 @@ export function DynamoDBDashboard({ service }: DynamoDBDashboardProps): JSX.Elem
       return
     }
     setItemsState({ status: 'loading' })
-    listDynamoDBItems(activeTableName)
+    listDynamoDBItems(activeTableName, normalizedItemLimit(itemLimit))
       .then(({ items }) => {
         setActiveItemIndex(0)
         setItemsState({ status: 'success', items })
@@ -72,11 +105,42 @@ export function DynamoDBDashboard({ service }: DynamoDBDashboardProps): JSX.Elem
       .catch((error: Error) => {
         setItemsState({ status: 'error', message: error.message })
       })
-  }, [activeTableName, isDisabled])
+  }, [activeTableName, isDisabled, itemLimit])
 
   useEffect(() => {
     refreshItems()
   }, [refreshItems])
+
+  const refreshTableDetail = useCallback(() => {
+    if (!activeTableName || isDisabled) {
+      setTableDetailState({ status: 'idle' })
+      return
+    }
+    setTableDetailState({ status: 'loading' })
+    Promise.all([
+      getDynamoDBTable(activeTableName),
+      getDynamoDBIndexes(activeTableName),
+      getDynamoDBTTL(activeTableName),
+      getDynamoDBStreams(activeTableName),
+    ])
+      .then(([table, indexes, ttl, streams]) => {
+        setTableDetailState({
+          status: 'success',
+          table: table.table,
+          globalSecondaryIndexes: indexes.globalSecondaryIndexes ?? [],
+          localSecondaryIndexes: indexes.localSecondaryIndexes ?? [],
+          ttl: ttl.timeToLiveDescription,
+          streams,
+        })
+      })
+      .catch((error: Error) => {
+        setTableDetailState({ status: 'error', message: error.message })
+      })
+  }, [activeTableName, isDisabled])
+
+  useEffect(() => {
+    refreshTableDetail()
+  }, [refreshTableDetail])
 
   const filteredTables = useMemo(() => {
     const query = tableFilter.trim().toLowerCase()
@@ -112,6 +176,38 @@ export function DynamoDBDashboard({ service }: DynamoDBDashboardProps): JSX.Elem
     setActiveTableName(tableName)
     setActiveItemIndex(0)
     setItemFilter('')
+    setKeyLookupValues({})
+    setKeyLookupMessage('')
+  }
+
+  function updateKeyLookupValue(attributeName: string, value: string): void {
+    setKeyLookupValues((current) => ({ ...current, [attributeName]: value }))
+    setKeyLookupMessage('')
+  }
+
+  function findLoadedItemByKey(): void {
+    if (!activeTable || itemsState.status !== 'success') {
+      setKeyLookupMessage('Load table items before using key lookup.')
+      return
+    }
+    const keyAttributes = activeTable.keySchema?.map((key) => key.AttributeName) ?? []
+    const expectedValues = keyAttributes
+      .map((attributeName) => [attributeName, keyLookupValues[attributeName]?.trim() ?? ''] as const)
+      .filter(([, value]) => value !== '')
+    if (expectedValues.length === 0) {
+      setKeyLookupMessage('Enter at least one key value.')
+      return
+    }
+    const matchedIndex = itemsState.items.findIndex((entry) =>
+      expectedValues.every(([attributeName, expected]) => attributeText(entry.item[attributeName]) === expected),
+    )
+    if (matchedIndex < 0) {
+      setKeyLookupMessage(`No loaded item matched ${expectedValues.map(([key]) => key).join(' / ')}.`)
+      return
+    }
+    setItemFilter('')
+    setActiveItemIndex(matchedIndex)
+    setKeyLookupMessage(`Selected loaded item ${matchedIndex + 1}.`)
   }
 
   return (
@@ -165,6 +261,16 @@ export function DynamoDBDashboard({ service }: DynamoDBDashboardProps): JSX.Elem
               value={itemFilter}
             />
           </label>
+          <label className="compact-filter small">
+            <span>Limit</span>
+            <input
+              aria-label="Limit DynamoDB items"
+              disabled={!activeTable}
+              inputMode="numeric"
+              onChange={(event) => setItemLimit(event.target.value)}
+              value={itemLimit}
+            />
+          </label>
           <Button disabled={!activeTable} onClick={refreshItems}>
             Refresh
           </Button>
@@ -176,11 +282,61 @@ export function DynamoDBDashboard({ service }: DynamoDBDashboardProps): JSX.Elem
           onSelectIndex={setActiveItemIndex}
           tableName={activeTableName}
         />
+        <KeyLookup
+          message={keyLookupMessage}
+          onFind={findLoadedItemByKey}
+          onUpdateValue={updateKeyLookupValue}
+          table={activeTable}
+          values={keyLookupValues}
+        />
       </Panel>
 
       <Panel title="Inspector">
-        <TableInspector item={selectedItem} table={activeTable} status={tablesState.status === 'success' ? tablesState.statusPayload : undefined} />
+        <TableInspector
+          detailState={tableDetailState}
+          item={selectedItem}
+          onRefreshDetail={refreshTableDetail}
+          status={tablesState.status === 'success' ? tablesState.statusPayload : undefined}
+          table={activeTable}
+        />
       </Panel>
+    </div>
+  )
+}
+
+type KeyLookupProps = {
+  message: string
+  onFind: () => void
+  onUpdateValue: (attributeName: string, value: string) => void
+  table?: DynamoDBTableSummary
+  values: Record<string, string>
+}
+
+function KeyLookup({ message, onFind, onUpdateValue, table, values }: KeyLookupProps): JSX.Element | null {
+  const keys = table?.keySchema ?? []
+  if (!table || keys.length === 0) {
+    return null
+  }
+  return (
+    <div className="dynamodb-key-lookup">
+      <span className="inspector-label">Key lookup</span>
+      <div className="pubsub-action-row">
+        {keys.map((key) => (
+          <label className="compact-filter" key={key.AttributeName}>
+            <span>
+              {key.AttributeName} {key.KeyType}
+            </span>
+            <input
+              aria-label={`DynamoDB key lookup ${key.AttributeName}`}
+              onChange={(event) => onUpdateValue(key.AttributeName, event.target.value)}
+              placeholder={key.AttributeName}
+              value={values[key.AttributeName] ?? ''}
+            />
+          </label>
+        ))}
+        <Button onClick={onFind}>Find loaded item</Button>
+      </div>
+      {message ? <p className="inspector-muted">{message}</p> : null}
     </div>
   )
 }
@@ -299,25 +455,54 @@ function AttributePreview({ item }: AttributePreviewProps): JSX.Element {
 }
 
 type TableInspectorProps = {
+  detailState: TableDetailState
   table?: DynamoDBTableSummary
   item?: DynamoDBItemSnapshot
+  onRefreshDetail: () => void
   status?: DynamoDBStatus
 }
 
-function TableInspector({ table, item, status }: TableInspectorProps): JSX.Element {
+function TableInspector({ detailState, table, item, onRefreshDetail, status }: TableInspectorProps): JSX.Element {
   if (!table) {
     return <EmptyState title="Inspector" description="Table schema and selected item JSON will appear here." />
   }
+  const detailTable = detailState.status === 'success' ? detailState.table : table
+  const globalSecondaryIndexes =
+    detailState.status === 'success' ? detailState.globalSecondaryIndexes : table.globalSecondaryIndexes ?? []
+  const localSecondaryIndexes =
+    detailState.status === 'success' ? detailState.localSecondaryIndexes : table.localSecondaryIndexes ?? []
+  const ttl = detailState.status === 'success' ? detailState.ttl : table.timeToLiveDescription
+  const streams =
+    detailState.status === 'success'
+      ? detailState.streams
+      : {
+          tableName: table.tableName,
+          streamEnabled: table.streamSpecification?.StreamEnabled ?? false,
+          latestStreamArn: table.latestStreamArn,
+          latestStreamLabel: table.latestStreamLabel,
+          streamSpecification: table.streamSpecification,
+        }
 
   return (
     <div className="dynamodb-inspector">
       <section>
-        <span className="inspector-label">Table</span>
-        <h3>{table.tableName}</h3>
+        <div className="inspector-heading">
+          <div>
+            <span className="inspector-label">Table</span>
+            <h3>{detailTable.tableName}</h3>
+          </div>
+          <Button onClick={onRefreshDetail}>Refresh detail</Button>
+        </div>
+        {detailState.status === 'loading' ? (
+          <p className="inspector-muted">Loading detail metadata.</p>
+        ) : null}
+        {detailState.status === 'error' ? (
+          <p className="operation-message error">{detailState.message}</p>
+        ) : null}
         <dl className="inspector-list">
           <div>
             <dt>Status</dt>
-            <dd>{table.tableStatus}</dd>
+            <dd>{detailTable.tableStatus}</dd>
           </div>
           <div>
             <dt>Endpoint</dt>
@@ -331,17 +516,29 @@ function TableInspector({ table, item, status }: TableInspectorProps): JSX.Eleme
           </div>
           <div>
             <dt>Key schema</dt>
-            <dd>{keySchemaLabel(table)}</dd>
+            <dd>{keySchemaLabel(detailTable)}</dd>
           </div>
           <div>
-            <dt>Indexes</dt>
-            <dd>{indexNames(table)}</dd>
+            <dt>Attributes</dt>
+            <dd>{attributeDefinitionsLabel(detailTable)}</dd>
           </div>
           <div>
             <dt>TTL</dt>
-            <dd>{ttlLabel(table)}</dd>
+            <dd>{ttlLabel({ ...detailTable, timeToLiveDescription: ttl })}</dd>
+          </div>
+          <div>
+            <dt>Streams</dt>
+            <dd>{streamLabel(streams)}</dd>
           </div>
         </dl>
+      </section>
+      <section>
+        <span className="inspector-label">Indexes</span>
+        <IndexSummary globalSecondaryIndexes={globalSecondaryIndexes} localSecondaryIndexes={localSecondaryIndexes} />
+      </section>
+      <section>
+        <span className="inspector-label">Streams</span>
+        <pre className="mail-preview">{JSON.stringify(streams, null, 2)}</pre>
       </section>
       <section>
         <span className="inspector-label">Selected item</span>
@@ -351,6 +548,45 @@ function TableInspector({ table, item, status }: TableInspectorProps): JSX.Eleme
           <p className="inspector-muted">Select an item row to inspect JSON.</p>
         )}
       </section>
+    </div>
+  )
+}
+
+type IndexSummaryProps = {
+  globalSecondaryIndexes: DynamoDBIndex[]
+  localSecondaryIndexes: DynamoDBIndex[]
+}
+
+function IndexSummary({ globalSecondaryIndexes, localSecondaryIndexes }: IndexSummaryProps): JSX.Element {
+  const indexes = [
+    ...globalSecondaryIndexes.map((index) => ({ ...index, type: 'GSI' })),
+    ...localSecondaryIndexes.map((index) => ({ ...index, type: 'LSI' })),
+  ]
+  if (indexes.length === 0) {
+    return <p className="inspector-muted">No secondary indexes.</p>
+  }
+  return (
+    <div className="dynamodb-item-table-wrap">
+      <table className="dynamodb-item-table compact">
+        <thead>
+          <tr>
+            <th scope="col">Type</th>
+            <th scope="col">Name</th>
+            <th scope="col">Key schema</th>
+            <th scope="col">Items</th>
+          </tr>
+        </thead>
+        <tbody>
+          {indexes.map((index) => (
+            <tr key={`${index.type}-${index.IndexName}`}>
+              <td>{index.type}</td>
+              <td>{index.IndexName}</td>
+              <td>{keySchemaLabel({ tableName: index.IndexName, tableStatus: '', itemCount: 0, keySchema: index.KeySchema })}</td>
+              <td>{index.ItemCount ?? 0}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
     </div>
   )
 }
@@ -386,12 +622,36 @@ function indexNames(table: DynamoDBTableSummary): string {
   return indexes.map((index) => index.IndexName).join(', ')
 }
 
+function attributeDefinitionsLabel(table: DynamoDBTableSummary): string {
+  const attributes = table.attributeDefinitions ?? []
+  if (attributes.length === 0) {
+    return 'none'
+  }
+  return attributes.map((attribute) => `${attribute.AttributeName} ${attribute.AttributeType}`).join(', ')
+}
+
 function ttlLabel(table: DynamoDBTableSummary): string {
   const ttl = table.timeToLiveDescription
   if (!ttl || ttl.TimeToLiveStatus === '') {
     return 'not configured'
   }
   return ttl.AttributeName ? `${ttl.TimeToLiveStatus} on ${ttl.AttributeName}` : ttl.TimeToLiveStatus
+}
+
+function streamLabel(streams: DynamoDBStreamsResponse): string {
+  if (!streams.streamEnabled) {
+    return 'disabled'
+  }
+  const viewType = streams.streamSpecification?.StreamViewType ?? 'enabled'
+  return streams.latestStreamLabel ? `${viewType} (${streams.latestStreamLabel})` : viewType
+}
+
+function normalizedItemLimit(value: string): number {
+  const parsed = Number.parseInt(value, 10)
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return 100
+  }
+  return Math.min(parsed, 1000)
 }
 
 function formatValue(value: unknown): string {
@@ -402,6 +662,19 @@ function formatValue(value: unknown): string {
     return JSON.stringify(value)
   }
   return String(value)
+}
+
+function attributeText(value: unknown): string {
+  if (value === null || value === undefined) {
+    return ''
+  }
+  if (typeof value === 'string') {
+    return value
+  }
+  if (typeof value === 'number' || typeof value === 'boolean') {
+    return String(value)
+  }
+  return JSON.stringify(value)
 }
 
 function formatBytes(size: number): string {
