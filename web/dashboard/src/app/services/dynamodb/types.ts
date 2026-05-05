@@ -60,3 +60,35 @@ export type DynamoDBItemsResponse = {
   tableName: string
   items: DynamoDBItemSnapshot[]
 }
+
+export type DynamoDBQueryScanResponse = {
+  Items?: Record<string, unknown>[]
+  Count?: number
+  ScannedCount?: number
+  LastEvaluatedKey?: Record<string, unknown>
+}
+
+export type DynamoDBTableResponse = {
+  table: DynamoDBTableSummary
+}
+
+export type DynamoDBIndexesResponse = {
+  tableName: string
+  globalSecondaryIndexes?: DynamoDBIndex[]
+  localSecondaryIndexes?: DynamoDBIndex[]
+}
+
+export type DynamoDBTTLResponse = {
+  tableName: string
+  timeToLiveDescription?: DynamoDBTimeToLiveDescription
+}
+
+export type DynamoDBStreamsResponse = {
+  tableName: string
+  streamEnabled: boolean
+  latestStreamArn?: string
+  latestStreamLabel?: string
+  streamSpecification?: DynamoDBStreamSpecification
+}
+
+export type DynamoDBOperationResponse = Record<string, unknown>

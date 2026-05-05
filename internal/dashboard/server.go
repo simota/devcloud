@@ -1,6 +1,7 @@
 package dashboard
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -1251,25 +1252,24 @@ func (s *Server) handleDynamoDBStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleDynamoDBTables(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		methodNotAllowed(w, "GET")
-		return
-	}
 	if s.dynamo == nil {
 		http.Error(w, "dynamodb service is disabled", http.StatusServiceUnavailable)
 		return
 	}
-	snapshot := s.dynamo.Snapshot()
-	writeJSON(w, map[string]any{
-		"tables": snapshot.Tables,
-	})
+	switch r.Method {
+	case http.MethodGet:
+		snapshot := s.dynamo.Snapshot()
+		writeJSON(w, map[string]any{
+			"tables": snapshot.Tables,
+		})
+	case http.MethodPost:
+		s.forwardDynamoDBDashboardOperation(w, r, "CreateTable", "")
+	default:
+		methodNotAllowed(w, "GET, POST")
+	}
 }
 
 func (s *Server) handleDynamoDBTable(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		methodNotAllowed(w, "GET")
-		return
-	}
 	if s.dynamo == nil {
 		http.Error(w, "dynamodb service is disabled", http.StatusServiceUnavailable)
 		return
@@ -1283,6 +1283,39 @@ func (s *Server) handleDynamoDBTable(w http.ResponseWriter, r *http.Request) {
 	}
 	if tableName == "" {
 		http.NotFound(w, r)
+		return
+	}
+	if hasSuffix {
+		switch suffix {
+		case "items":
+			if r.Method == http.MethodPost {
+				s.forwardDynamoDBDashboardOperation(w, r, "PutItem", tableName)
+				return
+			}
+		case "items/update":
+			s.forwardDynamoDBDashboardOperation(w, r, "UpdateItem", tableName)
+			return
+		case "items/delete":
+			s.forwardDynamoDBDashboardOperationWithConfirmation(w, r, "DeleteItem", tableName, tableName)
+			return
+		case "ttl":
+			if r.Method == http.MethodPost {
+				s.forwardDynamoDBDashboardOperation(w, r, "UpdateTimeToLive", tableName)
+				return
+			}
+		case "query":
+			s.forwardDynamoDBDashboardOperation(w, r, "Query", tableName)
+			return
+		case "scan":
+			s.forwardDynamoDBDashboardOperation(w, r, "Scan", tableName)
+			return
+		case "delete":
+			s.forwardDynamoDBDashboardOperationWithConfirmation(w, r, "DeleteTable", tableName, tableName)
+			return
+		}
+	}
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w, "GET")
 		return
 	}
 	table, found := s.dynamo.TableSnapshot(tableName)
@@ -1343,6 +1376,73 @@ func (s *Server) handleDynamoDBTable(w http.ResponseWriter, r *http.Request) {
 		"tableName": tableName,
 		"items":     items,
 	})
+}
+
+type dashboardDynamoDBOperationRequest struct {
+	Input        json.RawMessage `json:"input"`
+	Confirmation string          `json:"confirmation"`
+}
+
+func (s *Server) forwardDynamoDBDashboardOperation(w http.ResponseWriter, r *http.Request, operation string, tableName string) {
+	s.forwardDynamoDBDashboardOperationWithConfirmation(w, r, operation, tableName, "")
+}
+
+func (s *Server) forwardDynamoDBDashboardOperationWithConfirmation(w http.ResponseWriter, r *http.Request, operation string, tableName string, requiredConfirmation string) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w, "POST")
+		return
+	}
+	var request dashboardDynamoDBOperationRequest
+	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+		http.Error(w, "invalid json request", http.StatusBadRequest)
+		return
+	}
+	if requiredConfirmation != "" && request.Confirmation != requiredConfirmation {
+		http.Error(w, "confirmation must match table name", http.StatusBadRequest)
+		return
+	}
+	input, err := normalizeDynamoDBDashboardInput(request.Input, tableName)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	req := r.Clone(r.Context())
+	req.Method = http.MethodPost
+	req.URL = &url.URL{Path: "/"}
+	req.RequestURI = ""
+	req.Body = io.NopCloser(bytes.NewReader(input))
+	req.ContentLength = int64(len(input))
+	req.Header = make(http.Header)
+	req.Header.Set("Content-Type", "application/x-amz-json-1.0")
+	req.Header.Set("X-Amz-Target", "DynamoDB_20120810."+operation)
+	s.dynamo.ServeHTTP(w, req)
+}
+
+func normalizeDynamoDBDashboardInput(raw json.RawMessage, tableName string) ([]byte, error) {
+	if len(raw) == 0 {
+		return nil, errors.New("input is required")
+	}
+	var input map[string]any
+	if err := json.Unmarshal(raw, &input); err != nil {
+		return nil, errors.New("input must be valid JSON")
+	}
+	if input == nil {
+		return nil, errors.New("input must be a JSON object")
+	}
+	if tableName != "" {
+		if existing, ok := input["TableName"]; ok {
+			if existingName, ok := existing.(string); !ok || existingName != tableName {
+				return nil, errors.New("input TableName must match the selected table")
+			}
+		} else {
+			input["TableName"] = tableName
+		}
+	}
+	encoded, err := json.Marshal(input)
+	if err != nil {
+		return nil, errors.New("input could not be encoded")
+	}
+	return encoded, nil
 }
 
 func (s *Server) handleGCSUploadSessions(w http.ResponseWriter, r *http.Request) {

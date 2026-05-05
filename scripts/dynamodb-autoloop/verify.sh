@@ -10,6 +10,12 @@ GCS_VERIFY_PORT="${GCS_VERIFY_PORT:-4443}"
 S3_VERIFY_PORT="${S3_VERIFY_PORT:-4566}"
 DASHBOARD_VERIFY_PORT="${DASHBOARD_VERIFY_PORT:-8025}"
 SMTP_VERIFY_PORT="${SMTP_VERIFY_PORT:-1025}"
+BIGQUERY_VERIFY_PORT="${BIGQUERY_VERIFY_PORT:-9050}"
+REDSHIFT_VERIFY_PORT="${REDSHIFT_VERIFY_PORT:-5439}"
+REDSHIFT_API_VERIFY_PORT="${REDSHIFT_API_VERIFY_PORT:-9099}"
+SQS_VERIFY_PORT="${SQS_VERIFY_PORT:-9324}"
+PUBSUB_GRPC_VERIFY_PORT="${PUBSUB_GRPC_VERIFY_PORT:-8085}"
+PUBSUB_REST_VERIFY_PORT="${PUBSUB_REST_VERIFY_PORT:-8086}"
 VERIFY_HOST="127.0.0.1"
 DYNAMODB_ENDPOINT="http://${VERIFY_HOST}:${DYNAMODB_VERIFY_PORT}"
 DASHBOARD_ENDPOINT="http://${VERIFY_HOST}:${DASHBOARD_VERIFY_PORT}"
@@ -109,6 +115,12 @@ server:
   s3Port: ${S3_VERIFY_PORT}
   gcsPort: ${GCS_VERIFY_PORT}
   dynamodbPort: ${DYNAMODB_VERIFY_PORT}
+  bigqueryPort: ${BIGQUERY_VERIFY_PORT}
+  redshiftPort: ${REDSHIFT_VERIFY_PORT}
+  redshiftAPIPort: ${REDSHIFT_API_VERIFY_PORT}
+  sqsPort: ${SQS_VERIFY_PORT}
+  pubsubGrpcPort: ${PUBSUB_GRPC_VERIFY_PORT}
+  pubsubRestPort: ${PUBSUB_REST_VERIFY_PORT}
 
 auth:
   smtp:
@@ -144,6 +156,14 @@ services:
     region: us-east-1
     billingMode: PAY_PER_REQUEST
     maxItemBytes: 400000
+  bigquery:
+    enabled: false
+  redshift:
+    enabled: false
+  sqs:
+    enabled: false
+  pubsub:
+    enabled: false
 EOF
 
   run_check "devcloud binary builds" go build -o "${TMP_DIR}/devcloud" ./cmd/devcloud

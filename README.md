@@ -293,6 +293,8 @@ Legend:
 | Real capacity accounting/throttling | No | Local deterministic behavior, not AWS capacity simulation. |
 | IAM condition enforcement | No | Not implemented. |
 
+DynamoDB dashboard management is available under `/dashboard/dynamodb` and the local `/api/dynamodb/*` dashboard API. The dashboard can inspect tables, items, indexes, TTL, and streams, and can run guarded local management flows for `CreateTable`, `PutItem`, `UpdateItem`, `UpdateTimeToLive`, `DeleteItem`, `DeleteTable`, `Query`, and `Scan`. Query and Scan expose result pagination with count, scanned count, next/previous controls, and selected result item JSON. Recent operation history is stored only in browser `localStorage` as metadata; it does not persist item payloads, credentials, full request payloads, or pagination keys. Dashboard mutation endpoints forward through the local DynamoDB JSON protocol path instead of editing storage directly. Destructive `DeleteItem` and `DeleteTable` flows require confirmation text matching the selected table name, and disabled DynamoDB services do not expose active mutation controls.
+
 ### Google Cloud Pub/Sub-Compatible API
 
 | Feature | Status | Notes |
@@ -349,7 +351,7 @@ Pub/Sub dashboard actions are available under `/dashboard/pubsub`:
 | Mail messages API | Yes | List, fetch detail/raw, delete. |
 | S3 dashboard API | Yes | Bucket/object listing, download links. |
 | GCS dashboard API | Yes | Bucket/object/upload-session inspection. |
-| DynamoDB dashboard API | Yes | Status, tables, table detail, indexes, TTL, streams, items. |
+| DynamoDB dashboard API | Yes | Status, tables, table detail, indexes, TTL, streams, items, guarded management operations, Query, and Scan. |
 | SQS dashboard API | Yes | Status, queues, messages, leases, DLQ, and purge. |
 | Pub/Sub dashboard API | Yes | Status, topics, subscriptions, publish, pull, ack, and message metadata. |
 | Redshift dashboard API | Yes | Status, clusters, catalog, table detail, query runner, and statement history. |
