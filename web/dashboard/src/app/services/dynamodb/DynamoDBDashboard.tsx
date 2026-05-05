@@ -1,9 +1,12 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState, type FormEvent } from 'react'
 import { EmptyState } from '../../../ui/EmptyState'
 import { Panel } from '../../../ui/Panel'
 import { Button } from '../../../ui/Button'
 import type { DashboardService } from '../dashboard/types'
 import {
+  createDynamoDBTable,
+  deleteDynamoDBItem,
+  deleteDynamoDBTable,
   getDynamoDBIndexes,
   getDynamoDBStatus,
   getDynamoDBStreams,
@@ -11,10 +14,16 @@ import {
   getDynamoDBTTL,
   listDynamoDBItems,
   listDynamoDBTables,
+  putDynamoDBItem,
+  queryDynamoDBItems,
+  scanDynamoDBItems,
+  updateDynamoDBItem,
+  updateDynamoDBTTL,
 } from './api'
 import type {
   DynamoDBIndex,
   DynamoDBItemSnapshot,
+  DynamoDBQueryScanResponse,
   DynamoDBStatus,
   DynamoDBStreamsResponse,
   DynamoDBTableSummary,
@@ -60,6 +69,26 @@ export function DynamoDBDashboard({ service }: DynamoDBDashboardProps): JSX.Elem
   const [itemLimit, setItemLimit] = useState('100')
   const [keyLookupValues, setKeyLookupValues] = useState<Record<string, string>>({})
   const [keyLookupMessage, setKeyLookupMessage] = useState('')
+  const [createTableJSON, setCreateTableJSON] = useState(defaultCreateTableJSON)
+  const [putItemJSON, setPutItemJSON] = useState(defaultPutItemJSON)
+  const [updateItemJSON, setUpdateItemJSON] = useState(defaultUpdateItemJSON)
+  const [deleteItemJSON, setDeleteItemJSON] = useState(defaultDeleteItemJSON)
+  const [ttlJSON, setTTLJSON] = useState(defaultTTLJSON)
+  const [deleteTableJSON, setDeleteTableJSON] = useState('{}')
+  const [deleteItemConfirmation, setDeleteItemConfirmation] = useState('')
+  const [deleteTableConfirmation, setDeleteTableConfirmation] = useState('')
+  const [operationMessage, setOperationMessage] = useState('')
+  const [operationError, setOperationError] = useState('')
+  const [busyOperation, setBusyOperation] = useState<string>()
+  const [queryScanMode, setQueryScanMode] = useState<'Query' | 'Scan'>('Query')
+  const [queryScanIndexName, setQueryScanIndexName] = useState('')
+  const [queryScanLimit, setQueryScanLimit] = useState('25')
+  const [queryKeyCondition, setQueryKeyCondition] = useState('pk = :pk')
+  const [scanFilterExpression, setScanFilterExpression] = useState('')
+  const [queryScanExpressionAttributeValues, setQueryScanExpressionAttributeValues] = useState(defaultExpressionAttributeValuesJSON)
+  const [queryScanMessage, setQueryScanMessage] = useState('')
+  const [queryScanError, setQueryScanError] = useState('')
+  const [queryScanResult, setQueryScanResult] = useState<DynamoDBQueryScanResponse>()
   const isDisabled = service?.status === 'disabled'
 
   const refreshTables = useCallback(() => {
@@ -210,6 +239,189 @@ export function DynamoDBDashboard({ service }: DynamoDBDashboardProps): JSX.Elem
     setKeyLookupMessage(`Selected loaded item ${matchedIndex + 1}.`)
   }
 
+  async function runOperation(name: string, action: () => Promise<string>): Promise<void> {
+    setBusyOperation(name)
+    setOperationError('')
+    setOperationMessage('')
+    try {
+      const message = await action()
+      setOperationMessage(message)
+      refreshTables()
+      refreshItems()
+      refreshTableDetail()
+    } catch (error) {
+      setOperationError(error instanceof Error ? error.message : 'DynamoDB operation failed')
+    } finally {
+      setBusyOperation(undefined)
+    }
+  }
+
+  function handleCreateTable(event: FormEvent<HTMLFormElement>): void {
+    event.preventDefault()
+    const input = parseJSONForm(createTableJSON)
+    if (!input.ok) {
+      setOperationError(input.message)
+      return
+    }
+    const tableName = typeof input.value.TableName === 'string' ? input.value.TableName : ''
+    if (tableName.trim() === '') {
+      setOperationError('CreateTable input requires TableName.')
+      return
+    }
+    void runOperation('create-table', async () => {
+      await createDynamoDBTable(input.value)
+      setActiveTableName(tableName)
+      return `Created table ${tableName}.`
+    })
+  }
+
+  function handlePutItem(event: FormEvent<HTMLFormElement>): void {
+    event.preventDefault()
+    if (!activeTableName) {
+      setOperationError('Select a table before putting an item.')
+      return
+    }
+    const input = parseJSONForm(putItemJSON)
+    if (!input.ok) {
+      setOperationError(input.message)
+      return
+    }
+    void runOperation('put-item', async () => {
+      await putDynamoDBItem(activeTableName, input.value)
+      return `Put item in ${activeTableName}.`
+    })
+  }
+
+  function handleUpdateItem(event: FormEvent<HTMLFormElement>): void {
+    event.preventDefault()
+    if (!activeTableName) {
+      setOperationError('Select a table before updating an item.')
+      return
+    }
+    const input = parseJSONForm(updateItemJSON)
+    if (!input.ok) {
+      setOperationError(input.message)
+      return
+    }
+    void runOperation('update-item', async () => {
+      await updateDynamoDBItem(activeTableName, input.value)
+      return `Updated item in ${activeTableName}.`
+    })
+  }
+
+  function handleDeleteItem(event: FormEvent<HTMLFormElement>): void {
+    event.preventDefault()
+    if (!activeTableName) {
+      setOperationError('Select a table before deleting an item.')
+      return
+    }
+    if (deleteItemConfirmation !== activeTableName) {
+      setOperationError('DeleteItem confirmation must match the selected table name.')
+      return
+    }
+    const input = parseJSONForm(deleteItemJSON)
+    if (!input.ok) {
+      setOperationError(input.message)
+      return
+    }
+    void runOperation('delete-item', async () => {
+      await deleteDynamoDBItem(activeTableName, input.value, deleteItemConfirmation)
+      setDeleteItemConfirmation('')
+      return `Deleted item from ${activeTableName}.`
+    })
+  }
+
+  function handleUpdateTTL(event: FormEvent<HTMLFormElement>): void {
+    event.preventDefault()
+    if (!activeTableName) {
+      setOperationError('Select a table before updating TTL.')
+      return
+    }
+    const input = parseJSONForm(ttlJSON)
+    if (!input.ok) {
+      setOperationError(input.message)
+      return
+    }
+    void runOperation('ttl', async () => {
+      await updateDynamoDBTTL(activeTableName, input.value)
+      return `Updated TTL for ${activeTableName}.`
+    })
+  }
+
+  function handleDeleteTable(event: FormEvent<HTMLFormElement>): void {
+    event.preventDefault()
+    if (!activeTableName) {
+      setOperationError('Select a table before deleting it.')
+      return
+    }
+    if (deleteTableConfirmation !== activeTableName) {
+      setOperationError('DeleteTable confirmation must match the selected table name.')
+      return
+    }
+    const input = parseJSONForm(deleteTableJSON)
+    if (!input.ok) {
+      setOperationError(input.message)
+      return
+    }
+    void runOperation('delete-table', async () => {
+      await deleteDynamoDBTable(activeTableName, input.value, deleteTableConfirmation)
+      setDeleteTableConfirmation('')
+      setActiveTableName(undefined)
+      return `Deleted table ${activeTableName}.`
+    })
+  }
+
+  async function handleQueryScan(event: FormEvent<HTMLFormElement>): Promise<void> {
+    event.preventDefault()
+    if (!activeTableName) {
+      setQueryScanError('Select a table before running Query or Scan.')
+      return
+    }
+    const limit = normalizedItemLimit(queryScanLimit)
+    const expressionAttributeValues = parseOptionalJSONForm(queryScanExpressionAttributeValues)
+    if (!expressionAttributeValues.ok) {
+      setQueryScanError(expressionAttributeValues.message)
+      return
+    }
+    const input: Record<string, unknown> = { Limit: limit }
+    const indexName = queryScanIndexName.trim()
+    if (indexName !== '') {
+      input.IndexName = indexName
+    }
+    if (expressionAttributeValues.value) {
+      input.ExpressionAttributeValues = expressionAttributeValues.value
+    }
+    if (queryScanMode === 'Query') {
+      const keyCondition = queryKeyCondition.trim()
+      if (keyCondition === '') {
+        setQueryScanError('Query requires KeyConditionExpression.')
+        return
+      }
+      input.KeyConditionExpression = keyCondition
+    } else {
+      const filterExpression = scanFilterExpression.trim()
+      if (filterExpression !== '') {
+        input.FilterExpression = filterExpression
+      }
+    }
+    setBusyOperation(queryScanMode.toLowerCase())
+    setQueryScanError('')
+    setQueryScanMessage('')
+    setQueryScanResult(undefined)
+    try {
+      const result =
+        queryScanMode === 'Query'
+          ? await queryDynamoDBItems(activeTableName, input)
+          : await scanDynamoDBItems(activeTableName, input)
+      setQueryScanResult(result)
+      setQueryScanMessage(`${queryScanMode} returned ${result.Count ?? result.Items?.length ?? 0} item(s).`)
+    } catch (error) {
+      setQueryScanError(error instanceof Error ? error.message : `${queryScanMode} failed`)
+    } finally {
+      setBusyOperation(undefined)
+    }
+  }
+
   return (
     <div className="dynamodb-workspace">
       <Panel title="Tables">
@@ -291,6 +503,62 @@ export function DynamoDBDashboard({ service }: DynamoDBDashboardProps): JSX.Elem
         />
       </Panel>
 
+      <Panel title="Operations">
+        {operationError ? <p className="operation-message error">{operationError}</p> : null}
+        {operationMessage ? <p className="operation-message success">{operationMessage}</p> : null}
+        <DynamoDBOperationForms
+          activeTableName={activeTableName}
+          busyOperation={busyOperation}
+          createTableJSON={createTableJSON}
+          deleteItemConfirmation={deleteItemConfirmation}
+          deleteItemJSON={deleteItemJSON}
+          deleteTableConfirmation={deleteTableConfirmation}
+          deleteTableJSON={deleteTableJSON}
+          onCreateTable={handleCreateTable}
+          onDeleteItem={handleDeleteItem}
+          onDeleteTable={handleDeleteTable}
+          onPutItem={handlePutItem}
+          onUpdateItem={handleUpdateItem}
+          onUpdateTTL={handleUpdateTTL}
+          putItemJSON={putItemJSON}
+          setCreateTableJSON={setCreateTableJSON}
+          setDeleteItemConfirmation={setDeleteItemConfirmation}
+          setDeleteItemJSON={setDeleteItemJSON}
+          setDeleteTableConfirmation={setDeleteTableConfirmation}
+          setDeleteTableJSON={setDeleteTableJSON}
+          setPutItemJSON={setPutItemJSON}
+          setTTLJSON={setTTLJSON}
+          setUpdateItemJSON={setUpdateItemJSON}
+          ttlJSON={ttlJSON}
+          updateItemJSON={updateItemJSON}
+        />
+      </Panel>
+
+      <Panel title="Query / Scan">
+        <DynamoDBQueryScanForm
+          activeTableName={activeTableName}
+          busyOperation={busyOperation}
+          expressionAttributeValues={queryScanExpressionAttributeValues}
+          filterExpression={scanFilterExpression}
+          indexName={queryScanIndexName}
+          keyConditionExpression={queryKeyCondition}
+          limit={queryScanLimit}
+          message={queryScanMessage}
+          mode={queryScanMode}
+          onSubmit={(event) => {
+            void handleQueryScan(event)
+          }}
+          result={queryScanResult}
+          setExpressionAttributeValues={setQueryScanExpressionAttributeValues}
+          setFilterExpression={setScanFilterExpression}
+          setIndexName={setQueryScanIndexName}
+          setKeyConditionExpression={setQueryKeyCondition}
+          setLimit={setQueryScanLimit}
+          setMode={setQueryScanMode}
+          error={queryScanError}
+        />
+      </Panel>
+
       <Panel title="Inspector">
         <TableInspector
           detailState={tableDetailState}
@@ -338,6 +606,316 @@ function KeyLookup({ message, onFind, onUpdateValue, table, values }: KeyLookupP
       </div>
       {message ? <p className="inspector-muted">{message}</p> : null}
     </div>
+  )
+}
+
+type DynamoDBOperationFormsProps = {
+  activeTableName?: string
+  busyOperation?: string
+  createTableJSON: string
+  putItemJSON: string
+  updateItemJSON: string
+  deleteItemJSON: string
+  ttlJSON: string
+  deleteTableJSON: string
+  deleteItemConfirmation: string
+  deleteTableConfirmation: string
+  onCreateTable: (event: FormEvent<HTMLFormElement>) => void
+  onPutItem: (event: FormEvent<HTMLFormElement>) => void
+  onUpdateItem: (event: FormEvent<HTMLFormElement>) => void
+  onDeleteItem: (event: FormEvent<HTMLFormElement>) => void
+  onUpdateTTL: (event: FormEvent<HTMLFormElement>) => void
+  onDeleteTable: (event: FormEvent<HTMLFormElement>) => void
+  setCreateTableJSON: (value: string) => void
+  setPutItemJSON: (value: string) => void
+  setUpdateItemJSON: (value: string) => void
+  setDeleteItemJSON: (value: string) => void
+  setTTLJSON: (value: string) => void
+  setDeleteTableJSON: (value: string) => void
+  setDeleteItemConfirmation: (value: string) => void
+  setDeleteTableConfirmation: (value: string) => void
+}
+
+function DynamoDBOperationForms({
+  activeTableName,
+  busyOperation,
+  createTableJSON,
+  putItemJSON,
+  updateItemJSON,
+  deleteItemJSON,
+  ttlJSON,
+  deleteTableJSON,
+  deleteItemConfirmation,
+  deleteTableConfirmation,
+  onCreateTable,
+  onPutItem,
+  onUpdateItem,
+  onDeleteItem,
+  onUpdateTTL,
+  onDeleteTable,
+  setCreateTableJSON,
+  setPutItemJSON,
+  setUpdateItemJSON,
+  setDeleteItemJSON,
+  setTTLJSON,
+  setDeleteTableJSON,
+  setDeleteItemConfirmation,
+  setDeleteTableConfirmation,
+}: DynamoDBOperationFormsProps): JSX.Element {
+  const tableActionDisabled = !activeTableName
+
+  return (
+    <div className="dynamodb-operation-stack">
+      <JSONOperationForm
+        buttonLabel="Create table"
+        disabled={busyOperation === 'create-table'}
+        json={createTableJSON}
+        label="CreateTable input"
+        onChange={setCreateTableJSON}
+        onSubmit={onCreateTable}
+      />
+      <JSONOperationForm
+        buttonLabel="Put item"
+        disabled={tableActionDisabled || busyOperation === 'put-item'}
+        json={putItemJSON}
+        label="PutItem input"
+        onChange={setPutItemJSON}
+        onSubmit={onPutItem}
+      />
+      <JSONOperationForm
+        buttonLabel="Update item"
+        disabled={tableActionDisabled || busyOperation === 'update-item'}
+        json={updateItemJSON}
+        label="UpdateItem input"
+        onChange={setUpdateItemJSON}
+        onSubmit={onUpdateItem}
+      />
+      <JSONOperationForm
+        buttonLabel="Update TTL"
+        disabled={tableActionDisabled || busyOperation === 'ttl'}
+        json={ttlJSON}
+        label="UpdateTimeToLive input"
+        onChange={setTTLJSON}
+        onSubmit={onUpdateTTL}
+      />
+      <JSONOperationForm
+        buttonClassName="danger"
+        buttonLabel="Delete item"
+        confirmation={deleteItemConfirmation}
+        confirmationLabel={`Type ${activeTableName ?? 'table name'} to delete item`}
+        disabled={
+          tableActionDisabled || deleteItemConfirmation !== activeTableName || busyOperation === 'delete-item'
+        }
+        json={deleteItemJSON}
+        label="DeleteItem input"
+        onChange={setDeleteItemJSON}
+        onConfirmationChange={setDeleteItemConfirmation}
+        onSubmit={onDeleteItem}
+      />
+      <JSONOperationForm
+        buttonClassName="danger"
+        buttonLabel="Delete table"
+        confirmation={deleteTableConfirmation}
+        confirmationLabel={`Type ${activeTableName ?? 'table name'} to delete table`}
+        disabled={
+          tableActionDisabled || deleteTableConfirmation !== activeTableName || busyOperation === 'delete-table'
+        }
+        json={deleteTableJSON}
+        label="DeleteTable input"
+        onChange={setDeleteTableJSON}
+        onConfirmationChange={setDeleteTableConfirmation}
+        onSubmit={onDeleteTable}
+      />
+    </div>
+  )
+}
+
+type DynamoDBQueryScanFormProps = {
+  activeTableName?: string
+  busyOperation?: string
+  error: string
+  expressionAttributeValues: string
+  filterExpression: string
+  indexName: string
+  keyConditionExpression: string
+  limit: string
+  message: string
+  mode: 'Query' | 'Scan'
+  result?: DynamoDBQueryScanResponse
+  onSubmit: (event: FormEvent<HTMLFormElement>) => void
+  setExpressionAttributeValues: (value: string) => void
+  setFilterExpression: (value: string) => void
+  setIndexName: (value: string) => void
+  setKeyConditionExpression: (value: string) => void
+  setLimit: (value: string) => void
+  setMode: (value: 'Query' | 'Scan') => void
+}
+
+function DynamoDBQueryScanForm({
+  activeTableName,
+  busyOperation,
+  error,
+  expressionAttributeValues,
+  filterExpression,
+  indexName,
+  keyConditionExpression,
+  limit,
+  message,
+  mode,
+  onSubmit,
+  result,
+  setExpressionAttributeValues,
+  setFilterExpression,
+  setIndexName,
+  setKeyConditionExpression,
+  setLimit,
+  setMode,
+}: DynamoDBQueryScanFormProps): JSX.Element {
+  const disabled = !activeTableName || busyOperation === 'query' || busyOperation === 'scan'
+  const items = result?.Items ?? []
+
+  return (
+    <div className="dynamodb-query-scan">
+      {error ? <p className="operation-message error">{error}</p> : null}
+      {message ? <p className="operation-message success">{message}</p> : null}
+      <form className="dynamodb-query-scan-form" onSubmit={onSubmit}>
+        <div className="segmented-control" aria-label="DynamoDB read operation">
+          <button
+            className={mode === 'Query' ? 'active' : ''}
+            onClick={() => setMode('Query')}
+            type="button"
+          >
+            Query
+          </button>
+          <button className={mode === 'Scan' ? 'active' : ''} onClick={() => setMode('Scan')} type="button">
+            Scan
+          </button>
+        </div>
+        <label className="compact-filter">
+          <span>TableName</span>
+          <input aria-label="DynamoDB Query Scan table name" disabled value={activeTableName ?? ''} />
+        </label>
+        <label className="compact-filter">
+          <span>IndexName</span>
+          <input
+            aria-label="DynamoDB Query Scan index name"
+            onChange={(event) => setIndexName(event.target.value)}
+            placeholder="optional"
+            value={indexName}
+          />
+        </label>
+        <label className="compact-filter small">
+          <span>Limit</span>
+          <input
+            aria-label="DynamoDB Query Scan limit"
+            inputMode="numeric"
+            onChange={(event) => setLimit(event.target.value)}
+            value={limit}
+          />
+        </label>
+        {mode === 'Query' ? (
+          <label className="compact-filter wide">
+            <span>KeyConditionExpression</span>
+            <input
+              aria-label="DynamoDB Query key condition expression"
+              onChange={(event) => setKeyConditionExpression(event.target.value)}
+              placeholder="pk = :pk"
+              value={keyConditionExpression}
+            />
+          </label>
+        ) : (
+          <label className="compact-filter wide">
+            <span>FilterExpression</span>
+            <input
+              aria-label="DynamoDB Scan filter expression"
+              onChange={(event) => setFilterExpression(event.target.value)}
+              placeholder="optional"
+              value={filterExpression}
+            />
+          </label>
+        )}
+        <label className="redshift-sql-editor">
+          <span>ExpressionAttributeValues JSON</span>
+          <textarea
+            aria-label="DynamoDB Query Scan expression attribute values JSON"
+            onChange={(event) => setExpressionAttributeValues(event.target.value)}
+            spellCheck={false}
+            value={expressionAttributeValues}
+          />
+        </label>
+        <Button disabled={disabled} type="submit">
+          Run {mode}
+        </Button>
+      </form>
+      {result ? (
+        <div className="redshift-query-result">
+          <div className="dynamodb-toolbar">
+            <span className="toolbar-count">
+              Count {result.Count ?? items.length} / Scanned {result.ScannedCount ?? 0}
+            </span>
+            {result.LastEvaluatedKey ? <span className="toolbar-count">More results available</span> : null}
+          </div>
+          {items.length > 0 ? (
+            <pre className="mail-preview">{JSON.stringify(items, null, 2)}</pre>
+          ) : (
+            <p className="inspector-muted">No items returned.</p>
+          )}
+        </div>
+      ) : null}
+    </div>
+  )
+}
+
+type JSONOperationFormProps = {
+  buttonClassName?: string
+  buttonLabel: string
+  confirmation?: string
+  confirmationLabel?: string
+  disabled: boolean
+  json: string
+  label: string
+  onChange: (value: string) => void
+  onConfirmationChange?: (value: string) => void
+  onSubmit: (event: FormEvent<HTMLFormElement>) => void
+}
+
+function JSONOperationForm({
+  buttonClassName,
+  buttonLabel,
+  confirmation,
+  confirmationLabel,
+  disabled,
+  json,
+  label,
+  onChange,
+  onConfirmationChange,
+  onSubmit,
+}: JSONOperationFormProps): JSX.Element {
+  return (
+    <form className="dynamodb-operation-form" onSubmit={onSubmit}>
+      <label className="redshift-sql-editor">
+        <span>{label}</span>
+        <textarea
+          aria-label={label}
+          onChange={(event) => onChange(event.target.value)}
+          spellCheck={false}
+          value={json}
+        />
+      </label>
+      {onConfirmationChange ? (
+        <label className="compact-filter">
+          <span>{confirmationLabel}</span>
+          <input
+            aria-label={confirmationLabel}
+            onChange={(event) => onConfirmationChange(event.target.value)}
+            value={confirmation ?? ''}
+          />
+        </label>
+      ) : null}
+      <Button className={buttonClassName} disabled={disabled} type="submit">
+        {buttonLabel}
+      </Button>
+    </form>
   )
 }
 
@@ -654,6 +1232,31 @@ function normalizedItemLimit(value: string): number {
   return Math.min(parsed, 1000)
 }
 
+type ParsedJSONForm = { ok: true; value: Record<string, unknown> } | { ok: false; message: string }
+
+function parseJSONForm(value: string): ParsedJSONForm {
+  try {
+    const parsed = JSON.parse(value) as unknown
+    if (!parsed || Array.isArray(parsed) || typeof parsed !== 'object') {
+      return { ok: false, message: 'Input must be a JSON object.' }
+    }
+    return { ok: true, value: parsed as Record<string, unknown> }
+  } catch (error) {
+    return { ok: false, message: error instanceof Error ? error.message : 'Input must be valid JSON.' }
+  }
+}
+
+function parseOptionalJSONForm(value: string): { ok: true; value?: Record<string, unknown> } | { ok: false; message: string } {
+  if (value.trim() === '') {
+    return { ok: true }
+  }
+  const parsed = parseJSONForm(value)
+  if (!parsed.ok) {
+    return parsed
+  }
+  return { ok: true, value: parsed.value }
+}
+
 function formatValue(value: unknown): string {
   if (value === null || value === undefined) {
     return 'null'
@@ -686,3 +1289,51 @@ function formatBytes(size: number): string {
   }
   return `${(size / 1024).toFixed(1)} KB`
 }
+
+const defaultCreateTableJSON = `{
+  "TableName": "Demo",
+  "AttributeDefinitions": [
+    { "AttributeName": "pk", "AttributeType": "S" }
+  ],
+  "KeySchema": [
+    { "AttributeName": "pk", "KeyType": "HASH" }
+  ],
+  "BillingMode": "PAY_PER_REQUEST"
+}`
+
+const defaultPutItemJSON = `{
+  "Item": {
+    "pk": { "S": "user#1" },
+    "name": { "S": "Ada" }
+  }
+}`
+
+const defaultUpdateItemJSON = `{
+  "Key": {
+    "pk": { "S": "user#1" }
+  },
+  "UpdateExpression": "SET #name = :name",
+  "ExpressionAttributeNames": {
+    "#name": "name"
+  },
+  "ExpressionAttributeValues": {
+    ":name": { "S": "Grace" }
+  }
+}`
+
+const defaultDeleteItemJSON = `{
+  "Key": {
+    "pk": { "S": "user#1" }
+  }
+}`
+
+const defaultTTLJSON = `{
+  "TimeToLiveSpecification": {
+    "Enabled": true,
+    "AttributeName": "expiresAt"
+  }
+}`
+
+const defaultExpressionAttributeValuesJSON = `{
+  ":pk": { "S": "user#1" }
+}`

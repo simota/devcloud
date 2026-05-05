@@ -917,7 +917,7 @@ func TestDynamoDBDashboardPageAndAPIExposeTables(t *testing.T) {
 	}
 
 	ttl := performRequest(routes, http.MethodGet, "/api/dynamodb/tables/Demo/ttl")
-	if ttl.Code != http.StatusOK || !strings.Contains(ttl.Body.String(), `"TimeToLiveStatus":"ENABLED"`) {
+	if ttl.Code != http.StatusOK || !strings.Contains(ttl.Body.String(), `"AttributeName":"expiresAt"`) {
 		t.Fatalf("DynamoDB table ttl = %d body=%s", ttl.Code, ttl.Body.String())
 	}
 
@@ -929,6 +929,154 @@ func TestDynamoDBDashboardPageAndAPIExposeTables(t *testing.T) {
 	missing := performRequest(routes, http.MethodGet, "/api/dynamodb/tables/Missing/items")
 	if missing.Code != http.StatusNotFound {
 		t.Fatalf("missing DynamoDB table items status = %d, want %d", missing.Code, http.StatusNotFound)
+	}
+}
+
+func TestDynamoDBDashboardManagementAPIsForwardThroughService(t *testing.T) {
+	dynamo := dynamodbsvc.NewServer(dynamodbsvc.Config{Region: "us-east-1"})
+	server := NewServer(Config{
+		DynamoDBEndpoint:    "http://127.0.0.1:8000",
+		DynamoDBRegion:      "us-east-1",
+		DynamoDBStoragePath: ".devcloud/test/dynamodb",
+	}, newDashboardStore(nil, nil))
+	server.SetDynamoDB(dynamo)
+	routes := server.routes()
+
+	create := performRequestWithBody(routes, http.MethodPost, "/api/dynamodb/tables", `{"input":{
+		"TableName":"Managed",
+		"AttributeDefinitions":[{"AttributeName":"pk","AttributeType":"S"}],
+		"KeySchema":[{"AttributeName":"pk","KeyType":"HASH"}],
+		"BillingMode":"PAY_PER_REQUEST"
+	}}`)
+	if create.Code != http.StatusOK || !strings.Contains(create.Body.String(), `"TableName":"Managed"`) {
+		t.Fatalf("dashboard CreateTable = %d body=%s", create.Code, create.Body.String())
+	}
+
+	put := performRequestWithBody(routes, http.MethodPost, "/api/dynamodb/tables/Managed/items", `{"input":{
+		"Item":{"pk":{"S":"user#1"},"name":{"S":"Ada"}}
+	}}`)
+	if put.Code != http.StatusOK {
+		t.Fatalf("dashboard PutItem = %d body=%s", put.Code, put.Body.String())
+	}
+
+	update := performRequestWithBody(routes, http.MethodPost, "/api/dynamodb/tables/Managed/items/update", `{"input":{
+		"Key":{"pk":{"S":"user#1"}},
+		"UpdateExpression":"SET #name = :name",
+		"ExpressionAttributeNames":{"#name":"name"},
+		"ExpressionAttributeValues":{":name":{"S":"Grace"}}
+	}}`)
+	if update.Code != http.StatusOK {
+		t.Fatalf("dashboard UpdateItem = %d body=%s", update.Code, update.Body.String())
+	}
+
+	ttl := performRequestWithBody(routes, http.MethodPost, "/api/dynamodb/tables/Managed/ttl", `{"input":{
+		"TimeToLiveSpecification":{"Enabled":true,"AttributeName":"expiresAt"}
+	}}`)
+	if ttl.Code != http.StatusOK || !strings.Contains(ttl.Body.String(), `"AttributeName":"expiresAt"`) {
+		t.Fatalf("dashboard UpdateTimeToLive = %d body=%s", ttl.Code, ttl.Body.String())
+	}
+
+	items := performRequest(routes, http.MethodGet, "/api/dynamodb/tables/Managed/items?limit=1")
+	if items.Code != http.StatusOK || !strings.Contains(items.Body.String(), `"Grace"`) {
+		t.Fatalf("dashboard table items after update = %d body=%s", items.Code, items.Body.String())
+	}
+
+	query := performRequestWithBody(routes, http.MethodPost, "/api/dynamodb/tables/Managed/query", `{"input":{
+		"KeyConditionExpression":"pk = :pk",
+		"ExpressionAttributeValues":{":pk":{"S":"user#1"}},
+		"Limit":1
+	}}`)
+	if query.Code != http.StatusOK || !strings.Contains(query.Body.String(), `"Count":1`) || !strings.Contains(query.Body.String(), `"Grace"`) {
+		t.Fatalf("dashboard Query = %d body=%s", query.Code, query.Body.String())
+	}
+
+	scan := performRequestWithBody(routes, http.MethodPost, "/api/dynamodb/tables/Managed/scan", `{"input":{
+		"FilterExpression":"#name = :name",
+		"ExpressionAttributeNames":{"#name":"name"},
+		"ExpressionAttributeValues":{":name":{"S":"Grace"}},
+		"Limit":5
+	}}`)
+	if scan.Code != http.StatusOK || !strings.Contains(scan.Body.String(), `"ScannedCount":1`) || !strings.Contains(scan.Body.String(), `"Grace"`) {
+		t.Fatalf("dashboard Scan = %d body=%s", scan.Code, scan.Body.String())
+	}
+
+	rejectedQuery := performRequestWithBody(routes, http.MethodPost, "/api/dynamodb/tables/Managed/query", `{"input":{
+		"TableName":"Other",
+		"KeyConditionExpression":"pk = :pk",
+		"ExpressionAttributeValues":{":pk":{"S":"user#1"}}
+	}}`)
+	if rejectedQuery.Code != http.StatusBadRequest {
+		t.Fatalf("dashboard Query table mismatch = %d, want %d", rejectedQuery.Code, http.StatusBadRequest)
+	}
+
+	rejectedDeleteItem := performRequestWithBody(routes, http.MethodPost, "/api/dynamodb/tables/Managed/items/delete", `{"input":{
+		"Key":{"pk":{"S":"user#1"}}
+	},"confirmation":"wrong"}`)
+	if rejectedDeleteItem.Code != http.StatusBadRequest {
+		t.Fatalf("dashboard DeleteItem without confirmation = %d, want %d", rejectedDeleteItem.Code, http.StatusBadRequest)
+	}
+
+	deleteItem := performRequestWithBody(routes, http.MethodPost, "/api/dynamodb/tables/Managed/items/delete", `{"input":{
+		"Key":{"pk":{"S":"user#1"}}
+	},"confirmation":"Managed"}`)
+	if deleteItem.Code != http.StatusOK {
+		t.Fatalf("dashboard DeleteItem = %d body=%s", deleteItem.Code, deleteItem.Body.String())
+	}
+
+	rejectedDeleteTable := performRequestWithBody(routes, http.MethodPost, "/api/dynamodb/tables/Managed/delete", `{"input":{},"confirmation":""}`)
+	if rejectedDeleteTable.Code != http.StatusBadRequest {
+		t.Fatalf("dashboard DeleteTable without confirmation = %d, want %d", rejectedDeleteTable.Code, http.StatusBadRequest)
+	}
+
+	deleteTable := performRequestWithBody(routes, http.MethodPost, "/api/dynamodb/tables/Managed/delete", `{"input":{},"confirmation":"Managed"}`)
+	if deleteTable.Code != http.StatusOK {
+		t.Fatalf("dashboard DeleteTable = %d body=%s", deleteTable.Code, deleteTable.Body.String())
+	}
+}
+
+func TestDynamoDBDashboardQueryScanAPIsForwardThroughService(t *testing.T) {
+	dynamo := dynamodbsvc.NewServer(dynamodbsvc.Config{Region: "us-east-1"})
+	server := NewServer(Config{
+		DynamoDBEndpoint:    "http://127.0.0.1:8000",
+		DynamoDBRegion:      "us-east-1",
+		DynamoDBStoragePath: ".devcloud/test/dynamodb",
+	}, newDashboardStore(nil, nil))
+	server.SetDynamoDB(dynamo)
+	routes := server.routes()
+
+	create := performRequestWithBody(routes, http.MethodPost, "/api/dynamodb/tables", `{"input":{
+		"TableName":"ReadModel",
+		"AttributeDefinitions":[{"AttributeName":"pk","AttributeType":"S"}],
+		"KeySchema":[{"AttributeName":"pk","KeyType":"HASH"}],
+		"BillingMode":"PAY_PER_REQUEST"
+	}}`)
+	if create.Code != http.StatusOK {
+		t.Fatalf("dashboard CreateTable for Query/Scan = %d body=%s", create.Code, create.Body.String())
+	}
+	put := performRequestWithBody(routes, http.MethodPost, "/api/dynamodb/tables/ReadModel/items", `{"input":{
+		"Item":{"pk":{"S":"user#1"},"name":{"S":"Ada"}}
+	}}`)
+	if put.Code != http.StatusOK {
+		t.Fatalf("dashboard PutItem for Query/Scan = %d body=%s", put.Code, put.Body.String())
+	}
+
+	query := performRequestWithBody(routes, http.MethodPost, "/api/dynamodb/tables/ReadModel/query", `{"input":{
+		"KeyConditionExpression":"pk = :pk",
+		"ExpressionAttributeValues":{":pk":{"S":"user#1"}},
+		"Limit":1
+	}}`)
+	if query.Code != http.StatusOK || !strings.Contains(query.Body.String(), `"Count":1`) || !strings.Contains(query.Body.String(), `"Ada"`) {
+		t.Fatalf("dashboard Query = %d body=%s", query.Code, query.Body.String())
+	}
+
+	scan := performRequestWithBody(routes, http.MethodPost, "/api/dynamodb/tables/ReadModel/scan", `{"input":{
+		"FilterExpression":"#name = :name",
+		"ExpressionAttributeNames":{"#name":"name"},
+		"ExpressionAttributeValues":{":name":{"S":"Ada"}},
+		"Limit":5
+	}}`)
+	if scan.Code != http.StatusOK || !strings.Contains(scan.Body.String(), `"ScannedCount":1`) || !strings.Contains(scan.Body.String(), `"Ada"`) {
+		t.Fatalf("dashboard Scan = %d body=%s", scan.Code, scan.Body.String())
 	}
 }
 

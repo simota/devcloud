@@ -346,11 +346,53 @@ exercise_streams_ttl_tags() {
 }
 
 assert_dashboard_api() {
+  local dashboard_table="${TABLE}Dashboard"
   curl -fsS "${DASHBOARD_ENDPOINT}/api/dashboard/services" | grep -q '"id":"dynamodb"'
   curl -fsS "${DASHBOARD_ENDPOINT}/api/dynamodb/status" | grep -q '"running"'
   curl -fsS "${DASHBOARD_ENDPOINT}/api/dynamodb/tables" | grep -q "${TABLE}"
   curl -fsS "${DASHBOARD_ENDPOINT}/api/dynamodb/tables/${TABLE}/items?limit=10" | grep -q 'Ada Lovelace'
   curl -fsS "${DASHBOARD_ENDPOINT}/api/dynamodb/tables/${TABLE}/ttl" | grep -q 'ENABLED'
+
+  curl -fsS \
+    -X POST \
+    -H 'Content-Type: application/json' \
+    --data "{\"input\":{\"TableName\":\"${dashboard_table}\",\"AttributeDefinitions\":[{\"AttributeName\":\"pk\",\"AttributeType\":\"S\"}],\"KeySchema\":[{\"AttributeName\":\"pk\",\"KeyType\":\"HASH\"}],\"BillingMode\":\"PAY_PER_REQUEST\"}}" \
+    "${DASHBOARD_ENDPOINT}/api/dynamodb/tables" |
+    json_assert 'data["TableDescription"]["TableName"].endswith("Dashboard")'
+  curl -fsS \
+    -X POST \
+    -H 'Content-Type: application/json' \
+    --data '{"input":{"Item":{"pk":{"S":"dashboard#1"},"name":{"S":"dashboard-managed"}}}}' \
+    "${DASHBOARD_ENDPOINT}/api/dynamodb/tables/${dashboard_table}/items" >/dev/null
+  curl -fsS \
+    -X POST \
+    -H 'Content-Type: application/json' \
+    --data '{"input":{"KeyConditionExpression":"pk = :pk","ExpressionAttributeValues":{":pk":{"S":"dashboard#1"}},"Limit":1}}' \
+    "${DASHBOARD_ENDPOINT}/api/dynamodb/tables/${dashboard_table}/query" |
+    json_assert 'data["Count"] == 1 and data["Items"][0]["name"]["S"] == "dashboard-managed"'
+  curl -fsS \
+    -X POST \
+    -H 'Content-Type: application/json' \
+    --data '{"input":{"FilterExpression":"#name = :name","ExpressionAttributeNames":{"#name":"name"},"ExpressionAttributeValues":{":name":{"S":"dashboard-managed"}},"Limit":5}}' \
+    "${DASHBOARD_ENDPOINT}/api/dynamodb/tables/${dashboard_table}/scan" |
+    json_assert 'data["ScannedCount"] == 1 and data["Items"][0]["pk"]["S"] == "dashboard#1"'
+  curl -fsS \
+    -X POST \
+    -H 'Content-Type: application/json' \
+    --data '{"input":{"TimeToLiveSpecification":{"Enabled":true,"AttributeName":"expiresAt"}}}' \
+    "${DASHBOARD_ENDPOINT}/api/dynamodb/tables/${dashboard_table}/ttl" |
+    json_assert 'data["TimeToLiveSpecification"]["AttributeName"] == "expiresAt"'
+  curl -fsS \
+    -X POST \
+    -H 'Content-Type: application/json' \
+    --data "{\"input\":{\"Key\":{\"pk\":{\"S\":\"dashboard#1\"}}},\"confirmation\":\"${dashboard_table}\"}" \
+    "${DASHBOARD_ENDPOINT}/api/dynamodb/tables/${dashboard_table}/items/delete" >/dev/null
+  curl -fsS \
+    -X POST \
+    -H 'Content-Type: application/json' \
+    --data "{\"input\":{},\"confirmation\":\"${dashboard_table}\"}" \
+    "${DASHBOARD_ENDPOINT}/api/dynamodb/tables/${dashboard_table}/delete" >/dev/null
+
   curl -fsS "${DASHBOARD_ENDPOINT}/dashboard/dynamodb" | grep -qi 'devcloud Dashboard'
 }
 

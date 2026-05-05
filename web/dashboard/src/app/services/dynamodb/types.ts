@@ -61,6 +61,13 @@ export type DynamoDBItemsResponse = {
   items: DynamoDBItemSnapshot[]
 }
 
+export type DynamoDBQueryScanResponse = {
+  Items?: Record<string, unknown>[]
+  Count?: number
+  ScannedCount?: number
+  LastEvaluatedKey?: Record<string, unknown>
+}
+
 export type DynamoDBTableResponse = {
   table: DynamoDBTableSummary
 }
@@ -83,3 +90,5 @@ export type DynamoDBStreamsResponse = {
   latestStreamLabel?: string
   streamSpecification?: DynamoDBStreamSpecification
 }
+
+export type DynamoDBOperationResponse = Record<string, unknown>
