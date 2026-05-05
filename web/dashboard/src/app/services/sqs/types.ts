@@ -30,6 +30,65 @@ export type SQSMessageAttribute = {
   BinaryListValues?: string[]
 }
 
+export type SQSCreateQueueInput = {
+  QueueName: string
+  Attributes?: Record<string, string>
+  Tags?: Record<string, string>
+}
+
+export type SQSCreateQueueResponse = {
+  QueueUrl: string
+}
+
+export type SQSSendMessageInput = {
+  MessageBody: string
+  DelaySeconds?: number
+  MessageAttributes?: Record<string, SQSMessageAttribute>
+  MessageGroupId?: string
+  MessageDeduplicationId?: string
+}
+
+export type SQSSendMessageResponse = {
+  MessageId: string
+  MD5OfMessageBody: string
+  MD5OfMessageAttributes?: string
+  MD5OfMessageSystemAttributes?: string
+  SequenceNumber?: string
+}
+
+export type SQSReceiveMessageInput = {
+  MaxNumberOfMessages?: number
+  VisibilityTimeout?: number
+  WaitTimeSeconds?: number
+  AttributeNames?: string[]
+  MessageAttributeNames?: string[]
+  MessageSystemAttributeNames?: string[]
+}
+
+export type SQSReceivedMessage = {
+  MessageId: string
+  ReceiptHandle: string
+  MD5OfMessageBody: string
+  MD5OfMessageAttributes?: string
+  MD5OfMessageSystemAttributes?: string
+  Body: string
+  Attributes?: Record<string, string>
+  MessageAttributes?: Record<string, SQSMessageAttribute>
+}
+
+export type SQSReceiveMessageResponse = {
+  Messages?: SQSReceivedMessage[]
+}
+
+export type SQSDeleteMessageInput = {
+  ReceiptHandle: string
+}
+
+export type SQSChangeMessageVisibilityInput = {
+  ReceiptHandle: string
+  VisibilityTimeout: number
+}
+
 export type SQSMessageSnapshot = {
   messageId: string
   body: string

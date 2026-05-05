@@ -156,6 +156,10 @@ services:
     enabled: true
     project: devcloud
     location: US
+  redshift:
+    enabled: false
+  pubsub:
+    enabled: false
   sqs:
     enabled: true
     region: us-east-1

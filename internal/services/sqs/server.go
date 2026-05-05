@@ -53,6 +53,11 @@ type Server struct {
 }
 
 func NewServer(cfg Config) *Server {
+	if storagePath := strings.TrimSpace(cfg.StoragePath); storagePath != "" {
+		if absolutePath, err := filepath.Abs(storagePath); err == nil {
+			cfg.StoragePath = absolutePath
+		}
+	}
 	server := &Server{
 		config:    cfg,
 		queues:    map[string]*queueState{},
