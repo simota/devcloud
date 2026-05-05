@@ -78,6 +78,17 @@ scripts/bigquery-autoloop/progress.md
 scripts/bigquery-autoloop/done.md
 scripts/bigquery-autoloop/iteration-*.out
 scripts/bigquery-autoloop/prompt-*.*
+scripts/bigquery-dashboard-management-autoloop/.run-loop.lock
+scripts/bigquery-dashboard-management-autoloop/.circuit-state
+scripts/bigquery-dashboard-management-autoloop/runner.jsonl
+scripts/bigquery-dashboard-management-autoloop/runner.log
+scripts/bigquery-dashboard-management-autoloop/state.env
+scripts/bigquery-dashboard-management-autoloop/state.env.sha256
+scripts/bigquery-dashboard-management-autoloop/progress.md
+scripts/bigquery-dashboard-management-autoloop/done.md
+scripts/bigquery-dashboard-management-autoloop/iteration-*.out
+scripts/bigquery-dashboard-management-autoloop/verify-*.out
+scripts/bigquery-dashboard-management-autoloop/prompt-*.*
 scripts/sqs-autoloop/.run-loop.lock
 scripts/sqs-autoloop/.circuit-state
 scripts/sqs-autoloop/runner.jsonl

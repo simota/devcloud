@@ -55,6 +55,7 @@ export type BigQueryJob = {
   jobId: string
   location?: string
   state: string
+  job?: BigQueryJobResource
 }
 
 export type BigQueryProjectsResponse = {
@@ -83,4 +84,140 @@ export type BigQueryRowsResponse = {
 export type BigQueryJobsResponse = {
   projectId: string
   jobs: BigQueryJob[]
+}
+
+export type BigQueryJobResponse = {
+  projectId: string
+  jobId: string
+  job: BigQueryJob
+}
+
+export type BigQueryJobReference = {
+  projectId: string
+  jobId: string
+  location?: string
+}
+
+export type BigQueryJobResource = {
+  kind?: string
+  id?: string
+  selfLink?: string
+  jobReference: BigQueryJobReference
+  configuration?: {
+    dryRun?: boolean
+    query?: {
+      query?: string
+      useLegacySql?: boolean
+      queryParameters?: unknown[]
+    }
+  }
+  status: {
+    state: string
+  }
+  statistics?: {
+    creationTime?: string
+    startTime?: string
+    endTime?: string
+    query?: {
+      totalRows?: string
+      cacheHit?: boolean
+      dryRun?: boolean
+    }
+  }
+}
+
+export type BigQueryTableCell = {
+  v: unknown
+}
+
+export type BigQueryTableDataRow = {
+  f: BigQueryTableCell[]
+}
+
+export type BigQueryQueryRequest = {
+  query: string
+  maxResults?: number
+  dryRun?: boolean
+  useLegacySql: false
+}
+
+export type BigQueryQueryResponse = {
+  kind: string
+  schema?: BigQuerySchema
+  jobReference: BigQueryJobReference
+  totalRows: string
+  pageToken?: string
+  rows?: BigQueryTableDataRow[]
+  jobComplete: boolean
+  cacheHit: boolean
+}
+
+export type BigQueryDatasetCreateRequest = {
+  datasetReference: {
+    datasetId: string
+    projectId?: string
+  }
+  location?: string
+  friendlyName?: string
+  description?: string
+  labels?: Record<string, string>
+}
+
+export type BigQueryDatasetResource = BigQueryDatasetCreateRequest & {
+  kind?: string
+  id?: string
+  selfLink?: string
+  etag?: string
+  creationTime?: string
+  lastModifiedTime?: string
+}
+
+export type BigQueryTableCreateRequest = {
+  tableReference: {
+    tableId: string
+    datasetId?: string
+    projectId?: string
+  }
+  schema?: BigQuerySchema
+  friendlyName?: string
+  description?: string
+  type?: string
+  labels?: Record<string, string>
+}
+
+export type BigQueryTableResource = BigQueryTableCreateRequest & {
+  kind?: string
+  id?: string
+  selfLink?: string
+  etag?: string
+  creationTime?: string
+  lastModifiedTime?: string
+  numRows?: string
+  numBytes?: string
+  location?: string
+}
+
+export type BigQueryInsertAllRow = {
+  insertId?: string
+  json: Record<string, unknown>
+}
+
+export type BigQueryInsertAllRequest = {
+  skipInvalidRows?: boolean
+  ignoreUnknownValues?: boolean
+  rows: BigQueryInsertAllRow[]
+}
+
+export type BigQueryInsertError = {
+  index: number
+  errors: Array<{
+    reason: string
+    location?: string
+    message: string
+  }>
+}
+
+export type BigQueryInsertAllResponse = {
+  kind: string
+  insertErrors?: BigQueryInsertError[]
 }
