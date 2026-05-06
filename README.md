@@ -383,6 +383,7 @@ VERIFY_STAGE=full bash scripts/dynamodb-autoloop/verify.sh
 VERIFY_STAGE=full bash scripts/bigquery-autoloop/verify.sh
 VERIFY_STAGE=full bash scripts/sqs-autoloop/verify.sh
 VERIFY_STAGE=full bash scripts/pubsub-autoloop/verify.sh
+VERIFY_STAGE=full-sdk-compat bash scripts/gcs-sdk-compat-autoloop/verify.sh
 VERIFY_STAGE=full-compat bash scripts/pubsub-full-compat-autoloop/verify.sh
 VERIFY_STAGE=full-advanced bash scripts/redshift-advanced-compat-autoloop/verify.sh
 ```
@@ -393,6 +394,7 @@ Run E2E smoke tests:
 scripts/mail-e2e.sh
 scripts/s3-e2e.sh
 scripts/gcs-e2e.sh
+scripts/gcs-sdk-e2e.sh
 scripts/dynamodb-e2e.sh
 scripts/bigquery-e2e.sh
 scripts/sqs-e2e.sh
@@ -418,6 +420,7 @@ Override ports when defaults are already in use:
 E2E_INTERACTIVE=true E2E_SMTP_PORT=1125 E2E_DASHBOARD_PORT=8125 scripts/mail-e2e.sh
 E2E_INTERACTIVE=true E2E_S3_PORT=14566 E2E_DASHBOARD_PORT=18025 E2E_SMTP_PORT=11025 scripts/s3-e2e.sh
 E2E_INTERACTIVE=true E2E_GCS_PORT=14443 E2E_DASHBOARD_PORT=18025 scripts/gcs-e2e.sh
+E2E_GCS_PORT=14443 E2E_DASHBOARD_PORT=18025 scripts/gcs-sdk-e2e.sh
 E2E_INTERACTIVE=true E2E_DYNAMODB_PORT=18000 E2E_DASHBOARD_PORT=18025 scripts/dynamodb-e2e.sh
 E2E_INTERACTIVE=true E2E_BIGQUERY_PORT=19050 E2E_DASHBOARD_PORT=18025 scripts/bigquery-e2e.sh
 E2E_INTERACTIVE=true E2E_SQS_PORT=19324 E2E_DASHBOARD_PORT=18025 scripts/sqs-e2e.sh

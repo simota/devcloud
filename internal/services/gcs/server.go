@@ -967,10 +967,6 @@ func (s *Server) writeCopyError(w http.ResponseWriter, err error) {
 }
 
 func (s *Server) bucketResource(bucket s3svc.Bucket) bucketResource {
-	project := s.config.Project
-	if project == "" {
-		project = "devcloud"
-	}
 	location := s.config.Location
 	if location == "" {
 		location = "US"
@@ -979,7 +975,7 @@ func (s *Server) bucketResource(bucket s3svc.Bucket) bucketResource {
 		Kind:          "storage#bucket",
 		ID:            bucket.Name,
 		Name:          bucket.Name,
-		ProjectNumber: project,
+		ProjectNumber: "0",
 		Location:      location,
 		StorageClass:  "STANDARD",
 		TimeCreated:   bucket.CreatedAt.Format(time.RFC3339Nano),

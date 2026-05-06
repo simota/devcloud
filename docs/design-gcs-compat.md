@@ -552,7 +552,15 @@ UI は S3 Object Explorer の構造を再利用し、GCS 固有列として `gen
 go test ./...
 VERIFY_STAGE=foundation bash scripts/gcs-autoloop/verify.sh
 VERIFY_STAGE=full bash scripts/gcs-autoloop/verify.sh
+scripts/gcs-sdk-e2e.sh
+VERIFY_STAGE=full-sdk-compat bash scripts/gcs-sdk-compat-autoloop/verify.sh
 ```
+
+`scripts/gcs-sdk-e2e.sh` は `cloud.google.com/go/storage` の Google Cloud Storage SDK client を
+`option.WithEndpoint`、`option.WithoutAuthentication`、`storage.WithJSONReads` で devcloud の local GCS
+endpoint に向け、bucket create/list/get、object upload/attrs/download/list/delete、bucket delete を検証する。
+この compatibility target は endpoint override のみを対象とし、実 Google Cloud、`gcloud auth`、production
+credentials、外部 emulator には依存しない。
 
 ### Acceptance Criteria
 

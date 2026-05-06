@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -25,6 +26,9 @@ func TestBucketLifecycleAndListBuckets(t *testing.T) {
 	}
 	if created.Name != "demo-bucket" || created.Kind != "storage#bucket" || created.StorageClass != "STANDARD" {
 		t.Fatalf("created bucket = %#v", created)
+	}
+	if _, err := strconv.ParseUint(created.ProjectNumber, 10, 64); err != nil {
+		t.Fatalf("created projectNumber = %q, want uint64 string", created.ProjectNumber)
 	}
 
 	get := performRequest(routes, http.MethodGet, "/storage/v1/b/demo-bucket", "")
