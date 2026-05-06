@@ -20,6 +20,8 @@ LOCATION="${E2E_BIGQUERY_LOCATION:-US}"
 DATASET="${E2E_BIGQUERY_DATASET:-devcloud_e2e_$(date +%s)}"
 TABLE="${E2E_BIGQUERY_TABLE:-people}"
 COPY_TABLE="${E2E_BIGQUERY_COPY_TABLE:-people_copy}"
+VIEW_TABLE="${E2E_BIGQUERY_VIEW_TABLE:-active_people}"
+ROUTINE="${E2E_BIGQUERY_ROUTINE:-normalize_name}"
 BUCKET="${E2E_BIGQUERY_BUCKET:-devcloud-bigquery-e2e-$(date +%s)}"
 BEARER_TOKEN="${E2E_BIGQUERY_BEARER_TOKEN:-devcloud-e2e-token}"
 KEEP_WORKDIR="${E2E_KEEP_WORKDIR:-false}"
@@ -41,6 +43,8 @@ Environment:
   E2E_BIGQUERY_PROJECT=devcloud       Override the BigQuery project id.
   E2E_BIGQUERY_DATASET=devcloud_e2e   Override the test dataset id.
   E2E_BIGQUERY_TABLE=people           Override the primary test table id.
+  E2E_BIGQUERY_VIEW_TABLE=active_people Override the view metadata table id.
+  E2E_BIGQUERY_ROUTINE=normalize_name Override the routine metadata id.
   E2E_BIGQUERY_BUCKET=devcloud-bq     Override the local GCS bucket for extract checks.
   E2E_DELETE_DATA=false               Keep datasets, tables, rows, jobs, and GCS extract output after assertions.
   E2E_KEEP_WORKDIR=true               Keep the temporary workspace for debugging.
@@ -296,6 +300,32 @@ create_dataset_and_table() {
     grep -q "\"tableId\"[[:space:]]*:[[:space:]]*\"${TABLE}\""
 }
 
+create_view_and_routine_metadata() {
+  json_post "${BIGQUERY_ENDPOINT}/bigquery/v2/projects/${PROJECT}/datasets/${DATASET}/tables" "{
+    \"tableReference\":{\"projectId\":\"${PROJECT}\",\"datasetId\":\"${DATASET}\",\"tableId\":\"${VIEW_TABLE}\"},
+    \"type\":\"VIEW\",
+    \"view\":{\"query\":\"SELECT id, name FROM ${PROJECT}.${DATASET}.${TABLE} WHERE active = TRUE\",\"useLegacySql\":false}
+  }" | json_assert 'data["type"] == "VIEW" and data["view"]["useLegacySql"] is False'
+
+  json_post "${BIGQUERY_ENDPOINT}/bigquery/v2/projects/${PROJECT}/datasets/${DATASET}/routines" "{
+    \"routineReference\":{\"projectId\":\"${PROJECT}\",\"datasetId\":\"${DATASET}\",\"routineId\":\"${ROUTINE}\"},
+    \"routineType\":\"SCALAR_FUNCTION\",
+    \"language\":\"SQL\",
+    \"arguments\":[{\"name\":\"name\",\"dataType\":{\"typeKind\":\"STRING\"}}],
+    \"returnType\":{\"typeKind\":\"STRING\"},
+    \"definitionBody\":\"LOWER(name)\",
+    \"description\":\"Normalize display names\",
+    \"determinismLevel\":\"DETERMINISTIC\"
+  }" | json_assert 'data["kind"] == "bigquery#routine" and data["routineReference"]["routineId"] == "'"${ROUTINE}"'"'
+
+  json_patch "${BIGQUERY_ENDPOINT}/bigquery/v2/projects/${PROJECT}/datasets/${DATASET}/routines/${ROUTINE}" \
+    '{"description":"patched by scripts/bigquery-e2e.sh"}' |
+    json_assert 'data["description"] == "patched by scripts/bigquery-e2e.sh" and data["definitionBody"] == "LOWER(name)"'
+
+  json_get "${BIGQUERY_ENDPOINT}/bigquery/v2/projects/${PROJECT}/datasets/${DATASET}/routines?maxResults=10" |
+    grep -q "\"routineId\"[[:space:]]*:[[:space:]]*\"${ROUTINE}\""
+}
+
 insert_and_query_rows() {
   json_post "${BIGQUERY_ENDPOINT}/bigquery/v2/projects/${PROJECT}/datasets/${DATASET}/tables/${TABLE}/insertAll" '{
     "skipInvalidRows":false,
@@ -355,12 +385,15 @@ assert_dashboard_api() {
   curl -fsS "${DASHBOARD_ENDPOINT}/api/bigquery/projects" | grep -q "${PROJECT}"
   curl -fsS "${DASHBOARD_ENDPOINT}/api/bigquery/projects/${PROJECT}/datasets" | grep -q "${DATASET}"
   curl -fsS "${DASHBOARD_ENDPOINT}/api/bigquery/projects/${PROJECT}/datasets/${DATASET}/tables" | grep -q "${TABLE}"
+  curl -fsS "${DASHBOARD_ENDPOINT}/api/bigquery/projects/${PROJECT}/datasets/${DATASET}/tables" | grep -q "${VIEW_TABLE}"
   curl -fsS "${DASHBOARD_ENDPOINT}/api/bigquery/projects/${PROJECT}/datasets/${DATASET}/tables/${TABLE}/rows?limit=10" | grep -q 'Ada'
   curl -fsS "${DASHBOARD_ENDPOINT}/api/bigquery/projects/${PROJECT}/jobs" | grep -q 'extract_people_e2e'
   curl -fsS "${DASHBOARD_ENDPOINT}/dashboard/bigquery" | grep -qi 'devcloud Dashboard'
 }
 
 delete_data() {
+  json_delete "${BIGQUERY_ENDPOINT}/bigquery/v2/projects/${PROJECT}/datasets/${DATASET}/routines/${ROUTINE}" >/dev/null 2>&1 || true
+  json_delete "${BIGQUERY_ENDPOINT}/bigquery/v2/projects/${PROJECT}/datasets/${DATASET}/tables/${VIEW_TABLE}" >/dev/null 2>&1 || true
   json_delete "${BIGQUERY_ENDPOINT}/bigquery/v2/projects/${PROJECT}/datasets/${DATASET}/tables/${COPY_TABLE}" >/dev/null 2>&1 || true
   json_delete "${BIGQUERY_ENDPOINT}/bigquery/v2/projects/${PROJECT}/datasets/${DATASET}/tables/${TABLE}" >/dev/null 2>&1 || true
   json_delete "${BIGQUERY_ENDPOINT}/bigquery/v2/projects/${PROJECT}/datasets/${DATASET}?deleteContents=true" >/dev/null 2>&1 || true
@@ -371,6 +404,7 @@ delete_data() {
 run_bigquery_journey() {
   create_gcs_bucket
   create_dataset_and_table
+  create_view_and_routine_metadata
   insert_and_query_rows
   exercise_copy_and_extract_jobs
   assert_dashboard_api
@@ -400,7 +434,8 @@ show_retained_data() {
     return 0
   fi
   log "retained BigQuery dataset: ${PROJECT}.${DATASET}"
-  log "retained BigQuery tables: ${TABLE}, ${COPY_TABLE}"
+  log "retained BigQuery tables: ${TABLE}, ${COPY_TABLE}, ${VIEW_TABLE}"
+  log "retained BigQuery routine: ${ROUTINE}"
   log "retained GCS bucket: ${BUCKET}"
   log "retained workspace: ${WORKSPACE}"
   json_get "${BIGQUERY_ENDPOINT}/bigquery/v2/projects/${PROJECT}/datasets/${DATASET}/tables" || true

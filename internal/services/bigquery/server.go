@@ -297,53 +297,82 @@ func (s *Server) handleDatasets(w http.ResponseWriter, r *http.Request, parts []
 			methodNotAllowed(w, "GET, PATCH, PUT, DELETE")
 		}
 	case 4:
-		if parts[3] != "tables" {
-			writeError(w, http.StatusNotFound, "notFound", "not found")
-			return
-		}
 		datasetID := parts[2]
 		if err := validateResourceID(datasetID, "dataset"); err != nil {
 			writeError(w, http.StatusBadRequest, "invalid", err.Error())
 			return
 		}
-		switch r.Method {
-		case http.MethodGet:
-			s.listTables(w, r, projectID, datasetID)
-		case http.MethodPost:
-			s.createTable(w, r, projectID, datasetID)
+		switch parts[3] {
+		case "tables":
+			switch r.Method {
+			case http.MethodGet:
+				s.listTables(w, r, projectID, datasetID)
+			case http.MethodPost:
+				s.createTable(w, r, projectID, datasetID)
+			default:
+				methodNotAllowed(w, "GET, POST")
+			}
+		case "routines":
+			switch r.Method {
+			case http.MethodGet:
+				s.listRoutines(w, r, projectID, datasetID)
+			case http.MethodPost:
+				s.createRoutine(w, r, projectID, datasetID)
+			default:
+				methodNotAllowed(w, "GET, POST")
+			}
 		default:
-			methodNotAllowed(w, "GET, POST")
+			writeError(w, http.StatusNotFound, "notFound", "not found")
 		}
 	case 5:
-		if parts[3] != "tables" {
-			writeError(w, http.StatusNotFound, "notFound", "not found")
-			return
-		}
 		datasetID := parts[2]
-		tableID, action := splitResourceAction(parts[4])
 		if err := validateResourceID(datasetID, "dataset"); err != nil {
 			writeError(w, http.StatusBadRequest, "invalid", err.Error())
 			return
 		}
-		if err := validateResourceID(tableID, "table"); err != nil {
-			writeError(w, http.StatusBadRequest, "invalid", err.Error())
-			return
-		}
-		if action != "" {
-			s.handleTableIAMPolicy(w, r, projectID, datasetID, tableID, action)
-			return
-		}
-		switch r.Method {
-		case http.MethodGet:
-			s.getTable(w, r, projectID, datasetID, tableID)
-		case http.MethodPatch:
-			s.patchTable(w, r, projectID, datasetID, tableID, false)
-		case http.MethodPut:
-			s.patchTable(w, r, projectID, datasetID, tableID, true)
-		case http.MethodDelete:
-			s.deleteTable(w, r, projectID, datasetID, tableID)
+		switch parts[3] {
+		case "tables":
+			tableID, action := splitResourceAction(parts[4])
+			if err := validateResourceID(tableID, "table"); err != nil {
+				writeError(w, http.StatusBadRequest, "invalid", err.Error())
+				return
+			}
+			if action != "" {
+				s.handleTableIAMPolicy(w, r, projectID, datasetID, tableID, action)
+				return
+			}
+			switch r.Method {
+			case http.MethodGet:
+				s.getTable(w, r, projectID, datasetID, tableID)
+			case http.MethodPatch:
+				s.patchTable(w, r, projectID, datasetID, tableID, false)
+			case http.MethodPut:
+				s.patchTable(w, r, projectID, datasetID, tableID, true)
+			case http.MethodDelete:
+				s.deleteTable(w, r, projectID, datasetID, tableID)
+			default:
+				methodNotAllowed(w, "GET, PATCH, PUT, DELETE")
+			}
+		case "routines":
+			routineID := parts[4]
+			if err := validateResourceID(routineID, "routine"); err != nil {
+				writeError(w, http.StatusBadRequest, "invalid", err.Error())
+				return
+			}
+			switch r.Method {
+			case http.MethodGet:
+				s.getRoutine(w, r, projectID, datasetID, routineID)
+			case http.MethodPatch:
+				s.patchRoutine(w, r, projectID, datasetID, routineID, false)
+			case http.MethodPut:
+				s.patchRoutine(w, r, projectID, datasetID, routineID, true)
+			case http.MethodDelete:
+				s.deleteRoutine(w, r, projectID, datasetID, routineID)
+			default:
+				methodNotAllowed(w, "GET, PATCH, PUT, DELETE")
+			}
 		default:
-			methodNotAllowed(w, "GET, PATCH, PUT, DELETE")
+			writeError(w, http.StatusNotFound, "notFound", "not found")
 		}
 	case 6:
 		if parts[3] != "tables" {
@@ -561,7 +590,7 @@ func (s *Server) deleteDataset(w http.ResponseWriter, r *http.Request, projectID
 		return
 	}
 	if r.URL.Query().Get("deleteContents") != "true" {
-		if hasChildren(filepath.Join(dir, "tables")) {
+		if hasChildren(filepath.Join(dir, "tables")) || hasChildren(filepath.Join(dir, "routines")) {
 			writeError(w, http.StatusConflict, "duplicate", "dataset is not empty")
 			return
 		}
@@ -629,6 +658,7 @@ func (s *Server) createTable(w http.ResponseWriter, r *http.Request, projectID s
 		TimePartitioning:  request.TimePartitioning,
 		RangePartitioning: request.RangePartitioning,
 		Clustering:        request.Clustering,
+		View:              request.View,
 		ETag:              datasetETag(now),
 		CreationTime:      unixMillisString(now),
 		LastModifiedTime:  unixMillisString(now),
@@ -698,6 +728,7 @@ func (s *Server) listTables(w http.ResponseWriter, r *http.Request, projectID st
 			TimePartitioning:  table.TimePartitioning,
 			RangePartitioning: table.RangePartitioning,
 			Clustering:        table.Clustering,
+			View:              table.View,
 		})
 	}
 	response := tablesListResponse{
@@ -749,6 +780,7 @@ func (s *Server) patchTable(w http.ResponseWriter, r *http.Request, projectID st
 		existing.TimePartitioning = request.TimePartitioning
 		existing.RangePartitioning = request.RangePartitioning
 		existing.Clustering = request.Clustering
+		existing.View = request.View
 	} else {
 		if request.FriendlyName != "" {
 			existing.FriendlyName = request.FriendlyName
@@ -774,6 +806,9 @@ func (s *Server) patchTable(w http.ResponseWriter, r *http.Request, projectID st
 		if request.Clustering != nil {
 			existing.Clustering = request.Clustering
 		}
+		if request.View != nil {
+			existing.View = request.View
+		}
 	}
 	existing.ETag = datasetETag(now)
 	existing.LastModifiedTime = unixMillisString(now)
@@ -788,6 +823,199 @@ func (s *Server) deleteTable(w http.ResponseWriter, r *http.Request, projectID s
 	dir := s.tableDir(projectID, datasetID, tableID)
 	if _, err := os.Stat(filepath.Join(dir, "table.json")); errors.Is(err, os.ErrNotExist) {
 		writeError(w, http.StatusNotFound, "notFound", fmt.Sprintf("Not found: Table %s:%s.%s", projectID, datasetID, tableID))
+		return
+	} else if err != nil {
+		writeError(w, http.StatusInternalServerError, "backendError", "internal error")
+		return
+	}
+	if err := os.RemoveAll(dir); err != nil {
+		writeError(w, http.StatusInternalServerError, "backendError", "internal error")
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) createRoutine(w http.ResponseWriter, r *http.Request, projectID string, datasetID string) {
+	if _, found, err := s.readDataset(projectID, datasetID); err != nil {
+		writeError(w, http.StatusInternalServerError, "backendError", "internal error")
+		return
+	} else if !found {
+		writeError(w, http.StatusNotFound, "notFound", fmt.Sprintf("Not found: Dataset %s:%s", projectID, datasetID))
+		return
+	}
+
+	request, err := s.decodeRoutineRequest(r.Body)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid", "invalid json request")
+		return
+	}
+	if request.RoutineReference.ProjectID == "" {
+		request.RoutineReference.ProjectID = projectID
+	}
+	if request.RoutineReference.DatasetID == "" {
+		request.RoutineReference.DatasetID = datasetID
+	}
+	if request.RoutineReference.ProjectID != projectID || request.RoutineReference.DatasetID != datasetID {
+		writeError(w, http.StatusBadRequest, "invalid", "routineReference must match request project and dataset")
+		return
+	}
+	if err := validateRoutineResource(request); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid", err.Error())
+		return
+	}
+
+	path := s.routinePath(projectID, datasetID, request.RoutineReference.RoutineID)
+	if _, err := os.Stat(path); err == nil {
+		writeError(w, http.StatusConflict, "duplicate", fmt.Sprintf("Already Exists: Routine %s:%s.%s", projectID, datasetID, request.RoutineReference.RoutineID))
+		return
+	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+		writeError(w, http.StatusInternalServerError, "backendError", "internal error")
+		return
+	}
+
+	now := time.Now().UTC()
+	resource := request
+	resource.Kind = "bigquery#routine"
+	resource.ID = projectID + ":" + datasetID + "." + request.RoutineReference.RoutineID
+	resource.SelfLink = s.routineSelfLink(projectID, datasetID, request.RoutineReference.RoutineID)
+	resource.ETag = datasetETag(now)
+	resource.CreationTime = unixMillisString(now)
+	resource.LastModifiedTime = unixMillisString(now)
+	if err := s.writeRoutine(resource); err != nil {
+		writeError(w, http.StatusInternalServerError, "backendError", "internal error")
+		return
+	}
+	writeJSON(w, http.StatusOK, resource)
+}
+
+func (s *Server) getRoutine(w http.ResponseWriter, r *http.Request, projectID string, datasetID string, routineID string) {
+	resource, found, err := s.readRoutine(projectID, datasetID, routineID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "backendError", "internal error")
+		return
+	}
+	if !found {
+		writeError(w, http.StatusNotFound, "notFound", fmt.Sprintf("Not found: Routine %s:%s.%s", projectID, datasetID, routineID))
+		return
+	}
+	writeJSON(w, http.StatusOK, resource)
+}
+
+func (s *Server) listRoutines(w http.ResponseWriter, r *http.Request, projectID string, datasetID string) {
+	if _, found, err := s.readDataset(projectID, datasetID); err != nil {
+		writeError(w, http.StatusInternalServerError, "backendError", "internal error")
+		return
+	} else if !found {
+		writeError(w, http.StatusNotFound, "notFound", fmt.Sprintf("Not found: Dataset %s:%s", projectID, datasetID))
+		return
+	}
+	routines, err := s.readRoutines(projectID, datasetID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "backendError", "internal error")
+		return
+	}
+	offset, err := rowOffsetFromRequest(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid", err.Error())
+		return
+	}
+	maxResults, err := maxResultsFromRequest(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid", err.Error())
+		return
+	}
+	if offset > len(routines) {
+		offset = len(routines)
+	}
+	end := offset + maxResults
+	if end > len(routines) {
+		end = len(routines)
+	}
+	response := routinesListResponse{
+		Kind:       "bigquery#routineList",
+		Routines:   routines[offset:end],
+		TotalItems: len(routines),
+	}
+	if end < len(routines) {
+		response.NextPageToken = strconv.Itoa(end)
+	}
+	writeJSON(w, http.StatusOK, response)
+}
+
+func (s *Server) patchRoutine(w http.ResponseWriter, r *http.Request, projectID string, datasetID string, routineID string, replace bool) {
+	existing, found, err := s.readRoutine(projectID, datasetID, routineID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "backendError", "internal error")
+		return
+	}
+	if !found {
+		writeError(w, http.StatusNotFound, "notFound", fmt.Sprintf("Not found: Routine %s:%s.%s", projectID, datasetID, routineID))
+		return
+	}
+	request, err := s.decodeRoutineRequest(r.Body)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid", "invalid json request")
+		return
+	}
+	if request.RoutineReference.ProjectID != "" && request.RoutineReference.ProjectID != projectID ||
+		request.RoutineReference.DatasetID != "" && request.RoutineReference.DatasetID != datasetID ||
+		request.RoutineReference.RoutineID != "" && request.RoutineReference.RoutineID != routineID {
+		writeError(w, http.StatusBadRequest, "invalid", "routineReference must match request routine")
+		return
+	}
+
+	now := time.Now().UTC()
+	if replace {
+		creationTime := existing.CreationTime
+		existing = request
+		existing.Kind = "bigquery#routine"
+		existing.ID = projectID + ":" + datasetID + "." + routineID
+		existing.SelfLink = s.routineSelfLink(projectID, datasetID, routineID)
+		existing.RoutineReference = routineReference{ProjectID: projectID, DatasetID: datasetID, RoutineID: routineID}
+		existing.CreationTime = creationTime
+	} else {
+		if request.RoutineType != "" {
+			existing.RoutineType = request.RoutineType
+		}
+		if request.Language != "" {
+			existing.Language = request.Language
+		}
+		if request.Arguments != nil {
+			existing.Arguments = request.Arguments
+		}
+		if request.ReturnType != nil {
+			existing.ReturnType = request.ReturnType
+		}
+		if request.DefinitionBody != "" {
+			existing.DefinitionBody = request.DefinitionBody
+		}
+		if request.Description != "" {
+			existing.Description = request.Description
+		}
+		if request.DeterminismLevel != "" {
+			existing.DeterminismLevel = request.DeterminismLevel
+		}
+		if request.ImportedLibraries != nil {
+			existing.ImportedLibraries = request.ImportedLibraries
+		}
+	}
+	if err := validateRoutineResource(existing); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid", err.Error())
+		return
+	}
+	existing.ETag = datasetETag(now)
+	existing.LastModifiedTime = unixMillisString(now)
+	if err := s.writeRoutine(existing); err != nil {
+		writeError(w, http.StatusInternalServerError, "backendError", "internal error")
+		return
+	}
+	writeJSON(w, http.StatusOK, existing)
+}
+
+func (s *Server) deleteRoutine(w http.ResponseWriter, r *http.Request, projectID string, datasetID string, routineID string) {
+	dir := s.routineDir(projectID, datasetID, routineID)
+	if _, err := os.Stat(filepath.Join(dir, "routine.json")); errors.Is(err, os.ErrNotExist) {
+		writeError(w, http.StatusNotFound, "notFound", fmt.Sprintf("Not found: Routine %s:%s.%s", projectID, datasetID, routineID))
 		return
 	} else if err != nil {
 		writeError(w, http.StatusInternalServerError, "backendError", "internal error")
@@ -1870,6 +2098,21 @@ func validateResourceID(id string, kind string) error {
 	return nil
 }
 
+func validateRoutineResource(routine routineResource) error {
+	if err := validateResourceID(routine.RoutineReference.RoutineID, "routine"); err != nil {
+		return err
+	}
+	if strings.TrimSpace(routine.RoutineType) == "" {
+		return fmt.Errorf("routineType is required")
+	}
+	switch strings.ToUpper(routine.RoutineType) {
+	case "SCALAR_FUNCTION", "PROCEDURE", "TABLE_VALUED_FUNCTION":
+	default:
+		return fmt.Errorf("unsupported routineType %q", routine.RoutineType)
+	}
+	return nil
+}
+
 func (s *Server) decodeDatasetRequest(body io.Reader) (datasetResource, error) {
 	var request datasetResource
 	decoder := json.NewDecoder(http.MaxBytesReader(nil, io.NopCloser(body), s.maxRequestBytes()))
@@ -1884,6 +2127,15 @@ func (s *Server) decodeTableRequest(body io.Reader) (tableResource, error) {
 	decoder := json.NewDecoder(http.MaxBytesReader(nil, io.NopCloser(body), s.maxRequestBytes()))
 	if err := decoder.Decode(&request); err != nil && !errors.Is(err, io.EOF) {
 		return tableResource{}, err
+	}
+	return request, nil
+}
+
+func (s *Server) decodeRoutineRequest(body io.Reader) (routineResource, error) {
+	var request routineResource
+	decoder := json.NewDecoder(http.MaxBytesReader(nil, io.NopCloser(body), s.maxRequestBytes()))
+	if err := decoder.Decode(&request); err != nil && !errors.Is(err, io.EOF) {
+		return routineResource{}, err
 	}
 	return request, nil
 }
@@ -1985,6 +2237,14 @@ func (s *Server) tableIAMPolicyPath(projectID string, datasetID string, tableID 
 	return filepath.Join(s.tableDir(projectID, datasetID, tableID), "iam-policy.json")
 }
 
+func (s *Server) routineDir(projectID string, datasetID string, routineID string) string {
+	return filepath.Join(s.datasetDir(projectID, datasetID), "routines", routineID)
+}
+
+func (s *Server) routinePath(projectID string, datasetID string, routineID string) string {
+	return filepath.Join(s.routineDir(projectID, datasetID, routineID), "routine.json")
+}
+
 func (s *Server) rowsPath(projectID string, datasetID string, tableID string) string {
 	return filepath.Join(s.tableDir(projectID, datasetID, tableID), "rows", "streaming-buffer.jsonl")
 }
@@ -2046,13 +2306,14 @@ type Snapshot struct {
 }
 
 type DatasetSnapshot struct {
-	ID           string          `json:"id"`
-	ProjectID    string          `json:"projectId"`
-	DatasetID    string          `json:"datasetId"`
-	Location     string          `json:"location,omitempty"`
-	FriendlyName string          `json:"friendlyName,omitempty"`
-	Description  string          `json:"description,omitempty"`
-	Tables       []TableSnapshot `json:"tables"`
+	ID           string            `json:"id"`
+	ProjectID    string            `json:"projectId"`
+	DatasetID    string            `json:"datasetId"`
+	Location     string            `json:"location,omitempty"`
+	FriendlyName string            `json:"friendlyName,omitempty"`
+	Description  string            `json:"description,omitempty"`
+	Tables       []TableSnapshot   `json:"tables"`
+	Routines     []routineResource `json:"routines,omitempty"`
 }
 
 type TableSnapshot struct {
@@ -2069,6 +2330,7 @@ type TableSnapshot struct {
 	TimePartitioning  *timePartitioning  `json:"timePartitioning,omitempty"`
 	RangePartitioning *rangePartitioning `json:"rangePartitioning,omitempty"`
 	Clustering        *clustering        `json:"clustering,omitempty"`
+	View              *viewDefinition    `json:"view,omitempty"`
 	Rows              []RowSnapshot      `json:"rows,omitempty"`
 }
 
@@ -2119,6 +2381,9 @@ func (s *Server) Snapshot() Snapshot {
 		for _, table := range tables {
 			datasetSnapshot.Tables = append(datasetSnapshot.Tables, s.tableSnapshot(table, 0))
 		}
+		if routines, err := s.readRoutines(projectID, dataset.DatasetReference.DatasetID); err == nil {
+			datasetSnapshot.Routines = routines
+		}
 		snapshot.Datasets = append(snapshot.Datasets, datasetSnapshot)
 	}
 	jobs, err := s.readQueryJobs(projectID)
@@ -2148,6 +2413,9 @@ func (s *Server) DatasetSnapshot(projectID string, datasetID string) (DatasetSna
 	}
 	for _, table := range tables {
 		result.Tables = append(result.Tables, s.tableSnapshot(table, 0))
+	}
+	if routines, err := s.readRoutines(projectID, datasetID); err == nil {
+		result.Routines = routines
 	}
 	return result, true
 }
@@ -2183,6 +2451,7 @@ func (s *Server) tableSnapshot(table tableResource, rowLimit int) TableSnapshot 
 		TimePartitioning:  table.TimePartitioning,
 		RangePartitioning: table.RangePartitioning,
 		Clustering:        table.Clustering,
+		View:              table.View,
 	}
 	if rowLimit <= 0 {
 		return result
@@ -2211,6 +2480,10 @@ func (s *Server) datasetSelfLink(projectID string, datasetID string) string {
 
 func (s *Server) tableSelfLink(projectID string, datasetID string, tableID string) string {
 	return s.datasetSelfLink(projectID, datasetID) + "/tables/" + url.PathEscape(tableID)
+}
+
+func (s *Server) routineSelfLink(projectID string, datasetID string, routineID string) string {
+	return s.datasetSelfLink(projectID, datasetID) + "/routines/" + url.PathEscape(routineID)
 }
 
 func (s *Server) readDataset(projectID string, datasetID string) (datasetResource, bool, error) {
@@ -2380,6 +2653,75 @@ func (s *Server) writeTable(table tableResource) error {
 	encoder := json.NewEncoder(f)
 	encoder.SetIndent("", "  ")
 	if err := encoder.Encode(table); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
+func (s *Server) readRoutine(projectID string, datasetID string, routineID string) (routineResource, bool, error) {
+	f, err := os.Open(s.routinePath(projectID, datasetID, routineID))
+	if errors.Is(err, os.ErrNotExist) {
+		return routineResource{}, false, nil
+	}
+	if err != nil {
+		return routineResource{}, false, err
+	}
+	defer f.Close()
+
+	var routine routineResource
+	if err := json.NewDecoder(f).Decode(&routine); err != nil {
+		return routineResource{}, false, err
+	}
+	return routine, true, nil
+}
+
+func (s *Server) readRoutines(projectID string, datasetID string) ([]routineResource, error) {
+	root := filepath.Join(s.datasetDir(projectID, datasetID), "routines")
+	entries, err := os.ReadDir(root)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	routines := make([]routineResource, 0, len(entries))
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		routine, found, err := s.readRoutine(projectID, datasetID, entry.Name())
+		if err != nil {
+			return nil, err
+		}
+		if found {
+			routines = append(routines, routine)
+		}
+	}
+	sort.Slice(routines, func(i, j int) bool {
+		return routines[i].RoutineReference.RoutineID < routines[j].RoutineReference.RoutineID
+	})
+	return routines, nil
+}
+
+func (s *Server) writeRoutine(routine routineResource) error {
+	path := s.routinePath(routine.RoutineReference.ProjectID, routine.RoutineReference.DatasetID, routine.RoutineReference.RoutineID)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	encoder := json.NewEncoder(f)
+	encoder.SetIndent("", "  ")
+	if err := encoder.Encode(routine); err != nil {
 		f.Close()
 		os.Remove(tmp)
 		return err
@@ -4169,6 +4511,12 @@ type tableReference struct {
 	TableID   string `json:"tableId"`
 }
 
+type routineReference struct {
+	ProjectID string `json:"projectId"`
+	DatasetID string `json:"datasetId"`
+	RoutineID string `json:"routineId"`
+}
+
 type datasetResource struct {
 	Kind             string            `json:"kind,omitempty"`
 	ID               string            `json:"id,omitempty"`
@@ -4211,6 +4559,7 @@ type tableResource struct {
 	TimePartitioning  *timePartitioning  `json:"timePartitioning,omitempty"`
 	RangePartitioning *rangePartitioning `json:"rangePartitioning,omitempty"`
 	Clustering        *clustering        `json:"clustering,omitempty"`
+	View              *viewDefinition    `json:"view,omitempty"`
 	ETag              string             `json:"etag,omitempty"`
 	CreationTime      string             `json:"creationTime,omitempty"`
 	LastModifiedTime  string             `json:"lastModifiedTime,omitempty"`
@@ -4241,6 +4590,11 @@ type clustering struct {
 	Fields []string `json:"fields,omitempty"`
 }
 
+type viewDefinition struct {
+	Query        string `json:"query,omitempty"`
+	UseLegacySQL bool   `json:"useLegacySql"`
+}
+
 type tableSchema struct {
 	Fields []tableFieldSchema `json:"fields,omitempty"`
 }
@@ -4269,6 +4623,55 @@ type tableListItem struct {
 	TimePartitioning  *timePartitioning  `json:"timePartitioning,omitempty"`
 	RangePartitioning *rangePartitioning `json:"rangePartitioning,omitempty"`
 	Clustering        *clustering        `json:"clustering,omitempty"`
+	View              *viewDefinition    `json:"view,omitempty"`
+}
+
+type routineResource struct {
+	Kind              string               `json:"kind,omitempty"`
+	ID                string               `json:"id,omitempty"`
+	SelfLink          string               `json:"selfLink,omitempty"`
+	RoutineReference  routineReference     `json:"routineReference"`
+	RoutineType       string               `json:"routineType,omitempty"`
+	Language          string               `json:"language,omitempty"`
+	Arguments         []routineArgument    `json:"arguments,omitempty"`
+	ReturnType        *standardSQLDataType `json:"returnType,omitempty"`
+	DefinitionBody    string               `json:"definitionBody,omitempty"`
+	Description       string               `json:"description,omitempty"`
+	DeterminismLevel  string               `json:"determinismLevel,omitempty"`
+	ImportedLibraries []string             `json:"importedLibraries,omitempty"`
+	ETag              string               `json:"etag,omitempty"`
+	CreationTime      string               `json:"creationTime,omitempty"`
+	LastModifiedTime  string               `json:"lastModifiedTime,omitempty"`
+}
+
+type routineArgument struct {
+	Name         string               `json:"name,omitempty"`
+	Kind         string               `json:"kind,omitempty"`
+	Mode         string               `json:"mode,omitempty"`
+	DataType     *standardSQLDataType `json:"dataType,omitempty"`
+	ArgumentKind string               `json:"argumentKind,omitempty"`
+}
+
+type standardSQLDataType struct {
+	TypeKind         string                 `json:"typeKind,omitempty"`
+	ArrayElementType *standardSQLDataType   `json:"arrayElementType,omitempty"`
+	StructType       *standardSQLStructType `json:"structType,omitempty"`
+}
+
+type standardSQLStructType struct {
+	Fields []standardSQLField `json:"fields,omitempty"`
+}
+
+type standardSQLField struct {
+	Name string               `json:"name,omitempty"`
+	Type *standardSQLDataType `json:"type,omitempty"`
+}
+
+type routinesListResponse struct {
+	Kind          string            `json:"kind"`
+	Routines      []routineResource `json:"routines,omitempty"`
+	TotalItems    int               `json:"totalItems"`
+	NextPageToken string            `json:"nextPageToken,omitempty"`
 }
 
 type insertAllRequest struct {

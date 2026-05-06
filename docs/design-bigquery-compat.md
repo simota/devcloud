@@ -923,12 +923,14 @@ full: all of the above + client smoke
 | AC-007 | `jobs.getQueryResults` returns paginated rows with `TableSchema`. |
 | AC-008 | Dashboard shows BigQuery service, datasets, tables, rows, jobs, and query results. |
 | AC-009 | `VERIFY_STAGE=full bash scripts/bigquery-autoloop/verify.sh` passes. |
+| AC-010 | View table metadata and routine metadata CRUD persist through the REST catalog surface. |
 
 ## References
 
 - BigQuery REST API v2: https://cloud.google.com/bigquery/docs/reference/rest/
 - Datasets resource: https://cloud.google.com/bigquery/docs/reference/rest/v2/datasets
 - Tables resource: https://cloud.google.com/bigquery/docs/reference/rest/v2/tables
+- Routines resource: https://cloud.google.com/bigquery/docs/reference/rest/v2/routines
 - `tabledata.insertAll`: https://cloud.google.com/bigquery/docs/reference/rest/v2/tabledata/insertAll
 - Jobs resource: https://cloud.google.com/bigquery/docs/reference/rest/v2/jobs
 - `jobs.query`: https://cloud.google.com/bigquery/docs/reference/rest/v2/jobs/query
@@ -939,3 +941,4 @@ full: all of the above + client smoke
 | Date | Change |
 | --- | --- |
 | 2026-05-01 | Initial BigQuery compatibility design draft. |
+| 2026-05-06 | Added implemented catalog parity target for view metadata and routine metadata CRUD. |

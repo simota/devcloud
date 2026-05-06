@@ -421,6 +421,102 @@ func TestTablePartitioningAndClusteringMetadataPersists(t *testing.T) {
 	}
 }
 
+func TestTableViewAndRoutineMetadataCatalogPersists(t *testing.T) {
+	server := NewServer(Config{Project: "local-project", StoragePath: t.TempDir()})
+	createDatasetForTest(t, server, "local-project", "analytics")
+
+	viewBody := `{
+		"tableReference":{"tableId":"active_people"},
+		"type":"VIEW",
+		"view":{"query":"SELECT id FROM ` + "`local-project.analytics.people`" + ` WHERE active = TRUE","useLegacySql":false}
+	}`
+	createView := httptest.NewRecorder()
+	server.routes().ServeHTTP(createView, httptest.NewRequest(http.MethodPost, "/bigquery/v2/projects/local-project/datasets/analytics/tables", strings.NewReader(viewBody)))
+	if createView.Code != http.StatusOK {
+		t.Fatalf("create view status = %d, body = %s", createView.Code, createView.Body.String())
+	}
+	createViewResponse := createView.Body.String()
+	var view tableResource
+	if err := json.NewDecoder(strings.NewReader(createViewResponse)).Decode(&view); err != nil {
+		t.Fatalf("decode view: %v", err)
+	}
+	if view.Type != "VIEW" || view.View == nil || !strings.Contains(view.View.Query, "active = TRUE") {
+		t.Fatalf("view metadata = %#v", view)
+	}
+	if !strings.Contains(createViewResponse, `"useLegacySql":false`) {
+		t.Fatalf("view response omitted useLegacySql=false: %s", createViewResponse)
+	}
+
+	createRoutineBody := `{
+		"routineReference":{"routineId":"normalize_name"},
+		"routineType":"SCALAR_FUNCTION",
+		"language":"SQL",
+		"arguments":[{"name":"name","dataType":{"typeKind":"STRING"}}],
+		"returnType":{"typeKind":"STRING"},
+		"definitionBody":"LOWER(name)",
+		"description":"Normalize display names",
+		"determinismLevel":"DETERMINISTIC"
+	}`
+	createRoutine := httptest.NewRecorder()
+	server.routes().ServeHTTP(createRoutine, httptest.NewRequest(http.MethodPost, "/bigquery/v2/projects/local-project/datasets/analytics/routines", strings.NewReader(createRoutineBody)))
+	if createRoutine.Code != http.StatusOK {
+		t.Fatalf("create routine status = %d, body = %s", createRoutine.Code, createRoutine.Body.String())
+	}
+	var routine routineResource
+	if err := json.NewDecoder(createRoutine.Body).Decode(&routine); err != nil {
+		t.Fatalf("decode routine: %v", err)
+	}
+	if routine.Kind != "bigquery#routine" || routine.RoutineReference.RoutineID != "normalize_name" || routine.ReturnType == nil || routine.ReturnType.TypeKind != "STRING" {
+		t.Fatalf("routine metadata = %#v", routine)
+	}
+	if routine.SelfLink != "/bigquery/v2/projects/local-project/datasets/analytics/routines/normalize_name" {
+		t.Fatalf("routine selfLink = %q", routine.SelfLink)
+	}
+
+	patchRoutine := httptest.NewRecorder()
+	server.routes().ServeHTTP(patchRoutine, httptest.NewRequest(http.MethodPatch, "/bigquery/v2/projects/local-project/datasets/analytics/routines/normalize_name", strings.NewReader(`{"description":"patched routine"}`)))
+	if patchRoutine.Code != http.StatusOK {
+		t.Fatalf("patch routine status = %d, body = %s", patchRoutine.Code, patchRoutine.Body.String())
+	}
+	var patched routineResource
+	if err := json.NewDecoder(patchRoutine.Body).Decode(&patched); err != nil {
+		t.Fatalf("decode patched routine: %v", err)
+	}
+	if patched.Description != "patched routine" || patched.DefinitionBody != "LOWER(name)" {
+		t.Fatalf("patched routine = %#v", patched)
+	}
+
+	listRoutines := httptest.NewRecorder()
+	server.routes().ServeHTTP(listRoutines, httptest.NewRequest(http.MethodGet, "/bigquery/v2/projects/local-project/datasets/analytics/routines?maxResults=1", nil))
+	if listRoutines.Code != http.StatusOK {
+		t.Fatalf("list routines status = %d, body = %s", listRoutines.Code, listRoutines.Body.String())
+	}
+	var listed routinesListResponse
+	if err := json.NewDecoder(listRoutines.Body).Decode(&listed); err != nil {
+		t.Fatalf("decode routines: %v", err)
+	}
+	if listed.Kind != "bigquery#routineList" || listed.TotalItems != 1 || len(listed.Routines) != 1 {
+		t.Fatalf("listed routines = %#v", listed)
+	}
+
+	snapshot, found := server.DatasetSnapshot("local-project", "analytics")
+	if !found {
+		t.Fatal("dataset snapshot missing")
+	}
+	if len(snapshot.Routines) != 1 || snapshot.Routines[0].RoutineReference.RoutineID != "normalize_name" {
+		t.Fatalf("snapshot routines = %#v", snapshot.Routines)
+	}
+	if len(snapshot.Tables) != 1 || snapshot.Tables[0].View == nil {
+		t.Fatalf("snapshot tables = %#v", snapshot.Tables)
+	}
+
+	deleteRoutine := httptest.NewRecorder()
+	server.routes().ServeHTTP(deleteRoutine, httptest.NewRequest(http.MethodDelete, "/bigquery/v2/projects/local-project/datasets/analytics/routines/normalize_name", nil))
+	if deleteRoutine.Code != http.StatusNoContent {
+		t.Fatalf("delete routine status = %d, body = %s", deleteRoutine.Code, deleteRoutine.Body.String())
+	}
+}
+
 func TestTableCreateRejectsMissingDatasetDuplicateAndInvalidSchema(t *testing.T) {
 	server := NewServer(Config{Project: "local-project", StoragePath: t.TempDir()})
 	body := `{"tableReference":{"tableId":"people"},"schema":{"fields":[{"name":"id","type":"STRING"}]}}`
