@@ -2876,7 +2876,7 @@ func executeGroupedAggregateQuery(rows []storedRow, schema tableSchema, query si
 		}
 		cell := tableCell{V: nil}
 		if raw := groupValues[key]; !isJSONNull(raw) {
-			cell.V = rawValueForResponse(raw)
+			cell.V = rawValueForFieldResponse(raw, fields[0])
 		}
 		if len(aggregate.Rows) == 0 || len(aggregate.Rows[0].F) == 0 {
 			return queryExecutionResult{}, fmt.Errorf("aggregate result is empty")
@@ -3968,8 +3968,11 @@ func maxResultsFromRequest(r *http.Request) (int, error) {
 		return 100, nil
 	}
 	maxResults, err := strconv.Atoi(raw)
-	if err != nil || maxResults <= 0 {
+	if err != nil || maxResults < 0 {
 		return 0, fmt.Errorf("maxResults must be positive")
+	}
+	if maxResults == 0 {
+		return 100, nil
 	}
 	if maxResults > 10000 {
 		return 10000, nil
@@ -4005,9 +4008,38 @@ func formatRowValues(row map[string]json.RawMessage, fields []tableFieldSchema) 
 			values = append(values, tableCell{V: nil})
 			continue
 		}
-		values = append(values, tableCell{V: rawValueForResponse(raw)})
+		values = append(values, tableCell{V: rawValueForFieldResponse(raw, field)})
 	}
 	return values
+}
+
+func rawValueForFieldResponse(raw json.RawMessage, field tableFieldSchema) any {
+	if strings.EqualFold(field.Mode, "REPEATED") {
+		return rawValueForResponse(raw)
+	}
+	switch strings.ToUpper(defaultString(field.Type, "STRING")) {
+	case "INTEGER", "INT64":
+		if value, ok := rawInt(raw); ok {
+			return strconv.FormatInt(value, 10)
+		}
+	case "BOOLEAN", "BOOL":
+		var value bool
+		if err := json.Unmarshal(raw, &value); err == nil {
+			return strconv.FormatBool(value)
+		}
+	case "NUMERIC", "BIGNUMERIC":
+		var value string
+		if err := json.Unmarshal(raw, &value); err == nil {
+			return value
+		}
+		var number json.Number
+		decoder := json.NewDecoder(strings.NewReader(string(raw)))
+		decoder.UseNumber()
+		if err := decoder.Decode(&number); err == nil {
+			return number.String()
+		}
+	}
+	return rawValueForResponse(raw)
 }
 
 func rawValueForResponse(raw json.RawMessage) any {

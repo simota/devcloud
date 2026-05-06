@@ -251,6 +251,12 @@ services:
       maxResultRows: 10000
       maxExecutionSeconds: 30
       defaultUseLegacySql: false
+  redshift:
+    enabled: false
+  sqs:
+    enabled: false
+  pubsub:
+    enabled: false
 EOF
 }
 

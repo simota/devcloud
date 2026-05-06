@@ -954,10 +954,10 @@ func TestJobsQuerySupportsOrderByDesc(t *testing.T) {
 	if response.TotalRows != "2" || len(response.Rows) != 2 {
 		t.Fatalf("response rows = %#v", response)
 	}
-	if response.Rows[0].F[0].V != "1" || response.Rows[0].F[1].V != float64(37) {
+	if response.Rows[0].F[0].V != "1" || response.Rows[0].F[1].V != "37" {
 		t.Fatalf("desc first row = %#v", response.Rows[0])
 	}
-	if response.Rows[1].F[0].V != "2" || response.Rows[1].F[1].V != float64(31) {
+	if response.Rows[1].F[0].V != "2" || response.Rows[1].F[1].V != "31" {
 		t.Fatalf("desc second row = %#v", response.Rows[1])
 	}
 }
@@ -1282,10 +1282,10 @@ func TestJobsQuerySupportsGroupedCountAggregate(t *testing.T) {
 	if len(response.Schema.Fields) != 2 || response.Schema.Fields[0].Name != "active" || response.Schema.Fields[1].Name != "total" {
 		t.Fatalf("schema = %#v", response.Schema)
 	}
-	if response.Rows[0].F[0].V != false || response.Rows[0].F[1].V != "1" {
+	if response.Rows[0].F[0].V != "false" || response.Rows[0].F[1].V != "1" {
 		t.Fatalf("false group = %#v", response.Rows[0])
 	}
-	if response.Rows[1].F[0].V != true || response.Rows[1].F[1].V != "2" {
+	if response.Rows[1].F[0].V != "true" || response.Rows[1].F[1].V != "2" {
 		t.Fatalf("true group = %#v", response.Rows[1])
 	}
 }
@@ -1315,10 +1315,10 @@ func TestJobsQuerySupportsGroupedOrderByDesc(t *testing.T) {
 	if response.TotalRows != "2" || len(response.Rows) != 2 {
 		t.Fatalf("response rows = %#v", response)
 	}
-	if response.Rows[0].F[0].V != true || response.Rows[0].F[1].V != "2" {
+	if response.Rows[0].F[0].V != "true" || response.Rows[0].F[1].V != "2" {
 		t.Fatalf("true group first = %#v", response.Rows[0])
 	}
-	if response.Rows[1].F[0].V != false || response.Rows[1].F[1].V != "1" {
+	if response.Rows[1].F[0].V != "false" || response.Rows[1].F[1].V != "1" {
 		t.Fatalf("false group second = %#v", response.Rows[1])
 	}
 }
@@ -1705,7 +1705,7 @@ func TestJobsInsertLoadJobReadsGCSCSV(t *testing.T) {
 	if err := json.NewDecoder(rows.Body).Decode(&rowList); err != nil {
 		t.Fatalf("decode CSV loaded rows: %v", err)
 	}
-	if rowList.TotalRows != "2" || len(rowList.Rows) != 2 || rowList.Rows[0].F[1].V != "Barbara" || rowList.Rows[0].F[2].V != float64(39) {
+	if rowList.TotalRows != "2" || len(rowList.Rows) != 2 || rowList.Rows[0].F[1].V != "Barbara" || rowList.Rows[0].F[2].V != "39" {
 		t.Fatalf("CSV loaded rows = %#v", rowList)
 	}
 }

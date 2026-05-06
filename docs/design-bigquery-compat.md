@@ -835,6 +835,7 @@ jobs.cancel
 
 ```bash
 scripts/bigquery-e2e.sh
+scripts/bigquery-sdk-e2e.sh
 ```
 
 Test journey:
@@ -848,6 +849,18 @@ Test journey:
 7. fetch results through `jobs.getQueryResults`.
 8. inspect dashboard API.
 9. optionally keep data with `E2E_INTERACTIVE=true E2E_DELETE_DATA=false`.
+
+SDK compatibility journey:
+
+1. start `devcloud up` on free ports with BigQuery enabled.
+2. create/list/get a dataset through `cloud.google.com/go/bigquery`.
+3. create/get a table through the SDK.
+4. insert rows with `Inserter` and read them with `Table.Read`.
+5. run a GoogleSQL query with `Query.Run`, wait for the `Job`, and read results with `Job.Read`.
+6. delete the table and dataset through the SDK.
+
+The SDK E2E uses `option.WithEndpoint` and `option.WithoutAuthentication` to target only the local BigQuery REST endpoint.
+It does not call real Google Cloud, require `gcloud auth`, use production credentials, or depend on an external emulator.
 
 ### Stage Gates
 
