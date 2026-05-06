@@ -1,12 +1,16 @@
+import { type FormEvent, useEffect, useState } from 'react'
 import { EmptyState } from '../../../ui/EmptyState'
+import { Button } from '../../../ui/Button'
 import type { S3ObjectSummary } from './types'
 
 type ObjectInspectorProps = {
   bucketName?: string
+  disabled: boolean
   object?: S3ObjectSummary
+  onCopyObject: (destinationKey: string) => Promise<void>
 }
 
-export function ObjectInspector({ bucketName, object }: ObjectInspectorProps): JSX.Element {
+export function ObjectInspector({ bucketName, disabled, object, onCopyObject }: ObjectInspectorProps): JSX.Element {
   if (!object) {
     return (
       <EmptyState
@@ -66,7 +70,58 @@ export function ObjectInspector({ bucketName, object }: ObjectInspectorProps): J
       <a className="compat-link inspector-download" href={safeS3DownloadURL(object.downloadUrl)}>
         Download object
       </a>
+      <CopyObjectForm disabled={disabled} object={object} onCopyObject={onCopyObject} />
     </div>
+  )
+}
+
+type CopyObjectFormProps = {
+  disabled: boolean
+  object: S3ObjectSummary
+  onCopyObject: (destinationKey: string) => Promise<void>
+}
+
+function CopyObjectForm({ disabled, object, onCopyObject }: CopyObjectFormProps): JSX.Element {
+  const [destinationKey, setDestinationKey] = useState(`${object.key}.copy`)
+  const [busy, setBusy] = useState(false)
+
+  useEffect(() => {
+    setDestinationKey(`${object.key}.copy`)
+  }, [object.key])
+
+  async function submitCopy(event: FormEvent<HTMLFormElement>): Promise<void> {
+    event.preventDefault()
+    const key = destinationKey.trim()
+    if (disabled || busy || key === '') {
+      return
+    }
+    setBusy(true)
+    try {
+      await onCopyObject(key)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <form className="s3-copy-form" onSubmit={submitCopy}>
+      <label className="prefix-filter">
+        <span>Copy source</span>
+        <input aria-label="S3 copy source" disabled value={object.s3Uri} />
+      </label>
+      <label className="prefix-filter">
+        <span>Copy destination key</span>
+        <input
+          aria-label="S3 copy destination key"
+          disabled={disabled || busy}
+          onChange={(event) => setDestinationKey(event.target.value)}
+          value={destinationKey}
+        />
+      </label>
+      <Button disabled={disabled || busy || destinationKey.trim() === ''} type="submit">
+        {busy ? 'Copying' : 'CopyObject'}
+      </Button>
+    </form>
   )
 }
 

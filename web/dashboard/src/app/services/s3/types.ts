@@ -14,3 +14,11 @@ export type S3ObjectSummary = {
   s3Uri: string
   downloadUrl: string
 }
+
+export type S3MultipartUploadSummary = {
+  key: string
+  uploadId: string
+  initiated: string
+  contentType: string
+  metadata?: Record<string, string>
+}

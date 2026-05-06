@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -1603,6 +1604,139 @@ func TestS3DashboardPageAndAPIExposeObjects(t *testing.T) {
 	}
 	if got := escapedLookingDownload.Body.String(); got != "literal percent key\n" {
 		t.Fatalf("escaped-looking key download body = %q", got)
+	}
+}
+
+func TestS3DashboardBucketObjectManagement(t *testing.T) {
+	s3Store := s3svc.NewFileBucketStore(t.TempDir())
+	routes := NewServer(Config{
+		S3Endpoint:    "http://127.0.0.1:4566",
+		S3Region:      "us-east-1",
+		S3AuthMode:    "relaxed",
+		S3StoragePath: ".devcloud/data/s3",
+	}, newDashboardStore(nil, nil), s3Store).routes()
+
+	createdBucket := performRequestWithBody(routes, http.MethodPost, "/api/s3/buckets", `{"name":"managed-bucket"}`)
+	if createdBucket.Code != http.StatusCreated {
+		t.Fatalf("create s3 bucket code = %d, want %d; body=%s", createdBucket.Code, http.StatusCreated, createdBucket.Body.String())
+	}
+	if !strings.Contains(createdBucket.Body.String(), `"name":"managed-bucket"`) {
+		t.Fatalf("create s3 bucket response missing name: %s", createdBucket.Body.String())
+	}
+
+	if _, err := s3Store.PutObject(context.Background(), s3svc.PutObjectInput{
+		Bucket:      "managed-bucket",
+		Key:         "docs/delete-me.txt",
+		Body:        strings.NewReader("temporary object"),
+		ContentType: "text/plain",
+		Metadata:    map[string]string{"source": "dashboard-management-test"},
+	}); err != nil {
+		t.Fatalf("put object: %v", err)
+	}
+
+	deleteNonEmptyBucket := performRequest(routes, http.MethodDelete, "/api/s3/buckets/managed-bucket")
+	if deleteNonEmptyBucket.Code != http.StatusConflict {
+		t.Fatalf("delete non-empty bucket code = %d, want %d", deleteNonEmptyBucket.Code, http.StatusConflict)
+	}
+
+	deleteObject := performRequest(routes, http.MethodDelete, "/api/s3/buckets/managed-bucket/objects/docs/delete-me.txt")
+	if deleteObject.Code != http.StatusNoContent {
+		t.Fatalf("delete s3 object code = %d, want %d; body=%s", deleteObject.Code, http.StatusNoContent, deleteObject.Body.String())
+	}
+	if _, _, found, err := s3Store.GetObject(context.Background(), "managed-bucket", "docs/delete-me.txt"); err != nil || found {
+		t.Fatalf("deleted object found=%t err=%v", found, err)
+	}
+
+	deleteBucket := performRequest(routes, http.MethodDelete, "/api/s3/buckets/managed-bucket")
+	if deleteBucket.Code != http.StatusNoContent {
+		t.Fatalf("delete empty bucket code = %d, want %d; body=%s", deleteBucket.Code, http.StatusNoContent, deleteBucket.Body.String())
+	}
+}
+
+func TestS3DashboardUploadCopyAndMetadata(t *testing.T) {
+	s3Store := s3svc.NewFileBucketStore(t.TempDir())
+	if _, created, err := s3Store.CreateBucket(context.Background(), "managed-bucket"); err != nil || !created {
+		t.Fatalf("create bucket created=%t err=%v", created, err)
+	}
+	routes := NewServer(Config{
+		S3Endpoint:    "http://127.0.0.1:4566",
+		S3Region:      "us-east-1",
+		S3AuthMode:    "relaxed",
+		S3StoragePath: ".devcloud/data/s3",
+	}, newDashboardStore(nil, nil), s3Store).routes()
+
+	putReq := httptest.NewRequest(http.MethodPut, "/api/s3/buckets/managed-bucket/objects/docs/upload.txt", strings.NewReader("dashboard upload"))
+	putReq.Header.Set("Content-Type", "text/plain")
+	putReq.Header.Set("x-amz-meta-source", "dashboard-upload")
+	putRec := httptest.NewRecorder()
+	routes.ServeHTTP(putRec, putReq)
+	if putRec.Code != http.StatusOK {
+		t.Fatalf("upload s3 object code = %d, want %d; body=%s", putRec.Code, http.StatusOK, putRec.Body.String())
+	}
+	for _, want := range []string{`"key":"docs/upload.txt"`, `"contentType":"text/plain"`, `"source":"dashboard-upload"`, `"downloadUrl":`} {
+		if !strings.Contains(putRec.Body.String(), want) {
+			t.Fatalf("upload response missing %q: %s", want, putRec.Body.String())
+		}
+	}
+
+	copyReq := httptest.NewRequest(http.MethodPut, "/api/s3/buckets/managed-bucket/objects/docs/copied.txt", nil)
+	copyReq.Header.Set("x-amz-copy-source", "/managed-bucket/docs%2Fupload.txt")
+	copyRec := httptest.NewRecorder()
+	routes.ServeHTTP(copyRec, copyReq)
+	if copyRec.Code != http.StatusOK {
+		t.Fatalf("copy s3 object code = %d, want %d; body=%s", copyRec.Code, http.StatusOK, copyRec.Body.String())
+	}
+	if !strings.Contains(copyRec.Body.String(), `"key":"docs/copied.txt"`) || !strings.Contains(copyRec.Body.String(), `"source":"dashboard-upload"`) {
+		t.Fatalf("copy response missing copied object metadata: %s", copyRec.Body.String())
+	}
+
+	_, body, found, err := s3Store.GetObject(context.Background(), "managed-bucket", "docs/copied.txt")
+	if err != nil || !found {
+		t.Fatalf("copied object found=%t err=%v", found, err)
+	}
+	if got := string(body); got != "dashboard upload" {
+		t.Fatalf("copied object body = %q, want dashboard upload", got)
+	}
+}
+
+func TestS3DashboardMultipartUploadsCanBeListedAndAborted(t *testing.T) {
+	s3Store := s3svc.NewFileBucketStore(t.TempDir())
+	if _, created, err := s3Store.CreateBucket(context.Background(), "managed-bucket"); err != nil || !created {
+		t.Fatalf("create bucket created=%t err=%v", created, err)
+	}
+	upload, err := s3Store.CreateMultipartUpload(context.Background(), s3svc.CreateMultipartUploadInput{
+		Bucket:      "managed-bucket",
+		Key:         "large.bin",
+		ContentType: "application/octet-stream",
+		Metadata:    map[string]string{"source": "dashboard-multipart"},
+	})
+	if err != nil {
+		t.Fatalf("create multipart upload: %v", err)
+	}
+	routes := NewServer(Config{
+		S3Endpoint:    "http://127.0.0.1:4566",
+		S3Region:      "us-east-1",
+		S3AuthMode:    "relaxed",
+		S3StoragePath: ".devcloud/data/s3",
+	}, newDashboardStore(nil, nil), s3Store).routes()
+
+	list := performRequest(routes, http.MethodGet, "/api/s3/buckets/managed-bucket/multipart")
+	if list.Code != http.StatusOK {
+		t.Fatalf("list multipart uploads code = %d, want %d; body=%s", list.Code, http.StatusOK, list.Body.String())
+	}
+	for _, want := range []string{`"key":"large.bin"`, `"uploadId":"` + upload.UploadID + `"`, `"source":"dashboard-multipart"`} {
+		if !strings.Contains(list.Body.String(), want) {
+			t.Fatalf("multipart uploads response missing %q: %s", want, list.Body.String())
+		}
+	}
+
+	abort := performRequest(routes, http.MethodDelete, "/api/s3/buckets/managed-bucket/multipart/"+url.PathEscape(upload.UploadID))
+	if abort.Code != http.StatusNoContent {
+		t.Fatalf("abort multipart upload code = %d, want %d; body=%s", abort.Code, http.StatusNoContent, abort.Body.String())
+	}
+	uploads, ok, err := s3Store.ListMultipartUploads(context.Background(), "managed-bucket")
+	if err != nil || !ok || len(uploads) != 0 {
+		t.Fatalf("multipart uploads after abort len=%d ok=%t err=%v", len(uploads), ok, err)
 	}
 }
 
