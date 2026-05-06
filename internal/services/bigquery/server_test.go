@@ -848,6 +848,58 @@ func TestJobsQueryPersistsResultsAndGetQueryResultsReturnsBigQueryShape(t *testi
 	}
 }
 
+func TestJobsQueryCanReadViewMetadataQuery(t *testing.T) {
+	server := NewServer(Config{Project: "local-project", Location: "US", StoragePath: t.TempDir()})
+	createDatasetForTest(t, server, "local-project", "analytics")
+	createTableForTest(t, server, "local-project", "analytics", "people")
+	insertRowsForTest(t, server, "local-project", "analytics", "people")
+
+	createView := httptest.NewRecorder()
+	viewBody := `{
+		"tableReference":{"tableId":"active_people"},
+		"type":"VIEW",
+		"view":{"query":"SELECT id, name, age FROM ` + "`local-project.analytics.people`" + ` WHERE active = TRUE","useLegacySql":false}
+	}`
+	server.routes().ServeHTTP(createView, httptest.NewRequest(http.MethodPost, "/bigquery/v2/projects/local-project/datasets/analytics/tables", strings.NewReader(viewBody)))
+	if createView.Code != http.StatusOK {
+		t.Fatalf("create view status = %d, body = %s", createView.Code, createView.Body.String())
+	}
+
+	query := httptest.NewRecorder()
+	body := `{"query":"SELECT id, name FROM ` + "`local-project.analytics.active_people`" + ` WHERE age >= 35 ORDER BY id","useLegacySql":false,"location":"US"}`
+	server.routes().ServeHTTP(query, httptest.NewRequest(http.MethodPost, "/bigquery/v2/projects/local-project/queries", strings.NewReader(body)))
+	if query.Code != http.StatusOK {
+		t.Fatalf("query view status = %d, body = %s", query.Code, query.Body.String())
+	}
+	var response queryResponse
+	if err := json.NewDecoder(query.Body).Decode(&response); err != nil {
+		t.Fatalf("decode view query response: %v", err)
+	}
+	if response.TotalRows != "1" || len(response.Rows) != 1 {
+		t.Fatalf("view query response = %#v", response)
+	}
+	if len(response.Schema.Fields) != 2 || response.Schema.Fields[0].Name != "id" || response.Schema.Fields[1].Name != "name" {
+		t.Fatalf("view query schema = %#v", response.Schema)
+	}
+	if response.Rows[0].F[0].V != "1" || response.Rows[0].F[1].V != "Ada" {
+		t.Fatalf("view query rows = %#v", response.Rows)
+	}
+
+	dryRun := httptest.NewRecorder()
+	dryRunBody := `{"query":"SELECT id, name FROM ` + "`local-project.analytics.active_people`" + `","useLegacySql":false,"dryRun":true}`
+	server.routes().ServeHTTP(dryRun, httptest.NewRequest(http.MethodPost, "/bigquery/v2/projects/local-project/queries", strings.NewReader(dryRunBody)))
+	if dryRun.Code != http.StatusOK {
+		t.Fatalf("dry run view status = %d, body = %s", dryRun.Code, dryRun.Body.String())
+	}
+	var dryRunResponse queryResponse
+	if err := json.NewDecoder(dryRun.Body).Decode(&dryRunResponse); err != nil {
+		t.Fatalf("decode dry run view response: %v", err)
+	}
+	if dryRunResponse.TotalRows != "0" || len(dryRunResponse.Schema.Fields) != 2 {
+		t.Fatalf("dry run view response = %#v", dryRunResponse)
+	}
+}
+
 func TestJobsQueryRejectsLegacySQLWithoutLeakingQueryText(t *testing.T) {
 	server := NewServer(Config{Project: "local-project", Location: "US", StoragePath: t.TempDir()})
 	createDatasetForTest(t, server, "local-project", "analytics")

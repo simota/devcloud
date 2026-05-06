@@ -350,6 +350,12 @@ insert_and_query_rows() {
   job_id="$(json_value 'data["jobReference"]["jobId"]' < "${TMP_DIR}/query.json")"
   json_get "${BIGQUERY_ENDPOINT}/bigquery/v2/projects/${PROJECT}/jobs/${job_id}/getQueryResults?location=${LOCATION}" |
     json_assert 'data["jobComplete"] is True and data["totalRows"] == "2"'
+
+  json_post "${BIGQUERY_ENDPOINT}/bigquery/v2/projects/${PROJECT}/queries" "{
+    \"query\":\"SELECT id, name FROM ${PROJECT}.${DATASET}.${VIEW_TABLE} WHERE id = '1'\",
+    \"useLegacySql\":false,
+    \"location\":\"${LOCATION}\"
+  }" | json_assert 'data["jobComplete"] is True and data["totalRows"] == "1" and data["rows"][0]["f"][1]["v"] == "Ada"'
 }
 
 exercise_copy_and_extract_jobs() {

@@ -2983,38 +2983,39 @@ func (s *Server) createQueryJob(requestProjectID string, requestedRef jobReferen
 
 func (s *Server) executeQueryForJob(requestProjectID string, rawQuery string, dryRun bool) (queryExecutionResult, error) {
 	if dryRun {
-		return s.dryRunQuery(requestProjectID, rawQuery)
+		return s.dryRunQueryWithDepth(requestProjectID, rawQuery, 0)
 	}
-	return s.executeQuery(requestProjectID, rawQuery)
+	return s.executeQueryWithDepth(requestProjectID, rawQuery, 0)
 }
 
 func (s *Server) dryRunQuery(requestProjectID string, rawQuery string) (queryExecutionResult, error) {
+	return s.dryRunQueryWithDepth(requestProjectID, rawQuery, 0)
+}
+
+func (s *Server) dryRunQueryWithDepth(requestProjectID string, rawQuery string, depth int) (queryExecutionResult, error) {
 	query, err := parseSimpleSelect(rawQuery, requestProjectID)
 	if err != nil {
 		return queryExecutionResult{}, err
 	}
-	table, found, err := s.readTable(query.ProjectID, query.DatasetID, query.TableID)
+	schema, _, err := s.querySource(query, true, depth)
 	if err != nil {
 		return queryExecutionResult{}, err
 	}
-	if !found {
-		return queryExecutionResult{}, fmt.Errorf("not found: table %s:%s.%s", query.ProjectID, query.DatasetID, query.TableID)
-	}
 	if query.Aggregate.Function != "" {
 		if query.GroupBy != "" {
-			fields, err := groupedAggregateDryRunFields(table.Schema, query)
+			fields, err := groupedAggregateDryRunFields(schema, query)
 			if err != nil {
 				return queryExecutionResult{}, err
 			}
 			return queryExecutionResult{Fields: fields}, nil
 		}
-		fields, err := aggregateDryRunFields(table.Schema, query.Aggregate)
+		fields, err := aggregateDryRunFields(schema, query.Aggregate)
 		if err != nil {
 			return queryExecutionResult{}, err
 		}
 		return queryExecutionResult{Fields: fields}, nil
 	}
-	fields, err := fieldsForQuery(table.Schema, query.SelectedFields)
+	fields, err := fieldsForQuery(schema, query.SelectedFields)
 	if err != nil {
 		return queryExecutionResult{}, err
 	}
@@ -3022,22 +3023,69 @@ func (s *Server) dryRunQuery(requestProjectID string, rawQuery string) (queryExe
 }
 
 func (s *Server) executeQuery(requestProjectID string, rawQuery string) (queryExecutionResult, error) {
+	return s.executeQueryWithDepth(requestProjectID, rawQuery, 0)
+}
+
+func (s *Server) executeQueryWithDepth(requestProjectID string, rawQuery string, depth int) (queryExecutionResult, error) {
 	query, err := parseSimpleSelect(rawQuery, requestProjectID)
 	if err != nil {
 		return queryExecutionResult{}, err
 	}
-	table, found, err := s.readTable(query.ProjectID, query.DatasetID, query.TableID)
+	schema, rows, err := s.querySource(query, false, depth)
 	if err != nil {
 		return queryExecutionResult{}, err
 	}
+	return executeParsedQuery(schema, rows, query)
+}
+
+func (s *Server) querySource(query simpleSelectQuery, dryRun bool, depth int) (tableSchema, []storedRow, error) {
+	table, found, err := s.readTable(query.ProjectID, query.DatasetID, query.TableID)
+	if err != nil {
+		return tableSchema{}, nil, err
+	}
 	if !found {
-		return queryExecutionResult{}, fmt.Errorf("not found: table %s:%s.%s", query.ProjectID, query.DatasetID, query.TableID)
+		return tableSchema{}, nil, fmt.Errorf("not found: table %s:%s.%s", query.ProjectID, query.DatasetID, query.TableID)
+	}
+
+	if strings.EqualFold(table.Type, "VIEW") {
+		if table.View == nil || strings.TrimSpace(table.View.Query) == "" {
+			return tableSchema{}, nil, fmt.Errorf("view %s:%s.%s has no query", query.ProjectID, query.DatasetID, query.TableID)
+		}
+		if table.View.UseLegacySQL {
+			return tableSchema{}, nil, fmt.Errorf("legacy SQL views are not supported")
+		}
+		if depth >= 8 {
+			return tableSchema{}, nil, fmt.Errorf("view reference depth exceeded")
+		}
+		result, err := s.executeQueryForView(query.ProjectID, table.View.Query, dryRun, depth+1)
+		if err != nil {
+			return tableSchema{}, nil, err
+		}
+		if dryRun {
+			return tableSchema{Fields: result.Fields}, nil, nil
+		}
+		return tableSchema{Fields: result.Fields}, queryResultRowsToStoredRows(result), nil
+	}
+
+	if dryRun {
+		return table.Schema, nil, nil
 	}
 	rows, err := s.readRows(query.ProjectID, query.DatasetID, query.TableID)
 	if err != nil {
-		return queryExecutionResult{}, err
+		return tableSchema{}, nil, err
 	}
-	selectedFields, err := fieldsForQuery(table.Schema, query.SelectedFields)
+	return table.Schema, rows, nil
+}
+
+func (s *Server) executeQueryForView(requestProjectID string, rawQuery string, dryRun bool, depth int) (queryExecutionResult, error) {
+	if dryRun {
+		return s.dryRunQueryWithDepth(requestProjectID, rawQuery, depth)
+	}
+	return s.executeQueryWithDepth(requestProjectID, rawQuery, depth)
+}
+
+func executeParsedQuery(schema tableSchema, rows []storedRow, query simpleSelectQuery) (queryExecutionResult, error) {
+	selectedFields, err := fieldsForQuery(schema, query.SelectedFields)
 	if err != nil {
 		return queryExecutionResult{}, err
 	}
@@ -3053,9 +3101,9 @@ func (s *Server) executeQuery(requestProjectID string, rawQuery string) (queryEx
 	}
 	if query.Aggregate.Function != "" {
 		if query.GroupBy != "" {
-			return executeGroupedAggregateQuery(filtered, table.Schema, query)
+			return executeGroupedAggregateQuery(filtered, schema, query)
 		}
-		return executeAggregateQuery(filtered, table.Schema, query)
+		return executeAggregateQuery(filtered, schema, query)
 	}
 	if query.OrderBy != "" {
 		sort.SliceStable(filtered, func(i, j int) bool {
@@ -3083,6 +3131,26 @@ func (s *Server) executeQuery(requestProjectID string, rawQuery string) (queryEx
 		responseRows = append(responseRows, tableDataRow{F: formatRowValues(row.JSON, selectedFields)})
 	}
 	return queryExecutionResult{Fields: selectedFields, Rows: responseRows}, nil
+}
+
+func queryResultRowsToStoredRows(result queryExecutionResult) []storedRow {
+	rows := make([]storedRow, 0, len(result.Rows))
+	for _, row := range result.Rows {
+		values := make(map[string]json.RawMessage, len(result.Fields))
+		for i, field := range result.Fields {
+			var value any
+			if i < len(row.F) {
+				value = row.F[i].V
+			}
+			raw, err := json.Marshal(value)
+			if err != nil {
+				raw = []byte("null")
+			}
+			values[field.Name] = json.RawMessage(raw)
+		}
+		rows = append(rows, storedRow{JSON: values})
+	}
+	return rows
 }
 
 func executeAggregateQuery(rows []storedRow, schema tableSchema, query simpleSelectQuery) (queryExecutionResult, error) {
@@ -3957,6 +4025,14 @@ func rawJSONLiteral(value string) (json.RawMessage, error) {
 			return nil, fmt.Errorf("invalid string literal")
 		}
 		return []byte(trimmed), nil
+	}
+	switch strings.ToUpper(trimmed) {
+	case "TRUE":
+		return []byte("true"), nil
+	case "FALSE":
+		return []byte("false"), nil
+	case "NULL":
+		return []byte("null"), nil
 	}
 	var valueAny any
 	decoder := json.NewDecoder(strings.NewReader(trimmed))
