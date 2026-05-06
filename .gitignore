@@ -177,6 +177,17 @@ scripts/bigquery-sdk-compat-autoloop/done.md
 scripts/bigquery-sdk-compat-autoloop/iteration-*.out
 scripts/bigquery-sdk-compat-autoloop/verify-*.out
 scripts/bigquery-sdk-compat-autoloop/prompt-*.*
+scripts/bigquery-server-refactor-autoloop/.run-loop.lock
+scripts/bigquery-server-refactor-autoloop/.circuit-state
+scripts/bigquery-server-refactor-autoloop/runner.jsonl
+scripts/bigquery-server-refactor-autoloop/runner.log
+scripts/bigquery-server-refactor-autoloop/state.env
+scripts/bigquery-server-refactor-autoloop/state.env.sha256
+scripts/bigquery-server-refactor-autoloop/progress.md
+scripts/bigquery-server-refactor-autoloop/done.md
+scripts/bigquery-server-refactor-autoloop/iteration-*.out
+scripts/bigquery-server-refactor-autoloop/verify-*.out
+scripts/bigquery-server-refactor-autoloop/prompt-*.*
 scripts/sqs-autoloop/.run-loop.lock
 scripts/sqs-autoloop/.circuit-state
 scripts/sqs-autoloop/runner.jsonl
