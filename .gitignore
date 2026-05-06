@@ -134,6 +134,17 @@ scripts/dynamodb-dashboard-advanced-autoloop/done.md
 scripts/dynamodb-dashboard-advanced-autoloop/iteration-*.out
 scripts/dynamodb-dashboard-advanced-autoloop/verify-*.out
 scripts/dynamodb-dashboard-advanced-autoloop/prompt-*.*
+scripts/dynamodb-server-refactor-autoloop/.run-loop.lock
+scripts/dynamodb-server-refactor-autoloop/.circuit-state
+scripts/dynamodb-server-refactor-autoloop/runner.jsonl
+scripts/dynamodb-server-refactor-autoloop/runner.log
+scripts/dynamodb-server-refactor-autoloop/state.env
+scripts/dynamodb-server-refactor-autoloop/state.env.sha256
+scripts/dynamodb-server-refactor-autoloop/progress.md
+scripts/dynamodb-server-refactor-autoloop/done.md
+scripts/dynamodb-server-refactor-autoloop/iteration-*.out
+scripts/dynamodb-server-refactor-autoloop/verify-*.out
+scripts/dynamodb-server-refactor-autoloop/prompt-*.*
 scripts/bigquery-autoloop/.run-loop.lock
 scripts/bigquery-autoloop/.circuit-state
 scripts/bigquery-autoloop/runner.jsonl
