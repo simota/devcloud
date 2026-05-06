@@ -240,6 +240,17 @@ scripts/pubsub-full-compat-autoloop/progress.md
 scripts/pubsub-full-compat-autoloop/done.md
 scripts/pubsub-full-compat-autoloop/iteration-*.out
 scripts/pubsub-full-compat-autoloop/prompt-*.*
+scripts/pubsub-server-refactor-autoloop/.run-loop.lock
+scripts/pubsub-server-refactor-autoloop/.circuit-state
+scripts/pubsub-server-refactor-autoloop/runner.jsonl
+scripts/pubsub-server-refactor-autoloop/runner.log
+scripts/pubsub-server-refactor-autoloop/state.env
+scripts/pubsub-server-refactor-autoloop/state.env.sha256
+scripts/pubsub-server-refactor-autoloop/progress.md
+scripts/pubsub-server-refactor-autoloop/done.md
+scripts/pubsub-server-refactor-autoloop/iteration-*.out
+scripts/pubsub-server-refactor-autoloop/verify-*.out
+scripts/pubsub-server-refactor-autoloop/prompt-*.*
 scripts/redshift-autoloop/.run-loop.lock
 scripts/redshift-autoloop/.circuit-state
 scripts/redshift-autoloop/runner.jsonl
