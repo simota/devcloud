@@ -38,6 +38,17 @@ scripts/s3-test-coverage-autoloop/done.md
 scripts/s3-test-coverage-autoloop/iteration-*.out
 scripts/s3-test-coverage-autoloop/verify-*.out
 scripts/s3-test-coverage-autoloop/prompt-*.*
+scripts/s3-feature-parity-autoloop/.run-loop.lock
+scripts/s3-feature-parity-autoloop/.circuit-state
+scripts/s3-feature-parity-autoloop/runner.jsonl
+scripts/s3-feature-parity-autoloop/runner.log
+scripts/s3-feature-parity-autoloop/state.env
+scripts/s3-feature-parity-autoloop/state.env.sha256
+scripts/s3-feature-parity-autoloop/progress.md
+scripts/s3-feature-parity-autoloop/done.md
+scripts/s3-feature-parity-autoloop/iteration-*.out
+scripts/s3-feature-parity-autoloop/verify-*.out
+scripts/s3-feature-parity-autoloop/prompt-*.*
 scripts/gcs-autoloop/.run-loop.lock
 scripts/gcs-autoloop/.circuit-state
 scripts/gcs-autoloop/runner.jsonl

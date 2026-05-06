@@ -242,7 +242,7 @@ Legend:
 | Feature | Status | Notes |
 | --- | --- | --- |
 | Path-style bucket/object routes | Yes | Default route model. |
-| Virtual-host style routes | No | Config field exists, but runtime routing is path-style. |
+| Virtual-host style routes | Partial | `{bucket}.localhost` Host-header requests route to the same local bucket handlers; path-style remains the default. |
 | List buckets | Yes | `GET /`. |
 | Create, head, list, delete bucket | Yes | Empty-bucket delete is supported. |
 | Get bucket location | Yes | Returns configured region. |
@@ -254,10 +254,15 @@ Legend:
 | Multipart upload | Yes | Create/upload/list/complete/abort local multipart flows. |
 | Presigned URL validation | Yes | Covered for local SigV4 GET. |
 | AWS SigV4 header auth | Partial | Relaxed mode is default; strict mode validates local credentials. |
-| ACLs, bucket policy, IAM | No | Not implemented. |
-| Versioning, lifecycle, replication | No | Not implemented. |
-| SSE/KMS, Object Lock, notifications | No | Not implemented. |
-| S3 Select / inventory / analytics | No | Not implemented. |
+| ACLs, bucket policy, IAM | Partial | Bucket policy and bucket/object ACL metadata endpoints are supported locally, including versionId-aware object ACL metadata; IAM enforcement is not implemented. |
+| Versioning | Partial | Bucket versioning, generated and `null` version IDs, version-aware get/delete/copy-source, delete markers, multipart-complete version IDs/ETags, and local ListObjectVersions with key/version markers are supported. |
+| Lifecycle | Partial | Bucket lifecycle metadata endpoints are supported; Enabled expiration rules for current objects are applied locally on S3 reads/lists. |
+| Notifications | Partial | Bucket notification configuration metadata, including EventBridge metadata, is supported; matching local object create/delete flows append local event records. |
+| SSE/KMS | Partial | SSE-S3 and SSE-KMS request metadata is stored locally and exposed through object read/write response headers; real KMS and SSE-C are not implemented. |
+| Replication | Partial | Bucket replication configuration metadata is supported; enabled prefix rules replicate local object write/copy/multipart-complete flows and enabled delete marker replication to existing local destination buckets. |
+| Object Lock | Partial | Bucket object lock configuration, object retention/legal-hold metadata, response headers, local delete guards, and governance retention bypass are supported. |
+| S3 Select | Partial | Minimal SelectObjectContent supports `SELECT * FROM S3Object` for CSV and JSON Lines with eventstream responses; filtering and projections are not implemented. |
+| Inventory / analytics | Partial | Bucket inventory and analytics configuration metadata endpoints are supported locally; CSV-format enabled inventory configs generate deterministic local reports under bucket storage. |
 
 ### GCS-Compatible JSON API
 

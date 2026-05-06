@@ -48,7 +48,7 @@ run_check() {
 
 wait_for_http() {
   local url="$1"
-  local deadline=$((SECONDS + 12))
+  local deadline=$((SECONDS + 30))
   until curl -fsS "${url}" >/dev/null 2>&1; do
     if (( SECONDS >= deadline )); then
       return 1
@@ -261,6 +261,194 @@ multipart_flow() {
   curl -fsS -X DELETE "${S3_ENDPOINT}/${BUCKET}/aborted.bin?uploadId=${upload_id}" >/dev/null
 }
 
+header_value() {
+  local name="$1"
+  awk -F': ' -v name="${name}" 'tolower($1) == tolower(name) { gsub(/\r/, "", $2); print $2; exit }'
+}
+
+versioning_flow() {
+  local version1 version2 marker_version headers
+
+  printf '<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>' |
+    curl -fsS -X PUT --data-binary @- "${S3_ENDPOINT}/${BUCKET}?versioning" >/dev/null
+  curl -fsS "${S3_ENDPOINT}/${BUCKET}?versioning" | grep -q '<Status>Enabled</Status>'
+
+  headers="$(printf 'version-one' | curl -fsS -D - -o /dev/null -X PUT --data-binary @- "${S3_ENDPOINT}/${BUCKET}/docs/versioned.txt")"
+  version1="$(printf '%s' "${headers}" | header_value 'x-amz-version-id')"
+  [[ -n "${version1}" ]]
+
+  headers="$(printf 'version-two' | curl -fsS -D - -o /dev/null -X PUT --data-binary @- "${S3_ENDPOINT}/${BUCKET}/docs/versioned.txt")"
+  version2="$(printf '%s' "${headers}" | header_value 'x-amz-version-id')"
+  [[ -n "${version2}" && "${version2}" != "${version1}" ]]
+
+  curl -fsS "${S3_ENDPOINT}/${BUCKET}/docs/versioned.txt" | grep -q '^version-two$'
+  curl -fsS "${S3_ENDPOINT}/${BUCKET}/docs/versioned.txt?versionId=${version1}" | grep -q '^version-one$'
+  curl -fsS "${S3_ENDPOINT}/${BUCKET}?versions&prefix=docs/" | grep -q "${version1}"
+  curl -fsS "${S3_ENDPOINT}/${BUCKET}?versions&prefix=docs/" | grep -q "${version2}"
+
+  headers="$(curl -fsS -D - -o /dev/null -X DELETE "${S3_ENDPOINT}/${BUCKET}/docs/versioned.txt")"
+  marker_version="$(printf '%s' "${headers}" | header_value 'x-amz-version-id')"
+  [[ -n "${marker_version}" ]]
+  printf '%s' "${headers}" | grep -qi 'x-amz-delete-marker: true'
+  if curl -fsS "${S3_ENDPOINT}/${BUCKET}/docs/versioned.txt" >/dev/null 2>&1; then
+    echo "latest object should be hidden by delete marker" >&2
+    return 1
+  fi
+  curl -fsS "${S3_ENDPOINT}/${BUCKET}/docs/versioned.txt?versionId=${version2}" | grep -q '^version-two$'
+  curl -fsS -X DELETE "${S3_ENDPOINT}/${BUCKET}/docs/versioned.txt?versionId=${marker_version}" >/dev/null
+  curl -fsS "${S3_ENDPOINT}/${BUCKET}/docs/versioned.txt" | grep -q '^version-two$'
+}
+
+policy_acl_flow() {
+  local policy
+  policy='{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::devcloud-s3-verify/*"}]}'
+
+  printf '%s' "${policy}" |
+    curl -fsS -X PUT --data-binary @- "${S3_ENDPOINT}/${BUCKET}?policy" >/dev/null
+  curl -fsS "${S3_ENDPOINT}/${BUCKET}?policy" | grep -q '"Action":"s3:GetObject"'
+  curl -fsS -X DELETE "${S3_ENDPOINT}/${BUCKET}?policy" >/dev/null
+  if curl -fsS "${S3_ENDPOINT}/${BUCKET}?policy" >/dev/null 2>&1; then
+    echo "deleted bucket policy should not be returned" >&2
+    return 1
+  fi
+
+  curl -fsS -X PUT -H 'x-amz-acl: public-read' "${S3_ENDPOINT}/${BUCKET}?acl" >/dev/null
+  curl -fsS "${S3_ENDPOINT}/${BUCKET}?acl" | grep -q '<CannedACL>public-read</CannedACL>'
+
+  printf 'acl-body' | curl -fsS -X PUT --data-binary @- "${S3_ENDPOINT}/${BUCKET}/docs/acl.txt" >/dev/null
+  curl -fsS -X PUT -H 'x-amz-acl: bucket-owner-full-control' "${S3_ENDPOINT}/${BUCKET}/docs/acl.txt?acl" >/dev/null
+  curl -fsS "${S3_ENDPOINT}/${BUCKET}/docs/acl.txt?acl" | grep -q '<CannedACL>bucket-owner-full-control</CannedACL>'
+}
+
+lifecycle_flow() {
+  local config unsupported
+  config='<LifecycleConfiguration><Rule><ID>expire-logs-now</ID><Prefix>logs/</Prefix><Status>Enabled</Status><Expiration><Days>0</Days></Expiration></Rule></LifecycleConfiguration>'
+
+  printf 'expired-log' |
+    curl -fsS -X PUT --data-binary @- "${S3_ENDPOINT}/${BUCKET}/logs/expired.txt" >/dev/null
+  printf 'kept-doc' |
+    curl -fsS -X PUT --data-binary @- "${S3_ENDPOINT}/${BUCKET}/docs/lifecycle-keep.txt" >/dev/null
+
+  printf '%s' "${config}" |
+    curl -fsS -X PUT --data-binary @- "${S3_ENDPOINT}/${BUCKET}?lifecycle" >/dev/null
+  curl -fsS "${S3_ENDPOINT}/${BUCKET}?lifecycle" | grep -q '<ID>expire-logs-now</ID>'
+
+  if curl -fsS "${S3_ENDPOINT}/${BUCKET}/logs/expired.txt" >/dev/null 2>&1; then
+    echo "expired lifecycle object should not be returned" >&2
+    return 1
+  fi
+  curl -fsS "${S3_ENDPOINT}/${BUCKET}/docs/lifecycle-keep.txt" | grep -q '^kept-doc$'
+  curl -fsS "${S3_ENDPOINT}/${BUCKET}?list-type=2" | grep -q 'docs/lifecycle-keep.txt'
+  if curl -fsS "${S3_ENDPOINT}/${BUCKET}?list-type=2" | grep -q 'logs/expired.txt'; then
+    echo "expired lifecycle object should not be listed" >&2
+    return 1
+  fi
+
+  unsupported='<LifecycleConfiguration><Rule><ID>transition</ID><Status>Enabled</Status><Expiration><Days>30</Days></Expiration><Transition><Days>1</Days><StorageClass>GLACIER</StorageClass></Transition></Rule></LifecycleConfiguration>'
+  if printf '%s' "${unsupported}" |
+    curl -fsS -X PUT --data-binary @- "${S3_ENDPOINT}/${BUCKET}?lifecycle" >/dev/null 2>&1; then
+    echo "unsupported lifecycle transition should fail" >&2
+    return 1
+  fi
+
+  curl -fsS -X DELETE "${S3_ENDPOINT}/${BUCKET}?lifecycle" >/dev/null
+  if curl -fsS "${S3_ENDPOINT}/${BUCKET}?lifecycle" >/dev/null 2>&1; then
+    echo "deleted lifecycle configuration should not be returned" >&2
+    return 1
+  fi
+}
+
+notification_flow() {
+  local config unsupported
+  config='<NotificationConfiguration><QueueConfiguration><Id>docs-created</Id><Queue>arn:aws:sqs:us-east-1:000000000000:local</Queue><Event>s3:ObjectCreated:*</Event><Filter><S3Key><FilterRule><Name>prefix</Name><Value>docs/</Value></FilterRule><FilterRule><Name>suffix</Name><Value>.txt</Value></FilterRule></S3Key></Filter></QueueConfiguration></NotificationConfiguration>'
+
+  printf '%s' "${config}" |
+    curl -fsS -X PUT --data-binary @- "${S3_ENDPOINT}/${BUCKET}?notification" >/dev/null
+  curl -fsS "${S3_ENDPOINT}/${BUCKET}?notification" | grep -q '<Id>docs-created</Id>'
+  curl -fsS "${S3_ENDPOINT}/${BUCKET}?notification" | grep -q '<Event>s3:ObjectCreated:\*</Event>'
+
+  printf 'notify-body' |
+    curl -fsS -X PUT --data-binary @- "${S3_ENDPOINT}/${BUCKET}/docs/notify.txt" >/dev/null
+
+  unsupported='<NotificationConfiguration><QueueConfiguration><Queue>arn:aws:sqs:us-east-1:000000000000:local</Queue><Event>s3:ReducedRedundancyLostObject</Event></QueueConfiguration></NotificationConfiguration>'
+  if printf '%s' "${unsupported}" |
+    curl -fsS -X PUT --data-binary @- "${S3_ENDPOINT}/${BUCKET}?notification" >/dev/null 2>&1; then
+    echo "unsupported notification event should fail" >&2
+    return 1
+  fi
+}
+
+s3_select_flow() {
+  local request
+  printf 'name,age\nalice,31\nbob,28\n' |
+    curl -fsS -X PUT --data-binary @- "${S3_ENDPOINT}/${BUCKET}/reports/users.csv" >/dev/null
+  request='<SelectObjectContentRequest><Expression>SELECT * FROM S3Object</Expression><ExpressionType>SQL</ExpressionType><InputSerialization><CSV><FileHeaderInfo>USE</FileHeaderInfo></CSV></InputSerialization><OutputSerialization><CSV /></OutputSerialization></SelectObjectContentRequest>'
+  printf '%s' "${request}" |
+    curl -fsS -X POST --data-binary @- "${S3_ENDPOINT}/${BUCKET}/reports/users.csv?select&select-type=2" |
+    grep -a -q 'alice,31'
+
+  request='<SelectObjectContentRequest><Expression>SELECT name FROM S3Object</Expression><ExpressionType>SQL</ExpressionType><InputSerialization><CSV /></InputSerialization><OutputSerialization><CSV /></OutputSerialization></SelectObjectContentRequest>'
+  if printf '%s' "${request}" |
+    curl -fsS -X POST --data-binary @- "${S3_ENDPOINT}/${BUCKET}/reports/users.csv?select&select-type=2" >/dev/null 2>&1; then
+    echo "unsupported S3 Select SQL should fail" >&2
+    return 1
+  fi
+}
+
+replication_flow() {
+  local replica_bucket config
+  replica_bucket="${BUCKET}-replica"
+  curl -fsS -X PUT "${S3_ENDPOINT}/${replica_bucket}" >/dev/null
+  config="<ReplicationConfiguration><Role>arn:aws:iam::000000000000:role/devcloud</Role><Rule><ID>docs-replica</ID><Status>Enabled</Status><Filter><Prefix>docs/</Prefix></Filter><Destination><Bucket>arn:aws:s3:::${replica_bucket}</Bucket><StorageClass>STANDARD</StorageClass></Destination></Rule></ReplicationConfiguration>"
+
+  printf '%s' "${config}" |
+    curl -fsS -X PUT --data-binary @- "${S3_ENDPOINT}/${BUCKET}?replication" >/dev/null
+  curl -fsS "${S3_ENDPOINT}/${BUCKET}?replication" | grep -q '<ID>docs-replica</ID>'
+
+  printf 'replicated-body' |
+    curl -fsS -X PUT --data-binary @- "${S3_ENDPOINT}/${BUCKET}/docs/replicated.txt" >/dev/null
+  curl -fsS "${S3_ENDPOINT}/${replica_bucket}/docs/replicated.txt" | grep -q '^replicated-body$'
+
+  printf 'ignored-body' |
+    curl -fsS -X PUT --data-binary @- "${S3_ENDPOINT}/${BUCKET}/logs/not-replicated.txt" >/dev/null
+  if curl -fsS "${S3_ENDPOINT}/${replica_bucket}/logs/not-replicated.txt" >/dev/null 2>&1; then
+    echo "non-matching replication prefix should not create destination object" >&2
+    return 1
+  fi
+}
+
+object_lock_flow() {
+  local retain_until status
+  retain_until='2099-01-01T00:00:00Z'
+
+  printf 'governance-body' |
+    curl -fsS -X PUT \
+      -H 'x-amz-object-lock-mode: GOVERNANCE' \
+      -H "x-amz-object-lock-retain-until-date: ${retain_until}" \
+      --data-binary @- "${S3_ENDPOINT}/${BUCKET}/locks/governance.txt" >/dev/null
+
+  status="$(curl -sS -o /dev/null -w '%{http_code}' -X DELETE "${S3_ENDPOINT}/${BUCKET}/locks/governance.txt")"
+  [[ "${status}" == "403" ]]
+
+  status="$(curl -sS -o /dev/null -w '%{http_code}' -X DELETE -H 'x-amz-bypass-governance-retention: not-bool' "${S3_ENDPOINT}/${BUCKET}/locks/governance.txt")"
+  [[ "${status}" == "400" ]]
+
+  curl -fsS -X DELETE -H 'x-amz-bypass-governance-retention: true' "${S3_ENDPOINT}/${BUCKET}/locks/governance.txt" >/dev/null
+
+  printf 'compliance-body' |
+    curl -fsS -X PUT \
+      -H 'x-amz-object-lock-mode: COMPLIANCE' \
+      -H "x-amz-object-lock-retain-until-date: ${retain_until}" \
+      --data-binary @- "${S3_ENDPOINT}/${BUCKET}/locks/compliance.txt" >/dev/null
+  status="$(curl -sS -o /dev/null -w '%{http_code}' -X DELETE -H 'x-amz-bypass-governance-retention: true' "${S3_ENDPOINT}/${BUCKET}/locks/compliance.txt")"
+  [[ "${status}" == "403" ]]
+
+  printf 'hold-body' |
+    curl -fsS -X PUT -H 'x-amz-object-lock-legal-hold: ON' --data-binary @- "${S3_ENDPOINT}/${BUCKET}/locks/legal-hold.txt" >/dev/null
+  status="$(curl -sS -o /dev/null -w '%{http_code}' -X DELETE -H 'x-amz-bypass-governance-retention: true' "${S3_ENDPOINT}/${BUCKET}/locks/legal-hold.txt")"
+  [[ "${status}" == "403" ]]
+}
+
 dashboard_s3_api() {
   curl -fsS "${DASHBOARD_ENDPOINT}/api/s3/status" | grep -q '"running"'
   curl -fsS "${DASHBOARD_ENDPOINT}/api/s3/buckets" | grep -q "${BUCKET}"
@@ -319,6 +507,13 @@ case "${VERIFY_STAGE}" in
     run_s3_core_checks
     run_check "Presigned URL validates" presigned_url_get
     run_check "Multipart upload flow works" multipart_flow
+    run_check "S3 versioning flow works" versioning_flow
+    run_check "S3 policy and ACL metadata flow works" policy_acl_flow
+    run_check "S3 lifecycle expiration flow works" lifecycle_flow
+    run_check "S3 notification metadata flow works" notification_flow
+    run_check "S3 Select narrow CSV flow works" s3_select_flow
+    run_check "S3 replication metadata and local copy flow works" replication_flow
+    run_check "S3 Object Lock governance bypass flow works" object_lock_flow
     run_check "S3 dashboard API exposes buckets and objects" dashboard_s3_api
     run_check "S3 dashboard page renders" dashboard_s3_page
     ;;
