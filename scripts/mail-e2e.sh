@@ -6,8 +6,8 @@ cd "${ROOT_DIR}"
 
 export GOCACHE="${GOCACHE:-${ROOT_DIR}/.devcloud/go-build}"
 
-SMTP_PORT="${E2E_SMTP_PORT:-1025}"
-DASHBOARD_PORT="${E2E_DASHBOARD_PORT:-8025}"
+SMTP_PORT="${E2E_SMTP_PORT:-12026}"
+DASHBOARD_PORT="${E2E_DASHBOARD_PORT:-18026}"
 KEEP_WORKDIR="${E2E_KEEP_WORKDIR:-false}"
 INTERACTIVE="${E2E_INTERACTIVE:-false}"
 DELETE_MESSAGE="${E2E_DELETE_MESSAGE:-true}"
@@ -92,6 +92,20 @@ services:
   mail:
     enabled: true
     maxMessageBytes: 10485760
+  s3:
+    enabled: false
+  gcs:
+    enabled: false
+  dynamodb:
+    enabled: false
+  bigquery:
+    enabled: false
+  redshift:
+    enabled: false
+  sqs:
+    enabled: false
+  pubsub:
+    enabled: false
 EOF
 }
 
