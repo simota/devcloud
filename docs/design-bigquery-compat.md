@@ -925,6 +925,7 @@ full: all of the above + client smoke
 | AC-009 | `VERIFY_STAGE=full bash scripts/bigquery-autoloop/verify.sh` passes. |
 | AC-010 | View table metadata and routine metadata CRUD persist through the REST catalog surface. |
 | AC-011 | View table queries resolve through the local GoogleSQL subset and support outer projection/filter/order/limit. |
+| AC-012 | Query jobs can materialize results into destination tables with create/write disposition enforcement. |
 
 ## References
 
@@ -944,3 +945,4 @@ full: all of the above + client smoke
 | 2026-05-01 | Initial BigQuery compatibility design draft. |
 | 2026-05-06 | Added implemented catalog parity target for view metadata and routine metadata CRUD. |
 | 2026-05-06 | Added local view query execution target for the existing SELECT evaluator subset. |
+| 2026-05-06 | Added query job destination table materialization for balanced job workflow parity. |

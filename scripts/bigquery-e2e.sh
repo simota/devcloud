@@ -20,6 +20,7 @@ LOCATION="${E2E_BIGQUERY_LOCATION:-US}"
 DATASET="${E2E_BIGQUERY_DATASET:-devcloud_e2e_$(date +%s)}"
 TABLE="${E2E_BIGQUERY_TABLE:-people}"
 COPY_TABLE="${E2E_BIGQUERY_COPY_TABLE:-people_copy}"
+QUERY_TABLE="${E2E_BIGQUERY_QUERY_TABLE:-people_query}"
 VIEW_TABLE="${E2E_BIGQUERY_VIEW_TABLE:-active_people}"
 ROUTINE="${E2E_BIGQUERY_ROUTINE:-normalize_name}"
 BUCKET="${E2E_BIGQUERY_BUCKET:-devcloud-bigquery-e2e-$(date +%s)}"
@@ -43,6 +44,7 @@ Environment:
   E2E_BIGQUERY_PROJECT=devcloud       Override the BigQuery project id.
   E2E_BIGQUERY_DATASET=devcloud_e2e   Override the test dataset id.
   E2E_BIGQUERY_TABLE=people           Override the primary test table id.
+  E2E_BIGQUERY_QUERY_TABLE=people_query Override the query destination table id.
   E2E_BIGQUERY_VIEW_TABLE=active_people Override the view metadata table id.
   E2E_BIGQUERY_ROUTINE=normalize_name Override the routine metadata id.
   E2E_BIGQUERY_BUCKET=devcloud-bq     Override the local GCS bucket for extract checks.
@@ -356,6 +358,20 @@ insert_and_query_rows() {
     \"useLegacySql\":false,
     \"location\":\"${LOCATION}\"
   }" | json_assert 'data["jobComplete"] is True and data["totalRows"] == "1" and data["rows"][0]["f"][1]["v"] == "Ada"'
+
+  json_post "${BIGQUERY_ENDPOINT}/bigquery/v2/projects/${PROJECT}/jobs" "{
+    \"jobReference\":{\"projectId\":\"${PROJECT}\",\"jobId\":\"query_to_table_e2e\",\"location\":\"${LOCATION}\"},
+    \"configuration\":{\"query\":{
+      \"query\":\"SELECT id, age FROM ${PROJECT}.${DATASET}.${TABLE} WHERE age >= 30 ORDER BY id\",
+      \"useLegacySql\":false,
+      \"destinationTable\":{\"projectId\":\"${PROJECT}\",\"datasetId\":\"${DATASET}\",\"tableId\":\"${QUERY_TABLE}\"},
+      \"createDisposition\":\"CREATE_IF_NEEDED\",
+      \"writeDisposition\":\"WRITE_TRUNCATE\"
+    }}
+  }" | json_assert 'data["status"]["state"] == "DONE" and data["configuration"]["query"]["destinationTable"]["tableId"] == "'"${QUERY_TABLE}"'"'
+
+  json_get "${BIGQUERY_ENDPOINT}/bigquery/v2/projects/${PROJECT}/datasets/${DATASET}/tables/${QUERY_TABLE}/data?maxResults=10" |
+    json_assert 'data["totalRows"] == "2" and data["rows"][0]["f"][1]["v"] == "37"'
 }
 
 exercise_copy_and_extract_jobs() {
@@ -400,6 +416,7 @@ assert_dashboard_api() {
 delete_data() {
   json_delete "${BIGQUERY_ENDPOINT}/bigquery/v2/projects/${PROJECT}/datasets/${DATASET}/routines/${ROUTINE}" >/dev/null 2>&1 || true
   json_delete "${BIGQUERY_ENDPOINT}/bigquery/v2/projects/${PROJECT}/datasets/${DATASET}/tables/${VIEW_TABLE}" >/dev/null 2>&1 || true
+  json_delete "${BIGQUERY_ENDPOINT}/bigquery/v2/projects/${PROJECT}/datasets/${DATASET}/tables/${QUERY_TABLE}" >/dev/null 2>&1 || true
   json_delete "${BIGQUERY_ENDPOINT}/bigquery/v2/projects/${PROJECT}/datasets/${DATASET}/tables/${COPY_TABLE}" >/dev/null 2>&1 || true
   json_delete "${BIGQUERY_ENDPOINT}/bigquery/v2/projects/${PROJECT}/datasets/${DATASET}/tables/${TABLE}" >/dev/null 2>&1 || true
   json_delete "${BIGQUERY_ENDPOINT}/bigquery/v2/projects/${PROJECT}/datasets/${DATASET}?deleteContents=true" >/dev/null 2>&1 || true
@@ -440,7 +457,7 @@ show_retained_data() {
     return 0
   fi
   log "retained BigQuery dataset: ${PROJECT}.${DATASET}"
-  log "retained BigQuery tables: ${TABLE}, ${COPY_TABLE}, ${VIEW_TABLE}"
+  log "retained BigQuery tables: ${TABLE}, ${COPY_TABLE}, ${QUERY_TABLE}, ${VIEW_TABLE}"
   log "retained BigQuery routine: ${ROUTINE}"
   log "retained GCS bucket: ${BUCKET}"
   log "retained workspace: ${WORKSPACE}"

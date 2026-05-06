@@ -1561,6 +1561,95 @@ func TestJobsInsertQueryJobDryRunPersistsSchemaOnly(t *testing.T) {
 	}
 }
 
+func TestJobsInsertQueryJobWritesDestinationTable(t *testing.T) {
+	server := NewServer(Config{Project: "local-project", Location: "US", StoragePath: t.TempDir()})
+	createDatasetForTest(t, server, "local-project", "analytics")
+	createTableForTest(t, server, "local-project", "analytics", "people")
+	insertRowsForTest(t, server, "local-project", "analytics", "people")
+
+	insert := httptest.NewRecorder()
+	body := `{"jobReference":{"jobId":"query_to_table","location":"US"},"configuration":{"query":{"query":"SELECT id, age FROM ` + "`local-project.analytics.people`" + ` WHERE age >= 30 ORDER BY id","useLegacySql":false,"destinationTable":{"datasetId":"analytics","tableId":"people_query"},"createDisposition":"CREATE_IF_NEEDED","writeDisposition":"WRITE_TRUNCATE"}}}`
+	server.routes().ServeHTTP(insert, httptest.NewRequest(http.MethodPost, "/bigquery/v2/projects/local-project/jobs", strings.NewReader(body)))
+	if insert.Code != http.StatusOK {
+		t.Fatalf("query destination status = %d, body = %s", insert.Code, insert.Body.String())
+	}
+	var job jobResource
+	if err := json.NewDecoder(insert.Body).Decode(&job); err != nil {
+		t.Fatalf("decode query destination job: %v", err)
+	}
+	if job.Configuration.Query.DestinationTable.TableID != "people_query" || job.Statistics.Query.TotalRows != "2" {
+		t.Fatalf("query destination job = %#v", job)
+	}
+
+	tableRec := httptest.NewRecorder()
+	server.routes().ServeHTTP(tableRec, httptest.NewRequest(http.MethodGet, "/bigquery/v2/projects/local-project/datasets/analytics/tables/people_query", nil))
+	if tableRec.Code != http.StatusOK {
+		t.Fatalf("destination table status = %d, body = %s", tableRec.Code, tableRec.Body.String())
+	}
+	var table tableResource
+	if err := json.NewDecoder(tableRec.Body).Decode(&table); err != nil {
+		t.Fatalf("decode destination table: %v", err)
+	}
+	if table.NumRows != "2" || len(table.Schema.Fields) != 2 || table.Schema.Fields[0].Name != "id" || table.Schema.Fields[1].Name != "age" {
+		t.Fatalf("destination table = %#v", table)
+	}
+
+	rows := httptest.NewRecorder()
+	server.routes().ServeHTTP(rows, httptest.NewRequest(http.MethodGet, "/bigquery/v2/projects/local-project/datasets/analytics/tables/people_query/data", nil))
+	var rowList tableDataListResponse
+	if err := json.NewDecoder(rows.Body).Decode(&rowList); err != nil {
+		t.Fatalf("decode query destination rows: %v", err)
+	}
+	if rowList.TotalRows != "2" || len(rowList.Rows) != 2 || rowList.Rows[0].F[0].V != "1" || rowList.Rows[0].F[1].V != "37" {
+		t.Fatalf("query destination rows = %#v", rowList)
+	}
+}
+
+func TestJobsInsertQueryJobHonorsDestinationDispositions(t *testing.T) {
+	server := NewServer(Config{Project: "local-project", Location: "US", StoragePath: t.TempDir()})
+	createDatasetForTest(t, server, "local-project", "analytics")
+	createTableForTest(t, server, "local-project", "analytics", "people")
+	insertRowsForTest(t, server, "local-project", "analytics", "people")
+
+	createNever := httptest.NewRecorder()
+	createNeverBody := `{"configuration":{"query":{"query":"SELECT id FROM ` + "`local-project.analytics.people`" + `","useLegacySql":false,"destinationTable":{"datasetId":"analytics","tableId":"missing"},"createDisposition":"CREATE_NEVER"}}}`
+	server.routes().ServeHTTP(createNever, httptest.NewRequest(http.MethodPost, "/bigquery/v2/projects/local-project/jobs", strings.NewReader(createNeverBody)))
+	if createNever.Code != http.StatusBadRequest {
+		t.Fatalf("CREATE_NEVER status = %d, body = %s", createNever.Code, createNever.Body.String())
+	}
+
+	first := httptest.NewRecorder()
+	firstBody := `{"jobReference":{"jobId":"query_write_empty_first"},"configuration":{"query":{"query":"SELECT id, age FROM ` + "`local-project.analytics.people`" + `","useLegacySql":false,"destinationTable":{"datasetId":"analytics","tableId":"query_disposition"},"writeDisposition":"WRITE_EMPTY"}}}`
+	server.routes().ServeHTTP(first, httptest.NewRequest(http.MethodPost, "/bigquery/v2/projects/local-project/jobs", strings.NewReader(firstBody)))
+	if first.Code != http.StatusOK {
+		t.Fatalf("first WRITE_EMPTY status = %d, body = %s", first.Code, first.Body.String())
+	}
+
+	writeEmptyAgain := httptest.NewRecorder()
+	writeEmptyAgainBody := `{"configuration":{"query":{"query":"SELECT id, age FROM ` + "`local-project.analytics.people`" + `","useLegacySql":false,"destinationTable":{"datasetId":"analytics","tableId":"query_disposition"},"writeDisposition":"WRITE_EMPTY"}}}`
+	server.routes().ServeHTTP(writeEmptyAgain, httptest.NewRequest(http.MethodPost, "/bigquery/v2/projects/local-project/jobs", strings.NewReader(writeEmptyAgainBody)))
+	if writeEmptyAgain.Code != http.StatusBadRequest {
+		t.Fatalf("second WRITE_EMPTY status = %d, body = %s", writeEmptyAgain.Code, writeEmptyAgain.Body.String())
+	}
+
+	appendRec := httptest.NewRecorder()
+	appendBody := `{"jobReference":{"jobId":"query_append"},"configuration":{"query":{"query":"SELECT id, age FROM ` + "`local-project.analytics.people`" + `","useLegacySql":false,"destinationTable":{"datasetId":"analytics","tableId":"query_disposition"},"writeDisposition":"WRITE_APPEND"}}}`
+	server.routes().ServeHTTP(appendRec, httptest.NewRequest(http.MethodPost, "/bigquery/v2/projects/local-project/jobs", strings.NewReader(appendBody)))
+	if appendRec.Code != http.StatusOK {
+		t.Fatalf("WRITE_APPEND status = %d, body = %s", appendRec.Code, appendRec.Body.String())
+	}
+
+	rows := httptest.NewRecorder()
+	server.routes().ServeHTTP(rows, httptest.NewRequest(http.MethodGet, "/bigquery/v2/projects/local-project/datasets/analytics/tables/query_disposition/data", nil))
+	var rowList tableDataListResponse
+	if err := json.NewDecoder(rows.Body).Decode(&rowList); err != nil {
+		t.Fatalf("decode disposition rows: %v", err)
+	}
+	if rowList.TotalRows != "4" || len(rowList.Rows) != 4 {
+		t.Fatalf("disposition rows = %#v", rowList)
+	}
+}
+
 func TestJobsListCancelAndDeleteMetadata(t *testing.T) {
 	server := NewServer(Config{Project: "local-project", Location: "US", StoragePath: t.TempDir()})
 	createDatasetForTest(t, server, "local-project", "analytics")

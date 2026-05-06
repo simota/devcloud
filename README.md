@@ -286,7 +286,7 @@ Legend:
 | Partitioning and clustering metadata | Yes | Time/range partitioning and clustering fields round-trip in table metadata. |
 | View metadata and query execution | Partial | View table resources persist query metadata and can be queried through the local SELECT subset. |
 | Routine metadata | Partial | `routines.insert/list/get/patch/update/delete` persist local UDF/procedure metadata; routines are not executable. |
-| Jobs API | Yes | Query, load, copy, extract, get, list, cancel, and result workflows are covered locally. |
+| Jobs API | Yes | Query, query destination tables, load, copy, extract, get, list, cancel, and result workflows are covered locally. |
 | GoogleSQL query execution | Partial | Deterministic local subset for common `SELECT` workflows; unsupported syntax fails closed. |
 | Google Cloud BigQuery client libraries | Partial | Go SDK dataset/table/row/query smoke workflows are covered with endpoint override. |
 | IAM policy endpoints | Partial | Local policy shape is supported; no real Google IAM enforcement. |
