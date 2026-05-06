@@ -209,6 +209,17 @@ scripts/sqs-dashboard-management-autoloop/done.md
 scripts/sqs-dashboard-management-autoloop/iteration-*.out
 scripts/sqs-dashboard-management-autoloop/verify-*.out
 scripts/sqs-dashboard-management-autoloop/prompt-*.*
+scripts/sqs-server-refactor-autoloop/.run-loop.lock
+scripts/sqs-server-refactor-autoloop/.circuit-state
+scripts/sqs-server-refactor-autoloop/runner.jsonl
+scripts/sqs-server-refactor-autoloop/runner.log
+scripts/sqs-server-refactor-autoloop/state.env
+scripts/sqs-server-refactor-autoloop/state.env.sha256
+scripts/sqs-server-refactor-autoloop/progress.md
+scripts/sqs-server-refactor-autoloop/done.md
+scripts/sqs-server-refactor-autoloop/iteration-*.out
+scripts/sqs-server-refactor-autoloop/verify-*.out
+scripts/sqs-server-refactor-autoloop/prompt-*.*
 scripts/pubsub-autoloop/.run-loop.lock
 scripts/pubsub-autoloop/.circuit-state
 scripts/pubsub-autoloop/runner.jsonl
