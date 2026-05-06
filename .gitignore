@@ -16,6 +16,17 @@ scripts/s3-autoloop/progress.md
 scripts/s3-autoloop/done.md
 scripts/s3-autoloop/iteration-*.out
 scripts/s3-autoloop/prompt-*.*
+scripts/s3-dashboard-management-autoloop/.run-loop.lock
+scripts/s3-dashboard-management-autoloop/.circuit-state
+scripts/s3-dashboard-management-autoloop/runner.jsonl
+scripts/s3-dashboard-management-autoloop/runner.log
+scripts/s3-dashboard-management-autoloop/state.env
+scripts/s3-dashboard-management-autoloop/state.env.sha256
+scripts/s3-dashboard-management-autoloop/progress.md
+scripts/s3-dashboard-management-autoloop/done.md
+scripts/s3-dashboard-management-autoloop/iteration-*.out
+scripts/s3-dashboard-management-autoloop/verify-*.out
+scripts/s3-dashboard-management-autoloop/prompt-*.*
 scripts/gcs-autoloop/.run-loop.lock
 scripts/gcs-autoloop/.circuit-state
 scripts/gcs-autoloop/runner.jsonl

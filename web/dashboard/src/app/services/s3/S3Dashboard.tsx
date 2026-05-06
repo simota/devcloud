@@ -6,7 +6,7 @@ import type { DashboardService } from '../dashboard/types'
 import { BucketSidebar } from './BucketSidebar'
 import { ObjectBrowser } from './ObjectBrowser'
 import { ObjectInspector } from './ObjectInspector'
-import { listS3Buckets } from './api'
+import { copyS3Object, createS3Bucket, deleteS3Bucket, deleteS3Object, listS3Buckets, uploadS3Object } from './api'
 import type { S3BucketSummary, S3ObjectSummary } from './types'
 
 type BucketsState =
@@ -22,6 +22,9 @@ export function S3Dashboard({ service }: S3DashboardProps): JSX.Element {
   const [bucketsState, setBucketsState] = useState<BucketsState>({ status: 'loading' })
   const [activeBucket, setActiveBucket] = useState<string>()
   const [activeObject, setActiveObject] = useState<S3ObjectSummary>()
+  const [bucketName, setBucketName] = useState('')
+  const [message, setMessage] = useState('')
+  const [objectsRefreshNonce, setObjectsRefreshNonce] = useState(0)
   const isDisabled = service?.status === 'disabled'
 
   const refreshBuckets = useCallback(() => {
@@ -75,6 +78,97 @@ export function S3Dashboard({ service }: S3DashboardProps): JSX.Element {
     setActiveObject(undefined)
   }
 
+  function createBucket(): void {
+    const name = bucketName.trim()
+    if (isDisabled || name === '') {
+      return
+    }
+    createS3Bucket(name)
+      .then((bucket) => {
+        setMessage(`Created bucket ${bucket.name}`)
+        setBucketName('')
+        setActiveBucket(bucket.name)
+        refreshBuckets()
+      })
+      .catch((error: Error) => setMessage(error.message))
+  }
+
+  function confirmDeleteBucket(bucketName: string): void {
+    if (isDisabled || window.prompt(`Confirm DeleteBucket by typing ${bucketName}`) !== bucketName) {
+      return
+    }
+    deleteS3Bucket(bucketName)
+      .then(() => {
+        setMessage(`Deleted bucket ${bucketName}`)
+        setActiveBucket((current) => (current === bucketName ? undefined : current))
+        setActiveObject(undefined)
+        refreshBuckets()
+      })
+      .catch((error: Error) => setMessage(error.message))
+  }
+
+  function confirmDeleteObject(object: S3ObjectSummary): void {
+    if (!selectedBucket || isDisabled || window.prompt(`Confirm DeleteObject by typing ${object.key}`) !== object.key) {
+      return
+    }
+    deleteS3Object(selectedBucket, object.key)
+      .then(() => {
+        setMessage(`Deleted object ${object.s3Uri}`)
+        setActiveObject(undefined)
+        setObjectsRefreshNonce((current) => current + 1)
+        refreshBuckets()
+      })
+      .catch((error: Error) => setMessage(error.message))
+  }
+
+  async function uploadObject(input: {
+    key: string
+    file: File
+    contentType: string
+    metadata: Record<string, string>
+  }): Promise<void> {
+    if (!selectedBucket || isDisabled) {
+      return
+    }
+    try {
+      const object = await uploadS3Object({
+        bucketName: selectedBucket,
+        objectKey: input.key,
+        body: input.file,
+        contentType: input.contentType,
+        metadata: input.metadata,
+      })
+      setMessage(`Uploaded object ${object.s3Uri}`)
+      setActiveObject(object)
+      setObjectsRefreshNonce((current) => current + 1)
+      refreshBuckets()
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : 'S3 upload failed')
+      throw error
+    }
+  }
+
+  async function copyObject(destinationKey: string): Promise<void> {
+    if (!selectedBucket || !selectedObject || isDisabled) {
+      return
+    }
+    try {
+      const object = await copyS3Object({
+        sourceBucketName: selectedBucket,
+        sourceObjectKey: selectedObject.key,
+        destinationBucketName: selectedBucket,
+        destinationObjectKey: destinationKey,
+      })
+      setMessage(`Copied object ${selectedObject.s3Uri} to ${object.s3Uri}`)
+      setActiveObject(object)
+      setObjectsRefreshNonce((current) => current + 1)
+      refreshBuckets()
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : 'S3 copy failed')
+      throw error
+    }
+  }
+
   return (
     <div className="s3-workspace">
       <Panel title="Buckets">
@@ -94,23 +188,64 @@ export function S3Dashboard({ service }: S3DashboardProps): JSX.Element {
           />
         ) : null}
         {bucketsState.status === 'success' ? (
-          <BucketSidebar buckets={buckets} activeBucket={selectedBucket} onSelectBucket={selectBucket} />
+          <div className="gcs-sidebar">
+            <CreateBucketForm bucketName={bucketName} disabled={isDisabled} onChange={setBucketName} onCreate={createBucket} />
+            <BucketSidebar
+              buckets={buckets}
+              activeBucket={selectedBucket}
+              disabled={isDisabled}
+              onDeleteBucket={confirmDeleteBucket}
+              onSelectBucket={selectBucket}
+            />
+          </div>
         ) : null}
       </Panel>
       <Panel title="Object browser">
         <ObjectBrowser
           bucketName={selectedBucket}
           activeObjectKey={selectedObject?.key}
+          disabled={isDisabled}
+          refreshNonce={objectsRefreshNonce}
           onClearObject={clearActiveObject}
+          onDeleteObject={confirmDeleteObject}
+          onUploadObject={uploadObject}
           onSelectObject={setActiveObject}
         />
       </Panel>
       <Panel title="Inspector">
-        <ObjectInspector bucketName={selectedBucket} object={selectedObject} />
+        <ObjectInspector bucketName={selectedBucket} disabled={isDisabled} object={selectedObject} onCopyObject={copyObject} />
       </Panel>
       <a className="compat-link" href="/s3">
         Open current S3 dashboard
       </a>
+      {message ? <p className="inspector-muted gcs-message">{message}</p> : null}
+    </div>
+  )
+}
+
+type CreateBucketFormProps = {
+  bucketName: string
+  disabled: boolean
+  onChange: (value: string) => void
+  onCreate: () => void
+}
+
+function CreateBucketForm({ bucketName, disabled, onChange, onCreate }: CreateBucketFormProps): JSX.Element {
+  return (
+    <div className="gcs-create-bucket">
+      <label className="prefix-filter">
+        <span>CreateBucket</span>
+        <input
+          aria-label="S3 bucket name"
+          disabled={disabled}
+          onChange={(event) => onChange(event.target.value)}
+          placeholder="local-bucket"
+          value={bucketName}
+        />
+      </label>
+      <Button disabled={disabled || bucketName.trim() === ''} onClick={onCreate}>
+        Create
+      </Button>
     </div>
   )
 }

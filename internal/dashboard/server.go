@@ -1173,7 +1173,15 @@ func (s *Server) handleS3Bucket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if strings.HasPrefix(suffix, "objects/") {
-		s.handleS3ObjectDownload(w, r, bucket, strings.TrimPrefix(suffix, "objects/"))
+		s.handleS3Object(w, r, bucket, strings.TrimPrefix(suffix, "objects/"))
+		return
+	}
+	if suffix == "multipart" {
+		s.handleS3MultipartUploads(w, r, bucket)
+		return
+	}
+	if strings.HasPrefix(suffix, "multipart/") {
+		s.handleS3MultipartUpload(w, r, bucket, strings.TrimPrefix(suffix, "multipart/"))
 		return
 	}
 	http.NotFound(w, r)
@@ -1238,25 +1246,181 @@ func (s *Server) handleS3Objects(w http.ResponseWriter, r *http.Request, bucket 
 		Objects: make([]s3ObjectSummary, 0, len(objects)),
 	}
 	for _, object := range objects {
-		response.Objects = append(response.Objects, s3ObjectSummary{
-			Key:          object.Key,
-			Size:         object.Size,
-			ETag:         object.ETag,
-			ContentType:  object.ContentType,
-			LastModified: object.LastModified,
-			Metadata:     object.Metadata,
-			S3URI:        "s3://" + bucket + "/" + object.Key,
-			DownloadURL:  "/api/s3/buckets/" + url.PathEscape(bucket) + "/objects/" + url.PathEscape(object.Key) + "/download",
+		response.Objects = append(response.Objects, s3ObjectResponse(bucket, object))
+	}
+	writeJSON(w, response)
+}
+
+func (s *Server) handleS3MultipartUploads(w http.ResponseWriter, r *http.Request, bucket string) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w, "GET")
+		return
+	}
+	uploads, ok, err := s.s3.ListMultipartUploads(r.Context(), bucket)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+	response := struct {
+		Bucket  string                     `json:"bucket"`
+		Uploads []s3MultipartUploadSummary `json:"uploads"`
+	}{
+		Bucket:  bucket,
+		Uploads: make([]s3MultipartUploadSummary, 0, len(uploads)),
+	}
+	for _, upload := range uploads {
+		response.Uploads = append(response.Uploads, s3MultipartUploadSummary{
+			Key:         upload.Key,
+			UploadID:    upload.UploadID,
+			Initiated:   upload.CreatedAt,
+			ContentType: upload.ContentType,
+			Metadata:    upload.Metadata,
 		})
 	}
 	writeJSON(w, response)
 }
 
-func (s *Server) handleS3ObjectDownload(w http.ResponseWriter, r *http.Request, bucket string, path string) {
-	if r.Method != http.MethodGet {
-		methodNotAllowed(w, "GET")
+func (s *Server) handleS3MultipartUpload(w http.ResponseWriter, r *http.Request, bucket string, escapedUploadID string) {
+	if r.Method != http.MethodDelete {
+		methodNotAllowed(w, "DELETE")
 		return
 	}
+	uploadID, err := url.PathUnescape(escapedUploadID)
+	if err != nil || uploadID == "" {
+		http.Error(w, "invalid upload id", http.StatusBadRequest)
+		return
+	}
+	uploads, ok, err := s.s3.ListMultipartUploads(r.Context(), bucket)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+	for _, upload := range uploads {
+		if upload.UploadID != uploadID {
+			continue
+		}
+		aborted, err := s.s3.AbortMultipartUpload(r.Context(), bucket, upload.Key, uploadID)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if !aborted {
+			http.NotFound(w, r)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	http.NotFound(w, r)
+}
+
+func (s *Server) handleS3Object(w http.ResponseWriter, r *http.Request, bucket string, path string) {
+	if path == "" {
+		http.NotFound(w, r)
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		s.handleS3ObjectDownload(w, r, bucket, path)
+	case http.MethodPut:
+		s.handleS3ObjectPut(w, r, bucket, path)
+	case http.MethodDelete:
+		key, err := url.PathUnescape(path)
+		if err != nil {
+			http.Error(w, "invalid object path", http.StatusBadRequest)
+			return
+		}
+		deleted, err := s.s3.DeleteObject(r.Context(), bucket, key)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if !deleted {
+			http.NotFound(w, r)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	default:
+		methodNotAllowed(w, "GET, PUT, DELETE")
+	}
+}
+
+func (s *Server) handleS3ObjectPut(w http.ResponseWriter, r *http.Request, bucket string, path string) {
+	key, err := url.PathUnescape(path)
+	if err != nil {
+		http.Error(w, "invalid object path", http.StatusBadRequest)
+		return
+	}
+	if key == "" {
+		http.NotFound(w, r)
+		return
+	}
+
+	copySource := r.Header.Get("x-amz-copy-source")
+	var object s3svc.Object
+	if copySource == "" {
+		defer r.Body.Close()
+		object, err = s.s3.PutObject(r.Context(), s3svc.PutObjectInput{
+			Bucket:             bucket,
+			Key:                key,
+			Body:               r.Body,
+			ContentType:        r.Header.Get("Content-Type"),
+			ContentEncoding:    r.Header.Get("Content-Encoding"),
+			CacheControl:       r.Header.Get("Cache-Control"),
+			ContentDisposition: r.Header.Get("Content-Disposition"),
+			Metadata:           s3UserMetadataFromHeaders(r.Header),
+		})
+	} else {
+		sourceBucket, sourceKey, parseErr := parseDashboardS3CopySource(copySource)
+		if parseErr != nil {
+			http.Error(w, parseErr.Error(), http.StatusBadRequest)
+			return
+		}
+		sourceObject, body, found, getErr := s.s3.GetObject(r.Context(), sourceBucket, sourceKey)
+		if getErr != nil {
+			http.Error(w, getErr.Error(), http.StatusBadRequest)
+			return
+		}
+		if !found {
+			http.NotFound(w, r)
+			return
+		}
+		input := s3svc.PutObjectInput{
+			Bucket:             bucket,
+			Key:                key,
+			Body:               bytes.NewReader(body),
+			ContentType:        sourceObject.ContentType,
+			ContentEncoding:    sourceObject.ContentEncoding,
+			CacheControl:       sourceObject.CacheControl,
+			ContentDisposition: sourceObject.ContentDisposition,
+			Metadata:           sourceObject.Metadata,
+		}
+		if strings.EqualFold(r.Header.Get("x-amz-metadata-directive"), "REPLACE") {
+			input.ContentType = r.Header.Get("Content-Type")
+			input.ContentEncoding = r.Header.Get("Content-Encoding")
+			input.CacheControl = r.Header.Get("Cache-Control")
+			input.ContentDisposition = r.Header.Get("Content-Disposition")
+			input.Metadata = s3UserMetadataFromHeaders(r.Header)
+		}
+		object, err = s.s3.PutObject(r.Context(), input)
+	}
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	w.Header().Set("ETag", object.ETag)
+	writeJSON(w, s3ObjectResponse(bucket, object))
+}
+
+func (s *Server) handleS3ObjectDownload(w http.ResponseWriter, r *http.Request, bucket string, path string) {
 	escapedKey, ok := strings.CutSuffix(path, "/download")
 	if !ok || escapedKey == "" {
 		http.NotFound(w, r)
@@ -1294,6 +1458,51 @@ func (s *Server) handleS3ObjectDownload(w http.ResponseWriter, r *http.Request, 
 	}
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(body)
+}
+
+func s3ObjectResponse(bucket string, object s3svc.Object) s3ObjectSummary {
+	return s3ObjectSummary{
+		Key:          object.Key,
+		Size:         object.Size,
+		ETag:         object.ETag,
+		ContentType:  object.ContentType,
+		LastModified: object.LastModified,
+		Metadata:     object.Metadata,
+		S3URI:        "s3://" + bucket + "/" + object.Key,
+		DownloadURL:  "/api/s3/buckets/" + url.PathEscape(bucket) + "/objects/" + url.PathEscape(object.Key) + "/download",
+	}
+}
+
+func s3UserMetadataFromHeaders(header http.Header) map[string]string {
+	metadata := map[string]string{}
+	for key, values := range header {
+		lower := strings.ToLower(key)
+		if !strings.HasPrefix(lower, "x-amz-meta-") || len(values) == 0 {
+			continue
+		}
+		metadata[strings.TrimPrefix(lower, "x-amz-meta-")] = values[0]
+	}
+	if len(metadata) == 0 {
+		return nil
+	}
+	return metadata
+}
+
+func parseDashboardS3CopySource(source string) (string, string, error) {
+	trimmed := strings.TrimPrefix(source, "/")
+	sourceBucket, sourceKey, ok := strings.Cut(trimmed, "/")
+	if !ok || sourceBucket == "" || sourceKey == "" {
+		return "", "", errors.New("invalid copy source")
+	}
+	bucket, err := url.PathUnescape(sourceBucket)
+	if err != nil {
+		return "", "", errors.New("invalid copy source bucket")
+	}
+	key, err := url.PathUnescape(sourceKey)
+	if err != nil {
+		return "", "", errors.New("invalid copy source key")
+	}
+	return bucket, key, nil
 }
 
 func (s *Server) handleGCSStatus(w http.ResponseWriter, r *http.Request) {
@@ -1962,6 +2171,14 @@ type s3ObjectSummary struct {
 	Metadata     map[string]string `json:"metadata,omitempty"`
 	S3URI        string            `json:"s3Uri"`
 	DownloadURL  string            `json:"downloadUrl"`
+}
+
+type s3MultipartUploadSummary struct {
+	Key         string            `json:"key"`
+	UploadID    string            `json:"uploadId"`
+	Initiated   time.Time         `json:"initiated"`
+	ContentType string            `json:"contentType"`
+	Metadata    map[string]string `json:"metadata,omitempty"`
 }
 
 type gcsBucketSummary struct {

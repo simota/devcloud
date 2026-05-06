@@ -86,6 +86,18 @@ services:
   s3:
     enabled: true
     region: us-east-1
+  gcs:
+    enabled: false
+  dynamodb:
+    enabled: false
+  bigquery:
+    enabled: false
+  redshift:
+    enabled: false
+  sqs:
+    enabled: false
+  pubsub:
+    enabled: false
 EOF
 
   run_check "devcloud binary builds" go build -o "${TMP_DIR}/devcloud" ./cmd/devcloud

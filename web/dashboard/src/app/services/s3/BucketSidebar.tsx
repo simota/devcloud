@@ -1,13 +1,22 @@
 import { EmptyState } from '../../../ui/EmptyState'
+import { Button } from '../../../ui/Button'
 import type { S3BucketSummary } from './types'
 
 type BucketSidebarProps = {
   buckets: S3BucketSummary[]
   activeBucket?: string
+  disabled: boolean
+  onDeleteBucket: (bucketName: string) => void
   onSelectBucket: (bucketName: string) => void
 }
 
-export function BucketSidebar({ buckets, activeBucket, onSelectBucket }: BucketSidebarProps): JSX.Element {
+export function BucketSidebar({
+  buckets,
+  activeBucket,
+  disabled,
+  onDeleteBucket,
+  onSelectBucket,
+}: BucketSidebarProps): JSX.Element {
   if (buckets.length === 0) {
     return <EmptyState title="No buckets" description="Buckets created through the S3 API will appear here." />
   }
@@ -15,17 +24,21 @@ export function BucketSidebar({ buckets, activeBucket, onSelectBucket }: BucketS
   return (
     <div className="bucket-list">
       {buckets.map((bucket) => (
-        <button
-          className={bucket.name === activeBucket ? 'bucket-item active' : 'bucket-item'}
-          key={bucket.name}
-          onClick={() => onSelectBucket(bucket.name)}
-        >
-          <span>
+        <div className={bucket.name === activeBucket ? 'bucket-item active gcs-bucket-row' : 'bucket-item gcs-bucket-row'} key={bucket.name}>
+          <button className="object-select" onClick={() => onSelectBucket(bucket.name)}>
             <span className="bucket-name">{bucket.name}</span>
             <span className="bucket-meta">Created {formatDate(bucket.creationDate)}</span>
-          </span>
+          </button>
           <span className="count-pill">{bucket.objectCount}</span>
-        </button>
+          <Button
+            aria-label={`Delete bucket ${bucket.name} with confirmation`}
+            className="danger"
+            disabled={disabled}
+            onClick={() => onDeleteBucket(bucket.name)}
+          >
+            Delete bucket
+          </Button>
+        </div>
       ))}
     </div>
   )

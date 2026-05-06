@@ -408,7 +408,8 @@ code {
   text-transform: uppercase;
 }
 
-.prefix-filter input {
+.prefix-filter input,
+.prefix-filter textarea {
   width: 100%;
   border: 1px solid var(--border-default);
   border-radius: var(--radius-md);
@@ -418,10 +419,79 @@ code {
   font: inherit;
 }
 
-.prefix-filter input:focus {
+.prefix-filter textarea {
+  min-height: 72px;
+  resize: vertical;
+}
+
+.prefix-filter input:focus,
+.prefix-filter textarea:focus {
   border-color: var(--accent-primary);
   outline: 2px solid #cfe5d9;
   outline-offset: 1px;
+}
+
+.prefix-filter input:disabled,
+.prefix-filter textarea:disabled {
+  background: var(--surface-subtle);
+  color: var(--text-secondary);
+}
+
+.s3-object-form {
+  display: grid;
+  grid-template-columns: minmax(160px, 1fr) minmax(140px, 0.8fr) minmax(160px, 1fr) auto;
+  gap: 10px;
+  align-items: end;
+  border-bottom: 1px solid var(--border-default);
+  padding-bottom: 12px;
+}
+
+.s3-metadata-input {
+  grid-column: 1 / -2;
+}
+
+.s3-copy-form {
+  display: grid;
+  gap: 10px;
+  border-top: 1px solid var(--border-default);
+  padding-top: 12px;
+}
+
+.multipart-upload-list {
+  display: grid;
+  gap: 8px;
+  border-bottom: 1px solid var(--border-default);
+  padding-bottom: 12px;
+}
+
+.multipart-upload-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: start;
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  padding: 10px;
+  background: var(--surface-subtle);
+}
+
+.multipart-upload-row div {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+}
+
+.multipart-upload-row strong,
+.multipart-upload-row span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.multipart-upload-row span {
+  color: var(--text-secondary);
+  font-size: 12px;
 }
 
 .object-table {
@@ -1171,9 +1241,14 @@ code {
     grid-template-columns: 1fr;
   }
 
+  .s3-object-form,
   .gcs-create-bucket,
   .gcs-bucket-row {
     grid-template-columns: 1fr;
+  }
+
+  .s3-metadata-input {
+    grid-column: auto;
   }
 
   .mail-toolbar {
