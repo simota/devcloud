@@ -261,6 +261,17 @@ scripts/redshift-autoloop/progress.md
 scripts/redshift-autoloop/done.md
 scripts/redshift-autoloop/iteration-*.out
 scripts/redshift-autoloop/prompt-*.*
+scripts/redshift-pgwire-refactor-autoloop/.run-loop.lock
+scripts/redshift-pgwire-refactor-autoloop/.circuit-state
+scripts/redshift-pgwire-refactor-autoloop/runner.jsonl
+scripts/redshift-pgwire-refactor-autoloop/runner.log
+scripts/redshift-pgwire-refactor-autoloop/state.env
+scripts/redshift-pgwire-refactor-autoloop/state.env.sha256
+scripts/redshift-pgwire-refactor-autoloop/progress.md
+scripts/redshift-pgwire-refactor-autoloop/done.md
+scripts/redshift-pgwire-refactor-autoloop/iteration-*.out
+scripts/redshift-pgwire-refactor-autoloop/verify-*.out
+scripts/redshift-pgwire-refactor-autoloop/prompt-*.*
 scripts/redshift-postgres-backend-autoloop/.run-loop.lock
 scripts/redshift-postgres-backend-autoloop/.circuit-state
 scripts/redshift-postgres-backend-autoloop/runner.jsonl
