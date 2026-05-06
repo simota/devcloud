@@ -69,6 +69,17 @@ scripts/gcs-test-coverage-autoloop/done.md
 scripts/gcs-test-coverage-autoloop/iteration-*.out
 scripts/gcs-test-coverage-autoloop/verify-*.out
 scripts/gcs-test-coverage-autoloop/prompt-*.*
+scripts/gcs-sdk-compat-autoloop/.run-loop.lock
+scripts/gcs-sdk-compat-autoloop/.circuit-state
+scripts/gcs-sdk-compat-autoloop/runner.jsonl
+scripts/gcs-sdk-compat-autoloop/runner.log
+scripts/gcs-sdk-compat-autoloop/state.env
+scripts/gcs-sdk-compat-autoloop/state.env.sha256
+scripts/gcs-sdk-compat-autoloop/progress.md
+scripts/gcs-sdk-compat-autoloop/done.md
+scripts/gcs-sdk-compat-autoloop/iteration-*.out
+scripts/gcs-sdk-compat-autoloop/verify-*.out
+scripts/gcs-sdk-compat-autoloop/prompt-*.*
 scripts/dynamodb-autoloop/.run-loop.lock
 scripts/dynamodb-autoloop/.circuit-state
 scripts/dynamodb-autoloop/runner.jsonl
