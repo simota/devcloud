@@ -1740,6 +1740,160 @@ func TestS3DashboardMultipartUploadsCanBeListedAndAborted(t *testing.T) {
 	}
 }
 
+func TestS3DashboardAPIReturnsDisabledState(t *testing.T) {
+	routes := NewServer(Config{
+		S3Endpoint:    "http://127.0.0.1:4566",
+		S3Region:      "us-east-1",
+		S3AuthMode:    "relaxed",
+		S3StoragePath: ".devcloud/data/s3",
+	}, newDashboardStore(nil, nil)).routes()
+
+	status := performRequest(routes, http.MethodGet, "/api/s3/status")
+	if status.Code != http.StatusOK {
+		t.Fatalf("s3 status code = %d, want %d", status.Code, http.StatusOK)
+	}
+	for _, want := range []string{`"status":"disabled"`, `"running":false`, `"endpoint":"http://127.0.0.1:4566"`} {
+		if !strings.Contains(status.Body.String(), want) {
+			t.Fatalf("disabled status missing %q: %s", want, status.Body.String())
+		}
+	}
+
+	for _, target := range []string{
+		"/api/s3/buckets",
+		"/api/s3/buckets/demo-bucket",
+		"/api/s3/buckets/demo-bucket/objects",
+		"/api/s3/buckets/demo-bucket/multipart",
+	} {
+		rec := performRequest(routes, http.MethodGet, target)
+		if rec.Code != http.StatusServiceUnavailable {
+			t.Fatalf("%s code = %d, want %d", target, rec.Code, http.StatusServiceUnavailable)
+		}
+		if !strings.Contains(rec.Body.String(), "s3 service is disabled") {
+			t.Fatalf("%s response missing disabled message: %s", target, rec.Body.String())
+		}
+	}
+}
+
+func TestS3DashboardAPIValidationAndMissingResources(t *testing.T) {
+	s3Store := s3svc.NewFileBucketStore(t.TempDir())
+	if _, created, err := s3Store.CreateBucket(context.Background(), "managed-bucket"); err != nil || !created {
+		t.Fatalf("create bucket created=%t err=%v", created, err)
+	}
+	server := NewServer(Config{
+		S3Endpoint:    "http://127.0.0.1:4566",
+		S3Region:      "us-east-1",
+		S3AuthMode:    "relaxed",
+		S3StoragePath: ".devcloud/data/s3",
+	}, newDashboardStore(nil, nil), s3Store)
+	routes := server.routes()
+
+	invalidJSON := performRequestWithBody(routes, http.MethodPost, "/api/s3/buckets", `{"name":`)
+	if invalidJSON.Code != http.StatusBadRequest {
+		t.Fatalf("invalid bucket json code = %d, want %d", invalidJSON.Code, http.StatusBadRequest)
+	}
+	invalidBucket := performRequestWithBody(routes, http.MethodPost, "/api/s3/buckets", `{"name":"Bad_Bucket"}`)
+	if invalidBucket.Code != http.StatusBadRequest {
+		t.Fatalf("invalid bucket name code = %d, want %d", invalidBucket.Code, http.StatusBadRequest)
+	}
+	missingBucketObjects := performRequest(routes, http.MethodGet, "/api/s3/buckets/missing-bucket/objects")
+	if missingBucketObjects.Code != http.StatusNotFound {
+		t.Fatalf("missing bucket objects code = %d, want %d", missingBucketObjects.Code, http.StatusNotFound)
+	}
+	invalidObjectPathReq := httptest.NewRequest(http.MethodPut, "/api/s3/buckets/managed-bucket/objects/bad", strings.NewReader("body"))
+	invalidObjectPath := httptest.NewRecorder()
+	server.handleS3ObjectPut(invalidObjectPath, invalidObjectPathReq, "managed-bucket", "%zz")
+	if invalidObjectPath.Code != http.StatusBadRequest {
+		t.Fatalf("invalid object path code = %d, want %d", invalidObjectPath.Code, http.StatusBadRequest)
+	}
+	invalidCopy := httptest.NewRequest(http.MethodPut, "/api/s3/buckets/managed-bucket/objects/docs/copied.txt", nil)
+	invalidCopy.Header.Set("x-amz-copy-source", "missing-key-only")
+	invalidCopyRec := httptest.NewRecorder()
+	routes.ServeHTTP(invalidCopyRec, invalidCopy)
+	if invalidCopyRec.Code != http.StatusBadRequest {
+		t.Fatalf("invalid copy source code = %d, want %d", invalidCopyRec.Code, http.StatusBadRequest)
+	}
+	missingCopySource := httptest.NewRequest(http.MethodPut, "/api/s3/buckets/managed-bucket/objects/docs/copied.txt", nil)
+	missingCopySource.Header.Set("x-amz-copy-source", "/managed-bucket/docs%2Fmissing.txt")
+	missingCopyRec := httptest.NewRecorder()
+	routes.ServeHTTP(missingCopyRec, missingCopySource)
+	if missingCopyRec.Code != http.StatusNotFound {
+		t.Fatalf("missing copy source code = %d, want %d", missingCopyRec.Code, http.StatusNotFound)
+	}
+	if _, _, found, err := s3Store.GetObject(context.Background(), "managed-bucket", "docs/copied.txt"); err != nil || found {
+		t.Fatalf("copy target should not be created after validation failure; found=%t err=%v", found, err)
+	}
+}
+
+func TestS3DashboardCopyReplaceMetadataDoesNotMutateSource(t *testing.T) {
+	s3Store := s3svc.NewFileBucketStore(t.TempDir())
+	if _, created, err := s3Store.CreateBucket(context.Background(), "managed-bucket"); err != nil || !created {
+		t.Fatalf("create bucket created=%t err=%v", created, err)
+	}
+	if _, err := s3Store.PutObject(context.Background(), s3svc.PutObjectInput{
+		Bucket:             "managed-bucket",
+		Key:                "docs/source.txt",
+		Body:               strings.NewReader("copy body"),
+		ContentType:        "text/plain",
+		CacheControl:       "max-age=60",
+		ContentDisposition: `inline; filename="source.txt"`,
+		Metadata:           map[string]string{"source": "original", "owner": "dashboard"},
+	}); err != nil {
+		t.Fatalf("put source object: %v", err)
+	}
+	routes := NewServer(Config{
+		S3Endpoint:    "http://127.0.0.1:4566",
+		S3Region:      "us-east-1",
+		S3AuthMode:    "relaxed",
+		S3StoragePath: ".devcloud/data/s3",
+	}, newDashboardStore(nil, nil), s3Store).routes()
+
+	copyReq := httptest.NewRequest(http.MethodPut, "/api/s3/buckets/managed-bucket/objects/docs/replaced.txt", nil)
+	copyReq.Header.Set("x-amz-copy-source", "/managed-bucket/docs%2Fsource.txt")
+	copyReq.Header.Set("x-amz-metadata-directive", "REPLACE")
+	copyReq.Header.Set("Content-Type", "application/json")
+	copyReq.Header.Set("Cache-Control", "no-store")
+	copyReq.Header.Set("Content-Disposition", `attachment; filename="replaced.json"`)
+	copyReq.Header.Set("x-amz-meta-source", "replacement")
+	copyRec := httptest.NewRecorder()
+	routes.ServeHTTP(copyRec, copyReq)
+	if copyRec.Code != http.StatusOK {
+		t.Fatalf("copy replace code = %d, want %d; body=%s", copyRec.Code, http.StatusOK, copyRec.Body.String())
+	}
+	for _, want := range []string{`"key":"docs/replaced.txt"`, `"contentType":"application/json"`, `"source":"replacement"`} {
+		if !strings.Contains(copyRec.Body.String(), want) {
+			t.Fatalf("copy replace response missing %q: %s", want, copyRec.Body.String())
+		}
+	}
+	if strings.Contains(copyRec.Body.String(), `"owner"`) {
+		t.Fatalf("copy replace response retained old metadata: %s", copyRec.Body.String())
+	}
+
+	source, sourceBody, found, err := s3Store.GetObject(context.Background(), "managed-bucket", "docs/source.txt")
+	if err != nil || !found {
+		t.Fatalf("get source object found=%t err=%v", found, err)
+	}
+	if string(sourceBody) != "copy body" || source.ContentType != "text/plain" || source.Metadata["source"] != "original" || source.Metadata["owner"] != "dashboard" {
+		t.Fatalf("source object mutated after copy: object=%#v body=%q", source, string(sourceBody))
+	}
+
+	copied, copiedBody, found, err := s3Store.GetObject(context.Background(), "managed-bucket", "docs/replaced.txt")
+	if err != nil || !found {
+		t.Fatalf("get copied object found=%t err=%v", found, err)
+	}
+	if string(copiedBody) != "copy body" {
+		t.Fatalf("copied body = %q, want copy body", string(copiedBody))
+	}
+	if copied.ContentType != "application/json" || copied.CacheControl != "no-store" || copied.ContentDisposition != `attachment; filename="replaced.json"` {
+		t.Fatalf("copied headers = contentType:%q cacheControl:%q contentDisposition:%q", copied.ContentType, copied.CacheControl, copied.ContentDisposition)
+	}
+	if got := copied.Metadata["source"]; got != "replacement" {
+		t.Fatalf("copied metadata source = %q, want replacement", got)
+	}
+	if _, ok := copied.Metadata["owner"]; ok {
+		t.Fatalf("copied metadata should not keep owner: %#v", copied.Metadata)
+	}
+}
+
 func TestGCSDashboardPageAndAPIExposeObjects(t *testing.T) {
 	gcsStore := s3svc.NewFileBucketStore(t.TempDir())
 	sessionDir := t.TempDir()
