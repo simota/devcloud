@@ -49,6 +49,17 @@ scripts/s3-feature-parity-autoloop/done.md
 scripts/s3-feature-parity-autoloop/iteration-*.out
 scripts/s3-feature-parity-autoloop/verify-*.out
 scripts/s3-feature-parity-autoloop/prompt-*.*
+scripts/s3-server-refactor-autoloop/.run-loop.lock
+scripts/s3-server-refactor-autoloop/.circuit-state
+scripts/s3-server-refactor-autoloop/runner.jsonl
+scripts/s3-server-refactor-autoloop/runner.log
+scripts/s3-server-refactor-autoloop/state.env
+scripts/s3-server-refactor-autoloop/state.env.sha256
+scripts/s3-server-refactor-autoloop/progress.md
+scripts/s3-server-refactor-autoloop/done.md
+scripts/s3-server-refactor-autoloop/iteration-*.out
+scripts/s3-server-refactor-autoloop/verify-*.out
+scripts/s3-server-refactor-autoloop/prompt-*.*
 scripts/gcs-autoloop/.run-loop.lock
 scripts/gcs-autoloop/.circuit-state
 scripts/gcs-autoloop/runner.jsonl
