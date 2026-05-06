@@ -58,6 +58,17 @@ scripts/gcs-dashboard-react-autoloop/done.md
 scripts/gcs-dashboard-react-autoloop/iteration-*.out
 scripts/gcs-dashboard-react-autoloop/verify-*.out
 scripts/gcs-dashboard-react-autoloop/prompt-*.*
+scripts/gcs-test-coverage-autoloop/.run-loop.lock
+scripts/gcs-test-coverage-autoloop/.circuit-state
+scripts/gcs-test-coverage-autoloop/runner.jsonl
+scripts/gcs-test-coverage-autoloop/runner.log
+scripts/gcs-test-coverage-autoloop/state.env
+scripts/gcs-test-coverage-autoloop/state.env.sha256
+scripts/gcs-test-coverage-autoloop/progress.md
+scripts/gcs-test-coverage-autoloop/done.md
+scripts/gcs-test-coverage-autoloop/iteration-*.out
+scripts/gcs-test-coverage-autoloop/verify-*.out
+scripts/gcs-test-coverage-autoloop/prompt-*.*
 scripts/dynamodb-autoloop/.run-loop.lock
 scripts/dynamodb-autoloop/.circuit-state
 scripts/dynamodb-autoloop/runner.jsonl

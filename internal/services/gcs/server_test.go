@@ -666,6 +666,70 @@ func TestObjectReadDownloadAndDeleteRejectGenerationPreconditionMismatch(t *test
 	}
 }
 
+func TestObjectOperationsRejectInvalidPreconditionValues(t *testing.T) {
+	store := s3svc.NewFileBucketStore(t.TempDir())
+	routes := NewServer(Config{}, store).routes()
+
+	if create := performRequest(routes, http.MethodPost, "/storage/v1/b?project=devcloud", `{"name":"demo-bucket"}`); create.Code != http.StatusOK {
+		t.Fatalf("create bucket status = %d; body=%s", create.Code, create.Body.String())
+	}
+	if upload := performRequestWithHeaders(routes, http.MethodPost, "/upload/storage/v1/b/demo-bucket/o?uploadType=media&name=docs/source.txt", "body", map[string]string{"Content-Type": "text/plain"}); upload.Code != http.StatusOK {
+		t.Fatalf("upload status = %d; body=%s", upload.Code, upload.Body.String())
+	}
+
+	for _, tc := range []struct {
+		name   string
+		method string
+		target string
+		body   string
+	}{
+		{
+			name:   "media upload invalid generation match",
+			method: http.MethodPost,
+			target: "/upload/storage/v1/b/demo-bucket/o?uploadType=media&name=docs/new.txt&ifGenerationMatch=bad",
+			body:   "new body",
+		},
+		{
+			name:   "metadata invalid metageneration match",
+			method: http.MethodGet,
+			target: "/storage/v1/b/demo-bucket/o/docs%2Fsource.txt?ifMetagenerationMatch=bad",
+		},
+		{
+			name:   "download invalid generation not match",
+			method: http.MethodGet,
+			target: "/download/storage/v1/b/demo-bucket/o/docs%2Fsource.txt?alt=media&ifGenerationNotMatch=bad",
+		},
+		{
+			name:   "patch invalid metageneration not match",
+			method: http.MethodPatch,
+			target: "/storage/v1/b/demo-bucket/o/docs%2Fsource.txt?ifMetagenerationNotMatch=bad",
+			body:   `{"metadata":{"source":"invalid"}}`,
+		},
+		{
+			name:   "delete invalid generation match",
+			method: http.MethodDelete,
+			target: "/storage/v1/b/demo-bucket/o/docs%2Fsource.txt?ifGenerationMatch=bad",
+		},
+		{
+			name:   "copy invalid source metageneration",
+			method: http.MethodPost,
+			target: "/storage/v1/b/demo-bucket/o/docs%2Fsource.txt/copyTo/b/demo-bucket/o/docs%2Fcopy.txt?ifSourceMetagenerationMatch=bad",
+			body:   `{}`,
+		},
+		{
+			name:   "compose invalid destination generation",
+			method: http.MethodPost,
+			target: "/storage/v1/b/demo-bucket/o/docs%2Fjoined.txt/compose?ifGenerationMatch=bad",
+			body:   `{"sourceObjects":[{"name":"docs/source.txt"}]}`,
+		},
+	} {
+		rec := performRequest(routes, tc.method, tc.target, tc.body)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("%s status = %d, want %d; body=%s", tc.name, rec.Code, http.StatusBadRequest, rec.Body.String())
+		}
+	}
+}
+
 func TestObjectOperationsHonorGenerationQuery(t *testing.T) {
 	store := s3svc.NewFileBucketStore(t.TempDir())
 	routes := NewServer(Config{}, store).routes()
@@ -1245,6 +1309,58 @@ func TestResumableUploadPersistsChunkStatusAcrossServerRestart(t *testing.T) {
 	}
 	if got := download.Body.String(); got != "resumable body" {
 		t.Fatalf("download body = %q", got)
+	}
+}
+
+func TestResumableUploadRejectsMalformedCommitRequests(t *testing.T) {
+	store := s3svc.NewFileBucketStore(t.TempDir())
+	routes := NewServer(Config{}, store).routes()
+
+	if create := performRequest(routes, http.MethodPost, "/storage/v1/b?project=devcloud", `{"name":"demo-bucket"}`); create.Code != http.StatusOK {
+		t.Fatalf("create bucket status = %d; body=%s", create.Code, create.Body.String())
+	}
+
+	missingID := performRequestWithHeaders(routes, http.MethodPut, "/upload/storage/v1/b/demo-bucket/o?uploadType=resumable", "body", map[string]string{
+		"Content-Range": "bytes 0-3/4",
+	})
+	if missingID.Code != http.StatusBadRequest {
+		t.Fatalf("missing upload id status = %d, want %d; body=%s", missingID.Code, http.StatusBadRequest, missingID.Body.String())
+	}
+
+	unknownID := performRequestWithHeaders(routes, http.MethodPut, "/upload/storage/v1/b/demo-bucket/o?uploadType=resumable&upload_id=missing", "body", map[string]string{
+		"Content-Range": "bytes 0-3/4",
+	})
+	if unknownID.Code != http.StatusNotFound {
+		t.Fatalf("unknown upload id status = %d, want %d; body=%s", unknownID.Code, http.StatusNotFound, unknownID.Body.String())
+	}
+
+	init := performRequestWithHeaders(routes, http.MethodPost, "/upload/storage/v1/b/demo-bucket/o?uploadType=resumable&name=docs/resumable.txt", `{"contentType":"text/plain"}`, map[string]string{
+		"Content-Type": "application/json",
+	})
+	if init.Code != http.StatusOK {
+		t.Fatalf("init status = %d, want %d; body=%s", init.Code, http.StatusOK, init.Body.String())
+	}
+	sessionURL, err := url.Parse(init.Header().Get("Location"))
+	if err != nil {
+		t.Fatalf("parse session location: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name         string
+		contentRange string
+		body         string
+	}{
+		{name: "wrong unit", contentRange: "items 0-3/4", body: "body"},
+		{name: "payload size mismatch", contentRange: "bytes 0-9/10", body: "body"},
+		{name: "wrong committed offset", contentRange: "bytes 1-4/5", body: "body"},
+	} {
+		rec := performRequestWithHeaders(routes, http.MethodPut, sessionURL.RequestURI(), tc.body, map[string]string{
+			"Content-Type":  "text/plain",
+			"Content-Range": tc.contentRange,
+		})
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("%s status = %d, want %d; body=%s", tc.name, rec.Code, http.StatusBadRequest, rec.Body.String())
+		}
 	}
 }
 

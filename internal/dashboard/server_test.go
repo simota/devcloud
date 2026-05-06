@@ -2042,6 +2042,96 @@ func TestGCSDashboardPageAndAPIExposeObjects(t *testing.T) {
 	}
 }
 
+func TestGCSDashboardAPIHandlesDisabledValidationAndMissingResources(t *testing.T) {
+	disabledRoutes := NewServer(Config{}, newDashboardStore(nil, nil)).routes()
+
+	status := performRequest(disabledRoutes, http.MethodGet, "/api/gcs/status")
+	if status.Code != http.StatusOK {
+		t.Fatalf("disabled status code = %d, want %d", status.Code, http.StatusOK)
+	}
+	if body := status.Body.String(); !strings.Contains(body, `"status":"disabled"`) || !strings.Contains(body, `"running":false`) {
+		t.Fatalf("disabled status body = %s", body)
+	}
+	for _, target := range []string{"/api/gcs/buckets", "/api/gcs/upload-sessions", "/api/gcs/uploads/session-test"} {
+		rec := performRequest(disabledRoutes, http.MethodGet, target)
+		if target == "/api/gcs/uploads/session-test" {
+			rec = performRequest(disabledRoutes, http.MethodDelete, target)
+		}
+		if rec.Code != http.StatusServiceUnavailable {
+			t.Fatalf("disabled %s status = %d, want %d", target, rec.Code, http.StatusServiceUnavailable)
+		}
+	}
+	if rec := performRequest(disabledRoutes, http.MethodPost, "/api/gcs/status"); rec.Code != http.StatusMethodNotAllowed || rec.Header().Get("Allow") != "GET" {
+		t.Fatalf("disabled status POST = %d Allow=%q, want 405 GET", rec.Code, rec.Header().Get("Allow"))
+	}
+
+	gcsStore := s3svc.NewFileBucketStore(t.TempDir())
+	routes := NewServer(Config{GCSUploadSessionPath: t.TempDir()}, newDashboardStore(nil, nil), nil, gcsStore).routes()
+
+	invalidJSON := performRequestWithBody(routes, http.MethodPost, "/api/gcs/buckets", `{"name":`)
+	if invalidJSON.Code != http.StatusBadRequest {
+		t.Fatalf("invalid bucket json status = %d, want %d; body=%s", invalidJSON.Code, http.StatusBadRequest, invalidJSON.Body.String())
+	}
+	invalidBucket := performRequestWithBody(routes, http.MethodPost, "/api/gcs/buckets", `{"name":"Bad_Bucket"}`)
+	if invalidBucket.Code != http.StatusBadRequest {
+		t.Fatalf("invalid bucket name status = %d, want %d; body=%s", invalidBucket.Code, http.StatusBadRequest, invalidBucket.Body.String())
+	}
+	createBucket := performRequestWithBody(routes, http.MethodPost, "/api/gcs/buckets", `{"name":"managed-bucket"}`)
+	if createBucket.Code != http.StatusCreated {
+		t.Fatalf("create bucket status = %d, want %d; body=%s", createBucket.Code, http.StatusCreated, createBucket.Body.String())
+	}
+	duplicateBucket := performRequestWithBody(routes, http.MethodPost, "/api/gcs/buckets", `{"name":"managed-bucket"}`)
+	if duplicateBucket.Code != http.StatusConflict {
+		t.Fatalf("duplicate bucket status = %d, want %d; body=%s", duplicateBucket.Code, http.StatusConflict, duplicateBucket.Body.String())
+	}
+
+	missingBucket := performRequest(routes, http.MethodGet, "/api/gcs/buckets/missing-bucket")
+	if missingBucket.Code != http.StatusNotFound {
+		t.Fatalf("missing bucket status = %d, want %d; body=%s", missingBucket.Code, http.StatusNotFound, missingBucket.Body.String())
+	}
+	missingObjects := performRequest(routes, http.MethodGet, "/api/gcs/buckets/missing-bucket/objects")
+	if missingObjects.Code != http.StatusNotFound {
+		t.Fatalf("missing bucket objects status = %d, want %d; body=%s", missingObjects.Code, http.StatusNotFound, missingObjects.Body.String())
+	}
+	missingObject := performRequest(routes, http.MethodGet, "/api/gcs/buckets/managed-bucket/objects/docs/missing.txt")
+	if missingObject.Code != http.StatusNotFound {
+		t.Fatalf("missing object status = %d, want %d; body=%s", missingObject.Code, http.StatusNotFound, missingObject.Body.String())
+	}
+	missingDownload := performRequest(routes, http.MethodGet, "/api/gcs/buckets/managed-bucket/objects/docs/missing.txt/download")
+	if missingDownload.Code != http.StatusNotFound {
+		t.Fatalf("missing download status = %d, want %d; body=%s", missingDownload.Code, http.StatusNotFound, missingDownload.Body.String())
+	}
+	if rec := performRequest(routes, http.MethodPut, "/api/gcs/buckets/managed-bucket/objects/docs/missing.txt"); rec.Code != http.StatusMethodNotAllowed || rec.Header().Get("Allow") != "GET, DELETE" {
+		t.Fatalf("object PUT status = %d Allow=%q, want 405 GET, DELETE", rec.Code, rec.Header().Get("Allow"))
+	}
+
+	if _, err := gcsStore.PutObject(context.Background(), s3svc.PutObjectInput{
+		Bucket: "managed-bucket",
+		Key:    "docs/live.txt",
+		Body:   strings.NewReader("dashboard object"),
+	}); err != nil {
+		t.Fatalf("put gcs object: %v", err)
+	}
+	deleteNonEmptyBucket := performRequest(routes, http.MethodDelete, "/api/gcs/buckets/managed-bucket")
+	if deleteNonEmptyBucket.Code != http.StatusConflict {
+		t.Fatalf("delete non-empty bucket status = %d, want %d; body=%s", deleteNonEmptyBucket.Code, http.StatusConflict, deleteNonEmptyBucket.Body.String())
+	}
+	deleteObject := performRequest(routes, http.MethodDelete, "/api/gcs/buckets/managed-bucket/objects/docs/live.txt")
+	if deleteObject.Code != http.StatusNoContent {
+		t.Fatalf("delete object status = %d, want %d; body=%s", deleteObject.Code, http.StatusNoContent, deleteObject.Body.String())
+	}
+	deleteMissingBucket := performRequest(routes, http.MethodDelete, "/api/gcs/buckets/missing-bucket")
+	if deleteMissingBucket.Code != http.StatusNotFound {
+		t.Fatalf("delete missing bucket status = %d, want %d; body=%s", deleteMissingBucket.Code, http.StatusNotFound, deleteMissingBucket.Body.String())
+	}
+	if rec := performRequest(routes, http.MethodPost, "/api/gcs/upload-sessions"); rec.Code != http.StatusMethodNotAllowed || rec.Header().Get("Allow") != "GET" {
+		t.Fatalf("upload sessions POST status = %d Allow=%q, want 405 GET", rec.Code, rec.Header().Get("Allow"))
+	}
+	if rec := performRequest(routes, http.MethodGet, "/api/gcs/uploads/session-test"); rec.Code != http.StatusMethodNotAllowed || rec.Header().Get("Allow") != "DELETE" {
+		t.Fatalf("upload session GET status = %d Allow=%q, want 405 DELETE", rec.Code, rec.Header().Get("Allow"))
+	}
+}
+
 func TestS3DashboardEscapesDynamicObjectValues(t *testing.T) {
 	for _, want := range []string{
 		"function escapeHTML(value)",
