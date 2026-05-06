@@ -439,6 +439,10 @@ func (s *Server) handleBigQueryProjectResource(w http.ResponseWriter, r *http.Re
 		s.forwardBigQueryRequest(w, r, "/bigquery/v2/projects/"+url.PathEscape(projectID)+"/queries")
 		return
 	}
+	if len(parts) == 2 && parts[1] == "jobs" && r.Method == http.MethodPost {
+		s.forwardBigQueryRequest(w, r, "/bigquery/v2/projects/"+url.PathEscape(projectID)+"/jobs")
+		return
+	}
 	if len(parts) == 2 && parts[1] == "datasets" && r.Method == http.MethodPost {
 		s.forwardBigQueryRequest(w, r, "/bigquery/v2/projects/"+url.PathEscape(projectID)+"/datasets")
 		return

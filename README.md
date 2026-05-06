@@ -51,6 +51,8 @@ go run ./cmd/devcloud reset
 
 The dashboard can create local datasets and tables and insert local table rows through guarded `datasets.insert`, `tables.insert`, and `tabledata.insertAll` flows. Guided forms cover common fields, raw JSON mode is available for request-shape testing, and the row editor validates JSON before calling insertAll while showing partial insert errors.
 
+Dashboard API clients can also start local BigQuery `jobs.insert` workflows through `/api/bigquery/projects/{projectId}/jobs`, including GCS-backed load/import and extract/export jobs that use devcloud GCS `gs://` URIs.
+
 Safety boundaries: dashboard mutations go through `/api/bigquery/*` or the local BigQuery REST API path, never direct storage calls. The UI does not persist or log row payloads, credentials, Authorization headers, bearer tokens, or full request bodies. When BigQuery is disabled, query and mutation controls remain unavailable.
 
 ## Configuration

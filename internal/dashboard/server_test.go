@@ -1324,10 +1324,26 @@ func TestDynamoDBDashboardQueryPaginationForwardsExclusiveStartKey(t *testing.T)
 }
 
 func TestBigQueryDashboardPageAndAPIExposeCatalog(t *testing.T) {
+	gcsStore := s3svc.NewFileBucketStore(t.TempDir())
+	if _, created, err := gcsStore.CreateBucket(context.Background(), "bq-fixtures"); err != nil || !created {
+		t.Fatalf("create GCS fixture bucket created=%t err=%v", created, err)
+	}
+	if _, created, err := gcsStore.CreateBucket(context.Background(), "bq-exports"); err != nil || !created {
+		t.Fatalf("create GCS export bucket created=%t err=%v", created, err)
+	}
+	if _, err := gcsStore.PutObject(context.Background(), s3svc.PutObjectInput{
+		Bucket:      "bq-fixtures",
+		Key:         "events.ndjson",
+		Body:        strings.NewReader(`{"event_id":"imported","count":2}` + "\n"),
+		ContentType: "application/x-ndjson",
+	}); err != nil {
+		t.Fatalf("put GCS import fixture: %v", err)
+	}
 	bq := bigquerysvc.NewServer(bigquerysvc.Config{
 		Project:     "devcloud",
 		Location:    "US",
 		StoragePath: t.TempDir(),
+		ObjectStore: gcsStore,
 	})
 	performBigQueryRequest(t, bq, http.MethodPost, "/bigquery/v2/projects/devcloud/datasets", `{"datasetReference":{"datasetId":"analytics"}}`)
 	performBigQueryRequest(t, bq, http.MethodPost, "/bigquery/v2/projects/devcloud/datasets/analytics/tables", `{
@@ -1445,6 +1461,37 @@ func TestBigQueryDashboardPageAndAPIExposeCatalog(t *testing.T) {
 	managementRows := performRequest(routes, http.MethodGet, "/api/bigquery/projects/devcloud/datasets/dashboard_ops/tables/events/rows?limit=1")
 	if managementRows.Code != http.StatusOK || !strings.Contains(managementRows.Body.String(), `"event_id":"signup"`) {
 		t.Fatalf("BigQuery dashboard inserted rows = %d body=%s", managementRows.Code, managementRows.Body.String())
+	}
+	importJob := performRequestWithBody(routes, http.MethodPost, "/api/bigquery/projects/devcloud/jobs", `{
+		"jobReference":{"jobId":"dashboard_gcs_import","location":"US"},
+		"configuration":{"load":{
+			"sourceUris":["gs://bq-fixtures/events.ndjson"],
+			"destinationTable":{"datasetId":"dashboard_ops","tableId":"events"},
+			"sourceFormat":"NEWLINE_DELIMITED_JSON",
+			"writeDisposition":"WRITE_APPEND"
+		}}
+	}`)
+	if importJob.Code != http.StatusOK || !strings.Contains(importJob.Body.String(), `"jobId":"dashboard_gcs_import"`) || !strings.Contains(importJob.Body.String(), `"state":"DONE"`) {
+		t.Fatalf("BigQuery dashboard GCS import job = %d body=%s", importJob.Code, importJob.Body.String())
+	}
+	importedRows := performRequest(routes, http.MethodGet, "/api/bigquery/projects/devcloud/datasets/dashboard_ops/tables/events/rows?limit=10")
+	if importedRows.Code != http.StatusOK || !strings.Contains(importedRows.Body.String(), `"event_id":"imported"`) {
+		t.Fatalf("BigQuery dashboard imported rows = %d body=%s", importedRows.Code, importedRows.Body.String())
+	}
+	exportJob := performRequestWithBody(routes, http.MethodPost, "/api/bigquery/projects/devcloud/jobs", `{
+		"jobReference":{"jobId":"dashboard_gcs_export","location":"US"},
+		"configuration":{"extract":{
+			"sourceTable":{"datasetId":"dashboard_ops","tableId":"events"},
+			"destinationUris":["gs://bq-exports/events.ndjson"],
+			"destinationFormat":"NEWLINE_DELIMITED_JSON"
+		}}
+	}`)
+	if exportJob.Code != http.StatusOK || !strings.Contains(exportJob.Body.String(), `"jobId":"dashboard_gcs_export"`) || !strings.Contains(exportJob.Body.String(), `"state":"DONE"`) {
+		t.Fatalf("BigQuery dashboard GCS export job = %d body=%s", exportJob.Code, exportJob.Body.String())
+	}
+	_, exportedBody, found, err := gcsStore.GetObject(context.Background(), "bq-exports", "events.ndjson")
+	if err != nil || !found || !strings.Contains(string(exportedBody), `"event_id":"imported"`) {
+		t.Fatalf("exported GCS object found=%t err=%v body=%s", found, err, string(exportedBody))
 	}
 }
 

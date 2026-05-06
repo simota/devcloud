@@ -410,6 +410,21 @@ assert_dashboard_api() {
   curl -fsS "${DASHBOARD_ENDPOINT}/api/bigquery/projects/${PROJECT}/datasets/${DATASET}/tables" | grep -q "${VIEW_TABLE}"
   curl -fsS "${DASHBOARD_ENDPOINT}/api/bigquery/projects/${PROJECT}/datasets/${DATASET}/tables/${TABLE}/rows?limit=10" | grep -q 'Ada'
   curl -fsS "${DASHBOARD_ENDPOINT}/api/bigquery/projects/${PROJECT}/jobs" | grep -q 'extract_people_e2e'
+  curl -fsS \
+    -X POST \
+    -H 'Content-Type: application/json' \
+    --data "{
+      \"jobReference\":{\"projectId\":\"${PROJECT}\",\"jobId\":\"dashboard_extract_people_e2e\",\"location\":\"${LOCATION}\"},
+      \"configuration\":{\"extract\":{
+        \"sourceTable\":{\"projectId\":\"${PROJECT}\",\"datasetId\":\"${DATASET}\",\"tableId\":\"${TABLE}\"},
+        \"destinationUris\":[\"gs://${BUCKET}/exports/dashboard-people.ndjson\"],
+        \"destinationFormat\":\"NEWLINE_DELIMITED_JSON\"
+      }}
+    }" \
+    "${DASHBOARD_ENDPOINT}/api/bigquery/projects/${PROJECT}/jobs" |
+    json_assert 'data["status"]["state"] == "DONE" and data["configuration"]["extract"]["destinationUris"][0].endswith("dashboard-people.ndjson")'
+  curl -fsS "${GCS_ENDPOINT}/download/storage/v1/b/${BUCKET}/o/exports%2Fdashboard-people.ndjson?alt=media" |
+    grep -q '"name":"Ada"'
   curl -fsS "${DASHBOARD_ENDPOINT}/dashboard/bigquery" | grep -qi 'devcloud Dashboard'
 }
 
@@ -420,6 +435,7 @@ delete_data() {
   json_delete "${BIGQUERY_ENDPOINT}/bigquery/v2/projects/${PROJECT}/datasets/${DATASET}/tables/${COPY_TABLE}" >/dev/null 2>&1 || true
   json_delete "${BIGQUERY_ENDPOINT}/bigquery/v2/projects/${PROJECT}/datasets/${DATASET}/tables/${TABLE}" >/dev/null 2>&1 || true
   json_delete "${BIGQUERY_ENDPOINT}/bigquery/v2/projects/${PROJECT}/datasets/${DATASET}?deleteContents=true" >/dev/null 2>&1 || true
+  curl -fsS -X DELETE "${GCS_ENDPOINT}/storage/v1/b/${BUCKET}/o/exports%2Fdashboard-people.ndjson" >/dev/null 2>&1 || true
   curl -fsS -X DELETE "${GCS_ENDPOINT}/storage/v1/b/${BUCKET}/o/exports%2Fpeople.ndjson" >/dev/null 2>&1 || true
   curl -fsS -X DELETE "${GCS_ENDPOINT}/storage/v1/b/${BUCKET}" >/dev/null 2>&1 || true
 }
