@@ -27,6 +27,17 @@ scripts/s3-dashboard-management-autoloop/done.md
 scripts/s3-dashboard-management-autoloop/iteration-*.out
 scripts/s3-dashboard-management-autoloop/verify-*.out
 scripts/s3-dashboard-management-autoloop/prompt-*.*
+scripts/s3-test-coverage-autoloop/.run-loop.lock
+scripts/s3-test-coverage-autoloop/.circuit-state
+scripts/s3-test-coverage-autoloop/runner.jsonl
+scripts/s3-test-coverage-autoloop/runner.log
+scripts/s3-test-coverage-autoloop/state.env
+scripts/s3-test-coverage-autoloop/state.env.sha256
+scripts/s3-test-coverage-autoloop/progress.md
+scripts/s3-test-coverage-autoloop/done.md
+scripts/s3-test-coverage-autoloop/iteration-*.out
+scripts/s3-test-coverage-autoloop/verify-*.out
+scripts/s3-test-coverage-autoloop/prompt-*.*
 scripts/gcs-autoloop/.run-loop.lock
 scripts/gcs-autoloop/.circuit-state
 scripts/gcs-autoloop/runner.jsonl

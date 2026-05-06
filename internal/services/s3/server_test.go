@@ -1,6 +1,7 @@
 package s3
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/md5"
 	"crypto/sha256"
@@ -477,6 +478,102 @@ func TestPresignedURLValidatesSignature(t *testing.T) {
 	}
 }
 
+func TestPresignedURLRejectsInvalidArguments(t *testing.T) {
+	store := NewFileBucketStore(t.TempDir())
+	routes := NewServer(Config{
+		Region:          "us-east-1",
+		AuthMode:        "relaxed",
+		AccessKeyID:     "dev",
+		SecretAccessKey: "dev",
+	}, store).routes()
+	fixedNow := time.Date(2026, 4, 30, 12, 0, 0, 0, time.UTC)
+	previousNow := nowUTC
+	nowUTC = func() time.Time { return fixedNow }
+	defer func() { nowUTC = previousNow }()
+
+	validTarget := presignedTarget(t, "GET", "example.com", "/demo-bucket/docs/readme.txt", fixedNow)
+	tests := []struct {
+		name       string
+		mutate     func(url.Values)
+		wantStatus int
+		wantCode   string
+	}{
+		{
+			name: "unsupported algorithm",
+			mutate: func(values url.Values) {
+				values.Set("X-Amz-Algorithm", "AWS4-HMAC-SHA1")
+			},
+			wantStatus: http.StatusBadRequest,
+			wantCode:   "InvalidArgument",
+		},
+		{
+			name: "malformed credential",
+			mutate: func(values url.Values) {
+				values.Set("X-Amz-Credential", "dev/us-east-1/s3")
+			},
+			wantStatus: http.StatusBadRequest,
+			wantCode:   "AuthorizationHeaderMalformed",
+		},
+		{
+			name: "wrong access key",
+			mutate: func(values url.Values) {
+				values.Set("X-Amz-Credential", strings.Replace(values.Get("X-Amz-Credential"), "dev/", "other/", 1))
+			},
+			wantStatus: http.StatusForbidden,
+			wantCode:   "InvalidAccessKeyId",
+		},
+		{
+			name: "bad date",
+			mutate: func(values url.Values) {
+				values.Set("X-Amz-Date", "not-a-date")
+			},
+			wantStatus: http.StatusForbidden,
+			wantCode:   "AccessDenied",
+		},
+		{
+			name: "expires too large",
+			mutate: func(values url.Values) {
+				values.Set("X-Amz-Expires", "604801")
+			},
+			wantStatus: http.StatusForbidden,
+			wantCode:   "AccessDenied",
+		},
+		{
+			name: "missing signed headers",
+			mutate: func(values url.Values) {
+				values.Del("X-Amz-SignedHeaders")
+			},
+			wantStatus: http.StatusBadRequest,
+			wantCode:   "AuthorizationHeaderMalformed",
+		},
+	}
+
+	parsedTarget, err := url.Parse(validTarget)
+	if err != nil {
+		t.Fatalf("parse presigned target: %v", err)
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			values := parsedTarget.Query()
+			tt.mutate(values)
+			req := httptest.NewRequest(http.MethodGet, parsedTarget.Path+"?"+values.Encode(), nil)
+			req.Host = "example.com"
+			rec := httptest.NewRecorder()
+			routes.ServeHTTP(rec, req)
+			if rec.Code != tt.wantStatus {
+				t.Fatalf("status = %d, want %d; body=%s", rec.Code, tt.wantStatus, rec.Body.String())
+			}
+			var parsed errorResponse
+			if err := xml.NewDecoder(rec.Body).Decode(&parsed); err != nil {
+				t.Fatalf("decode error response: %v", err)
+			}
+			if parsed.Code != tt.wantCode {
+				t.Fatalf("error code = %q, want %q", parsed.Code, tt.wantCode)
+			}
+		})
+	}
+}
+
 func TestAuthorizationHeaderValidatesPayloadHashAndPreservesBody(t *testing.T) {
 	store := NewFileBucketStore(t.TempDir())
 	routes := NewServer(Config{
@@ -544,6 +641,70 @@ func TestAuthorizationHeaderRejectsPayloadHashMismatch(t *testing.T) {
 	}
 	if parsed.Code != "XAmzContentSHA256Mismatch" {
 		t.Fatalf("tampered put code = %q, want XAmzContentSHA256Mismatch", parsed.Code)
+	}
+}
+
+func TestFileBucketStoreUpdateObjectMetadataPreservesBody(t *testing.T) {
+	store := NewFileBucketStore(t.TempDir())
+	ctx := context.Background()
+	if _, created, err := store.CreateBucket(ctx, "demo-bucket"); err != nil || !created {
+		t.Fatalf("create bucket created=%t err=%v", created, err)
+	}
+	if _, err := store.PutObject(ctx, PutObjectInput{
+		Bucket:             "demo-bucket",
+		Key:                "docs/readme.txt",
+		Body:               strings.NewReader("metadata body"),
+		ContentType:        "text/plain",
+		ContentDisposition: `inline; filename="readme.txt"`,
+		Metadata:           map[string]string{"source": "original"},
+	}); err != nil {
+		t.Fatalf("put object: %v", err)
+	}
+
+	updated, found, err := store.UpdateObjectMetadata(ctx, UpdateObjectMetadataInput{
+		Bucket:          "demo-bucket",
+		Key:             "docs/readme.txt",
+		ContentType:     "text/markdown",
+		ContentEncoding: "gzip",
+		CacheControl:    "max-age=60",
+		Metadata:        map[string]string{"source": "updated", "empty": ""},
+	})
+	if err != nil || !found {
+		t.Fatalf("update metadata found=%t err=%v", found, err)
+	}
+	if updated.ContentType != "text/markdown" || updated.ContentEncoding != "gzip" || updated.CacheControl != "max-age=60" {
+		t.Fatalf("updated headers = contentType:%q contentEncoding:%q cacheControl:%q", updated.ContentType, updated.ContentEncoding, updated.CacheControl)
+	}
+	if got := updated.ContentDisposition; got != `inline; filename="readme.txt"` {
+		t.Fatalf("content disposition = %q, want preserved inline disposition", got)
+	}
+	if got := updated.Metadata["source"]; got != "updated" {
+		t.Fatalf("metadata source = %q, want updated", got)
+	}
+	if got := updated.Metadata["empty"]; got != "" {
+		t.Fatalf("empty metadata = %q, want empty value preserved", got)
+	}
+	if updated.Metageneration != 2 {
+		t.Fatalf("metageneration = %d, want 2", updated.Metageneration)
+	}
+
+	gotObject, body, found, err := store.GetObject(ctx, "demo-bucket", "docs/readme.txt")
+	if err != nil || !found {
+		t.Fatalf("get updated object found=%t err=%v", found, err)
+	}
+	if string(body) != "metadata body" {
+		t.Fatalf("body changed after metadata update: %q", string(body))
+	}
+	if gotObject.ETag != updated.ETag {
+		t.Fatalf("etag changed on metadata update: got %q want %q", gotObject.ETag, updated.ETag)
+	}
+
+	if _, found, err := store.UpdateObjectMetadata(ctx, UpdateObjectMetadataInput{
+		Bucket:      "demo-bucket",
+		Key:         "missing.txt",
+		ContentType: "text/plain",
+	}); err != nil || found {
+		t.Fatalf("update missing object found=%t err=%v", found, err)
 	}
 }
 
