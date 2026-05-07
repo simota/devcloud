@@ -16,26 +16,28 @@ import {
   receiveSQSMessage,
   sendSQSMessage,
 } from './api'
-import type {
-  SQSDeadLetterResponse,
-  SQSLeaseSnapshot,
-  SQSMessageAttribute,
-  SQSMessageSnapshot,
-  SQSQueueSnapshot,
-  SQSReceivedMessage,
-  SQSStatus,
-} from './types'
-
-type QueuesState =
-  | { status: 'loading' }
-  | { status: 'success'; statusPayload: SQSStatus; queues: SQSQueueSnapshot[] }
-  | { status: 'error'; message: string }
-
-type DetailState =
-  | { status: 'idle' }
-  | { status: 'loading' }
-  | { status: 'success'; messages: SQSMessageSnapshot[]; leases: SQSLeaseSnapshot[]; dlq: SQSDeadLetterResponse }
-  | { status: 'error'; message: string }
+import { CreateQueueForm } from './CreateQueueForm'
+import {
+  compactStringMap,
+  disabledStatus,
+  normalizedNonNegativeOptionalNumber,
+  normalizedNumberString,
+  normalizedOptionalNumber,
+  parseMessageAttributes,
+  parseNameList,
+} from './helpers'
+import {
+  ChangeVisibilityForm,
+  DeleteMessageForm,
+  PurgeQueueForm,
+} from './InspectorOperationForms'
+import { MessageBrowser } from './MessageBrowser'
+import { ReceiveMessageForm, SendMessageForm } from './MessageOperationForms'
+import { QueueList } from './QueueList'
+import { ReceivedMessageList } from './ReceivedMessageList'
+import { SQSInspector } from './SQSInspector'
+import type { DetailState, QueuesState } from './state'
+import type { SQSReceivedMessage } from './types'
 
 type SQSDashboardProps = {
   service?: DashboardService
@@ -349,49 +351,18 @@ export function SQSDashboard({ service }: SQSDashboardProps): JSX.Element {
           </label>
           <Button onClick={refreshQueues}>Refresh</Button>
         </div>
-        <form className="pubsub-action-form stacked" onSubmit={handleCreateQueue}>
-          <label className="compact-filter">
-            <span>Queue name</span>
-            <input
-              aria-label="New SQS queue name"
-              onChange={(event) => setNewQueueName(event.target.value)}
-              placeholder={newQueueKind === 'fifo' ? 'jobs.fifo' : 'jobs'}
-              value={newQueueName}
-            />
-          </label>
-          <label className="compact-filter small">
-            <span>Type</span>
-            <select
-              aria-label="New SQS queue type"
-              onChange={(event) => setNewQueueKind(event.target.value === 'fifo' ? 'fifo' : 'standard')}
-              value={newQueueKind}
-            >
-              <option value="standard">Standard</option>
-              <option value="fifo">FIFO</option>
-            </select>
-          </label>
-          <label className="compact-filter small">
-            <span>Visibility</span>
-            <input
-              aria-label="New SQS queue visibility timeout seconds"
-              inputMode="numeric"
-              onChange={(event) => setNewQueueVisibility(event.target.value)}
-              value={newQueueVisibility}
-            />
-          </label>
-          <label className="compact-filter small">
-            <span>Delay</span>
-            <input
-              aria-label="New SQS queue delay seconds"
-              inputMode="numeric"
-              onChange={(event) => setNewQueueDelay(event.target.value)}
-              value={newQueueDelay}
-            />
-          </label>
-          <Button disabled={busyAction === 'create-queue'} type="submit">
-            Create
-          </Button>
-        </form>
+        <CreateQueueForm
+          busyAction={busyAction}
+          newQueueDelay={newQueueDelay}
+          newQueueKind={newQueueKind}
+          newQueueName={newQueueName}
+          newQueueVisibility={newQueueVisibility}
+          onSubmit={handleCreateQueue}
+          setNewQueueDelay={setNewQueueDelay}
+          setNewQueueKind={setNewQueueKind}
+          setNewQueueName={setNewQueueName}
+          setNewQueueVisibility={setNewQueueVisibility}
+        />
         {queuesState.status === 'loading' ? <EmptyState title="Loading queues" description="Reading local SQS queue metadata." /> : null}
         {queuesState.status === 'error' ? (
           <EmptyState title="SQS queues unavailable" description={queuesState.message} actionLabel="Retry" onAction={refreshQueues} />
@@ -424,62 +395,21 @@ export function SQSDashboard({ service }: SQSDashboardProps): JSX.Element {
             Refresh
           </Button>
         </div>
-        <form className="pubsub-action-form stacked" onSubmit={handleSendMessage}>
-          <label className="compact-filter wide">
-            <span>Message body</span>
-            <textarea
-              aria-label="SQS message body"
-              disabled={!activeQueue}
-              onChange={(event) => setSendBody(event.target.value)}
-              placeholder="message body"
-              rows={3}
-              value={sendBody}
-            />
-          </label>
-          <label className="compact-filter small">
-            <span>Delay</span>
-            <input
-              aria-label="SQS message delay seconds"
-              disabled={!activeQueue}
-              inputMode="numeric"
-              onChange={(event) => setSendDelay(event.target.value)}
-              value={sendDelay}
-            />
-          </label>
-          <label className="compact-filter">
-            <span>Attributes JSON</span>
-            <input
-              aria-label="SQS message attributes JSON"
-              disabled={!activeQueue}
-              onChange={(event) => setSendAttributesJSON(event.target.value)}
-              placeholder='{"kind":{"DataType":"String","StringValue":"test"}}'
-              value={sendAttributesJSON}
-            />
-          </label>
-          <label className="compact-filter small">
-            <span>Group</span>
-            <input
-              aria-label="SQS FIFO message group ID"
-              disabled={!activeQueue}
-              onChange={(event) => setSendGroupId(event.target.value)}
-              placeholder="FIFO only"
-              value={sendGroupId}
-            />
-          </label>
-          <label className="compact-filter small">
-            <span>Dedup</span>
-            <input
-              aria-label="SQS FIFO message deduplication ID"
-              disabled={!activeQueue}
-              onChange={(event) => setSendDeduplicationId(event.target.value)}
-              placeholder="optional"
-              value={sendDeduplicationId}
-            />
-          </label>
-          <Button disabled={!activeQueue || busyAction === 'send-message'} type="submit">
-            Send
-          </Button>
-        </form>
+        <SendMessageForm
+          activeQueue={Boolean(activeQueue)}
+          busyAction={busyAction}
+          onSubmit={handleSendMessage}
+          sendAttributesJSON={sendAttributesJSON}
+          sendBody={sendBody}
+          sendDeduplicationId={sendDeduplicationId}
+          sendDelay={sendDelay}
+          sendGroupId={sendGroupId}
+          setSendAttributesJSON={setSendAttributesJSON}
+          setSendBody={setSendBody}
+          setSendDeduplicationId={setSendDeduplicationId}
+          setSendDelay={setSendDelay}
+          setSendGroupId={setSendGroupId}
+        />
         <MessageBrowser
           activeIndex={activeMessageIndex}
           detailState={detailState}
@@ -487,61 +417,21 @@ export function SQSDashboard({ service }: SQSDashboardProps): JSX.Element {
           onSelectIndex={setActiveMessageIndex}
           queueName={activeQueueName}
         />
-        <form className="pubsub-action-form stacked" onSubmit={handleReceiveMessage}>
-          <label className="compact-filter small">
-            <span>Max</span>
-            <input
-              aria-label="SQS receive max messages"
-              disabled={!activeQueue}
-              inputMode="numeric"
-              onChange={(event) => setReceiveMaxMessages(event.target.value)}
-              value={receiveMaxMessages}
-            />
-          </label>
-          <label className="compact-filter small">
-            <span>Visibility</span>
-            <input
-              aria-label="SQS receive visibility timeout seconds"
-              disabled={!activeQueue}
-              inputMode="numeric"
-              onChange={(event) => setReceiveVisibilityTimeout(event.target.value)}
-              value={receiveVisibilityTimeout}
-            />
-          </label>
-          <label className="compact-filter small">
-            <span>Wait</span>
-            <input
-              aria-label="SQS receive wait time seconds"
-              disabled={!activeQueue}
-              inputMode="numeric"
-              onChange={(event) => setReceiveWaitTime(event.target.value)}
-              value={receiveWaitTime}
-            />
-          </label>
-          <label className="compact-filter">
-            <span>Attrs</span>
-            <input
-              aria-label="SQS receive attribute names"
-              disabled={!activeQueue}
-              onChange={(event) => setReceiveAttributeNames(event.target.value)}
-              placeholder="All or comma-separated names"
-              value={receiveAttributeNames}
-            />
-          </label>
-          <label className="compact-filter">
-            <span>Msg attrs</span>
-            <input
-              aria-label="SQS receive message attribute names"
-              disabled={!activeQueue}
-              onChange={(event) => setReceiveMessageAttributeNames(event.target.value)}
-              placeholder="All or comma-separated names"
-              value={receiveMessageAttributeNames}
-            />
-          </label>
-          <Button disabled={!activeQueue || busyAction === 'receive-message'} type="submit">
-            Receive
-          </Button>
-        </form>
+        <ReceiveMessageForm
+          activeQueue={Boolean(activeQueue)}
+          busyAction={busyAction}
+          onSubmit={handleReceiveMessage}
+          receiveAttributeNames={receiveAttributeNames}
+          receiveMaxMessages={receiveMaxMessages}
+          receiveMessageAttributeNames={receiveMessageAttributeNames}
+          receiveVisibilityTimeout={receiveVisibilityTimeout}
+          receiveWaitTime={receiveWaitTime}
+          setReceiveAttributeNames={setReceiveAttributeNames}
+          setReceiveMaxMessages={setReceiveMaxMessages}
+          setReceiveMessageAttributeNames={setReceiveMessageAttributeNames}
+          setReceiveVisibilityTimeout={setReceiveVisibilityTimeout}
+          setReceiveWaitTime={setReceiveWaitTime}
+        />
         <ReceivedMessageList
           messages={receivedMessages}
           onSelectIndex={setSelectedReceiptIndex}
@@ -552,89 +442,35 @@ export function SQSDashboard({ service }: SQSDashboardProps): JSX.Element {
       <Panel title="Inspector">
         {operationError ? <p className="operation-message error">{operationError}</p> : null}
         {operationMessage ? <p className="operation-message success">{operationMessage}</p> : null}
-        <form className="pubsub-action-form stacked" onSubmit={purgeQueue}>
-          <span className="toolbar-count">{activeQueue ? activeQueue.name : 'No queue selected'}</span>
-          <label className="compact-filter">
-            <span>Purge confirmation</span>
-            <input
-              aria-label="Confirm SQS purge queue"
-              disabled={!activeQueue}
-              onChange={(event) => setPurgeConfirmation(event.target.value)}
-              placeholder={activeQueue?.name ?? 'queue name'}
-              value={purgeConfirmation}
-            />
-          </label>
-          <Button
-            className="danger"
-            disabled={!activeQueue || purgeConfirmation !== activeQueue.name || busyAction === 'purge-queue'}
-            type="submit"
-          >
-            Purge
-          </Button>
-        </form>
+        <PurgeQueueForm
+          activeQueue={activeQueue}
+          busyAction={busyAction}
+          onSubmit={purgeQueue}
+          purgeConfirmation={purgeConfirmation}
+          setPurgeConfirmation={setPurgeConfirmation}
+        />
         {purgeError ? <p className="inspector-muted">{purgeError}</p> : null}
-        <form className="pubsub-action-form stacked" onSubmit={handleChangeVisibility}>
-          <label className="compact-filter small">
-            <span>Visibility timeout</span>
-            <input
-              aria-label="SQS change visibility timeout seconds"
-              disabled={!activeQueue || selectedReceiptHandle === ''}
-              inputMode="numeric"
-              onChange={(event) => setVisibilityTimeout(event.target.value)}
-              value={visibilityTimeout}
-            />
-          </label>
-          <label className="compact-filter small">
-            <span>Confirm</span>
-            <input
-              aria-label="Confirm SQS change message visibility"
-              disabled={!activeQueue || selectedReceiptHandle === ''}
-              onChange={(event) => setVisibilityConfirmation(event.target.value)}
-              placeholder="visibility"
-              value={visibilityConfirmation}
-            />
-          </label>
-          <Button
-            disabled={
-              !activeQueue ||
-              selectedReceiptHandle === '' ||
-              visibilityConfirmation !== 'visibility' ||
-              busyAction === 'change-visibility'
-            }
-            type="submit"
-          >
-            Change visibility
-          </Button>
-        </form>
-        <form className="pubsub-action-form stacked" onSubmit={handleDeleteMessage}>
-          <label className="compact-filter wide">
-            <span>Receipt handle</span>
-            <input
-              aria-label="SQS delete receipt handle"
-              disabled={!activeQueue}
-              onChange={(event) => setPastedReceiptHandle(event.target.value)}
-              placeholder={selectedReceivedMessage ? maskReceiptHandle(selectedReceivedMessage.ReceiptHandle) : 'paste receipt handle or select received message'}
-              value={pastedReceiptHandle}
-            />
-          </label>
-          <label className="compact-filter small">
-            <span>Confirm</span>
-            <input
-              aria-label="Confirm SQS delete message"
-              disabled={!activeQueue || selectedReceiptHandle === ''}
-              onChange={(event) => setDeleteConfirmation(event.target.value)}
-              placeholder="delete"
-              value={deleteConfirmation}
-            />
-          </label>
-          <Button
-            className="danger"
-            disabled={!activeQueue || selectedReceiptHandle === '' || deleteConfirmation !== 'delete' || busyAction === 'delete-message'}
-            type="submit"
-          >
-            Delete
-          </Button>
-        </form>
+        <ChangeVisibilityForm
+          activeQueue={Boolean(activeQueue)}
+          busyAction={busyAction}
+          onSubmit={handleChangeVisibility}
+          selectedReceiptHandle={selectedReceiptHandle}
+          setVisibilityConfirmation={setVisibilityConfirmation}
+          setVisibilityTimeout={setVisibilityTimeout}
+          visibilityConfirmation={visibilityConfirmation}
+          visibilityTimeout={visibilityTimeout}
+        />
+        <DeleteMessageForm
+          activeQueue={Boolean(activeQueue)}
+          busyAction={busyAction}
+          deleteConfirmation={deleteConfirmation}
+          onSubmit={handleDeleteMessage}
+          pastedReceiptHandle={pastedReceiptHandle}
+          selectedReceiptHandle={selectedReceiptHandle}
+          selectedReceivedMessage={selectedReceivedMessage}
+          setDeleteConfirmation={setDeleteConfirmation}
+          setPastedReceiptHandle={setPastedReceiptHandle}
+        />
         <SQSInspector
           detailState={detailState}
           message={selectedMessage}
@@ -644,343 +480,4 @@ export function SQSDashboard({ service }: SQSDashboardProps): JSX.Element {
       </Panel>
     </div>
   )
-}
-
-type QueueListProps = {
-  queues: SQSQueueSnapshot[]
-  activeQueueName?: string
-  onSelectQueue: (queueName: string) => void
-}
-
-function QueueList({ activeQueueName, onSelectQueue, queues }: QueueListProps): JSX.Element {
-  if (queues.length === 0) {
-    return <EmptyState title="No queues" description="Queues created through the SQS API will appear here." />
-  }
-
-  return (
-    <div className="dynamodb-table-list" aria-label="SQS queues">
-      {queues.map((queue) => (
-        <button
-          className={queue.name === activeQueueName ? 'dynamodb-table-row active' : 'dynamodb-table-row'}
-          key={queue.name}
-          onClick={() => onSelectQueue(queue.name)}
-        >
-          <span className="table-row-top">
-            <span className="table-row-name">{queue.name}</span>
-            <span className="count-pill">{queue.totalRetainedMessages}</span>
-          </span>
-          <span className="table-row-meta">{queue.url}</span>
-          <span className="table-row-tags">
-            <span>{queue.visibleMessages} visible</span>
-            <span>{queue.notVisibleMessages} in flight</span>
-            <span>{queue.delayedMessages} delayed</span>
-          </span>
-        </button>
-      ))}
-    </div>
-  )
-}
-
-type MessageBrowserProps = {
-  activeIndex: number
-  detailState: DetailState
-  messages: SQSMessageSnapshot[]
-  queueName?: string
-  onSelectIndex: (index: number) => void
-}
-
-function MessageBrowser({ activeIndex, detailState, messages, onSelectIndex, queueName }: MessageBrowserProps): JSX.Element {
-  if (!queueName) {
-    return <EmptyState title="No queue selected" description="Choose a queue to inspect retained messages." />
-  }
-  if (detailState.status === 'loading') {
-    return <EmptyState title="Loading messages" description={`Reading messages from ${queueName}.`} />
-  }
-  if (detailState.status === 'error') {
-    return <EmptyState title="SQS messages unavailable" description={detailState.message} />
-  }
-  if (messages.length === 0) {
-    return <EmptyState title="No messages" description={`No retained messages in ${queueName} match the current filter.`} />
-  }
-
-  return (
-    <div className="dynamodb-item-table-wrap">
-      <table className="dynamodb-item-table">
-        <thead>
-          <tr>
-            <th scope="col">State</th>
-            <th scope="col">Body</th>
-            <th scope="col">Receive</th>
-          </tr>
-        </thead>
-        <tbody>
-          {messages.map((message, index) => (
-            <tr
-              className={index === activeIndex ? 'item-row active' : 'item-row'}
-              key={`${message.messageId}-${index}`}
-              onClick={() => onSelectIndex(index)}
-            >
-              <td>{message.state}</td>
-              <td>
-                <MessagePreview message={message} />
-              </td>
-              <td>{message.receiveCount}</td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
-    </div>
-  )
-}
-
-function MessagePreview({ message }: { message: SQSMessageSnapshot }): JSX.Element {
-  return (
-    <span className="attribute-preview">
-      <span className="attribute-chip">{message.body || '(empty body)'}</span>
-      {message.messageGroupId ? <span className="attribute-chip">group: {message.messageGroupId}</span> : null}
-      {message.sequenceNumber ? <span className="attribute-chip">seq: {message.sequenceNumber}</span> : null}
-    </span>
-  )
-}
-
-type ReceivedMessageListProps = {
-  messages: SQSReceivedMessage[]
-  selectedIndex: number
-  onSelectIndex: (index: number) => void
-}
-
-function ReceivedMessageList({ messages, onSelectIndex, selectedIndex }: ReceivedMessageListProps): JSX.Element | null {
-  if (messages.length === 0) {
-    return null
-  }
-
-  return (
-    <div className="dynamodb-item-table-wrap" aria-label="Received SQS messages">
-      <table className="dynamodb-item-table">
-        <thead>
-          <tr>
-            <th scope="col">Use</th>
-            <th scope="col">Message</th>
-            <th scope="col">Receipt handle</th>
-          </tr>
-        </thead>
-        <tbody>
-          {messages.map((message, index) => (
-            <tr
-              className={index === selectedIndex ? 'item-row active' : 'item-row'}
-              key={`${message.MessageId}-${index}`}
-              onClick={() => onSelectIndex(index)}
-            >
-              <td>{index === selectedIndex ? 'selected' : 'select'}</td>
-              <td>
-                <span className="attribute-preview">
-                  <span className="attribute-chip">{message.Body || '(empty body)'}</span>
-                  <span className="attribute-chip">{message.MessageId}</span>
-                </span>
-              </td>
-              <td>
-                <code>{maskReceiptHandle(message.ReceiptHandle)}</code>
-              </td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
-    </div>
-  )
-}
-
-type SQSInspectorProps = {
-  detailState: DetailState
-  message?: SQSMessageSnapshot
-  queue?: SQSQueueSnapshot
-  status?: SQSStatus
-}
-
-function SQSInspector({ detailState, message, queue, status }: SQSInspectorProps): JSX.Element {
-  if (!queue) {
-    return <EmptyState title="Inspector" description="Queue attributes and selected message JSON will appear here." />
-  }
-
-  const leases = detailState.status === 'success' ? detailState.leases : []
-  const dlq = detailState.status === 'success' ? detailState.dlq : undefined
-  const redrivePolicy = parseRedrivePolicy(queue.attributes.RedrivePolicy)
-  const redriveAllowPolicy = parseRedriveAllowPolicy(queue.attributes.RedriveAllowPolicy)
-
-  return (
-    <div className="dynamodb-inspector">
-      <section>
-        <span className="inspector-label">Queue</span>
-        <h3>{queue.name}</h3>
-        <dl className="inspector-list">
-          <div>
-            <dt>Endpoint</dt>
-            <dd>
-              <code>{status?.endpoint ?? 'unknown'}</code>
-            </dd>
-          </div>
-          <div>
-            <dt>Region</dt>
-            <dd>{status?.region ?? 'unknown'}</dd>
-          </div>
-          <div>
-            <dt>ARN</dt>
-            <dd>
-              <code>{queue.arn}</code>
-            </dd>
-          </div>
-          <div>
-            <dt>Visibility</dt>
-            <dd>{queue.attributes.VisibilityTimeout ?? 'unknown'}s</dd>
-          </div>
-          <div>
-            <dt>Leases</dt>
-            <dd>{leases.length}</dd>
-          </div>
-          <div>
-            <dt>DLQ sources</dt>
-            <dd>{dlq?.deadLetterSourceQueues.map((source) => source.name).join(', ') || 'none'}</dd>
-          </div>
-          <div>
-            <dt>DLQ target</dt>
-            <dd>{dlq?.deadLetterQueue?.name ?? redrivePolicy?.deadLetterTargetArn ?? 'none'}</dd>
-          </div>
-          <div>
-            <dt>Redrive</dt>
-            <dd>
-              {redrivePolicy ? `maxReceiveCount ${redrivePolicy.maxReceiveCount}` : 'none'}
-              {redriveAllowPolicy ? `, allow ${redriveAllowPolicy.redrivePermission}` : ''}
-            </dd>
-          </div>
-        </dl>
-      </section>
-      <section>
-        <span className="inspector-label">Selected message</span>
-        {message ? (
-          <pre className="mail-preview">{JSON.stringify(message, null, 2)}</pre>
-        ) : (
-          <p className="inspector-muted">Select a message row to inspect JSON.</p>
-        )}
-      </section>
-    </div>
-  )
-}
-
-function disabledStatus(service?: DashboardService): SQSStatus {
-  return {
-    service: 'sqs',
-    status: 'disabled',
-    running: false,
-    endpoint: service?.endpoint ?? 'http://127.0.0.1:9324',
-    region: 'us-east-1',
-    authMode: 'relaxed',
-    storagePath: service?.storagePath ?? '.devcloud/data/sqs',
-    queueCount: 0,
-  }
-}
-
-function normalizedNumberString(value: string): string | undefined {
-  const parsed = Number.parseInt(value, 10)
-  if (!Number.isFinite(parsed) || parsed < 0) {
-    return undefined
-  }
-  return String(parsed)
-}
-
-function normalizedOptionalNumber(value: string): number | undefined {
-  const parsed = Number.parseInt(value, 10)
-  if (!Number.isFinite(parsed) || parsed <= 0) {
-    return undefined
-  }
-  return parsed
-}
-
-function normalizedNonNegativeOptionalNumber(value: string): number | undefined {
-  const parsed = Number.parseInt(value, 10)
-  if (!Number.isFinite(parsed) || parsed < 0) {
-    return undefined
-  }
-  return parsed
-}
-
-function compactStringMap(input: Record<string, string | undefined>): Record<string, string> {
-  return Object.fromEntries(Object.entries(input).filter((entry): entry is [string, string] => typeof entry[1] === 'string'))
-}
-
-function parseMessageAttributes(value: string): Record<string, SQSMessageAttribute> | undefined | Error {
-  const trimmed = value.trim()
-  if (trimmed === '') {
-    return undefined
-  }
-  let parsed: unknown
-  try {
-    parsed = JSON.parse(trimmed)
-  } catch {
-    return new Error('Message attributes JSON is invalid')
-  }
-  if (!isPlainObject(parsed)) {
-    return new Error('Message attributes must be a JSON object')
-  }
-  for (const [name, attribute] of Object.entries(parsed)) {
-    if (!isPlainObject(attribute) || typeof attribute.DataType !== 'string' || attribute.DataType.trim() === '') {
-      return new Error(`Message attribute ${name} must include DataType`)
-    }
-  }
-  return parsed as Record<string, SQSMessageAttribute>
-}
-
-function parseNameList(value: string): string[] | undefined {
-  const names = value
-    .split(',')
-    .map((name) => name.trim())
-    .filter(Boolean)
-  return names.length > 0 ? names : undefined
-}
-
-function parseRedrivePolicy(value?: string): { deadLetterTargetArn: string; maxReceiveCount: string } | undefined {
-  if (!value) {
-    return undefined
-  }
-  try {
-    const parsed: unknown = JSON.parse(value)
-    if (!isPlainObject(parsed)) {
-      return undefined
-    }
-    const deadLetterTargetArn = parsed.deadLetterTargetArn
-    const maxReceiveCount = parsed.maxReceiveCount
-    if (typeof deadLetterTargetArn !== 'string') {
-      return undefined
-    }
-    return {
-      deadLetterTargetArn,
-      maxReceiveCount: typeof maxReceiveCount === 'string' ? maxReceiveCount : String(maxReceiveCount ?? ''),
-    }
-  } catch {
-    return undefined
-  }
-}
-
-function parseRedriveAllowPolicy(value?: string): { redrivePermission: string } | undefined {
-  if (!value) {
-    return undefined
-  }
-  try {
-    const parsed: unknown = JSON.parse(value)
-    if (!isPlainObject(parsed) || typeof parsed.redrivePermission !== 'string') {
-      return undefined
-    }
-    return { redrivePermission: parsed.redrivePermission }
-  } catch {
-    return undefined
-  }
-}
-
-function maskReceiptHandle(value: string): string {
-  if (value.length <= 12) {
-    return value === '' ? '' : '...'
-  }
-  return `${value.slice(0, 6)}...${value.slice(-6)}`
-}
-
-function isPlainObject(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
