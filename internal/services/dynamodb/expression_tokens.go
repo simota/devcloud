@@ -202,3 +202,11 @@ func resolveAttributeName(token string, names map[string]string) string {
 	}
 	return token
 }
+
+func parseFunctionCall(expression string, name string) (string, bool) {
+	prefix := name + "("
+	if !strings.HasPrefix(expression, prefix) || !strings.HasSuffix(expression, ")") {
+		return "", false
+	}
+	return strings.TrimSuffix(strings.TrimPrefix(expression, prefix), ")"), true
+}

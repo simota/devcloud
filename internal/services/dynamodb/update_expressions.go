@@ -112,8 +112,8 @@ func evaluateUpdateValue(target item, expression string, names map[string]string
 		}
 		return addAttributeValue(leftValue, rightValue)
 	}
-	if strings.HasPrefix(expression, "if_not_exists(") && strings.HasSuffix(expression, ")") {
-		args := splitCommaSeparated(strings.TrimSuffix(strings.TrimPrefix(expression, "if_not_exists("), ")"))
+	if body, ok := parseFunctionCall(expression, "if_not_exists"); ok {
+		args := splitCommaSeparated(body)
 		if len(args) != 2 {
 			return nil, errors.New("invalid if_not_exists expression")
 		}
@@ -123,8 +123,8 @@ func evaluateUpdateValue(target item, expression string, names map[string]string
 		}
 		return evaluateUpdateValue(target, strings.TrimSpace(args[1]), names, values)
 	}
-	if strings.HasPrefix(expression, "list_append(") && strings.HasSuffix(expression, ")") {
-		args := splitCommaSeparated(strings.TrimSuffix(strings.TrimPrefix(expression, "list_append("), ")"))
+	if body, ok := parseFunctionCall(expression, "list_append"); ok {
+		args := splitCommaSeparated(body)
 		if len(args) != 2 {
 			return nil, errors.New("invalid list_append expression")
 		}

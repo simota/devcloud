@@ -8,10 +8,11 @@ import (
 )
 
 func evaluateSizeOperand(expression string, names map[string]string, candidate item) (int, bool, error) {
-	if !strings.HasPrefix(expression, "size(") || !strings.HasSuffix(expression, ")") {
+	body, ok := parseFunctionCall(expression, "size")
+	if !ok {
 		return 0, false, nil
 	}
-	attr := resolveAttributeName(strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(expression, "size("), ")")), names)
+	attr := resolveAttributeName(strings.TrimSpace(body), names)
 	value, ok := candidate[attr]
 	if !ok {
 		return 0, true, nil
