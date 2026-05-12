@@ -1,0 +1,52 @@
+name: Services MVP (GCS / DynamoDB / BigQuery / SQS / Pub/Sub)
+
+on:
+  push:
+    branches:
+      - main
+      - feat/**
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions: {}
+
+jobs:
+  verify:
+    name: verify (${{ matrix.service }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    permissions:
+      contents: read
+
+    strategy:
+      fail-fast: false
+      matrix:
+        service:
+          - gcs
+          - dynamodb
+          - bigquery
+          - sqs
+          - pubsub
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
+      - name: Set up Go
+        uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5  # v5.5.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run tests
+        run: go test ./...
+
+      - name: Run ${{ matrix.service }} MVP acceptance gate
+        run: VERIFY_STAGE=full bash scripts/${{ matrix.service }}-autoloop/verify.sh
+
+      - name: Run ${{ matrix.service }} E2E
+        run: scripts/${{ matrix.service }}-e2e.sh
