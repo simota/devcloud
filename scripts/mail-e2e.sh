@@ -111,13 +111,13 @@ EOF
 
 assert_dashboard_shell() {
   local html_file="${TMP_DIR}/dashboard.html"
-  curl -fsS "http://127.0.0.1:${DASHBOARD_PORT}/mail" > "${html_file}"
-  grep -q '<title>devcloud Mail</title>' "${html_file}"
-  grep -q 'aria-label="Inbox"' "${html_file}"
-  grep -q 'id="messages"' "${html_file}"
-  grep -q 'data-tab="raw"' "${html_file}"
-  grep -q 'fetch("/api/messages"' "${html_file}"
-  grep -q 'Clear all' "${html_file}"
+  # Legacy /mail must 301-redirect to /dashboard/mail.
+  curl -fsS -o /dev/null -w '%{http_code} %{redirect_url}\n' "http://127.0.0.1:${DASHBOARD_PORT}/mail" \
+    | grep -q '^301 .*/dashboard/mail$'
+  # React shell serves the Mail dashboard at /dashboard/mail.
+  curl -fsS "http://127.0.0.1:${DASHBOARD_PORT}/dashboard/mail" > "${html_file}"
+  grep -q '<title>devcloud Dashboard</title>' "${html_file}"
+  grep -q '<div id="root"></div>' "${html_file}"
 }
 
 run_mail_journey() {
@@ -203,7 +203,7 @@ PY
 show_interactive_hint() {
   cat <<EOF
 [e2e] browser check:
-[e2e]   URL: http://127.0.0.1:${DASHBOARD_PORT}/mail
+[e2e]   URL: http://127.0.0.1:${DASHBOARD_PORT}/dashboard/mail
 [e2e]   Expected message subject is printed above.
 [e2e]   Use Refresh if the inbox is already open.
 EOF

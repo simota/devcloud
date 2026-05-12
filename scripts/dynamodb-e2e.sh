@@ -235,6 +235,14 @@ services:
       enabled: true
     ttl:
       schedulerIntervalSeconds: 60
+  bigquery:
+    enabled: false
+  sqs:
+    enabled: false
+  pubsub:
+    enabled: false
+  redshift:
+    enabled: false
 EOF
 }
 

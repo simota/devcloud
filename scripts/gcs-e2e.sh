@@ -284,7 +284,11 @@ assert_dashboard_api() {
   curl -fsS "${DASHBOARD_ENDPOINT}/api/gcs/status" | grep -q '"running"'
   curl -fsS "${DASHBOARD_ENDPOINT}/api/gcs/buckets" | grep -q "${BUCKET}"
   curl -fsS "${DASHBOARD_ENDPOINT}/api/gcs/buckets/${BUCKET}/objects?prefix=docs/" | grep -q 'docs/readme.txt'
-  curl -fsS "${DASHBOARD_ENDPOINT}/gcs" | grep -qi 'devcloud GCS'
+  # Legacy /gcs must 301-redirect to /dashboard/gcs.
+  curl -fsS -o /dev/null -w '%{http_code} %{redirect_url}\n' "${DASHBOARD_ENDPOINT}/gcs" \
+    | grep -q '^301 .*/dashboard/gcs$'
+  # React shell serves the GCS dashboard at /dashboard/gcs.
+  curl -fsS "${DASHBOARD_ENDPOINT}/dashboard/gcs" | grep -qi 'devcloud Dashboard'
 }
 
 delete_data() {
@@ -312,7 +316,7 @@ run_gcs_journey() {
 show_interactive_hint() {
   cat <<EOF
 [gcs-e2e] browser check:
-[gcs-e2e]   Dashboard: ${DASHBOARD_ENDPOINT}/gcs
+[gcs-e2e]   Dashboard: ${DASHBOARD_ENDPOINT}/dashboard/gcs
 [gcs-e2e]   GCS endpoint: ${GCS_ENDPOINT}
 [gcs-e2e]   Project: ${PROJECT}
 [gcs-e2e]   Bucket used: ${BUCKET}

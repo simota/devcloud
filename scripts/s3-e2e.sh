@@ -148,7 +148,11 @@ assert_dashboard_api() {
   curl -fsS "${DASHBOARD_ENDPOINT}/api/s3/status" | grep -q '"running":true'
   curl -fsS "${DASHBOARD_ENDPOINT}/api/s3/buckets" | grep -q "${BUCKET}"
   curl -fsS "${DASHBOARD_ENDPOINT}/api/s3/buckets/${BUCKET}/objects?prefix=docs/" | grep -q 'docs/readme.txt'
-  curl -fsS "${DASHBOARD_ENDPOINT}/s3" | grep -q 'devcloud S3'
+  # Legacy /s3 must 301-redirect to /dashboard/s3.
+  curl -fsS -o /dev/null -w '%{http_code} %{redirect_url}\n' "${DASHBOARD_ENDPOINT}/s3" \
+    | grep -q '^301 .*/dashboard/s3$'
+  # React shell serves the S3 dashboard at /dashboard/s3.
+  curl -fsS "${DASHBOARD_ENDPOINT}/dashboard/s3" | grep -q 'devcloud Dashboard'
 }
 
 run_s3_journey() {
@@ -261,7 +265,7 @@ EOF
 show_interactive_hint() {
   cat <<EOF
 [s3-e2e] browser check:
-[s3-e2e]   Dashboard: ${DASHBOARD_ENDPOINT}/s3
+[s3-e2e]   Dashboard: ${DASHBOARD_ENDPOINT}/dashboard/s3
 [s3-e2e]   S3 endpoint: ${S3_ENDPOINT}
 [s3-e2e]   Bucket used: ${BUCKET}
 [s3-e2e] awscli-local examples:
