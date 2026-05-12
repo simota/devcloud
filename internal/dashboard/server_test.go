@@ -120,11 +120,11 @@ func TestIndexServesServiceLinks(t *testing.T) {
 	body := rec.Body.String()
 	for _, want := range []string{
 		"devcloud Services",
-		`href="/mail"`,
-		`href="/s3"`,
-		`href="/gcs"`,
-		`href="/dynamodb"`,
-		`href="/bigquery"`,
+		`href="/dashboard/mail"`,
+		`href="/dashboard/s3"`,
+		`href="/dashboard/gcs"`,
+		`href="/dashboard/dynamodb"`,
+		`href="/dashboard/bigquery"`,
 		`href="/dashboard/sqs"`,
 		`href="/dashboard/pubsub"`,
 		"Local service dashboards",
@@ -179,7 +179,7 @@ func TestDashboardServicesAPIListsServiceRegistry(t *testing.T) {
 	assertService(t, response.Services[0], DashboardService{
 		ID:          "mail",
 		Name:        "Mail",
-		Path:        "/mail",
+		Path:        "/dashboard/mail",
 		Status:      "running",
 		Endpoint:    "smtp://127.0.0.1:2525",
 		StoragePath: ".devcloud/test/mail",
@@ -187,7 +187,7 @@ func TestDashboardServicesAPIListsServiceRegistry(t *testing.T) {
 	assertService(t, response.Services[1], DashboardService{
 		ID:          "s3",
 		Name:        "S3",
-		Path:        "/s3",
+		Path:        "/dashboard/s3",
 		Status:      "running",
 		Endpoint:    "http://127.0.0.1:4567",
 		StoragePath: ".devcloud/test/s3",
@@ -195,7 +195,7 @@ func TestDashboardServicesAPIListsServiceRegistry(t *testing.T) {
 	assertService(t, response.Services[2], DashboardService{
 		ID:          "gcs",
 		Name:        "GCS",
-		Path:        "/gcs",
+		Path:        "/dashboard/gcs",
 		Status:      "running",
 		Endpoint:    "http://127.0.0.1:4444",
 		StoragePath: ".devcloud/test/s3",
@@ -203,7 +203,7 @@ func TestDashboardServicesAPIListsServiceRegistry(t *testing.T) {
 	assertService(t, response.Services[3], DashboardService{
 		ID:          "dynamodb",
 		Name:        "DynamoDB",
-		Path:        "/dynamodb",
+		Path:        "/dashboard/dynamodb",
 		Status:      "running",
 		Endpoint:    "http://127.0.0.1:8001",
 		StoragePath: ".devcloud/test/dynamodb",
@@ -211,7 +211,7 @@ func TestDashboardServicesAPIListsServiceRegistry(t *testing.T) {
 	assertService(t, response.Services[4], DashboardService{
 		ID:          "bigquery",
 		Name:        "BigQuery",
-		Path:        "/bigquery",
+		Path:        "/dashboard/bigquery",
 		Status:      "running",
 		Endpoint:    "http://127.0.0.1:9051",
 		StoragePath: ".devcloud/test/bigquery",
@@ -335,8 +335,11 @@ func TestReactDashboardAssetsServeWithoutInterceptingCompatibilityRoutes(t *test
 	}
 
 	compatMail := performRequest(routes, http.MethodGet, "/mail")
-	if compatMail.Code != http.StatusOK || !strings.Contains(compatMail.Body.String(), "devcloud Mail") {
-		t.Fatalf("compat mail route changed: status=%d body=%s", compatMail.Code, compatMail.Body.String())
+	if compatMail.Code != http.StatusMovedPermanently {
+		t.Fatalf("compat mail route should redirect: status=%d body=%s", compatMail.Code, compatMail.Body.String())
+	}
+	if got := compatMail.Header().Get("Location"); got != "/dashboard/mail" {
+		t.Fatalf("compat mail redirect target = %q, want /dashboard/mail", got)
 	}
 
 	registry := performRequest(routes, http.MethodGet, "/api/dashboard/services")

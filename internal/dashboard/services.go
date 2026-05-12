@@ -19,7 +19,7 @@ func (s *Server) dashboardServices() []DashboardService {
 		{
 			ID:          "mail",
 			Name:        "Mail",
-			Path:        "/mail",
+			Path:        "/dashboard/mail",
 			Status:      mailServiceStatus(s.config.MailDisabled),
 			Endpoint:    defaultString(s.config.MailEndpoint, "smtp://127.0.0.1:1025"),
 			StoragePath: defaultString(s.config.MailStoragePath, ".devcloud/data/mail"),
@@ -30,7 +30,7 @@ func (s *Server) dashboardServices() []DashboardService {
 	services = append(services, DashboardService{
 		ID:          "s3",
 		Name:        "S3",
-		Path:        "/s3",
+		Path:        "/dashboard/s3",
 		Status:      s3ServiceStatus(s.s3 != nil),
 		Endpoint:    defaultString(s.config.S3Endpoint, "http://127.0.0.1:4566"),
 		StoragePath: defaultString(s.config.S3StoragePath, ".devcloud/data/s3"),
@@ -40,7 +40,7 @@ func (s *Server) dashboardServices() []DashboardService {
 	services = append(services, DashboardService{
 		ID:          "gcs",
 		Name:        "GCS",
-		Path:        "/gcs",
+		Path:        "/dashboard/gcs",
 		Status:      objectServiceStatus(s.gcs != nil),
 		Endpoint:    defaultString(s.config.GCSEndpoint, "http://127.0.0.1:4443"),
 		StoragePath: defaultString(s.config.GCSStoragePath, ".devcloud/data/s3"),
@@ -50,7 +50,7 @@ func (s *Server) dashboardServices() []DashboardService {
 	services = append(services, DashboardService{
 		ID:          "dynamodb",
 		Name:        "DynamoDB",
-		Path:        "/dynamodb",
+		Path:        "/dashboard/dynamodb",
 		Status:      objectServiceStatus(s.dynamo != nil),
 		Endpoint:    defaultString(s.config.DynamoDBEndpoint, "http://127.0.0.1:8000"),
 		StoragePath: defaultString(s.config.DynamoDBStoragePath, ".devcloud/data/dynamodb"),
@@ -60,7 +60,7 @@ func (s *Server) dashboardServices() []DashboardService {
 	services = append(services, DashboardService{
 		ID:          "bigquery",
 		Name:        "BigQuery",
-		Path:        "/bigquery",
+		Path:        "/dashboard/bigquery",
 		Status:      objectServiceStatus(s.bq != nil),
 		Endpoint:    defaultString(s.config.BigQueryEndpoint, "http://127.0.0.1:9050"),
 		StoragePath: defaultString(s.config.BigQueryStoragePath, ".devcloud/data/bigquery"),

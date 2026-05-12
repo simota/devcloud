@@ -60,9 +60,12 @@ func TestBigQueryDashboardPageAndAPIExposeCatalog(t *testing.T) {
 	if page.Code != http.StatusOK || !strings.Contains(page.Body.String(), "devcloud Dashboard") {
 		t.Fatalf("BigQuery dashboard route changed: status=%d body=%s", page.Code, page.Body.String())
 	}
-	compatPage := performRequest(routes, http.MethodGet, "/bigquery")
-	if compatPage.Code != http.StatusOK || !strings.Contains(compatPage.Body.String(), "devcloud Dashboard") {
-		t.Fatalf("BigQuery compat route changed: status=%d body=%s", compatPage.Code, compatPage.Body.String())
+	legacy := performRequest(routes, http.MethodGet, "/bigquery")
+	if legacy.Code != http.StatusMovedPermanently {
+		t.Fatalf("legacy /bigquery status = %d, want %d", legacy.Code, http.StatusMovedPermanently)
+	}
+	if got := legacy.Header().Get("Location"); got != "/dashboard/bigquery" {
+		t.Fatalf("legacy /bigquery redirect target = %q, want /dashboard/bigquery", got)
 	}
 
 	status := performRequest(routes, http.MethodGet, "/api/bigquery/status")

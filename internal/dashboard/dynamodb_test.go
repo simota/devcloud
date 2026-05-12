@@ -63,9 +63,12 @@ func TestDynamoDBDashboardPageAndAPIExposeTables(t *testing.T) {
 	server.SetDynamoDB(dynamo)
 	routes := server.routes()
 
-	page := performRequest(routes, http.MethodGet, "/dynamodb")
-	if page.Code != http.StatusOK || !strings.Contains(page.Body.String(), "devcloud Dashboard") {
-		t.Fatalf("DynamoDB page changed: status=%d body=%s", page.Code, page.Body.String())
+	legacy := performRequest(routes, http.MethodGet, "/dynamodb")
+	if legacy.Code != http.StatusMovedPermanently {
+		t.Fatalf("legacy /dynamodb status = %d, want %d", legacy.Code, http.StatusMovedPermanently)
+	}
+	if got := legacy.Header().Get("Location"); got != "/dashboard/dynamodb" {
+		t.Fatalf("legacy /dynamodb redirect target = %q, want /dashboard/dynamodb", got)
 	}
 
 	dashboardPage := performRequest(routes, http.MethodGet, "/dashboard/dynamodb")

@@ -24,9 +24,9 @@ Default local endpoints:
 
 | Service | Endpoint | Dashboard |
 | --- | --- | --- |
-| Mail SMTP | `127.0.0.1:1025` | `http://127.0.0.1:8025/mail` |
-| S3 | `http://127.0.0.1:4566` | `http://127.0.0.1:8025/s3` |
-| GCS | `http://127.0.0.1:4443` | `http://127.0.0.1:8025/gcs` |
+| Mail SMTP | `127.0.0.1:1025` | `http://127.0.0.1:8025/dashboard/mail` |
+| S3 | `http://127.0.0.1:4566` | `http://127.0.0.1:8025/dashboard/s3` |
+| GCS | `http://127.0.0.1:4443` | `http://127.0.0.1:8025/dashboard/gcs` |
 | DynamoDB | `http://127.0.0.1:8000` | `http://127.0.0.1:8025/dashboard/dynamodb` |
 | BigQuery | `http://127.0.0.1:9050` | `http://127.0.0.1:8025/dashboard/bigquery` |
 | SQS | `http://127.0.0.1:9324` | `http://127.0.0.1:8025/dashboard/sqs` |
@@ -385,7 +385,7 @@ Pub/Sub dashboard actions are available under `/dashboard/pubsub`:
 | SQS dashboard API | Yes | Status, queues, messages, leases, DLQ, and purge. |
 | Pub/Sub dashboard API | Yes | Status, topics, subscriptions, publish, pull, ack, and message metadata. |
 | Redshift dashboard API | Yes | Status, clusters, catalog, table detail, query runner, and statement history. |
-| Common React dashboard shell | Partial | Shared shell is available under `/dashboard/`; some legacy service pages still exist. |
+| Common React dashboard shell | Yes | All service pages are served under `/dashboard/<svc>` from the shared React shell; legacy `/mail`, `/s3`, `/gcs`, `/dynamodb`, `/bigquery` paths return 301 redirects. |
 
 ## Verification
 

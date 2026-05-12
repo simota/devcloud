@@ -11,9 +11,24 @@ import (
 	"devcloud/internal/services/mail"
 )
 
-func TestMailPathServesStaticMailDashboard(t *testing.T) {
+func TestMailLegacyPathRedirectsToDashboard(t *testing.T) {
 	server := NewServer(Config{}, newDashboardStore(nil, nil))
 	req := httptest.NewRequest(http.MethodGet, "/mail", nil)
+	rec := httptest.NewRecorder()
+
+	server.routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusMovedPermanently {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusMovedPermanently)
+	}
+	if got := rec.Header().Get("Location"); got != "/dashboard/mail" {
+		t.Fatalf("Location = %q, want /dashboard/mail", got)
+	}
+}
+
+func TestMailDashboardPathServesReactShell(t *testing.T) {
+	server := NewServer(Config{}, newDashboardStore(nil, nil))
+	req := httptest.NewRequest(http.MethodGet, "/dashboard/mail", nil)
 	rec := httptest.NewRecorder()
 
 	server.routes().ServeHTTP(rec, req)
@@ -24,22 +39,8 @@ func TestMailPathServesStaticMailDashboard(t *testing.T) {
 	if got := rec.Header().Get("Content-Type"); !strings.HasPrefix(got, "text/html") {
 		t.Fatalf("Content-Type = %q, want text/html", got)
 	}
-	body := rec.Body.String()
-	for _, want := range []string{
-		"devcloud Mail",
-		"smtp://localhost:1025",
-		`fetch("/api/messages"`,
-		`data-tab="raw"`,
-		"Storage: .devcloud/data",
-	} {
-		if !strings.Contains(body, want) {
-			t.Fatalf("dashboard HTML missing %q", want)
-		}
-	}
-	for _, forbidden := range []string{"react", "vite", "tailwind"} {
-		if strings.Contains(strings.ToLower(body), forbidden) {
-			t.Fatalf("dashboard HTML unexpectedly contains %q", forbidden)
-		}
+	if body := rec.Body.String(); !strings.Contains(body, "devcloud Dashboard") {
+		t.Fatalf("dashboard React shell missing title: %s", body)
 	}
 }
 

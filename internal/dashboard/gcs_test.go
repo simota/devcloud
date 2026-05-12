@@ -51,12 +51,20 @@ func TestGCSDashboardPageAndAPIExposeObjects(t *testing.T) {
 		GCSUploadSessionPath: sessionDir,
 	}, newDashboardStore(nil, nil), nil, gcsStore).routes()
 
-	page := performRequest(routes, http.MethodGet, "/gcs")
+	legacy := performRequest(routes, http.MethodGet, "/gcs")
+	if legacy.Code != http.StatusMovedPermanently {
+		t.Fatalf("legacy /gcs status = %d, want %d", legacy.Code, http.StatusMovedPermanently)
+	}
+	if got := legacy.Header().Get("Location"); got != "/dashboard/gcs" {
+		t.Fatalf("legacy /gcs redirect target = %q, want /dashboard/gcs", got)
+	}
+
+	page := performRequest(routes, http.MethodGet, "/dashboard/gcs")
 	if page.Code != http.StatusOK {
 		t.Fatalf("gcs page status = %d, want %d", page.Code, http.StatusOK)
 	}
-	if body := page.Body.String(); !strings.Contains(body, "devcloud GCS") || !strings.Contains(body, "/api/gcs/buckets") {
-		t.Fatalf("gcs page missing expected shell: %s", body)
+	if body := page.Body.String(); !strings.Contains(body, "devcloud Dashboard") {
+		t.Fatalf("gcs page missing React shell: %s", body)
 	}
 
 	status := performRequest(routes, http.MethodGet, "/api/gcs/status")

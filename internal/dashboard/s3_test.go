@@ -41,12 +41,20 @@ func TestS3DashboardPageAndAPIExposeObjects(t *testing.T) {
 		S3StoragePath: ".devcloud/data/s3",
 	}, newDashboardStore(nil, nil), s3Store).routes()
 
-	page := performRequest(routes, http.MethodGet, "/s3")
+	legacy := performRequest(routes, http.MethodGet, "/s3")
+	if legacy.Code != http.StatusMovedPermanently {
+		t.Fatalf("legacy /s3 status = %d, want %d", legacy.Code, http.StatusMovedPermanently)
+	}
+	if got := legacy.Header().Get("Location"); got != "/dashboard/s3" {
+		t.Fatalf("legacy /s3 redirect target = %q, want /dashboard/s3", got)
+	}
+
+	page := performRequest(routes, http.MethodGet, "/dashboard/s3")
 	if page.Code != http.StatusOK {
 		t.Fatalf("s3 page status = %d, want %d", page.Code, http.StatusOK)
 	}
-	if body := page.Body.String(); !strings.Contains(body, "devcloud S3") || !strings.Contains(body, "/api/s3/buckets") {
-		t.Fatalf("s3 page missing expected shell: %s", body)
+	if body := page.Body.String(); !strings.Contains(body, "devcloud Dashboard") {
+		t.Fatalf("s3 page missing React shell: %s", body)
 	}
 
 	status := performRequest(routes, http.MethodGet, "/api/s3/status")
@@ -407,26 +415,3 @@ func TestS3DashboardCopyReplaceMetadataDoesNotMutateSource(t *testing.T) {
 	}
 }
 
-func TestS3DashboardEscapesDynamicObjectValues(t *testing.T) {
-	for _, want := range []string{
-		"function escapeHTML(value)",
-		"escapeHTML(object.key)",
-		"escapeHTML(object.s3Uri)",
-		"escapeHTML(metadata[key])",
-		"data-index",
-	} {
-		if !strings.Contains(s3IndexHTML, want) {
-			t.Fatalf("s3 dashboard HTML missing %q", want)
-		}
-	}
-	for _, forbidden := range []string{
-		`data-bucket="' + bucket.name + '"`,
-		`<td class="key">' + object.key + '</td>`,
-		`<dt>Key</dt><dd>' + object.key + '</dd>`,
-		`metadata[key] + '</dd>`,
-	} {
-		if strings.Contains(s3IndexHTML, forbidden) {
-			t.Fatalf("s3 dashboard HTML still contains unsafe interpolation %q", forbidden)
-		}
-	}
-}

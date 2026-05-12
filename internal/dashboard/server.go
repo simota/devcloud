@@ -121,12 +121,11 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("/", s.handleServiceIndex)
 	mux.HandleFunc("/dashboard", s.handleReactDashboardAssets)
 	mux.HandleFunc("/dashboard/", s.handleReactDashboardAssets)
-	mux.HandleFunc("/mail", s.handleMailIndex)
-	mux.HandleFunc("/s3", s.handleS3Index)
-	mux.HandleFunc("/gcs", s.handleGCSIndex)
-	mux.HandleFunc("/dynamodb", s.handleDynamoDBIndex)
-	mux.HandleFunc("/bigquery", s.handleBigQueryIndex)
-	mux.HandleFunc("/dashboard/redshift", s.handleRedshiftIndex)
+	mux.HandleFunc("/mail", redirectToDashboard("/dashboard/mail"))
+	mux.HandleFunc("/s3", redirectToDashboard("/dashboard/s3"))
+	mux.HandleFunc("/gcs", redirectToDashboard("/dashboard/gcs"))
+	mux.HandleFunc("/dynamodb", redirectToDashboard("/dashboard/dynamodb"))
+	mux.HandleFunc("/bigquery", redirectToDashboard("/dashboard/bigquery"))
 	mux.HandleFunc("/api/services", s.handleDashboardServices)
 	mux.HandleFunc("/api/dashboard/services", s.handleDashboardServices)
 	mux.HandleFunc("/api/messages", s.handleMessages)
@@ -175,31 +174,14 @@ func (s *Server) handleServiceIndex(w http.ResponseWriter, r *http.Request) {
 	io.WriteString(w, serviceIndexHTML)
 }
 
-func (s *Server) handleMailIndex(w http.ResponseWriter, _ *http.Request) {
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	io.WriteString(w, indexHTML)
-}
-
-func (s *Server) handleS3Index(w http.ResponseWriter, _ *http.Request) {
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	io.WriteString(w, s3IndexHTML)
-}
-
-func (s *Server) handleGCSIndex(w http.ResponseWriter, _ *http.Request) {
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	io.WriteString(w, gcsIndexHTML)
-}
-
-func (s *Server) handleDynamoDBIndex(w http.ResponseWriter, r *http.Request) {
-	serveReactDashboardApp(w, r)
-}
-
-func (s *Server) handleBigQueryIndex(w http.ResponseWriter, r *http.Request) {
-	serveReactDashboardApp(w, r)
-}
-
-func (s *Server) handleRedshiftIndex(w http.ResponseWriter, r *http.Request) {
-	serveReactDashboardApp(w, r)
+func redirectToDashboard(target string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			methodNotAllowed(w, "GET, HEAD")
+			return
+		}
+		http.Redirect(w, r, target, http.StatusMovedPermanently)
+	}
 }
 
 func (s *Server) handleDashboardServices(w http.ResponseWriter, r *http.Request) {
