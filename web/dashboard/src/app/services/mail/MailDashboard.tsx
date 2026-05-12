@@ -78,9 +78,6 @@ export function MailDashboard({ service }: MailDashboardProps): JSX.Element {
           title="Mail is disabled"
           description="Enable the Mail service in devcloud config to inspect received messages."
         />
-        <a className="compat-link" href="/mail">
-          Open current Mail dashboard
-        </a>
       </Panel>
     )
   }
@@ -127,9 +124,6 @@ export function MailDashboard({ service }: MailDashboardProps): JSX.Element {
 
       <Panel title="Message">
         <MailMessageInspector message={selectedMessage} />
-        <a className="compat-link" href="/mail">
-          Open current Mail dashboard
-        </a>
       </Panel>
       {clearDialogOpen ? (
         <Dialog title="Clear inbox" onClose={() => setClearDialogOpen(false)}>

@@ -66,9 +66,6 @@ export function S3Dashboard({ service }: S3DashboardProps): JSX.Element {
           title="S3 is disabled"
           description="Enable the S3 service in devcloud config to browse buckets and objects."
         />
-        <a className="compat-link" href="/s3">
-          Open current S3 dashboard
-        </a>
       </Panel>
     )
   }
@@ -215,9 +212,6 @@ export function S3Dashboard({ service }: S3DashboardProps): JSX.Element {
       <Panel title="Inspector">
         <ObjectInspector bucketName={selectedBucket} disabled={isDisabled} object={selectedObject} onCopyObject={copyObject} />
       </Panel>
-      <a className="compat-link" href="/s3">
-        Open current S3 dashboard
-      </a>
       {message ? <p className="inspector-muted gcs-message">{message}</p> : null}
     </div>
   )
