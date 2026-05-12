@@ -44,5 +44,5 @@ These are not required for this loop to finish unless they become necessary for 
 - Do not log passwords, DSNs with credentials, authorization headers, SQL bind values, COPY credentials, object payloads, or statement results unless explicitly redacted.
 - Update tests and docs in the same slice as behavior changes.
 
-NEXUS_LOOP_STATUS: READY
-NEXUS_LOOP_SUMMARY: Redshift remaining-tasks loop contract is ready.
+NEXUS_LOOP_STATUS: DONE
+NEXUS_LOOP_SUMMARY: All ACs satisfied: default backend is postgres/managed (config.go DefaultConfig), actionable diagnostics for missing postgres binaries, MIG-001-009 marked Done in docs/design-redshift-compat.md, and all three verify gates (redshift-autoloop full, redshift-postgres-backend-autoloop full-postgres, redshift-managed-postgres-autoloop full-managed) plus go test ./... pass.
