@@ -47,6 +47,7 @@ Each provider lives under `internal/services/<svc>/` and exposes a `NewServer(Co
 `internal/dashboard` is the only HTTP entry point users hit at `:8025`. It serves:
 - The React SPA from `assets/react` (embedded). `assets.go` mounts `/dashboard/` and falls back to `index.html` for client-side routes.
 - A set of `/api/*` JSON endpoints (`mail_handlers.go`, `s3_handlers.go`, `dynamodb_handlers.go`, `bigquery_handlers.go`, `sqs_handlers.go`, `pubsub_handlers.go`, `redshift_handlers.go`, plus the service registry in `services.go`).
+- **Route convention:** every service page lives under `/dashboard/<svc>` (`mail`, `s3`, `gcs`, `dynamodb`, `bigquery`, `sqs`, `pubsub`, `redshift`). The legacy short paths `/mail`, `/s3`, `/gcs`, `/dynamodb`, `/bigquery` return 301 redirects to their `/dashboard/<svc>` counterpart — never add new functionality to the legacy paths.
 - **Safety rule:** dashboard mutations MUST go through the provider-protocol path (`/api/<svc>/*` forwarding into the in-process service) — never directly through storage. Never log credentials, Authorization headers, signatures, message bodies, or object payloads. See `AGENTS.md` and the per-service notes in `README.md`.
 
 ### Auth modes

@@ -418,71 +418,58 @@ Pub/Sub dashboard actions are available under `/dashboard/pubsub`:
 
 ## Verification
 
-Run all Go tests:
+### CI (every push and pull request)
+
+`.github/workflows/ci.yml` runs the lightweight build check on every push to `main` / `feat/**` and every pull request:
 
 ```bash
+go build ./...
+go vet ./...
 go test ./...
 ```
 
-Run acceptance gates:
+Service acceptance gates and E2E scripts are not run in CI because they require service-specific external tooling (`awscli-local`, `postgres` server binaries, `aws` CLI, etc.) that compile and unit tests already protect against.
 
-```bash
-VERIFY_STAGE=full bash scripts/mail-autoloop/verify.sh
-VERIFY_STAGE=full bash scripts/s3-autoloop/verify.sh
-VERIFY_STAGE=full bash scripts/gcs-autoloop/verify.sh
-VERIFY_STAGE=full bash scripts/dynamodb-autoloop/verify.sh
-VERIFY_STAGE=full bash scripts/bigquery-autoloop/verify.sh
-VERIFY_STAGE=full bash scripts/sqs-autoloop/verify.sh
-VERIFY_STAGE=full bash scripts/pubsub-autoloop/verify.sh
-VERIFY_STAGE=full bash scripts/redis-autoloop/verify.sh
-VERIFY_STAGE=full-sdk-compat bash scripts/gcs-sdk-compat-autoloop/verify.sh
-VERIFY_STAGE=full-sdk-compat bash scripts/bigquery-sdk-compat-autoloop/verify.sh
-VERIFY_STAGE=full-compat bash scripts/pubsub-full-compat-autoloop/verify.sh
-VERIFY_STAGE=full-advanced bash scripts/redshift-advanced-compat-autoloop/verify.sh
-```
+### Manual acceptance gates (per service)
 
-Run E2E smoke tests:
+Run before claiming a service MVP is complete or when investigating a service-level regression:
 
-```bash
-scripts/mail-e2e.sh
-scripts/s3-e2e.sh
-scripts/gcs-e2e.sh
-scripts/gcs-sdk-e2e.sh
-scripts/dynamodb-e2e.sh
-scripts/bigquery-e2e.sh
-scripts/bigquery-sdk-e2e.sh
-scripts/sqs-e2e.sh
-scripts/pubsub-e2e.sh
-scripts/redshift-e2e.sh
-scripts/redis-e2e.sh
-```
+| Stage | Command |
+| --- | --- |
+| Mail MVP | `VERIFY_STAGE=full bash scripts/mail-autoloop/verify.sh` |
+| S3 MVP | `VERIFY_STAGE=full bash scripts/s3-autoloop/verify.sh` |
+| GCS MVP | `VERIFY_STAGE=full bash scripts/gcs-autoloop/verify.sh` |
+| DynamoDB MVP | `VERIFY_STAGE=full bash scripts/dynamodb-autoloop/verify.sh` |
+| BigQuery MVP | `VERIFY_STAGE=full bash scripts/bigquery-autoloop/verify.sh` |
+| SQS MVP | `VERIFY_STAGE=full bash scripts/sqs-autoloop/verify.sh` |
+| Pub/Sub MVP | `VERIFY_STAGE=full bash scripts/pubsub-autoloop/verify.sh` |
+| Redis MVP | `VERIFY_STAGE=full bash scripts/redis-autoloop/verify.sh` |
+| GCS SDK compat | `VERIFY_STAGE=full-sdk-compat bash scripts/gcs-sdk-compat-autoloop/verify.sh` |
+| BigQuery SDK compat | `VERIFY_STAGE=full-sdk-compat bash scripts/bigquery-sdk-compat-autoloop/verify.sh` |
+| Pub/Sub full compat | `VERIFY_STAGE=full-compat bash scripts/pubsub-full-compat-autoloop/verify.sh` |
+| Redshift advanced compat | `VERIFY_STAGE=full-advanced bash scripts/redshift-advanced-compat-autoloop/verify.sh` |
 
-Keep a service running after the E2E journey for browser/API inspection:
+### Manual E2E smoke
 
-```bash
-E2E_INTERACTIVE=true scripts/mail-e2e.sh
-E2E_INTERACTIVE=true scripts/s3-e2e.sh
-E2E_INTERACTIVE=true scripts/gcs-e2e.sh
-E2E_INTERACTIVE=true E2E_DELETE_DATA=false scripts/dynamodb-e2e.sh
-E2E_INTERACTIVE=true E2E_DELETE_DATA=false scripts/bigquery-e2e.sh
-E2E_INTERACTIVE=true E2E_DELETE_DATA=false scripts/sqs-e2e.sh
-E2E_INTERACTIVE=true scripts/pubsub-e2e.sh
-```
+| Service | Script | Extra tool requirement |
+| --- | --- | --- |
+| Mail | `scripts/mail-e2e.sh` | none |
+| S3 | `scripts/s3-e2e.sh` | `awscli-local` (`pipx install awscli-local`) |
+| GCS | `scripts/gcs-e2e.sh` | none |
+| GCS SDK | `scripts/gcs-sdk-e2e.sh` | Go module deps |
+| DynamoDB | `scripts/dynamodb-e2e.sh` | `aws` CLI |
+| BigQuery | `scripts/bigquery-e2e.sh` | none |
+| BigQuery SDK | `scripts/bigquery-sdk-e2e.sh` | Go module deps |
+| SQS | `scripts/sqs-e2e.sh` | none |
+| Pub/Sub | `scripts/pubsub-e2e.sh` | none |
+| Redshift | `scripts/redshift-e2e.sh` | `psql`, `aws`, and `postgres` server binary on `PATH` for managed mode |
+| Redis | `scripts/redis-e2e.sh` | `redis-cli` |
 
-Override ports when defaults are already in use:
+Useful env vars:
 
-```bash
-E2E_INTERACTIVE=true E2E_SMTP_PORT=1125 E2E_DASHBOARD_PORT=8125 scripts/mail-e2e.sh
-E2E_INTERACTIVE=true E2E_S3_PORT=14566 E2E_DASHBOARD_PORT=18025 E2E_SMTP_PORT=11025 scripts/s3-e2e.sh
-E2E_INTERACTIVE=true E2E_GCS_PORT=14443 E2E_DASHBOARD_PORT=18025 scripts/gcs-e2e.sh
-E2E_GCS_PORT=14443 E2E_DASHBOARD_PORT=18025 scripts/gcs-sdk-e2e.sh
-E2E_INTERACTIVE=true E2E_DYNAMODB_PORT=18000 E2E_DASHBOARD_PORT=18025 scripts/dynamodb-e2e.sh
-E2E_INTERACTIVE=true E2E_BIGQUERY_PORT=19050 E2E_DASHBOARD_PORT=18025 scripts/bigquery-e2e.sh
-E2E_BIGQUERY_PORT=19050 E2E_DASHBOARD_PORT=18025 scripts/bigquery-sdk-e2e.sh
-E2E_INTERACTIVE=true E2E_SQS_PORT=19324 E2E_DASHBOARD_PORT=18025 scripts/sqs-e2e.sh
-PUBSUB_GRPC_PORT=18085 PUBSUB_REST_PORT=18086 DASHBOARD_PORT=18025 E2E_INTERACTIVE=true scripts/pubsub-e2e.sh
-E2E_INTERACTIVE=true E2E_REDIS_PORT=16379 E2E_DASHBOARD_PORT=18025 scripts/redis-e2e.sh
-```
+- `E2E_INTERACTIVE=true` keeps the daemon running after the journey for browser/API inspection.
+- `E2E_DELETE_DATA=false` preserves stored data for inspection (DynamoDB, BigQuery, SQS).
+- `E2E_<SVC>_PORT` and `E2E_DASHBOARD_PORT` override defaults when the standard ports are busy. Example: `E2E_INTERACTIVE=true E2E_S3_PORT=14566 E2E_DASHBOARD_PORT=18025 scripts/s3-e2e.sh`.
 
 ## Project Structure
 

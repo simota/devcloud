@@ -58,5 +58,5 @@ VERIFY_STAGE=api-smoke bash scripts/dashboard-design-renewal-autoloop/verify.sh
 VERIFY_STAGE=full bash scripts/dashboard-design-renewal-autoloop/verify.sh
 ```
 
-NEXUS_LOOP_STATUS: READY
-NEXUS_LOOP_SUMMARY: Dashboard design renewal contract is ready for Codex execution.
+NEXUS_LOOP_STATUS: DONE
+NEXUS_LOOP_SUMMARY: All ACs satisfied. Every service page is served under /dashboard/<svc> from the shared React shell; legacy /mail, /s3, /gcs, /dynamodb, /bigquery paths return 301 redirects. /api/messages/* and /api/<svc>/* contracts unchanged. VERIFY_STAGE=full bash scripts/dashboard-design-renewal-autoloop/verify.sh passes 7/7.
