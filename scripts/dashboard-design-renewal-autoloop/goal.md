@@ -2,7 +2,7 @@
 
 ## Objective
 
-Complete the `devcloud` common dashboard design renewal with a React/Vite shell while preserving the existing Go-served Mail and S3 dashboard contracts during migration.
+Complete the `devcloud` common dashboard design renewal with a React/Vite shell. Migration is now complete: every service page lives under `/dashboard/<svc>` in the shared React shell, and the legacy Go-served `/mail`, `/s3`, `/gcs`, `/dynamodb`, `/bigquery` paths return 301 redirects to their `/dashboard/<svc>` counterpart so existing bookmarks keep working.
 
 ## Why
 
@@ -13,7 +13,7 @@ The dashboard is becoming a cross-service operational console for Mail, S3, and 
 1. Foundation remains healthy: `go test ./...` passes.
 2. React dashboard scaffold remains healthy: `cd web/dashboard && npm run build` passes.
 3. Common dashboard registry remains available at `/api/dashboard/services` and reports Mail/S3 service status without marking disabled services as running.
-4. Existing compatibility routes remain intact while migration is in progress: `/`, `/mail`, `/s3`, `/api/messages/*`, and `/api/s3/*` keep their current contracts.
+4. All service pages are served under `/dashboard/<svc>` from the shared React shell. Legacy `/mail`, `/s3`, `/gcs`, `/dynamodb`, `/bigquery` return 301 redirects to the matching `/dashboard/<svc>` so existing bookmarks keep working. `/`, `/api/messages/*`, and `/api/<svc>/*` keep their current contracts unchanged.
 5. React shell uses the shared tokens and shell structure from `docs/design-dashboard-shell.md`: service index, service switcher, status pattern, activity footer, and service-specific surfaces.
 6. Production `devcloud up` can serve dashboard assets without requiring Node/Vite at runtime once asset embedding is introduced.
 7. Dynamic dashboard data is rendered through React escaping or safe DOM APIs; no `dangerouslySetInnerHTML` or raw `innerHTML` rendering is introduced.

@@ -144,6 +144,18 @@ services:
     maxObjectBytes: 5368709120
     multipart:
       minPartBytes: 5242880
+  gcs:
+    enabled: false
+  dynamodb:
+    enabled: false
+  bigquery:
+    enabled: false
+  sqs:
+    enabled: false
+  pubsub:
+    enabled: false
+  redshift:
+    enabled: false
 EOF
 
   go build -o "${TMP_DIR}/devcloud" ./cmd/devcloud
@@ -158,8 +170,12 @@ api_smoke() {
   start_devcloud
   wait_for_http "${DASHBOARD_ENDPOINT}/api/dashboard/services"
   curl -fsS "${DASHBOARD_ENDPOINT}/" | grep -q 'devcloud Services'
-  curl -fsS "${DASHBOARD_ENDPOINT}/mail" | grep -q 'devcloud Mail'
-  curl -fsS "${DASHBOARD_ENDPOINT}/s3" | grep -q 'devcloud S3'
+  # Legacy compatibility paths must 301-redirect to /dashboard/<svc>.
+  curl -fsS -o /dev/null -w '%{http_code} %{redirect_url}\n' "${DASHBOARD_ENDPOINT}/mail" | grep -q '^301 .*/dashboard/mail$'
+  curl -fsS -o /dev/null -w '%{http_code} %{redirect_url}\n' "${DASHBOARD_ENDPOINT}/s3" | grep -q '^301 .*/dashboard/s3$'
+  # React shell serves all service pages under /dashboard/<svc>.
+  curl -fsS "${DASHBOARD_ENDPOINT}/dashboard/mail" | grep -q 'devcloud Dashboard'
+  curl -fsS "${DASHBOARD_ENDPOINT}/dashboard/s3" | grep -q 'devcloud Dashboard'
   curl -fsS "${DASHBOARD_ENDPOINT}/api/dashboard/services" | grep -q '"id":"mail"'
   curl -fsS "${DASHBOARD_ENDPOINT}/api/dashboard/services" | grep -q '"id":"s3"'
   curl -fsS "${DASHBOARD_ENDPOINT}/api/dashboard/services" | grep -q '"status":"running"'
