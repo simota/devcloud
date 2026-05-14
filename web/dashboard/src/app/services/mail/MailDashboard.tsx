@@ -1,12 +1,11 @@
 import { useEffect, useMemo, useState } from 'react'
+import { Button } from '../../../ui/Button'
+import { dangerConfirm, useConfirm } from '../../../ui/Confirm'
 import { EmptyState } from '../../../ui/EmptyState'
 import { Panel } from '../../../ui/Panel'
-import { Button } from '../../../ui/Button'
-import { Tabs } from '../../../ui/Tabs'
-import { Dialog } from '../../../ui/Dialog'
 import type { DashboardService } from '../dashboard/types'
 import { deleteAllMailMessages, getMailMessageRaw, listMailMessages } from './api'
-import type { MailMessageSummary } from './types'
+import type { MailAttachment, MailMessageSummary } from './types'
 
 type MessagesState =
   | { status: 'loading' }
@@ -18,10 +17,10 @@ type MailDashboardProps = {
 }
 
 export function MailDashboard({ service }: MailDashboardProps): JSX.Element {
+  const confirm = useConfirm()
   const [messagesState, setMessagesState] = useState<MessagesState>({ status: 'loading' })
   const [selectedID, setSelectedID] = useState<string>()
   const [filter, setFilter] = useState('')
-  const [clearDialogOpen, setClearDialogOpen] = useState(false)
   const isDisabled = service?.status === 'disabled'
 
   function refreshMessages(): void {
@@ -40,15 +39,21 @@ export function MailDashboard({ service }: MailDashboardProps): JSX.Element {
       })
   }
 
-  function clearMessages(): void {
+  async function clearMessages(): Promise<void> {
     if (isDisabled) {
       return
     }
-    setClearDialogOpen(true)
-  }
-
-  function confirmClearMessages(): void {
-    setClearDialogOpen(false)
+    const ok = await confirm(
+      dangerConfirm({
+        title: 'Clear inbox',
+        description: 'Delete all stored Mail messages from this local devcloud inbox.',
+        target: 'CLEAR INBOX',
+        confirmLabel: 'Clear inbox',
+      }),
+    )
+    if (!ok) {
+      return
+    }
     setMessagesState({ status: 'loading' })
     deleteAllMailMessages()
       .then(() => {
@@ -62,6 +67,7 @@ export function MailDashboard({ service }: MailDashboardProps): JSX.Element {
 
   useEffect(() => {
     refreshMessages()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isDisabled])
 
   const messages = messagesState.status === 'success' ? messagesState.messages : []
@@ -76,17 +82,17 @@ export function MailDashboard({ service }: MailDashboardProps): JSX.Element {
       <Panel title="Mail">
         <EmptyState
           title="Mail is disabled"
-          description="Enable the Mail service in devcloud config to inspect received messages."
+          description="Enable services.mail.enabled in .devcloud/config.yaml to inspect received messages."
         />
       </Panel>
     )
   }
 
   return (
-    <div className="mail-workspace">
+    <div className="mail-shell">
       <Panel title="Inbox">
-        <div className="mail-toolbar">
-          <label className="mail-filter">
+        <div className="mail-inbox-toolbar">
+          <label className="mail-inbox-filter">
             <span>Filter</span>
             <input
               aria-label="Filter messages"
@@ -96,10 +102,12 @@ export function MailDashboard({ service }: MailDashboardProps): JSX.Element {
               value={filter}
             />
           </label>
-          <Button onClick={refreshMessages}>Refresh</Button>
-          <Button className="danger" onClick={clearMessages}>
-            Clear all
-          </Button>
+          <div className="mail-inbox-actions">
+            <Button onClick={refreshMessages}>Refresh</Button>
+            <Button className="danger" disabled={messages.length === 0} onClick={clearMessages}>
+              Clear all
+            </Button>
+          </div>
         </div>
         {messagesState.status === 'loading' ? (
           <EmptyState title="Loading messages" description="Reading the local Mail inbox." />
@@ -125,140 +133,242 @@ export function MailDashboard({ service }: MailDashboardProps): JSX.Element {
       <Panel title="Message">
         <MailMessageInspector message={selectedMessage} />
       </Panel>
-      {clearDialogOpen ? (
-        <Dialog title="Clear inbox" onClose={() => setClearDialogOpen(false)}>
-          <p className="dialog-copy">Delete all stored Mail messages from this local devcloud inbox?</p>
-          <div className="dialog-actions">
-            <Button onClick={() => setClearDialogOpen(false)}>Cancel</Button>
-            <Button className="danger" onClick={confirmClearMessages}>
-              Clear all
-            </Button>
-          </div>
-        </Dialog>
-      ) : null}
     </div>
   )
 }
 
 type MailMessageListProps = {
   messages: MailMessageSummary[]
-  selectedID?: string
+  selectedID: string | undefined
   totalMessages: number
   onSelectMessage: (messageID: string) => void
 }
 
-function MailMessageList({ messages, selectedID, totalMessages, onSelectMessage }: MailMessageListProps): JSX.Element {
+function MailMessageList({
+  messages,
+  selectedID,
+  totalMessages,
+  onSelectMessage,
+}: MailMessageListProps): JSX.Element {
   if (totalMessages === 0) {
-    return <EmptyState title="No messages" description="Send mail to localhost:1025 and refresh the inbox." />
+    return (
+      <EmptyState
+        title="Inbox is empty"
+        description="Send mail to localhost:1025 (relaxed SMTP AUTH) and refresh."
+      />
+    )
   }
-
   if (messages.length === 0) {
-    return <EmptyState title="No matching messages" description="Adjust the filter to show messages in the local inbox." />
+    return (
+      <EmptyState
+        title="No matches"
+        description="Try a different filter or clear the search."
+      />
+    )
   }
 
   return (
-    <div className="mail-list" aria-label="Messages">
-      {messages.map((message) => (
-        <button
-          className={message.id === selectedID ? 'mail-row active' : 'mail-row'}
-          key={message.id}
-          onClick={() => onSelectMessage(message.id)}
-        >
-          <span className="mail-row-top">
-            <span className="mail-from">{message.from || '(unknown sender)'}</span>
-            <span>{formatDate(message.receivedAt)}</span>
-          </span>
-          <span className="mail-subject">{message.subject || '(No subject)'}</span>
-          <span className="mail-snippet">{messageSnippet(message) || message.to.join(', ') || message.id}</span>
-        </button>
-      ))}
-    </div>
+    <ul className="mail-inbox-list" aria-label="Messages">
+      {messages.map((message) => {
+        const active = message.id === selectedID
+        const subject = decodeMimeEncodedWord(message.subject) || '(No subject)'
+        const fromDisplay = decodeMimeAddress(message.from) || '(unknown sender)'
+        const snippet = messageSnippet(message)
+        return (
+          <li key={message.id}>
+            <button
+              aria-current={active ? 'true' : undefined}
+              className={active ? 'mail-inbox-row active' : 'mail-inbox-row'}
+              onClick={() => onSelectMessage(message.id)}
+              type="button"
+            >
+              <span className="mail-inbox-row-top">
+                <span className="mail-inbox-sender">{fromDisplay}</span>
+                <time className="mail-inbox-time" dateTime={message.receivedAt} title={formatAbsoluteDate(message.receivedAt)}>
+                  {formatRelativeDate(message.receivedAt)}
+                </time>
+              </span>
+              <span className="mail-inbox-subject">{subject}</span>
+              {snippet ? <span className="mail-inbox-snippet">{snippet}</span> : null}
+            </button>
+          </li>
+        )
+      })}
+    </ul>
   )
 }
 
 type MailMessageInspectorProps = {
-  message?: MailMessageSummary
+  message: MailMessageSummary | undefined
 }
 
+type InspectorTab = 'preview' | 'attachments' | 'raw'
+
 function MailMessageInspector({ message }: MailMessageInspectorProps): JSX.Element {
-  const [activeTab, setActiveTab] = useState('preview')
+  const [activeTab, setActiveTab] = useState<InspectorTab>('preview')
+  const [showHeaders, setShowHeaders] = useState(false)
+
+  useEffect(() => {
+    setActiveTab('preview')
+    setShowHeaders(false)
+  }, [message?.id])
 
   if (!message) {
-    return <EmptyState title="Inbox is waiting" description="Messages accepted by SMTP appear here." />
+    return (
+      <EmptyState
+        title="Select a message"
+        description="Messages accepted via SMTP appear here. Pick a row on the left to inspect."
+      />
+    )
   }
 
-  const headerEntries = Object.entries(message.headers ?? {}).sort(([left], [right]) => left.localeCompare(right))
+  const subject = decodeMimeEncodedWord(message.subject) || '(No subject)'
+  const fromDisplay = decodeMimeAddress(message.from)
+  const toList = message.to.map(decodeMimeAddress).filter(Boolean)
+  const ccList = headerAddresses(message.headers, 'Cc')
+  const bccList = headerAddresses(message.headers, 'Bcc')
+  const replyTo = headerAddresses(message.headers, 'Reply-To')
+  const attachments = message.attachments ?? []
+  const previewBody = message.textBody || message.htmlBody || message.parseError || ''
+  const hasBody = previewBody.trim().length > 0
+
+  const tabs: { id: InspectorTab; label: string; count?: number }[] = [
+    { id: 'preview', label: 'Preview' },
+    { id: 'attachments', label: 'Attachments', count: attachments.length },
+    { id: 'raw', label: 'Raw' },
+  ]
 
   return (
-    <div className="mail-inspector">
-      <div>
-        <h3>{message.subject || '(No subject)'}</h3>
-        <p>
-          {message.from || '(unknown sender)'} to {message.to.join(', ') || '(no recipients)'} -{' '}
-          {formatDate(message.receivedAt)}
-        </p>
-      </div>
+    <article className="mail-inspector">
+      <header className="mail-inspector-header">
+        <h1 className="mail-subject">{subject}</h1>
+        <dl className="mail-recipients">
+          <RecipientRow label="From" values={fromDisplay ? [fromDisplay] : ['(unknown sender)']} />
+          <RecipientRow label="To" values={toList.length > 0 ? toList : ['(no recipients)']} />
+          {ccList.length > 0 ? <RecipientRow label="Cc" values={ccList} /> : null}
+          {bccList.length > 0 ? <RecipientRow label="Bcc" values={bccList} /> : null}
+          {replyTo.length > 0 ? <RecipientRow label="Reply-To" values={replyTo} /> : null}
+          <div className="mail-recipients-row">
+            <dt>Date</dt>
+            <dd>
+              <time dateTime={message.receivedAt} title={formatAbsoluteDate(message.receivedAt)}>
+                {formatAbsoluteDate(message.receivedAt)}
+              </time>
+              <span className="mail-recipients-aux">· {formatRelativeDate(message.receivedAt)}</span>
+            </dd>
+          </div>
+        </dl>
+      </header>
 
-      <Tabs
-        activeID={activeTab}
-        items={[
-          { id: 'preview', label: 'Preview' },
-          { id: 'raw', label: 'Raw' },
-        ]}
-        onChange={setActiveTab}
-      />
+      <nav className="mail-tabs" role="tablist" aria-label="Message view">
+        {tabs.map((tab) => (
+          <button
+            key={tab.id}
+            role="tab"
+            aria-selected={activeTab === tab.id}
+            className={activeTab === tab.id ? 'mail-tab active' : 'mail-tab'}
+            onClick={() => setActiveTab(tab.id)}
+            type="button"
+          >
+            {tab.label}
+            {tab.count !== undefined && tab.count > 0 ? (
+              <span className="mail-tab-count">{tab.count}</span>
+            ) : null}
+          </button>
+        ))}
+      </nav>
 
-      {activeTab === 'raw' ? (
-        <MailRawSource messageID={message.id} />
-      ) : (
-        <div>
-          <span className="inspector-label">Preview</span>
-          <pre className="mail-preview">
-            {message.textBody || message.htmlBody || message.parseError || '(No preview body)'}
-          </pre>
-        </div>
-      )}
-
-      {message.attachments && message.attachments.length > 0 ? (
-        <div>
-          <span className="inspector-label">Attachments</span>
-          <ul className="attachment-list">
-            {message.attachments.map((attachment) => (
-              <li key={attachment.id}>
-                <span>{attachment.fileName || attachment.id}</span>
-                <span>
-                  {attachment.contentType || 'application/octet-stream'} - {formatBytes(attachment.size)}
-                </span>
-              </li>
-            ))}
-          </ul>
-        </div>
+      {activeTab === 'preview' ? (
+        <PreviewTab body={previewBody} hasBody={hasBody} parseError={message.parseError} />
       ) : null}
+      {activeTab === 'attachments' ? <AttachmentsTab attachments={attachments} /> : null}
+      {activeTab === 'raw' ? <RawTab messageID={message.id} /> : null}
 
-      <div>
-        <span className="inspector-label">Headers</span>
-        {headerEntries.length === 0 ? (
-          <p className="inspector-muted">No parsed headers.</p>
-        ) : (
-          <dl className="metadata-list">
-            {headerEntries.map(([key, values]) => (
-              <div key={key}>
-                <dt>{key}</dt>
-                <dd>{values.join(', ')}</dd>
-              </div>
-            ))}
-          </dl>
-        )}
-      </div>
+      <details
+        className="mail-headers"
+        open={showHeaders}
+        onToggle={(event) => setShowHeaders((event.target as HTMLDetailsElement).open)}
+      >
+        <summary>
+          <span>Headers</span>
+          <span className="mail-headers-count">{Object.keys(message.headers ?? {}).length}</span>
+        </summary>
+        <HeadersTable headers={message.headers ?? {}} />
+      </details>
+    </article>
+  )
+}
+
+function RecipientRow({ label, values }: { label: string; values: string[] }): JSX.Element {
+  return (
+    <div className="mail-recipients-row">
+      <dt>{label}</dt>
+      <dd>{values.join(', ')}</dd>
     </div>
   )
 }
 
-type MailRawSourceProps = {
-  messageID: string
+function PreviewTab({
+  body,
+  hasBody,
+  parseError,
+}: {
+  body: string
+  hasBody: boolean
+  parseError: string | undefined
+}): JSX.Element {
+  if (!hasBody && !parseError) {
+    return (
+      <EmptyState
+        title="No body"
+        description="The message contains no decoded text content."
+      />
+    )
+  }
+  if (parseError && !hasBody) {
+    return (
+      <div className="mail-preview-error">
+        <span className="mail-eyebrow">Parse error</span>
+        <p>{parseError}</p>
+      </div>
+    )
+  }
+  return (
+    <div className="mail-preview" lang="auto">
+      {renderLinkedText(body)}
+    </div>
+  )
 }
 
-function MailRawSource({ messageID }: MailRawSourceProps): JSX.Element {
+function AttachmentsTab({ attachments }: { attachments: MailAttachment[] }): JSX.Element {
+  if (attachments.length === 0) {
+    return (
+      <EmptyState
+        title="No attachments"
+        description="This message has no parsed attachments."
+      />
+    )
+  }
+  return (
+    <ul className="mail-attachment-list" aria-label="Attachments">
+      {attachments.map((attachment) => (
+        <li key={attachment.id} className="mail-attachment-item">
+          <span className="mail-attachment-icon" aria-hidden="true">
+            {attachmentIcon(attachment.contentType)}
+          </span>
+          <div className="mail-attachment-body">
+            <span className="mail-attachment-name">{attachment.fileName || attachment.id}</span>
+            <span className="mail-attachment-meta">
+              {attachment.contentType || 'application/octet-stream'} · {formatBytes(attachment.size)}
+            </span>
+          </div>
+        </li>
+      ))}
+    </ul>
+  )
+}
+
+function RawTab({ messageID }: { messageID: string }): JSX.Element {
   const [rawState, setRawState] = useState<
     { status: 'loading' } | { status: 'success'; raw: string } | { status: 'error'; message: string }
   >({ status: 'loading' })
@@ -285,16 +395,49 @@ function MailRawSource({ messageID }: MailRawSourceProps): JSX.Element {
   if (rawState.status === 'loading') {
     return <EmptyState title="Loading raw source" description="Reading the stored RFC 822 message." />
   }
-
   if (rawState.status === 'error') {
     return <EmptyState title="Raw source unavailable" description={rawState.message} />
   }
 
+  const raw = rawState.raw
+  function copyRaw() {
+    if (!navigator.clipboard) {
+      return
+    }
+    navigator.clipboard.writeText(raw).catch(() => {
+      /* clipboard denied */
+    })
+  }
+
   return (
-    <div>
-      <span className="inspector-label">Raw source</span>
-      <pre className="mail-preview">{rawState.raw || '(No raw source)'}</pre>
+    <div className="mail-raw">
+      <div className="mail-raw-toolbar">
+        <span className="mail-raw-meta">{raw.length.toLocaleString()} bytes</span>
+        <button className="mail-raw-copy" onClick={copyRaw} type="button">
+          Copy
+        </button>
+      </div>
+      <pre className="mail-raw-pre">{raw || '(empty)'}</pre>
     </div>
+  )
+}
+
+function HeadersTable({ headers }: { headers: Record<string, string[]> }): JSX.Element {
+  const entries = Object.entries(headers).sort(([left], [right]) => left.localeCompare(right))
+  if (entries.length === 0) {
+    return <p className="mail-headers-empty">No parsed headers.</p>
+  }
+  return (
+    <table className="mail-headers-table">
+      <tbody>
+        {entries.map(([key, values]) => (
+          <tr key={key}>
+            <th scope="row">{key}</th>
+            <td>{values.map(decodeMimeEncodedWord).join(', ')}</td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
   )
 }
 
@@ -303,21 +446,206 @@ function filterMessages(messages: MailMessageSummary[], filter: string): MailMes
   if (query === '') {
     return messages
   }
-  return messages.filter((message) =>
-    [message.subject, message.from, ...message.to, messageSnippet(message)].join(' ').toLowerCase().includes(query),
-  )
+  return messages.filter((message) => {
+    const haystack = [
+      decodeMimeEncodedWord(message.subject),
+      decodeMimeAddress(message.from),
+      ...message.to.map(decodeMimeAddress),
+      messageSnippet(message),
+    ]
+    return haystack.join(' ').toLowerCase().includes(query)
+  })
 }
 
 function messageSnippet(message: MailMessageSummary): string {
-  return (message.textBody || message.htmlBody || message.parseError || '').replace(/\s+/g, ' ').trim()
+  const source = message.textBody || message.htmlBody || message.parseError || ''
+  return source.replace(/\s+/g, ' ').trim()
 }
 
-function formatDate(value: string): string {
+function headerAddresses(
+  headers: Record<string, string[]> | undefined,
+  field: string,
+): string[] {
+  if (!headers) {
+    return []
+  }
+  const lower = field.toLowerCase()
+  for (const [key, values] of Object.entries(headers)) {
+    if (key.toLowerCase() === lower) {
+      return values
+        .flatMap((value) => splitAddressList(value))
+        .map(decodeMimeAddress)
+        .filter(Boolean)
+    }
+  }
+  return []
+}
+
+function splitAddressList(value: string): string[] {
+  return value
+    .split(/,(?![^<]*>)/)
+    .map((part) => part.trim())
+    .filter((part) => part.length > 0)
+}
+
+function decodeMimeAddress(value: string): string {
+  if (!value) {
+    return ''
+  }
+  return decodeMimeEncodedWord(value).trim()
+}
+
+function decodeMimeEncodedWord(input: string): string {
+  if (!input || input.indexOf('=?') === -1) {
+    return input
+  }
+  return input.replace(
+    /=\?([^?]+)\?([BbQq])\?([^?]*)\?=(\s+(?==\?))?/g,
+    (match, charset: string, encoding: string, text: string) => {
+      try {
+        const bytes = encoding.toUpperCase() === 'B' ? decodeBase64Bytes(text) : decodeQEncodedBytes(text)
+        const decoder = new TextDecoder(normalizeCharset(charset))
+        return decoder.decode(bytes)
+      } catch {
+        return match
+      }
+    },
+  )
+}
+
+function decodeBase64Bytes(text: string): Uint8Array {
+  const binary = atob(text.replace(/\s+/g, ''))
+  const bytes = new Uint8Array(binary.length)
+  for (let i = 0; i < binary.length; i += 1) {
+    bytes[i] = binary.charCodeAt(i)
+  }
+  return bytes
+}
+
+function decodeQEncodedBytes(text: string): Uint8Array {
+  const normalized = text.replace(/_/g, ' ')
+  const out: number[] = []
+  for (let i = 0; i < normalized.length; i += 1) {
+    const ch = normalized[i]
+    if (ch === '=' && i + 2 < normalized.length) {
+      const hex = normalized.slice(i + 1, i + 3)
+      const code = parseInt(hex, 16)
+      if (!Number.isNaN(code)) {
+        out.push(code)
+        i += 2
+        continue
+      }
+    }
+    out.push(normalized.charCodeAt(i))
+  }
+  return new Uint8Array(out)
+}
+
+function normalizeCharset(charset: string): string {
+  const lower = charset.trim().toLowerCase()
+  if (lower === 'unknown-8bit' || lower === '') {
+    return 'utf-8'
+  }
+  return lower
+}
+
+function renderLinkedText(text: string): JSX.Element[] {
+  const nodes: JSX.Element[] = []
+  const pattern = /(https?:\/\/[^\s<>"']+)|((?:[a-zA-Z0-9._%+-]+)@(?:[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}))/g
+  let lastIndex = 0
+  let key = 0
+  let match: RegExpExecArray | null = pattern.exec(text)
+  while (match !== null) {
+    const beforeText = text.slice(lastIndex, match.index)
+    if (beforeText) {
+      key += 1
+      nodes.push(<span key={`t-${key}`}>{beforeText}</span>)
+    }
+    key += 1
+    if (match[1]) {
+      nodes.push(
+        <a key={`l-${key}`} href={match[1]} rel="noopener noreferrer" target="_blank">
+          {match[1]}
+        </a>,
+      )
+    } else {
+      nodes.push(
+        <a key={`m-${key}`} href={`mailto:${match[2]}`}>
+          {match[2]}
+        </a>,
+      )
+    }
+    lastIndex = pattern.lastIndex
+    match = pattern.exec(text)
+  }
+  const tail = text.slice(lastIndex)
+  if (tail) {
+    key += 1
+    nodes.push(<span key={`t-${key}`}>{tail}</span>)
+  }
+  return nodes
+}
+
+function attachmentIcon(contentType: string | undefined): string {
+  if (!contentType) {
+    return '📎'
+  }
+  const lower = contentType.toLowerCase()
+  if (lower.startsWith('image/')) {
+    return '🖼'
+  }
+  if (lower === 'application/pdf') {
+    return '📄'
+  }
+  if (lower.startsWith('audio/')) {
+    return '🎵'
+  }
+  if (lower.startsWith('video/')) {
+    return '🎬'
+  }
+  if (lower.includes('zip') || lower.includes('tar') || lower.includes('gzip')) {
+    return '🗜'
+  }
+  if (lower.startsWith('text/')) {
+    return '📝'
+  }
+  return '📎'
+}
+
+function formatAbsoluteDate(value: string): string {
   const date = new Date(value)
   if (Number.isNaN(date.getTime())) {
     return value || 'unknown'
   }
   return date.toLocaleString()
+}
+
+function formatRelativeDate(value: string): string {
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) {
+    return value || 'unknown'
+  }
+  const diffMs = Date.now() - date.getTime()
+  if (diffMs < 0) {
+    return 'in the future'
+  }
+  const seconds = Math.floor(diffMs / 1000)
+  if (seconds < 60) {
+    return 'just now'
+  }
+  const minutes = Math.floor(seconds / 60)
+  if (minutes < 60) {
+    return `${minutes}m ago`
+  }
+  const hours = Math.floor(minutes / 60)
+  if (hours < 24) {
+    return `${hours}h ago`
+  }
+  const days = Math.floor(hours / 24)
+  if (days < 7) {
+    return `${days}d ago`
+  }
+  return date.toLocaleDateString()
 }
 
 function formatBytes(value: number): string {
