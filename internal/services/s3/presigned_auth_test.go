@@ -15,7 +15,7 @@ func TestPresignedURLValidatesSignature(t *testing.T) {
 	store := NewFileBucketStore(t.TempDir())
 	routes := NewServer(Config{
 		Region:          "us-east-1",
-		AuthMode:        "relaxed",
+		AuthMode:        "strict",
 		AccessKeyID:     "dev",
 		SecretAccessKey: "dev",
 	}, store).routes()
@@ -24,14 +24,17 @@ func TestPresignedURLValidatesSignature(t *testing.T) {
 	nowUTC = func() time.Time { return fixedNow }
 	defer func() { nowUTC = previousNow }()
 
-	if create := performRequest(routes, http.MethodPut, "/demo-bucket", nil); create.Code != http.StatusOK {
-		t.Fatalf("create status = %d", create.Code)
+	create := signedRequest(t, http.MethodPut, "/demo-bucket", "", fixedNow)
+	createRec := httptest.NewRecorder()
+	routes.ServeHTTP(createRec, create)
+	if createRec.Code != http.StatusOK {
+		t.Fatalf("create status = %d; body=%s", createRec.Code, createRec.Body.String())
 	}
-	put := httptest.NewRequest(http.MethodPut, "/demo-bucket/docs/readme.txt", strings.NewReader("hello from devcloud s3\n"))
+	put := signedRequest(t, http.MethodPut, "/demo-bucket/docs/readme.txt", "hello from devcloud s3\n", fixedNow)
 	putRec := httptest.NewRecorder()
 	routes.ServeHTTP(putRec, put)
 	if putRec.Code != http.StatusOK {
-		t.Fatalf("put status = %d", putRec.Code)
+		t.Fatalf("put status = %d; body=%s", putRec.Code, putRec.Body.String())
 	}
 
 	target := presignedTarget(t, "GET", "example.com", "/demo-bucket/docs/readme.txt", fixedNow)
@@ -66,7 +69,7 @@ func TestPresignedURLRejectsInvalidArguments(t *testing.T) {
 	store := NewFileBucketStore(t.TempDir())
 	routes := NewServer(Config{
 		Region:          "us-east-1",
-		AuthMode:        "relaxed",
+		AuthMode:        "strict",
 		AccessKeyID:     "dev",
 		SecretAccessKey: "dev",
 	}, store).routes()

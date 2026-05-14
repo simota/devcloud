@@ -229,6 +229,36 @@ func TestStrictAuthRejectsUnsignedRequests(t *testing.T) {
 	}
 }
 
+func TestRelaxedAuthAcceptsArbitraryCredentials(t *testing.T) {
+	store := NewFileBucketStore(t.TempDir())
+	routes := NewServer(Config{
+		Region:          "us-east-1",
+		AuthMode:        "relaxed",
+		AccessKeyID:     "dev",
+		SecretAccessKey: "dev",
+	}, store).routes()
+
+	// awslocal / LocalStack default credentials are "test"/"test", which do
+	// not match the configured "dev"/"dev". In relaxed mode the server must
+	// still accept the request rather than returning InvalidAccessKeyId.
+	create := httptest.NewRequest(http.MethodPut, "/awslocal-bucket", nil)
+	create.Header.Set("Authorization", "AWS4-HMAC-SHA256 Credential=test/20260514/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=deadbeef")
+	create.Header.Set("x-amz-date", "20260514T120000Z")
+	createRec := httptest.NewRecorder()
+	routes.ServeHTTP(createRec, create)
+	if createRec.Code != http.StatusOK {
+		t.Fatalf("relaxed create-bucket with foreign creds status = %d, want %d; body=%s", createRec.Code, http.StatusOK, createRec.Body.String())
+	}
+
+	list := performRequest(routes, http.MethodGet, "/", nil)
+	if list.Code != http.StatusOK {
+		t.Fatalf("relaxed list status = %d, want %d; body=%s", list.Code, http.StatusOK, list.Body.String())
+	}
+	if !strings.Contains(list.Body.String(), "<Name>awslocal-bucket</Name>") {
+		t.Fatalf("relaxed list body missing bucket: %s", list.Body.String())
+	}
+}
+
 func performRequest(handler http.Handler, method string, target string, body *strings.Reader) *httptest.ResponseRecorder {
 	var reader *strings.Reader
 	if body == nil {

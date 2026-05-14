@@ -34,13 +34,18 @@ func (e signatureError) Error() string {
 }
 
 func (s *Server) verifySignature(r *http.Request) error {
+	if !strings.EqualFold(s.config.AuthMode, "strict") {
+		// Relaxed mode accepts every request: anonymous, any access key, any
+		// signature. This matches LocalStack/MinIO conventions and lets dev
+		// tools that ship with arbitrary credentials (awslocal with test/test,
+		// boto3 defaults, ad-hoc curl) work without configuring our specific
+		// AccessKeyID/SecretAccessKey. Use AuthMode: "strict" to enforce SigV4.
+		return nil
+	}
 	hasPresign := r.URL.Query().Get("X-Amz-Algorithm") != ""
 	hasHeaderAuth := r.Header.Get("Authorization") != ""
 	if !hasPresign && !hasHeaderAuth {
-		if strings.EqualFold(s.config.AuthMode, "strict") {
-			return signatureError{code: "AccessDenied", status: http.StatusForbidden}
-		}
-		return nil
+		return signatureError{code: "AccessDenied", status: http.StatusForbidden}
 	}
 	if hasPresign {
 		return s.verifyPresignedURL(r)
