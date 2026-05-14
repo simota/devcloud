@@ -3,6 +3,7 @@ import type { FormEvent } from 'react'
 import { Button } from '../../../ui/Button'
 import { EmptyState } from '../../../ui/EmptyState'
 import { Panel } from '../../../ui/Panel'
+import { useEventSource } from '../../api/hooks/useEventSource'
 import type { DashboardService } from '../dashboard/types'
 import { getRedshiftCatalog, getRedshiftStatus, listRedshiftClusters, listRedshiftStatements, runRedshiftQuery } from './api'
 import type { RedshiftCatalog, RedshiftCluster, RedshiftQueryResult, RedshiftStatement, RedshiftStatus, RedshiftTable } from './types'
@@ -62,6 +63,8 @@ export function RedshiftDashboard({ service }: RedshiftDashboardProps): JSX.Elem
   useEffect(() => {
     refresh()
   }, [refresh])
+
+  useEventSource({ topics: ['redshift'], onEvent: refresh, enabled: !isDisabled })
 
   const catalog = state.status === 'success' ? state.catalog : undefined
   const tables = catalog?.tables ?? []

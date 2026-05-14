@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useState, type FormEvent } from 'react
 import { EmptyState } from '../../../ui/EmptyState'
 import { Panel } from '../../../ui/Panel'
 import { Button } from '../../../ui/Button'
+import { useEventSource } from '../../api/hooks/useEventSource'
 import type { DashboardService } from '../dashboard/types'
 import {
   createDynamoDBTable,
@@ -128,6 +129,8 @@ export function DynamoDBDashboard({ service }: DynamoDBDashboardProps): JSX.Elem
   useEffect(() => {
     refreshTables()
   }, [refreshTables])
+
+  useEventSource({ topics: ['dynamodb'], onEvent: refreshTables, enabled: !isDisabled })
 
   const tables = tablesState.status === 'success' ? tablesState.tables : []
   const activeTable = tables.find((table) => table.tableName === activeTableName)

@@ -1,8 +1,9 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import { Button } from '../../../ui/Button'
 import { dangerConfirm, useConfirm } from '../../../ui/Confirm'
 import { EmptyState } from '../../../ui/EmptyState'
 import { Panel } from '../../../ui/Panel'
+import { useEventSource } from '../../api/hooks/useEventSource'
 import type { DashboardService } from '../dashboard/types'
 import { deleteAllMailMessages, getMailMessageRaw, listMailMessages } from './api'
 import type { MailAttachment, MailMessageSummary } from './types'
@@ -23,7 +24,7 @@ export function MailDashboard({ service }: MailDashboardProps): JSX.Element {
   const [filter, setFilter] = useState('')
   const isDisabled = service?.status === 'disabled'
 
-  function refreshMessages(): void {
+  const refreshMessages = useCallback((): void => {
     if (isDisabled) {
       setMessagesState({ status: 'success', messages: [] })
       return
@@ -37,7 +38,9 @@ export function MailDashboard({ service }: MailDashboardProps): JSX.Element {
       .catch((error: Error) => {
         setMessagesState({ status: 'error', message: error.message })
       })
-  }
+  }, [isDisabled])
+
+  useEventSource({ topics: ['mail'], onEvent: refreshMessages, enabled: !isDisabled })
 
   async function clearMessages(): Promise<void> {
     if (isDisabled) {
@@ -67,8 +70,7 @@ export function MailDashboard({ service }: MailDashboardProps): JSX.Element {
 
   useEffect(() => {
     refreshMessages()
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isDisabled])
+  }, [refreshMessages])
 
   const messages = messagesState.status === 'success' ? messagesState.messages : []
   const filteredMessages = useMemo(() => filterMessages(messages, filter), [messages, filter])

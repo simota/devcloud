@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useState, type FormEvent } from 'react
 import { Button } from '../../../ui/Button'
 import { EmptyState } from '../../../ui/EmptyState'
 import { Panel } from '../../../ui/Panel'
+import { useEventSource } from '../../api/hooks/useEventSource'
 import type { DashboardService } from '../dashboard/types'
 import {
   ackPubSubMessages,
@@ -82,6 +83,8 @@ export function PubSubDashboard({ service }: PubSubDashboardProps): JSX.Element 
   useEffect(() => {
     refresh()
   }, [refresh])
+
+  useEventSource({ topics: ['pubsub'], onEvent: refresh, enabled: !isDisabled })
 
   const topics = state.status === 'success' ? state.topics : []
   const subscriptions = state.status === 'success' ? state.subscriptions : []

@@ -3,6 +3,7 @@ import { EmptyState } from '../../../ui/EmptyState'
 import { Panel } from '../../../ui/Panel'
 import { Button } from '../../../ui/Button'
 import { dangerConfirm, useConfirm } from '../../../ui/Confirm'
+import { useEventSource } from '../../api/hooks/useEventSource'
 import type { DashboardService } from '../dashboard/types'
 import {
   createGCSBucket,
@@ -40,6 +41,7 @@ export function GCSDashboard({ service }: GCSDashboardProps): JSX.Element {
   const [prefix, setPrefix] = useState('')
   const [bucketName, setBucketName] = useState('')
   const [message, setMessage] = useState<string>()
+  const [objectsRefreshNonce, setObjectsRefreshNonce] = useState(0)
   const isDisabled = service?.status === 'disabled'
   const confirm = useConfirm()
 
@@ -75,6 +77,18 @@ export function GCSDashboard({ service }: GCSDashboardProps): JSX.Element {
     refresh()
   }, [refresh])
 
+  const onGCSEvent = useCallback(
+    (event: { type: string }) => {
+      refresh()
+      if (event.type.startsWith('gcs.object.')) {
+        setObjectsRefreshNonce((n) => n + 1)
+      }
+    },
+    [refresh],
+  )
+
+  useEventSource({ topics: ['gcs'], onEvent: onGCSEvent, enabled: !isDisabled })
+
   useEffect(() => {
     setActiveObject(undefined)
     if (!activeBucket || isDisabled) {
@@ -97,7 +111,7 @@ export function GCSDashboard({ service }: GCSDashboardProps): JSX.Element {
     return () => {
       cancelled = true
     }
-  }, [activeBucket, isDisabled, prefix])
+  }, [activeBucket, isDisabled, prefix, objectsRefreshNonce])
 
   const buckets = dashboardState.status === 'success' ? dashboardState.buckets : []
   const sessions = dashboardState.status === 'success' ? dashboardState.sessions : []

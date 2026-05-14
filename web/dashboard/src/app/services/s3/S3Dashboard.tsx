@@ -3,6 +3,7 @@ import { EmptyState } from '../../../ui/EmptyState'
 import { Panel } from '../../../ui/Panel'
 import { Button } from '../../../ui/Button'
 import { dangerConfirm, useConfirm } from '../../../ui/Confirm'
+import { useEventSource } from '../../api/hooks/useEventSource'
 import type { DashboardService } from '../dashboard/types'
 import { BucketSidebar } from './BucketSidebar'
 import { ObjectBrowser } from './ObjectBrowser'
@@ -52,6 +53,20 @@ export function S3Dashboard({ service }: S3DashboardProps): JSX.Element {
   useEffect(() => {
     refreshBuckets()
   }, [refreshBuckets])
+
+  const onS3Event = useCallback(
+    (event: { type: string }) => {
+      // Bucket-level events refresh the bucket list. Object-level events also
+      // bump the nonce so the open ObjectBrowser re-fetches its listing.
+      refreshBuckets()
+      if (event.type.startsWith('s3.object.')) {
+        setObjectsRefreshNonce((n) => n + 1)
+      }
+    },
+    [refreshBuckets],
+  )
+
+  useEventSource({ topics: ['s3'], onEvent: onS3Event, enabled: !isDisabled })
 
   const buckets = bucketsState.status === 'success' ? bucketsState.buckets : []
   const selectedBucket = buckets.find((bucket) => bucket.name === activeBucket)?.name

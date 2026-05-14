@@ -4,6 +4,7 @@ import { Button } from '../../../ui/Button'
 import { dangerConfirm, useConfirm } from '../../../ui/Confirm'
 import { EmptyState } from '../../../ui/EmptyState'
 import { Panel } from '../../../ui/Panel'
+import { useEventSource } from '../../api/hooks/useEventSource'
 import type { DashboardService } from '../dashboard/types'
 import {
   deleteRedisKey,
@@ -83,6 +84,8 @@ export function RedisDashboard({ service }: RedisDashboardProps): JSX.Element {
   useEffect(() => {
     refresh()
   }, [refresh])
+
+  useEventSource({ topics: ['redis'], onEvent: refresh, enabled: !isDisabled })
 
   useEffect(() => {
     if (!activeKey || isDisabled) {
