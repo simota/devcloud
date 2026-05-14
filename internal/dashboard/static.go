@@ -130,6 +130,11 @@ const serviceIndexHTML = `<!doctype html>
         <p>Inspect local Redshift clusters, catalog metadata, and statement history.</p>
         <span class="meta"><span class="meta-label">HTTP</span><code>127.0.0.1:9099</code></span>
       </a>
+      <a class="service" href="/dashboard/redis">
+        <h2>Redis</h2>
+        <p>Inspect local Redis keys, TTLs, and command results.</p>
+        <span class="meta"><span class="meta-label">TCP</span><code>127.0.0.1:6379</code></span>
+      </a>
       <a class="service" href="/dashboard/sqs">
         <h2>SQS</h2>
         <p>Inspect local SQS queues, messages, leases, and attributes.</p>

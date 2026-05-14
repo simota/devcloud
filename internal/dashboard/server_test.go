@@ -14,6 +14,7 @@ import (
 	dynamodbsvc "devcloud/internal/services/dynamodb"
 	"devcloud/internal/services/mail"
 	pubsubsvc "devcloud/internal/services/pubsub"
+	redissvc "devcloud/internal/services/redis"
 	redshiftsvc "devcloud/internal/services/redshift"
 	s3svc "devcloud/internal/services/s3"
 	sqssvc "devcloud/internal/services/sqs"
@@ -126,6 +127,7 @@ func TestIndexServesServiceLinks(t *testing.T) {
 		`href="/dashboard/dynamodb"`,
 		`href="/dashboard/bigquery"`,
 		`href="/dashboard/redshift"`,
+		`href="/dashboard/redis"`,
 		`href="/dashboard/sqs"`,
 		`href="/dashboard/pubsub"`,
 		"Local service dashboards",
@@ -151,6 +153,9 @@ func TestDashboardServicesAPIListsServiceRegistry(t *testing.T) {
 		BigQueryStoragePath: ".devcloud/test/bigquery",
 		RedshiftAPIEndpoint: "http://127.0.0.1:19099",
 		RedshiftStoragePath: ".devcloud/test/redshift",
+		RedisEndpoint:       "redis://127.0.0.1:16379",
+		RedisStoragePath:    ".devcloud/test/redis",
+		RedisEnabled:        true,
 		SQSEndpoint:         "http://127.0.0.1:9325",
 		SQSStoragePath:      ".devcloud/test/sqs",
 		PubSubRESTEndpoint:  "http://127.0.0.1:18086",
@@ -161,6 +166,7 @@ func TestDashboardServicesAPIListsServiceRegistry(t *testing.T) {
 	server.SetSQS(sqssvc.NewServer(sqssvc.Config{}))
 	server.SetPubSub(pubsubsvc.NewServer(pubsubsvc.Config{Project: "devcloud"}))
 	server.SetRedshift(redshiftsvc.NewServer(redshiftsvc.Config{ClusterIdentifier: "devcloud"}))
+	server.SetRedis(redissvc.NewServer(redissvc.Config{Mode: redissvc.ModeManaged, Addr: "127.0.0.1:16379"}))
 
 	rec := performRequest(server.routes(), http.MethodGet, "/api/dashboard/services")
 
@@ -174,8 +180,8 @@ func TestDashboardServicesAPIListsServiceRegistry(t *testing.T) {
 	if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
 		t.Fatalf("decode services response: %v", err)
 	}
-	if len(response.Services) != 8 {
-		t.Fatalf("services len = %d, want 8: %#v", len(response.Services), response.Services)
+	if len(response.Services) != 9 {
+		t.Fatalf("services len = %d, want 9: %#v", len(response.Services), response.Services)
 	}
 	assertService(t, response.Services[0], DashboardService{
 		ID:          "mail",
@@ -226,6 +232,14 @@ func TestDashboardServicesAPIListsServiceRegistry(t *testing.T) {
 		StoragePath: ".devcloud/test/redshift",
 	})
 	assertService(t, response.Services[6], DashboardService{
+		ID:          "redis",
+		Name:        "Redis",
+		Path:        "/dashboard/redis",
+		Status:      "running",
+		Endpoint:    "redis://127.0.0.1:16379",
+		StoragePath: ".devcloud/test/redis",
+	})
+	assertService(t, response.Services[7], DashboardService{
 		ID:          "sqs",
 		Name:        "SQS",
 		Path:        "/dashboard/sqs",
@@ -233,7 +247,7 @@ func TestDashboardServicesAPIListsServiceRegistry(t *testing.T) {
 		Endpoint:    "http://127.0.0.1:9325",
 		StoragePath: ".devcloud/test/sqs",
 	})
-	assertService(t, response.Services[7], DashboardService{
+	assertService(t, response.Services[8], DashboardService{
 		ID:          "pubsub",
 		Name:        "Pub/Sub",
 		Path:        "/dashboard/pubsub",
@@ -255,8 +269,8 @@ func TestDashboardServicesAPIMarksDisabledServices(t *testing.T) {
 	if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
 		t.Fatalf("decode services response: %v", err)
 	}
-	if len(response.Services) != 8 {
-		t.Fatalf("services len = %d, want 8: %#v", len(response.Services), response.Services)
+	if len(response.Services) != 9 {
+		t.Fatalf("services len = %d, want 9: %#v", len(response.Services), response.Services)
 	}
 	if response.Services[0].ID != "mail" || response.Services[0].Status != "disabled" {
 		t.Fatalf("mail service = %#v, want disabled mail", response.Services[0])
@@ -276,11 +290,14 @@ func TestDashboardServicesAPIMarksDisabledServices(t *testing.T) {
 	if response.Services[5].ID != "redshift" || response.Services[5].Status != "disabled" {
 		t.Fatalf("redshift service = %#v, want disabled redshift", response.Services[5])
 	}
-	if response.Services[6].ID != "sqs" || response.Services[6].Status != "disabled" {
-		t.Fatalf("sqs service = %#v, want disabled sqs", response.Services[6])
+	if response.Services[6].ID != "redis" || response.Services[6].Status != "disabled" {
+		t.Fatalf("redis service = %#v, want disabled redis", response.Services[6])
 	}
-	if response.Services[7].ID != "pubsub" || response.Services[7].Status != "disabled" {
-		t.Fatalf("pubsub service = %#v, want disabled pubsub", response.Services[7])
+	if response.Services[7].ID != "sqs" || response.Services[7].Status != "disabled" {
+		t.Fatalf("sqs service = %#v, want disabled sqs", response.Services[7])
+	}
+	if response.Services[8].ID != "pubsub" || response.Services[8].Status != "disabled" {
+		t.Fatalf("pubsub service = %#v, want disabled pubsub", response.Services[8])
 	}
 }
 

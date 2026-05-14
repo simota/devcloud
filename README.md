@@ -2,7 +2,7 @@
 
 Local cloud service emulator for development and E2E inspection.
 
-`devcloud` runs a local dashboard plus compatible development endpoints for Mail, S3, GCS, DynamoDB, BigQuery, SQS, Google Cloud Pub/Sub, and Redshift. It is designed for deterministic local tests and manual inspection, not for production workloads or full cloud-provider parity.
+`devcloud` runs a local dashboard plus compatible development endpoints for Mail, S3, GCS, DynamoDB, BigQuery, SQS, Google Cloud Pub/Sub, Redshift, and Redis. It is designed for deterministic local tests and manual inspection, not for production workloads or full cloud-provider parity.
 
 ## Quick Start
 
@@ -34,6 +34,7 @@ Default local endpoints:
 | Pub/Sub REST | `http://127.0.0.1:8086` | `http://127.0.0.1:8025/dashboard/pubsub` |
 | Redshift SQL | `127.0.0.1:5439` | `http://127.0.0.1:8025/dashboard/redshift` |
 | Redshift API | `http://127.0.0.1:9099` | `http://127.0.0.1:8025/dashboard/redshift` |
+| Redis | `redis://127.0.0.1:6379` | `http://127.0.0.1:8025/dashboard/redis` |
 
 Useful commands:
 
@@ -74,6 +75,7 @@ server:
   pubsubRestPort: 8086
   redshiftPort: 5439
   redshiftAPIPort: 9099
+  redisPort: 6379
 
 auth:
   smtp:
@@ -109,6 +111,9 @@ auth:
     accessKeyId: dev
     secretAccessKey: dev
     accountId: "000000000000"
+  redis:
+    mode: relaxed
+    password: ""
 
 storage:
   path: .devcloud/data
@@ -197,6 +202,14 @@ services:
     copyUnload:
       enableLocalS3: true
       maxInputRowBytes: 4194304
+  redis:
+    enabled: true
+    mode: managed
+    binaryPath: ""
+    externalUrl: ""
+    dataDir: redis
+    maxMemoryMB: 256
+    appendOnly: false
 ```
 
 ## Support Matrix
@@ -211,16 +224,16 @@ Legend:
 
 ### Service Availability
 
-| Capability | Mail | S3 | GCS | DynamoDB | BigQuery | SQS | Pub/Sub | Redshift |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Local endpoint | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
-| Dashboard view | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
-| Dashboard mutation actions | Partial | Partial | Partial | No | No | Partial | Yes | Yes |
-| Persistent local storage | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
-| Configurable port | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
-| Enable/disable via config | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
-| Local relaxed auth mode | N/A | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
-| Strict cloud-grade auth/IAM | No | Partial | No | Partial | No | Partial | No | Partial |
+| Capability | Mail | S3 | GCS | DynamoDB | BigQuery | SQS | Pub/Sub | Redshift | Redis |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Local endpoint | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
+| Dashboard view | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
+| Dashboard mutation actions | Partial | Partial | Partial | No | No | Partial | Yes | Yes | Partial |
+| Persistent local storage | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
+| Configurable port | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
+| Enable/disable via config | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
+| Local relaxed auth mode | N/A | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
+| Strict cloud-grade auth/IAM | No | Partial | No | Partial | No | Partial | No | Partial | Partial |
 
 ### Mail
 
@@ -373,6 +386,19 @@ Pub/Sub dashboard actions are available under `/dashboard/pubsub`:
 | Real AWS Redshift / IAM / KMS / CloudWatch | No | Not implemented; devcloud does not make real AWS calls. |
 | MPP / columnar execution / Spectrum / datashare | No | Out of local compatibility scope. |
 
+### Redis-Compatible Endpoint
+
+| Feature | Status | Notes |
+| --- | --- | --- |
+| Redis wire endpoint | Yes | Uses a real `redis-server` child process in managed mode; devcloud does not re-implement RESP. |
+| External Redis mode | Yes | `services.redis.mode: external` validates `externalUrl` with `PING` and exposes the same dashboard surface. |
+| Managed persistence | Yes | Runtime data is kept under `.devcloud/data/redis` by default. |
+| String/hash/list/set/zset inspection | Partial | `/dashboard/redis` lists keys with SCAN and shows type-specific previews. |
+| Command runner | Partial | Dashboard commands are restricted to the Redis allowlist in `docs/design-redis-compat.md`. |
+| Destructive actions | Partial | Key delete, expire, and guarded `FLUSHDB` are supported; `FLUSHALL` and unsafe commands are rejected. |
+| Redis AUTH | Partial | Relaxed mode does not set `requirepass`; strict mode passes the configured password to managed Redis. |
+| Cluster, Sentinel, modules, RedisJSON, RediSearch | No | Out of local compatibility scope. |
+
 ### Dashboard API
 
 | Feature | Status | Notes |
@@ -385,6 +411,7 @@ Pub/Sub dashboard actions are available under `/dashboard/pubsub`:
 | SQS dashboard API | Yes | Status, queues, messages, leases, DLQ, and purge. |
 | Pub/Sub dashboard API | Yes | Status, topics, subscriptions, publish, pull, ack, and message metadata. |
 | Redshift dashboard API | Yes | Status, clusters, catalog, table detail, query runner, and statement history. |
+| Redis dashboard API | Yes | Status, SCAN-based keys, key inspector, allowlisted command runner, delete, expire, and guarded `FLUSHDB`. |
 | Common React dashboard shell | Yes | All service pages are served under `/dashboard/<svc>` from the shared React shell; legacy `/mail`, `/s3`, `/gcs`, `/dynamodb`, `/bigquery` paths return 301 redirects. |
 
 ## Verification
@@ -405,6 +432,7 @@ VERIFY_STAGE=full bash scripts/dynamodb-autoloop/verify.sh
 VERIFY_STAGE=full bash scripts/bigquery-autoloop/verify.sh
 VERIFY_STAGE=full bash scripts/sqs-autoloop/verify.sh
 VERIFY_STAGE=full bash scripts/pubsub-autoloop/verify.sh
+VERIFY_STAGE=full bash scripts/redis-autoloop/verify.sh
 VERIFY_STAGE=full-sdk-compat bash scripts/gcs-sdk-compat-autoloop/verify.sh
 VERIFY_STAGE=full-sdk-compat bash scripts/bigquery-sdk-compat-autoloop/verify.sh
 VERIFY_STAGE=full-compat bash scripts/pubsub-full-compat-autoloop/verify.sh
@@ -424,6 +452,7 @@ scripts/bigquery-sdk-e2e.sh
 scripts/sqs-e2e.sh
 scripts/pubsub-e2e.sh
 scripts/redshift-e2e.sh
+scripts/redis-e2e.sh
 ```
 
 Keep a service running after the E2E journey for browser/API inspection:
@@ -450,6 +479,7 @@ E2E_INTERACTIVE=true E2E_BIGQUERY_PORT=19050 E2E_DASHBOARD_PORT=18025 scripts/bi
 E2E_BIGQUERY_PORT=19050 E2E_DASHBOARD_PORT=18025 scripts/bigquery-sdk-e2e.sh
 E2E_INTERACTIVE=true E2E_SQS_PORT=19324 E2E_DASHBOARD_PORT=18025 scripts/sqs-e2e.sh
 PUBSUB_GRPC_PORT=18085 PUBSUB_REST_PORT=18086 DASHBOARD_PORT=18025 E2E_INTERACTIVE=true scripts/pubsub-e2e.sh
+E2E_INTERACTIVE=true E2E_REDIS_PORT=16379 E2E_DASHBOARD_PORT=18025 scripts/redis-e2e.sh
 ```
 
 ## Project Structure
@@ -465,6 +495,7 @@ PUBSUB_GRPC_PORT=18085 PUBSUB_REST_PORT=18086 DASHBOARD_PORT=18025 E2E_INTERACTI
 | `internal/services/gcs` | GCS JSON API-compatible HTTP service. |
 | `internal/services/dynamodb` | DynamoDB-compatible JSON API service. |
 | `internal/services/bigquery` | BigQuery-compatible REST API service. |
+| `internal/services/redis` | Redis-compatible managed/external service wrapper. |
 | `internal/services/sqs` | SQS-compatible JSON and Query API service. |
 | `internal/services/pubsub` | Google Cloud Pub/Sub-compatible REST and gRPC service. |
 | `docs/` | Product and compatibility designs. |

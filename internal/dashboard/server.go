@@ -10,6 +10,7 @@ import (
 	bigquerysvc "devcloud/internal/services/bigquery"
 	dynamodbsvc "devcloud/internal/services/dynamodb"
 	pubsubsvc "devcloud/internal/services/pubsub"
+	redissvc "devcloud/internal/services/redis"
 	redshiftsvc "devcloud/internal/services/redshift"
 	s3svc "devcloud/internal/services/s3"
 	sqssvc "devcloud/internal/services/sqs"
@@ -43,6 +44,9 @@ type Config struct {
 	RedshiftCluster      string
 	RedshiftDatabase     string
 	RedshiftStoragePath  string
+	RedisEndpoint        string
+	RedisStoragePath     string
+	RedisEnabled         bool
 	SQSEndpoint          string
 	SQSRegion            string
 	SQSAuthMode          string
@@ -62,6 +66,7 @@ type Server struct {
 	bq       *bigquerysvc.Server
 	sqs      *sqssvc.Server
 	pubsub   *pubsubsvc.Server
+	redis    *redissvc.Server
 	redshift *redshiftsvc.Server
 }
 
@@ -96,6 +101,10 @@ func (s *Server) SetRedshift(server *redshiftsvc.Server) {
 	s.redshift = server
 }
 
+func (s *Server) SetRedis(server *redissvc.Server) {
+	s.redis = server
+}
+
 func (s *Server) Run(ctx context.Context) error {
 	server := &http.Server{
 		Addr:              s.config.Addr,
@@ -126,6 +135,7 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("/gcs", redirectToDashboard("/dashboard/gcs"))
 	mux.HandleFunc("/dynamodb", redirectToDashboard("/dashboard/dynamodb"))
 	mux.HandleFunc("/bigquery", redirectToDashboard("/dashboard/bigquery"))
+	mux.HandleFunc("/redis", redirectToDashboard("/dashboard/redis"))
 	mux.HandleFunc("/api/services", s.handleDashboardServices)
 	mux.HandleFunc("/api/dashboard/services", s.handleDashboardServices)
 	mux.HandleFunc("/api/messages", s.handleMessages)
@@ -151,6 +161,10 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("/api/redshift/statements", s.handleRedshiftStatements)
 	mux.HandleFunc("/api/redshift/tables/", s.handleRedshiftTable)
 	mux.HandleFunc("/api/redshift/query", s.handleRedshiftQuery)
+	mux.HandleFunc("/api/redis/status", s.handleRedisStatus)
+	mux.HandleFunc("/api/redis/keys", s.handleRedisKeys)
+	mux.HandleFunc("/api/redis/keys/", s.handleRedisKey)
+	mux.HandleFunc("/api/redis/command", s.handleRedisCommand)
 	mux.HandleFunc("/api/sqs/status", s.handleSQSStatus)
 	mux.HandleFunc("/api/sqs/queues", s.handleSQSQueues)
 	mux.HandleFunc("/api/sqs/queues/", s.handleSQSQueue)

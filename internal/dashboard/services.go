@@ -78,6 +78,16 @@ func (s *Server) dashboardServices() []DashboardService {
 	})
 
 	services = append(services, DashboardService{
+		ID:          "redis",
+		Name:        "Redis",
+		Path:        "/dashboard/redis",
+		Status:      objectServiceStatus(s.redis != nil),
+		Endpoint:    defaultString(s.config.RedisEndpoint, "redis://127.0.0.1:6379"),
+		StoragePath: defaultString(s.config.RedisStoragePath, ".devcloud/data/redis"),
+		Description: "Inspect local Redis keys, TTLs, and command results.",
+	})
+
+	services = append(services, DashboardService{
 		ID:          "sqs",
 		Name:        "SQS",
 		Path:        "/dashboard/sqs",

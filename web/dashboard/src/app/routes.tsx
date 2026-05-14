@@ -5,6 +5,7 @@ import { S3Dashboard } from './services/s3/S3Dashboard'
 import { DynamoDBDashboard } from './services/dynamodb/DynamoDBDashboard'
 import { BigQueryDashboard } from './services/bigquery/BigQueryDashboard'
 import { RedshiftDashboard } from './services/redshift/RedshiftDashboard'
+import { RedisDashboard } from './services/redis/RedisDashboard'
 import { SQSDashboard } from './services/sqs/SQSDashboard'
 import { PubSubDashboard } from './services/pubsub/PubSubDashboard'
 import { GCSDashboard } from './services/gcs/GCSDashboard'
@@ -32,6 +33,9 @@ export function renderRoute({ services, path }: RouteProps): JSX.Element {
   }
   if (path === '/redshift') {
     return <RedshiftDashboard service={services.find((service) => service.id === 'redshift')} />
+  }
+  if (path === '/redis') {
+    return <RedisDashboard service={services.find((service) => service.id === 'redis')} />
   }
   if (path === '/sqs') {
     return <SQSDashboard service={services.find((service) => service.id === 'sqs')} />
