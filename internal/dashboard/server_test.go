@@ -56,7 +56,7 @@ func (s *dashboardStore) Append(_ context.Context, message mail.Message, raw io.
 func (s *dashboardStore) List(context.Context, mail.ListMessagesInput) (mail.ListMessagesResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	result := mail.ListMessagesResult{}
+	result := mail.ListMessagesResult{Messages: []mail.Message{}}
 	for _, message := range s.messages {
 		if !s.deleted[message.ID] {
 			result.Messages = append(result.Messages, message)

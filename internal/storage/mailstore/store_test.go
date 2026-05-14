@@ -67,6 +67,31 @@ func TestFileStoreAppendListGetRawAndDelete(t *testing.T) {
 	}
 }
 
+func TestFileStoreListReturnsEmptySliceWhenLogMissing(t *testing.T) {
+	ctx := context.Background()
+	blobStore := blob.NewFileStore(t.TempDir())
+	store := NewFileStore(t.TempDir(), blobStore)
+
+	list, err := store.List(ctx, mail.ListMessagesInput{})
+	if err != nil {
+		t.Fatalf("List() error = %v", err)
+	}
+	if list.Messages == nil {
+		t.Fatal("List().Messages = nil, want non-nil empty slice (JSON-encodes as null otherwise)")
+	}
+	if len(list.Messages) != 0 {
+		t.Fatalf("List().Messages = %#v, want empty", list.Messages)
+	}
+
+	encoded, err := json.Marshal(list)
+	if err != nil {
+		t.Fatalf("Marshal(list) error = %v", err)
+	}
+	if !strings.Contains(string(encoded), `"messages":[]`) {
+		t.Fatalf("encoded list = %s, want messages serialized as []", encoded)
+	}
+}
+
 func TestFileStoreDeleteAllPreservesTombstones(t *testing.T) {
 	ctx := context.Background()
 	blobStore := blob.NewFileStore(t.TempDir())

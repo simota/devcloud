@@ -153,7 +153,7 @@ func (s *FileStore) loadAllLocked(ctx context.Context) ([]mail.Message, error) {
 	f, err := os.Open(s.messagesPath())
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, nil
+			return []mail.Message{}, nil
 		}
 		return nil, fmt.Errorf("open messages log: %w", err)
 	}

@@ -148,6 +148,27 @@ func TestMessagesAPIDeletesAllMessages(t *testing.T) {
 	}
 }
 
+func TestMessagesAPIEmptyInboxReturnsArrayNotNull(t *testing.T) {
+	routes := NewServer(Config{}, newDashboardStore(nil, nil)).routes()
+
+	rec := performRequest(routes, http.MethodGet, "/api/messages")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("list status = %d, want %d", rec.Code, http.StatusOK)
+	}
+	body := strings.TrimSpace(rec.Body.String())
+	if !strings.Contains(body, `"messages":[]`) {
+		t.Fatalf("empty inbox response = %s, want messages serialized as []", body)
+	}
+
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(body), &raw); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if string(raw["messages"]) != "[]" {
+		t.Fatalf(`messages field = %s, want "[]"`, raw["messages"])
+	}
+}
+
 func TestMessagesAPIHandlesMissingRawAndUnsupportedMethods(t *testing.T) {
 	routes := NewServer(Config{}, newDashboardStore(nil, nil)).routes()
 
