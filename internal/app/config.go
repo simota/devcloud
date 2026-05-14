@@ -26,6 +26,7 @@ type ServerConfig struct {
 	BigQueryPort    int
 	RedshiftPort    int
 	RedshiftAPIPort int
+	RedisPort       int
 	SQSPort         int
 	PubSubGRPCPort  int
 	PubSubRESTPort  int
@@ -38,6 +39,7 @@ type AuthConfig struct {
 	DynamoDB DynamoDBAuthConfig
 	BigQuery BigQueryAuthConfig
 	Redshift RedshiftAuthConfig
+	Redis    RedisAuthConfig
 	SQS      SQSAuthConfig
 	PubSub   PubSubAuthConfig
 }
@@ -79,6 +81,11 @@ type RedshiftAuthConfig struct {
 	AccountID       string
 }
 
+type RedisAuthConfig struct {
+	Mode     string
+	Password string
+}
+
 type SQSAuthConfig struct {
 	Mode            string
 	AccessKeyID     string
@@ -103,6 +110,7 @@ type ServicesConfig struct {
 	DynamoDB DynamoDBServiceConfig
 	BigQuery BigQueryServiceConfig
 	Redshift RedshiftServiceConfig
+	Redis    RedisServiceConfig
 	SQS      SQSServiceConfig
 	PubSub   PubSubServiceConfig
 }
@@ -201,6 +209,16 @@ type RedshiftCopyUnloadConfig struct {
 	MaxInputRowBytes int64
 }
 
+type RedisServiceConfig struct {
+	Enabled     bool
+	Mode        string
+	BinaryPath  string
+	ExternalURL string
+	DataDir     string
+	MaxMemoryMB int
+	AppendOnly  bool
+}
+
 type SQSServiceConfig struct {
 	Enabled                         bool
 	Region                          string
@@ -246,6 +264,7 @@ func DefaultConfig() Config {
 			BigQueryPort:    9050,
 			RedshiftPort:    5439,
 			RedshiftAPIPort: 9099,
+			RedisPort:       6379,
 			SQSPort:         9324,
 			PubSubGRPCPort:  8085,
 			PubSubRESTPort:  8086,
@@ -278,6 +297,9 @@ func DefaultConfig() Config {
 				AccessKeyID:     "dev",
 				SecretAccessKey: "dev",
 				AccountID:       "000000000000",
+			},
+			Redis: RedisAuthConfig{
+				Mode: "relaxed",
 			},
 			SQS: SQSAuthConfig{
 				Mode:            "relaxed",
@@ -368,6 +390,13 @@ func DefaultConfig() Config {
 					EnableLocalS3:    true,
 					MaxInputRowBytes: 4 * 1024 * 1024,
 				},
+			},
+			Redis: RedisServiceConfig{
+				Enabled:     false,
+				Mode:        "managed",
+				DataDir:     "redis",
+				MaxMemoryMB: 256,
+				AppendOnly:  false,
 			},
 			SQS: SQSServiceConfig{
 				Enabled:                         true,
@@ -464,6 +493,9 @@ func InitWorkspace(cfg Config) error {
 	if err := validateStoragePath(redshiftDataDir(cfg)); err != nil {
 		return fmt.Errorf("redshift dataDir: %w", err)
 	}
+	if err := validateStoragePath(redisDataDir(cfg)); err != nil {
+		return fmt.Errorf("redis dataDir: %w", err)
+	}
 	if err := os.MkdirAll(filepath.Join(cfg.Storage.Path, "blobs"), 0o755); err != nil {
 		return fmt.Errorf("create blob storage: %w", err)
 	}
@@ -490,6 +522,9 @@ func InitWorkspace(cfg Config) error {
 	}
 	if err := os.MkdirAll(redshiftDataDir(cfg), 0o755); err != nil {
 		return fmt.Errorf("create redshift storage: %w", err)
+	}
+	if err := os.MkdirAll(redisDataDir(cfg), 0o755); err != nil {
+		return fmt.Errorf("create redis storage: %w", err)
 	}
 	if err := os.MkdirAll(filepath.Join(cfg.Storage.Path, "sqs"), 0o755); err != nil {
 		return fmt.Errorf("create sqs storage: %w", err)
@@ -526,12 +561,20 @@ func ResetWorkspace(cfg Config) error {
 	if err := validateStoragePath(redshiftDataDir(cfg)); err != nil {
 		return fmt.Errorf("redshift dataDir: %w", err)
 	}
+	if err := validateStoragePath(redisDataDir(cfg)); err != nil {
+		return fmt.Errorf("redis dataDir: %w", err)
+	}
 	if err := os.RemoveAll(cfg.Storage.Path); err != nil {
 		return fmt.Errorf("remove storage: %w", err)
 	}
 	if cfg.Services.Redshift.DataDir != "" {
 		if err := os.RemoveAll(redshiftDataDir(cfg)); err != nil {
 			return fmt.Errorf("remove redshift storage: %w", err)
+		}
+	}
+	if cfg.Services.Redis.DataDir != "" {
+		if err := os.RemoveAll(redisDataDir(cfg)); err != nil {
+			return fmt.Errorf("remove redis storage: %w", err)
 		}
 	}
 	if cfg.Services.PubSub.DataDir != "" {
@@ -567,6 +610,7 @@ server:
   bigqueryPort: %d
   redshiftPort: %d
   redshiftAPIPort: %d
+  redisPort: %d
   sqsPort: %d
   pubsubGrpcPort: %d
   pubsubRestPort: %d
@@ -596,6 +640,9 @@ auth:
     accessKeyId: %s
     secretAccessKey: %s
     accountId: "%s"
+  redis:
+    mode: %s
+    password: %s
   sqs:
     mode: %s
     accessKeyId: %s
@@ -672,6 +719,14 @@ services:
     copyUnload:
       enableLocalS3: %t
       maxInputRowBytes: %d
+  redis:
+    enabled: %t
+    mode: %s
+    binaryPath: %s
+    externalUrl: %s
+    dataDir: %s
+    maxMemoryMB: %d
+    appendOnly: %t
   sqs:
     enabled: %t
     region: %s
@@ -697,7 +752,7 @@ services:
     enableREST: %t
     enableStreamingPull: %t
     enablePush: %t
-`, cfg.Project, cfg.Server.SMTPPort, cfg.Server.DashboardPort, cfg.Server.S3Port, cfg.Server.GCSPort, cfg.Server.DynamoDBPort, cfg.Server.BigQueryPort, cfg.Server.RedshiftPort, cfg.Server.RedshiftAPIPort, cfg.Server.SQSPort, cfg.Server.PubSubGRPCPort, cfg.Server.PubSubRESTPort, cfg.Auth.SMTP.Mode, cfg.Auth.S3.Mode, cfg.Auth.S3.AccessKeyID, cfg.Auth.S3.SecretAccessKey, cfg.Auth.GCS.Mode, cfg.Auth.GCS.Project, cfg.Auth.DynamoDB.Mode, cfg.Auth.DynamoDB.AccessKeyID, cfg.Auth.DynamoDB.SecretAccessKey, cfg.Auth.BigQuery.Mode, cfg.Auth.BigQuery.Project, cfg.Auth.BigQuery.BearerToken, cfg.Auth.Redshift.Mode, cfg.Auth.Redshift.User, cfg.Auth.Redshift.Password, cfg.Auth.Redshift.AccessKeyID, cfg.Auth.Redshift.SecretAccessKey, cfg.Auth.Redshift.AccountID, cfg.Auth.SQS.Mode, cfg.Auth.SQS.AccessKeyID, cfg.Auth.SQS.SecretAccessKey, cfg.Auth.SQS.AccountID, cfg.Auth.PubSub.Mode, cfg.Auth.PubSub.ProjectID, cfg.Auth.PubSub.BearerToken, cfg.Storage.Path, cfg.Services.Mail.Enabled, cfg.Services.Mail.MaxMessageBytes, cfg.Services.S3.Enabled, cfg.Services.S3.Region, cfg.Services.S3.PathStyle, cfg.Services.S3.VirtualHostStyle, cfg.Services.S3.MaxObjectBytes, cfg.Services.S3.Multipart.MinPartBytes, cfg.Services.GCS.Enabled, cfg.Services.GCS.Project, cfg.Services.GCS.Location, cfg.Services.DynamoDB.Enabled, cfg.Services.DynamoDB.Region, cfg.Services.DynamoDB.BillingMode, cfg.Services.DynamoDB.MaxItemBytes, cfg.Services.DynamoDB.MaxTables, cfg.Services.DynamoDB.Streams.Enabled, cfg.Services.DynamoDB.TTL.SchedulerIntervalSeconds, cfg.Services.BigQuery.Enabled, cfg.Services.BigQuery.Project, cfg.Services.BigQuery.Location, cfg.Services.BigQuery.MaxRowsPerTable, cfg.Services.BigQuery.MaxRequestBytes, cfg.Services.BigQuery.Query.MaxResultRows, cfg.Services.BigQuery.Query.MaxExecutionSeconds, cfg.Services.BigQuery.Query.DefaultUseLegacySQL, cfg.Services.Redshift.Enabled, cfg.Services.Redshift.Region, cfg.Services.Redshift.ClusterIdentifier, cfg.Services.Redshift.Database, defaultString(cfg.Services.Redshift.DataDir, "redshift"), cfg.Services.Redshift.NodeType, cfg.Services.Redshift.NumberOfNodes, cfg.Services.Redshift.MaxStatementBytes, redshiftBackendKind(cfg.Services.Redshift.Backend), redshiftBackendMode(cfg.Services.Redshift.Backend), cfg.Services.Redshift.Backend.ExternalDSN, redshiftBackendMode(cfg.Services.Redshift.Backend) == "managed", cfg.Services.Redshift.DataAPI.Enabled, cfg.Services.Redshift.DataAPI.MaxResultBytes, cfg.Services.Redshift.DataAPI.MaxResultRows, cfg.Services.Redshift.DataAPI.StatementRetentionSeconds, cfg.Services.Redshift.DataAPI.SessionRetentionSeconds, cfg.Services.Redshift.SQL.EnableExtendedProtocol, cfg.Services.Redshift.SQL.MaxResultRows, cfg.Services.Redshift.SQL.DefaultSearchPath, cfg.Services.Redshift.CopyUnload.EnableLocalS3, cfg.Services.Redshift.CopyUnload.MaxInputRowBytes, cfg.Services.SQS.Enabled, cfg.Services.SQS.Region, cfg.Services.SQS.QueueURLHost, cfg.Services.SQS.MaxQueues, cfg.Services.SQS.MaxMessageBytes, cfg.Services.SQS.MaxReceiveBatchSize, cfg.Services.SQS.DefaultVisibilityTimeoutSeconds, cfg.Services.SQS.DefaultDelaySeconds, cfg.Services.SQS.DefaultMessageRetentionSeconds, cfg.Services.SQS.DefaultReceiveWaitTimeSeconds, cfg.Services.SQS.SchedulerIntervalSeconds, cfg.Services.PubSub.Enabled, cfg.Services.PubSub.Project, defaultString(cfg.Services.PubSub.DataDir, filepath.Join(cfg.Storage.Path, "pubsub")), defaultString(cfg.Services.PubSub.MessageDataDir, filepath.Join(cfg.Storage.Path, "message")), cfg.Services.PubSub.DefaultAckDeadlineSeconds, cfg.Services.PubSub.MessageRetentionSeconds, cfg.Services.PubSub.MaxAckDeadlineSeconds, cfg.Services.PubSub.MaxPullMessages, cfg.Services.PubSub.PullWaitTimeoutSeconds, cfg.Services.PubSub.EnableREST, cfg.Services.PubSub.EnableStreamingPull, cfg.Services.PubSub.EnablePush)
+`, cfg.Project, cfg.Server.SMTPPort, cfg.Server.DashboardPort, cfg.Server.S3Port, cfg.Server.GCSPort, cfg.Server.DynamoDBPort, cfg.Server.BigQueryPort, cfg.Server.RedshiftPort, cfg.Server.RedshiftAPIPort, cfg.Server.RedisPort, cfg.Server.SQSPort, cfg.Server.PubSubGRPCPort, cfg.Server.PubSubRESTPort, cfg.Auth.SMTP.Mode, cfg.Auth.S3.Mode, cfg.Auth.S3.AccessKeyID, cfg.Auth.S3.SecretAccessKey, cfg.Auth.GCS.Mode, cfg.Auth.GCS.Project, cfg.Auth.DynamoDB.Mode, cfg.Auth.DynamoDB.AccessKeyID, cfg.Auth.DynamoDB.SecretAccessKey, cfg.Auth.BigQuery.Mode, cfg.Auth.BigQuery.Project, cfg.Auth.BigQuery.BearerToken, cfg.Auth.Redshift.Mode, cfg.Auth.Redshift.User, cfg.Auth.Redshift.Password, cfg.Auth.Redshift.AccessKeyID, cfg.Auth.Redshift.SecretAccessKey, cfg.Auth.Redshift.AccountID, cfg.Auth.Redis.Mode, cfg.Auth.Redis.Password, cfg.Auth.SQS.Mode, cfg.Auth.SQS.AccessKeyID, cfg.Auth.SQS.SecretAccessKey, cfg.Auth.SQS.AccountID, cfg.Auth.PubSub.Mode, cfg.Auth.PubSub.ProjectID, cfg.Auth.PubSub.BearerToken, cfg.Storage.Path, cfg.Services.Mail.Enabled, cfg.Services.Mail.MaxMessageBytes, cfg.Services.S3.Enabled, cfg.Services.S3.Region, cfg.Services.S3.PathStyle, cfg.Services.S3.VirtualHostStyle, cfg.Services.S3.MaxObjectBytes, cfg.Services.S3.Multipart.MinPartBytes, cfg.Services.GCS.Enabled, cfg.Services.GCS.Project, cfg.Services.GCS.Location, cfg.Services.DynamoDB.Enabled, cfg.Services.DynamoDB.Region, cfg.Services.DynamoDB.BillingMode, cfg.Services.DynamoDB.MaxItemBytes, cfg.Services.DynamoDB.MaxTables, cfg.Services.DynamoDB.Streams.Enabled, cfg.Services.DynamoDB.TTL.SchedulerIntervalSeconds, cfg.Services.BigQuery.Enabled, cfg.Services.BigQuery.Project, cfg.Services.BigQuery.Location, cfg.Services.BigQuery.MaxRowsPerTable, cfg.Services.BigQuery.MaxRequestBytes, cfg.Services.BigQuery.Query.MaxResultRows, cfg.Services.BigQuery.Query.MaxExecutionSeconds, cfg.Services.BigQuery.Query.DefaultUseLegacySQL, cfg.Services.Redshift.Enabled, cfg.Services.Redshift.Region, cfg.Services.Redshift.ClusterIdentifier, cfg.Services.Redshift.Database, defaultString(cfg.Services.Redshift.DataDir, "redshift"), cfg.Services.Redshift.NodeType, cfg.Services.Redshift.NumberOfNodes, cfg.Services.Redshift.MaxStatementBytes, redshiftBackendKind(cfg.Services.Redshift.Backend), redshiftBackendMode(cfg.Services.Redshift.Backend), cfg.Services.Redshift.Backend.ExternalDSN, redshiftBackendMode(cfg.Services.Redshift.Backend) == "managed", cfg.Services.Redshift.DataAPI.Enabled, cfg.Services.Redshift.DataAPI.MaxResultBytes, cfg.Services.Redshift.DataAPI.MaxResultRows, cfg.Services.Redshift.DataAPI.StatementRetentionSeconds, cfg.Services.Redshift.DataAPI.SessionRetentionSeconds, cfg.Services.Redshift.SQL.EnableExtendedProtocol, cfg.Services.Redshift.SQL.MaxResultRows, cfg.Services.Redshift.SQL.DefaultSearchPath, cfg.Services.Redshift.CopyUnload.EnableLocalS3, cfg.Services.Redshift.CopyUnload.MaxInputRowBytes, cfg.Services.Redis.Enabled, redisMode(cfg.Services.Redis), cfg.Services.Redis.BinaryPath, cfg.Services.Redis.ExternalURL, defaultString(cfg.Services.Redis.DataDir, "redis"), cfg.Services.Redis.MaxMemoryMB, cfg.Services.Redis.AppendOnly, cfg.Services.SQS.Enabled, cfg.Services.SQS.Region, cfg.Services.SQS.QueueURLHost, cfg.Services.SQS.MaxQueues, cfg.Services.SQS.MaxMessageBytes, cfg.Services.SQS.MaxReceiveBatchSize, cfg.Services.SQS.DefaultVisibilityTimeoutSeconds, cfg.Services.SQS.DefaultDelaySeconds, cfg.Services.SQS.DefaultMessageRetentionSeconds, cfg.Services.SQS.DefaultReceiveWaitTimeSeconds, cfg.Services.SQS.SchedulerIntervalSeconds, cfg.Services.PubSub.Enabled, cfg.Services.PubSub.Project, defaultString(cfg.Services.PubSub.DataDir, filepath.Join(cfg.Storage.Path, "pubsub")), defaultString(cfg.Services.PubSub.MessageDataDir, filepath.Join(cfg.Storage.Path, "message")), cfg.Services.PubSub.DefaultAckDeadlineSeconds, cfg.Services.PubSub.MessageRetentionSeconds, cfg.Services.PubSub.MaxAckDeadlineSeconds, cfg.Services.PubSub.MaxPullMessages, cfg.Services.PubSub.PullWaitTimeoutSeconds, cfg.Services.PubSub.EnableREST, cfg.Services.PubSub.EnableStreamingPull, cfg.Services.PubSub.EnablePush)
 }
 
 func ensureFile(path string, data []byte) error {
@@ -761,6 +816,12 @@ func applyConfigValue(cfg *Config, path []string, value string) error {
 			return fmt.Errorf("parse server.redshiftAPIPort: %w", err)
 		}
 		cfg.Server.RedshiftAPIPort = port
+	case "server.redisPort":
+		port, err := strconv.Atoi(value)
+		if err != nil {
+			return fmt.Errorf("parse server.redisPort: %w", err)
+		}
+		cfg.Server.RedisPort = port
 	case "server.sqsPort":
 		port, err := strconv.Atoi(value)
 		if err != nil {
@@ -817,6 +878,10 @@ func applyConfigValue(cfg *Config, path []string, value string) error {
 		cfg.Auth.Redshift.SecretAccessKey = value
 	case "auth.redshift.accountId":
 		cfg.Auth.Redshift.AccountID = strings.Trim(value, `"`)
+	case "auth.redis.mode":
+		cfg.Auth.Redis.Mode = value
+	case "auth.redis.password":
+		cfg.Auth.Redis.Password = value
 	case "auth.sqs.mode":
 		cfg.Auth.SQS.Mode = value
 	case "auth.sqs.accessKeyId":
@@ -1111,6 +1176,35 @@ func applyConfigValue(cfg *Config, path []string, value string) error {
 			return fmt.Errorf("parse services.redshift.copyUnload.maxInputRowBytes: must be positive")
 		}
 		cfg.Services.Redshift.CopyUnload.MaxInputRowBytes = maxBytes
+	case "services.redis.enabled":
+		enabled, err := strconv.ParseBool(value)
+		if err != nil {
+			return fmt.Errorf("parse services.redis.enabled: %w", err)
+		}
+		cfg.Services.Redis.Enabled = enabled
+	case "services.redis.mode":
+		cfg.Services.Redis.Mode = value
+	case "services.redis.binaryPath":
+		cfg.Services.Redis.BinaryPath = value
+	case "services.redis.externalUrl", "services.redis.externalURL":
+		cfg.Services.Redis.ExternalURL = value
+	case "services.redis.dataDir":
+		cfg.Services.Redis.DataDir = value
+	case "services.redis.maxMemoryMB":
+		maxMemoryMB, err := strconv.Atoi(value)
+		if err != nil {
+			return fmt.Errorf("parse services.redis.maxMemoryMB: %w", err)
+		}
+		if maxMemoryMB <= 0 {
+			return fmt.Errorf("parse services.redis.maxMemoryMB: must be positive")
+		}
+		cfg.Services.Redis.MaxMemoryMB = maxMemoryMB
+	case "services.redis.appendOnly":
+		appendOnly, err := strconv.ParseBool(value)
+		if err != nil {
+			return fmt.Errorf("parse services.redis.appendOnly: %w", err)
+		}
+		cfg.Services.Redis.AppendOnly = appendOnly
 	case "services.sqs.enabled":
 		enabled, err := strconv.ParseBool(value)
 		if err != nil {

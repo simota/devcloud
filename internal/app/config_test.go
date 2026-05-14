@@ -41,6 +41,9 @@ func TestInitWorkspaceCreatesDefaultsWithoutOverwritingConfig(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(cfg.Storage.Path, "redshift")); err != nil {
 		t.Fatalf("redshift storage not created: %v", err)
 	}
+	if _, err := os.Stat(filepath.Join(cfg.Storage.Path, "redis")); err != nil {
+		t.Fatalf("redis storage not created: %v", err)
+	}
 	if _, err := os.Stat(filepath.Join(cfg.Storage.Path, "sqs")); err != nil {
 		t.Fatalf("sqs storage not created: %v", err)
 	}
@@ -212,6 +215,7 @@ server:
   bigqueryPort: 9051
   redshiftPort: 15439
   redshiftAPIPort: 19099
+  redisPort: 16379
   sqsPort: 9325
   pubsubGrpcPort: 18085
   pubsubRestPort: 18086
@@ -242,6 +246,9 @@ auth:
     accessKeyId: local-redshift
     secretAccessKey: redshift-secret
     accountId: "210987654321"
+  redis:
+    mode: strict
+    password: redis-password
   sqs:
     mode: strict
     accessKeyId: local-sqs
@@ -318,6 +325,14 @@ services:
     copyUnload:
       enableLocalS3: false
       maxInputRowBytes: 1024
+  redis:
+    enabled: true
+    mode: external
+    binaryPath: /opt/redis/bin/redis-server
+    externalUrl: redis://127.0.0.1:6379/1
+    dataDir: custom-redis
+    maxMemoryMB: 128
+    appendOnly: true
   sqs:
     enabled: true
     region: ap-northeast-1
@@ -355,7 +370,7 @@ services:
 	if cfg.Project != "custom" {
 		t.Fatalf("Project = %q", cfg.Project)
 	}
-	if cfg.Server.SMTPPort != 2525 || cfg.Server.DashboardPort != 8825 || cfg.Server.S3Port != 4567 || cfg.Server.GCSPort != 4444 || cfg.Server.DynamoDBPort != 8100 || cfg.Server.BigQueryPort != 9051 || cfg.Server.RedshiftPort != 15439 || cfg.Server.RedshiftAPIPort != 19099 || cfg.Server.SQSPort != 9325 || cfg.Server.PubSubGRPCPort != 18085 || cfg.Server.PubSubRESTPort != 18086 {
+	if cfg.Server.SMTPPort != 2525 || cfg.Server.DashboardPort != 8825 || cfg.Server.S3Port != 4567 || cfg.Server.GCSPort != 4444 || cfg.Server.DynamoDBPort != 8100 || cfg.Server.BigQueryPort != 9051 || cfg.Server.RedshiftPort != 15439 || cfg.Server.RedshiftAPIPort != 19099 || cfg.Server.RedisPort != 16379 || cfg.Server.SQSPort != 9325 || cfg.Server.PubSubGRPCPort != 18085 || cfg.Server.PubSubRESTPort != 18086 {
 		t.Fatalf("Server = %#v", cfg.Server)
 	}
 	if cfg.Auth.S3.AccessKeyID != "local" || cfg.Auth.S3.SecretAccessKey != "secret" {
@@ -372,6 +387,9 @@ services:
 	}
 	if cfg.Auth.Redshift.Mode != "strict" || cfg.Auth.Redshift.User != "analyst" || cfg.Auth.Redshift.Password != "local-password" || cfg.Auth.Redshift.AccessKeyID != "local-redshift" || cfg.Auth.Redshift.SecretAccessKey != "redshift-secret" || cfg.Auth.Redshift.AccountID != "210987654321" {
 		t.Fatalf("Auth.Redshift = %#v", cfg.Auth.Redshift)
+	}
+	if cfg.Auth.Redis.Mode != "strict" || cfg.Auth.Redis.Password != "redis-password" {
+		t.Fatalf("Auth.Redis = %#v", cfg.Auth.Redis)
 	}
 	if cfg.Auth.SQS.Mode != "strict" || cfg.Auth.SQS.AccessKeyID != "local-sqs" || cfg.Auth.SQS.SecretAccessKey != "sqs-secret" || cfg.Auth.SQS.AccountID != "123456789012" {
 		t.Fatalf("Auth.SQS = %#v", cfg.Auth.SQS)
@@ -426,6 +444,12 @@ services:
 	}
 	if cfg.Services.Redshift.CopyUnload.EnableLocalS3 || cfg.Services.Redshift.CopyUnload.MaxInputRowBytes != 1024 {
 		t.Fatalf("Services.Redshift.CopyUnload = %#v", cfg.Services.Redshift.CopyUnload)
+	}
+	if !cfg.Services.Redis.Enabled || cfg.Services.Redis.Mode != "external" || cfg.Services.Redis.BinaryPath != "/opt/redis/bin/redis-server" || cfg.Services.Redis.ExternalURL != "redis://127.0.0.1:6379/1" {
+		t.Fatalf("Services.Redis = %#v", cfg.Services.Redis)
+	}
+	if cfg.Services.Redis.DataDir != "custom-redis" || cfg.Services.Redis.MaxMemoryMB != 128 || !cfg.Services.Redis.AppendOnly {
+		t.Fatalf("Services.Redis runtime = %#v", cfg.Services.Redis)
 	}
 	if !cfg.Services.SQS.Enabled || cfg.Services.SQS.Region != "ap-northeast-1" || cfg.Services.SQS.QueueURLHost != "localhost" {
 		t.Fatalf("Services.SQS = %#v", cfg.Services.SQS)
@@ -485,6 +509,9 @@ func TestDefaultConfigIncludesS3GCSAndDynamoDBDefaults(t *testing.T) {
 	}
 	if cfg.Server.RedshiftAPIPort != 9099 {
 		t.Fatalf("Server.RedshiftAPIPort = %d", cfg.Server.RedshiftAPIPort)
+	}
+	if cfg.Server.RedisPort != 6379 {
+		t.Fatalf("Server.RedisPort = %d", cfg.Server.RedisPort)
 	}
 	if cfg.Server.SQSPort != 9324 {
 		t.Fatalf("Server.SQSPort = %d", cfg.Server.SQSPort)
@@ -557,6 +584,12 @@ func TestDefaultConfigIncludesS3GCSAndDynamoDBDefaults(t *testing.T) {
 	}
 	if !cfg.Services.Redshift.CopyUnload.EnableLocalS3 || cfg.Services.Redshift.CopyUnload.MaxInputRowBytes != 4*1024*1024 {
 		t.Fatalf("Services.Redshift.CopyUnload = %#v", cfg.Services.Redshift.CopyUnload)
+	}
+	if cfg.Auth.Redis.Mode != "relaxed" || cfg.Auth.Redis.Password != "" {
+		t.Fatalf("Auth.Redis = %#v", cfg.Auth.Redis)
+	}
+	if cfg.Services.Redis.Enabled || cfg.Services.Redis.Mode != "managed" || cfg.Services.Redis.DataDir != "redis" || cfg.Services.Redis.MaxMemoryMB != 256 || cfg.Services.Redis.AppendOnly {
+		t.Fatalf("Services.Redis = %#v", cfg.Services.Redis)
 	}
 	if cfg.Auth.SQS.Mode != "relaxed" || cfg.Auth.SQS.AccessKeyID != "dev" || cfg.Auth.SQS.SecretAccessKey != "dev" || cfg.Auth.SQS.AccountID != "000000000000" {
 		t.Fatalf("Auth.SQS = %#v", cfg.Auth.SQS)
@@ -643,6 +676,9 @@ func TestWorkspaceStoragePathMustStayUnderDevcloud(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(".devcloud", "custom-data", "redshift")); err != nil {
 		t.Fatalf("custom redshift storage not created: %v", err)
 	}
+	if _, err := os.Stat(filepath.Join(".devcloud", "custom-data", "redis")); err != nil {
+		t.Fatalf("custom redis storage not created: %v", err)
+	}
 	if _, err := os.Stat(filepath.Join(".devcloud", "custom-data", "pubsub")); err != nil {
 		t.Fatalf("custom pubsub storage not created: %v", err)
 	}
@@ -704,6 +740,32 @@ func TestInitWorkspaceUsesRedshiftDataDirUnderDevcloud(t *testing.T) {
 	cfg.Services.Redshift.DataDir = filepath.Join("..", "..", "redshift-outside")
 	if err := InitWorkspace(cfg); err == nil {
 		t.Fatal("InitWorkspace() error = nil for redshift dataDir outside .devcloud")
+	}
+}
+
+func TestInitWorkspaceUsesRedisDataDirUnderDevcloud(t *testing.T) {
+	chdir(t, t.TempDir())
+	cfg := DefaultConfig()
+	cfg.Services.Redis.DataDir = filepath.Join(".devcloud", "redis-store")
+
+	if err := InitWorkspace(cfg); err != nil {
+		t.Fatalf("InitWorkspace() error = %v", err)
+	}
+	if _, err := os.Stat(cfg.Services.Redis.DataDir); err != nil {
+		t.Fatalf("custom redis dataDir not created: %v", err)
+	}
+
+	cfg.Services.Redis.DataDir = "redis-outside"
+	if err := InitWorkspace(cfg); err != nil {
+		t.Fatalf("relative redis dataDir should stay under storage path: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(cfg.Storage.Path, "redis-outside")); err != nil {
+		t.Fatalf("relative redis dataDir not created under storage path: %v", err)
+	}
+
+	cfg.Services.Redis.DataDir = filepath.Join("..", "..", "redis-outside")
+	if err := InitWorkspace(cfg); err == nil {
+		t.Fatal("InitWorkspace() error = nil for redis dataDir outside .devcloud")
 	}
 }
 
@@ -816,6 +878,14 @@ func TestLoadConfigIgnoresUnknownKeysAndRejectsInvalidKnownValues(t *testing.T) 
 	}
 	if _, err := LoadConfig(invalidPubSubTimeoutPath); err == nil {
 		t.Fatal("LoadConfig() invalid pubsub pullWaitTimeoutSeconds error = nil")
+	}
+
+	invalidRedisMemoryPath := filepath.Join(dir, "invalid-redis-memory.yaml")
+	if err := os.WriteFile(invalidRedisMemoryPath, []byte("services:\n  redis:\n    maxMemoryMB: 0\n"), 0o644); err != nil {
+		t.Fatalf("write invalid redis maxMemoryMB config: %v", err)
+	}
+	if _, err := LoadConfig(invalidRedisMemoryPath); err == nil {
+		t.Fatal("LoadConfig() invalid redis maxMemoryMB error = nil")
 	}
 }
 

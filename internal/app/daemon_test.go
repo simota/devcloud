@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -173,6 +174,12 @@ func TestDaemonEnabledServerCountIncludesPubSubRedshiftAndDashboard(t *testing.T
 		t.Fatalf("enabledServerCount() = %d, want 9", got)
 	}
 
+	cfg.Services.Redis.Enabled = true
+	if got := NewDaemon(cfg).enabledServerCount(); got != 10 {
+		t.Fatalf("enabledServerCount() with Redis = %d, want 10", got)
+	}
+	cfg.Services.Redis.Enabled = false
+
 	cfg.Services.PubSub.Enabled = false
 	if got := NewDaemon(cfg).enabledServerCount(); got != 8 {
 		t.Fatalf("enabledServerCount() without Pub/Sub = %d, want 8", got)
@@ -181,6 +188,168 @@ func TestDaemonEnabledServerCountIncludesPubSubRedshiftAndDashboard(t *testing.T
 	cfg.Services.Redshift.Enabled = false
 	if got := NewDaemon(cfg).enabledServerCount(); got != 7 {
 		t.Fatalf("enabledServerCount() without Pub/Sub and Redshift = %d, want 7", got)
+	}
+}
+
+func TestStartRedisBackendUsesManagedLifecycleByDefault(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Services.Redis.Enabled = true
+	cfg.Server.RedisPort = 16379
+	cfg.Auth.Redis.Mode = "strict"
+	cfg.Auth.Redis.Password = "secret"
+	cfg.Services.Redis.BinaryPath = "/opt/redis/bin/redis-server"
+	cfg.Services.Redis.MaxMemoryMB = 128
+	cfg.Services.Redis.AppendOnly = true
+
+	started := false
+	originalStart := startManagedRedis
+	startManagedRedis = func(ctx context.Context, got managedRedisConfig) (managedRedisLifecycle, error) {
+		started = true
+		if got.Port != 16379 || got.AuthMode != "strict" || got.Password != "secret" {
+			t.Fatalf("managed redis config auth/port = %#v", got)
+		}
+		if got.BinaryPath != "/opt/redis/bin/redis-server" || got.MaxMemoryMB != 128 || !got.AppendOnly {
+			t.Fatalf("managed redis config process settings = %#v", got)
+		}
+		return &fakeManagedRedisLifecycle{addr: "127.0.0.1:16379"}, nil
+	}
+	t.Cleanup(func() {
+		startManagedRedis = originalStart
+	})
+
+	lifecycle, err := startRedisBackend(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("startRedisBackend() error = %v", err)
+	}
+	if !started {
+		t.Fatal("startRedisBackend() did not start managed lifecycle")
+	}
+	if lifecycle == nil || lifecycle.Addr() != "127.0.0.1:16379" {
+		t.Fatalf("startRedisBackend() lifecycle = %#v", lifecycle)
+	}
+}
+
+func TestStartRedisBackendSkipsLifecycleForExternalMode(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Services.Redis.Enabled = true
+	cfg.Services.Redis.Mode = "external"
+	cfg.Services.Redis.ExternalURL = "redis://127.0.0.1:6379/1"
+
+	originalStart := startManagedRedis
+	startManagedRedis = func(ctx context.Context, got managedRedisConfig) (managedRedisLifecycle, error) {
+		t.Fatal("external redis mode should not start managed lifecycle")
+		return nil, nil
+	}
+	t.Cleanup(func() {
+		startManagedRedis = originalStart
+	})
+
+	lifecycle, err := startRedisBackend(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("startRedisBackend() error = %v", err)
+	}
+	if lifecycle != nil {
+		t.Fatalf("startRedisBackend() lifecycle = %#v, want nil", lifecycle)
+	}
+}
+
+func TestDaemonContinuesWhenManagedRedisBinaryIsMissing(t *testing.T) {
+	chdir(t, t.TempDir())
+	cfg := DefaultConfig()
+	cfg.Services.Mail.Enabled = false
+	cfg.Services.S3.Enabled = false
+	cfg.Services.GCS.Enabled = false
+	cfg.Services.DynamoDB.Enabled = false
+	cfg.Services.BigQuery.Enabled = false
+	cfg.Services.SQS.Enabled = false
+	cfg.Services.PubSub.Enabled = false
+	cfg.Services.Redshift.Enabled = false
+	cfg.Services.Redis.Enabled = true
+	cfg.Services.Redis.Mode = "managed"
+	cfg.Server.DashboardPort = freeTCPPort(t)
+	cfg.Server.RedisPort = freeTCPPort(t)
+
+	originalStart := startManagedRedis
+	startManagedRedis = func(ctx context.Context, got managedRedisConfig) (managedRedisLifecycle, error) {
+		return nil, errManagedRedisServerMissing
+	}
+	t.Cleanup(func() {
+		startManagedRedis = originalStart
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- NewDaemon(cfg).Run(ctx)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case err := <-errCh:
+			if err != nil {
+				t.Fatalf("daemon returned error: %v", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("daemon did not stop")
+		}
+	})
+
+	baseURL := "http://" + loopbackAddr(cfg.Server.DashboardPort)
+	waitForHTTP(t, baseURL+"/api/redis/status")
+
+	statusBody := getBody(t, baseURL+"/api/redis/status")
+	if !strings.Contains(statusBody, `"status":"disabled"`) || !strings.Contains(statusBody, `"running":false`) {
+		t.Fatalf("Redis status should be disabled after missing binary, got %s", statusBody)
+	}
+	servicesBody := getBody(t, baseURL+"/api/dashboard/services")
+	if !strings.Contains(servicesBody, `"id":"redis"`) || !strings.Contains(servicesBody, `"status":"disabled"`) {
+		t.Fatalf("dashboard services should keep Redis disabled and continue serving, got %s", servicesBody)
+	}
+}
+
+func TestRedisServerConfigUsesLifecycleAddressWithoutLeakingPassword(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Services.Redis.Mode = "managed"
+	cfg.Server.RedisPort = 16379
+	cfg.Auth.Redis.Mode = "strict"
+	cfg.Auth.Redis.Password = "secret"
+
+	got := redisServerConfig(cfg, &fakeManagedRedisLifecycle{addr: "127.0.0.1:26379"})
+	if got.Mode != "managed" || got.Addr != "127.0.0.1:26379" {
+		t.Fatalf("redisServerConfig() mode/addr = %#v", got)
+	}
+	if got.AuthMode != "strict" || got.Password != "secret" {
+		t.Fatalf("redisServerConfig() auth = %#v", got)
+	}
+	if !strings.HasPrefix(got.DataDir, filepath.Join(".devcloud", "data", "redis")) {
+		t.Fatalf("redisServerConfig() dataDir = %q", got.DataDir)
+	}
+}
+
+func TestRedisEndpointForDisplayUsesExternalURLWithoutCredentials(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Server.RedisPort = 16379
+	cfg.Services.Redis.Mode = "external"
+	cfg.Services.Redis.ExternalURL = "redis://:super-secret@redis.example.test:6380/2?protocol=3"
+
+	got := redisEndpointForDisplay(cfg)
+	if got != "redis://redis.example.test:6380/2" {
+		t.Fatalf("redisEndpointForDisplay() = %q", got)
+	}
+	if strings.Contains(got, "super-secret") {
+		t.Fatalf("redisEndpointForDisplay() leaked password: %q", got)
+	}
+}
+
+func TestRedisEndpointForDisplayFallsBackToLocalPortForInvalidExternalURL(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Server.RedisPort = 16379
+	cfg.Services.Redis.Mode = "external"
+	cfg.Services.Redis.ExternalURL = "://bad-url"
+
+	if got, want := redisEndpointForDisplay(cfg), "redis://127.0.0.1:16379"; got != want {
+		t.Fatalf("redisEndpointForDisplay() = %q, want %q", got, want)
 	}
 }
 
@@ -477,6 +646,20 @@ func (l *fakeManagedPostgresLifecycle) DSN() string {
 }
 
 func (l *fakeManagedPostgresLifecycle) Close() error {
+	l.closed = true
+	return nil
+}
+
+type fakeManagedRedisLifecycle struct {
+	addr   string
+	closed bool
+}
+
+func (l *fakeManagedRedisLifecycle) Addr() string {
+	return l.addr
+}
+
+func (l *fakeManagedRedisLifecycle) Close() error {
 	l.closed = true
 	return nil
 }

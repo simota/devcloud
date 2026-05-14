@@ -15,6 +15,7 @@ import (
 	gcssvc "devcloud/internal/services/gcs"
 	"devcloud/internal/services/mail"
 	pubsubsvc "devcloud/internal/services/pubsub"
+	redissvc "devcloud/internal/services/redis"
 	redshiftsvc "devcloud/internal/services/redshift"
 	"devcloud/internal/services/redshift/backend"
 	redshiftpostgres "devcloud/internal/services/redshift/backend/postgres"
@@ -139,6 +140,22 @@ func (d *Daemon) Run(ctx context.Context) error {
 	if redshiftBackend != nil {
 		defer redshiftBackend.Close()
 	}
+	var redisLifecycle managedRedisLifecycle
+	redisServiceEnabled := d.config.Services.Redis.Enabled
+	if redisServiceEnabled {
+		var err error
+		redisLifecycle, err = startRedisBackend(ctx, d.config)
+		if err != nil {
+			if !errors.Is(err, errManagedRedisServerMissing) {
+				return fmt.Errorf("start redis: %w", err)
+			}
+			fmt.Fprintf(os.Stderr, "devcloud: Redis disabled: %v\n", err)
+			redisServiceEnabled = false
+		}
+	}
+	if redisLifecycle != nil {
+		defer redisLifecycle.Close()
+	}
 	redshiftServer := redshiftsvc.NewServer(redshiftsvc.Config{
 		SQLAddr:           loopbackAddr(d.config.Server.RedshiftPort),
 		APIAddr:           loopbackAddr(d.config.Server.RedshiftAPIPort),
@@ -160,6 +177,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 		BackendMode:       redshiftBackendMode(d.config.Services.Redshift.Backend),
 		Translator:        redshiftTranslator(d.config),
 	})
+	redisServer := redissvc.NewServer(redisServerConfig(d.config, redisLifecycle))
 	dashboardConfig := dashboard.Config{
 		Addr:                 loopbackAddr(d.config.Server.DashboardPort),
 		MailDisabled:         !d.config.Services.Mail.Enabled,
@@ -187,6 +205,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 		RedshiftCluster:      d.config.Services.Redshift.ClusterIdentifier,
 		RedshiftDatabase:     d.config.Services.Redshift.Database,
 		RedshiftStoragePath:  redshiftDataDir(d.config),
+		RedisEndpoint:        redisEndpointForDisplay(d.config),
+		RedisStoragePath:     redisDataDir(d.config),
+		RedisEnabled:         redisServiceEnabled,
 		SQSEndpoint:          "http://" + loopbackAddr(d.config.Server.SQSPort),
 		SQSRegion:            d.config.Services.SQS.Region,
 		SQSAuthMode:          d.config.Auth.SQS.Mode,
@@ -211,6 +232,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	}
 	if d.config.Services.Redshift.Enabled {
 		dashboardServer.SetRedshift(redshiftServer)
+	}
+	if redisServiceEnabled {
+		dashboardServer.SetRedis(redisServer)
 	}
 
 	errCh := make(chan error, d.enabledServerCount())
@@ -238,9 +262,14 @@ func (d *Daemon) Run(ctx context.Context) error {
 	if d.config.Services.Redshift.Enabled {
 		go func() { errCh <- redshiftServer.Run(ctx) }()
 	}
+	if redisServiceEnabled {
+		go func() { errCh <- redisServer.Run(ctx) }()
+	}
 	go func() { errCh <- dashboardServer.Run(ctx) }()
 
-	printEndpoints(os.Stdout, d.config)
+	endpointConfig := d.config
+	endpointConfig.Services.Redis.Enabled = redisServiceEnabled
+	printEndpoints(os.Stdout, endpointConfig)
 
 	select {
 	case <-ctx.Done():
@@ -295,6 +324,9 @@ func (d *Daemon) enabledServerCount() int {
 		count++
 	}
 	if d.config.Services.Redshift.Enabled {
+		count++
+	}
+	if d.config.Services.Redis.Enabled {
 		count++
 	}
 	return count
@@ -389,6 +421,44 @@ func redshiftBackendMode(cfg RedshiftBackendConfig) string {
 	return "managed"
 }
 
+func startRedisBackend(ctx context.Context, cfg Config) (managedRedisLifecycle, error) {
+	switch redisMode(cfg.Services.Redis) {
+	case "managed":
+		return startManagedRedisFromConfig(ctx, cfg)
+	case "external":
+		return nil, nil
+	default:
+		return nil, fmt.Errorf("unsupported redis mode: %s", cfg.Services.Redis.Mode)
+	}
+}
+
+func redisServerConfig(cfg Config, lifecycle managedRedisLifecycle) redissvc.Config {
+	mode := redisMode(cfg.Services.Redis)
+	addr := loopbackAddr(cfg.Server.RedisPort)
+	if lifecycle != nil {
+		addr = lifecycle.Addr()
+	}
+	return redissvc.Config{
+		Mode:        mode,
+		Addr:        addr,
+		ExternalURL: cfg.Services.Redis.ExternalURL,
+		AuthMode:    cfg.Auth.Redis.Mode,
+		Password:    cfg.Auth.Redis.Password,
+		DataDir:     redisDataDir(cfg),
+	}
+}
+
+func redisMode(cfg RedisServiceConfig) string {
+	mode := strings.ToLower(strings.TrimSpace(cfg.Mode))
+	if mode != "" {
+		return mode
+	}
+	if strings.TrimSpace(cfg.ExternalURL) != "" {
+		return "external"
+	}
+	return "managed"
+}
+
 func pubsubDataDir(cfg Config) string {
 	return defaultString(cfg.Services.PubSub.DataDir, filepath.Join(cfg.Storage.Path, "pubsub"))
 }
@@ -401,6 +471,18 @@ func redshiftDataDir(cfg Config) string {
 	dataDir := cfg.Services.Redshift.DataDir
 	if dataDir == "" {
 		return filepath.Join(cfg.Storage.Path, "redshift")
+	}
+	clean := filepath.Clean(dataDir)
+	if clean == ".devcloud" || strings.HasPrefix(clean, ".devcloud"+string(filepath.Separator)) {
+		return clean
+	}
+	return filepath.Join(cfg.Storage.Path, clean)
+}
+
+func redisDataDir(cfg Config) string {
+	dataDir := cfg.Services.Redis.DataDir
+	if dataDir == "" {
+		return filepath.Join(cfg.Storage.Path, "redis")
 	}
 	clean := filepath.Clean(dataDir)
 	if clean == ".devcloud" || strings.HasPrefix(clean, ".devcloud"+string(filepath.Separator)) {

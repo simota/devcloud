@@ -9,6 +9,7 @@ import (
 func TestPrintEndpointsListsEveryEnabledService(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.Services.PubSub.EnableREST = true
+	cfg.Services.Redis.Enabled = true
 
 	var buf bytes.Buffer
 	printEndpoints(&buf, cfg)
@@ -42,6 +43,9 @@ func TestPrintEndpointsListsEveryEnabledService(t *testing.T) {
 		"postgres://127.0.0.1:5439",
 		"Redshift (API)",
 		"http://127.0.0.1:9099",
+		"Redis",
+		"redis://127.0.0.1:6379",
+		"http://127.0.0.1:8025/dashboard/redis",
 		"Press Ctrl-C to stop.",
 	} {
 		if !strings.Contains(out, want) {
@@ -60,6 +64,7 @@ func TestPrintEndpointsOmitsDisabledServices(t *testing.T) {
 	cfg.Services.SQS.Enabled = false
 	cfg.Services.PubSub.Enabled = false
 	cfg.Services.Redshift.Enabled = false
+	cfg.Services.Redis.Enabled = false
 
 	var buf bytes.Buffer
 	printEndpoints(&buf, cfg)
@@ -68,7 +73,7 @@ func TestPrintEndpointsOmitsDisabledServices(t *testing.T) {
 	if !strings.Contains(out, "Dashboard") {
 		t.Fatalf("dashboard line missing: %s", out)
 	}
-	for _, unwanted := range []string{"Mail (SMTP)", "S3", "GCS", "DynamoDB", "BigQuery", "SQS", "Pub/Sub", "Redshift"} {
+	for _, unwanted := range []string{"Mail (SMTP)", "S3", "GCS", "DynamoDB", "BigQuery", "SQS", "Pub/Sub", "Redshift", "Redis"} {
 		if strings.Contains(out, unwanted) {
 			t.Fatalf("banner unexpectedly contains %q for disabled service\n--- banner ---\n%s", unwanted, out)
 		}
@@ -88,5 +93,23 @@ func TestPrintEndpointsOmitsPubSubRESTWhenDisabled(t *testing.T) {
 	}
 	if strings.Contains(out, "Pub/Sub (REST)") {
 		t.Fatalf("banner unexpectedly lists pubsub REST when disabled: %s", out)
+	}
+}
+
+func TestPrintEndpointsRedactsExternalRedisCredentials(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Services.Redis.Enabled = true
+	cfg.Services.Redis.Mode = "external"
+	cfg.Services.Redis.ExternalURL = "redis://:super-secret@redis.example.test:6380/2"
+
+	var buf bytes.Buffer
+	printEndpoints(&buf, cfg)
+	out := buf.String()
+
+	if !strings.Contains(out, "redis://redis.example.test:6380/2") {
+		t.Fatalf("banner missing redacted external Redis endpoint:\n%s", out)
+	}
+	if strings.Contains(out, "super-secret") {
+		t.Fatalf("banner leaked Redis password:\n%s", out)
 	}
 }

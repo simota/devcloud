@@ -86,5 +86,8 @@ func collectEndpointRows(cfg Config, dashURL string) []endpointRow {
 		rows = append(rows, endpointRow{"Redshift (SQL)", "postgres://" + loopbackAddr(cfg.Server.RedshiftPort), dashLink("redshift")})
 		rows = append(rows, endpointRow{"Redshift (API)", httpAddr(cfg.Server.RedshiftAPIPort), ""})
 	}
+	if cfg.Services.Redis.Enabled {
+		rows = append(rows, endpointRow{"Redis", redisEndpointForDisplay(cfg), dashLink("redis")})
+	}
 	return rows
 }
