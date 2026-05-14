@@ -79,7 +79,9 @@ server:
 
 auth:
   smtp:
-    mode: off
+    mode: relaxed
+    user: dev
+    password: dev
   s3:
     mode: relaxed
     accessKeyId: dev

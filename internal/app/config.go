@@ -45,7 +45,9 @@ type AuthConfig struct {
 }
 
 type SMTPAuthConfig struct {
-	Mode string
+	Mode     string
+	Username string
+	Password string
 }
 
 type S3AuthConfig struct {
@@ -270,7 +272,7 @@ func DefaultConfig() Config {
 			PubSubRESTPort:  8086,
 		},
 		Auth: AuthConfig{
-			SMTP: SMTPAuthConfig{Mode: "off"},
+			SMTP: SMTPAuthConfig{Mode: "relaxed", Username: "dev", Password: "dev"},
 			S3: S3AuthConfig{
 				Mode:            "relaxed",
 				AccessKeyID:     "dev",
@@ -618,6 +620,8 @@ server:
 auth:
   smtp:
     mode: %s
+    user: %s
+    password: %s
   s3:
     mode: %s
     accessKeyId: %s
@@ -752,7 +756,7 @@ services:
     enableREST: %t
     enableStreamingPull: %t
     enablePush: %t
-`, cfg.Project, cfg.Server.SMTPPort, cfg.Server.DashboardPort, cfg.Server.S3Port, cfg.Server.GCSPort, cfg.Server.DynamoDBPort, cfg.Server.BigQueryPort, cfg.Server.RedshiftPort, cfg.Server.RedshiftAPIPort, cfg.Server.RedisPort, cfg.Server.SQSPort, cfg.Server.PubSubGRPCPort, cfg.Server.PubSubRESTPort, cfg.Auth.SMTP.Mode, cfg.Auth.S3.Mode, cfg.Auth.S3.AccessKeyID, cfg.Auth.S3.SecretAccessKey, cfg.Auth.GCS.Mode, cfg.Auth.GCS.Project, cfg.Auth.DynamoDB.Mode, cfg.Auth.DynamoDB.AccessKeyID, cfg.Auth.DynamoDB.SecretAccessKey, cfg.Auth.BigQuery.Mode, cfg.Auth.BigQuery.Project, cfg.Auth.BigQuery.BearerToken, cfg.Auth.Redshift.Mode, cfg.Auth.Redshift.User, cfg.Auth.Redshift.Password, cfg.Auth.Redshift.AccessKeyID, cfg.Auth.Redshift.SecretAccessKey, cfg.Auth.Redshift.AccountID, cfg.Auth.Redis.Mode, cfg.Auth.Redis.Password, cfg.Auth.SQS.Mode, cfg.Auth.SQS.AccessKeyID, cfg.Auth.SQS.SecretAccessKey, cfg.Auth.SQS.AccountID, cfg.Auth.PubSub.Mode, cfg.Auth.PubSub.ProjectID, cfg.Auth.PubSub.BearerToken, cfg.Storage.Path, cfg.Services.Mail.Enabled, cfg.Services.Mail.MaxMessageBytes, cfg.Services.S3.Enabled, cfg.Services.S3.Region, cfg.Services.S3.PathStyle, cfg.Services.S3.VirtualHostStyle, cfg.Services.S3.MaxObjectBytes, cfg.Services.S3.Multipart.MinPartBytes, cfg.Services.GCS.Enabled, cfg.Services.GCS.Project, cfg.Services.GCS.Location, cfg.Services.DynamoDB.Enabled, cfg.Services.DynamoDB.Region, cfg.Services.DynamoDB.BillingMode, cfg.Services.DynamoDB.MaxItemBytes, cfg.Services.DynamoDB.MaxTables, cfg.Services.DynamoDB.Streams.Enabled, cfg.Services.DynamoDB.TTL.SchedulerIntervalSeconds, cfg.Services.BigQuery.Enabled, cfg.Services.BigQuery.Project, cfg.Services.BigQuery.Location, cfg.Services.BigQuery.MaxRowsPerTable, cfg.Services.BigQuery.MaxRequestBytes, cfg.Services.BigQuery.Query.MaxResultRows, cfg.Services.BigQuery.Query.MaxExecutionSeconds, cfg.Services.BigQuery.Query.DefaultUseLegacySQL, cfg.Services.Redshift.Enabled, cfg.Services.Redshift.Region, cfg.Services.Redshift.ClusterIdentifier, cfg.Services.Redshift.Database, defaultString(cfg.Services.Redshift.DataDir, "redshift"), cfg.Services.Redshift.NodeType, cfg.Services.Redshift.NumberOfNodes, cfg.Services.Redshift.MaxStatementBytes, redshiftBackendKind(cfg.Services.Redshift.Backend), redshiftBackendMode(cfg.Services.Redshift.Backend), cfg.Services.Redshift.Backend.ExternalDSN, redshiftBackendMode(cfg.Services.Redshift.Backend) == "managed", cfg.Services.Redshift.DataAPI.Enabled, cfg.Services.Redshift.DataAPI.MaxResultBytes, cfg.Services.Redshift.DataAPI.MaxResultRows, cfg.Services.Redshift.DataAPI.StatementRetentionSeconds, cfg.Services.Redshift.DataAPI.SessionRetentionSeconds, cfg.Services.Redshift.SQL.EnableExtendedProtocol, cfg.Services.Redshift.SQL.MaxResultRows, cfg.Services.Redshift.SQL.DefaultSearchPath, cfg.Services.Redshift.CopyUnload.EnableLocalS3, cfg.Services.Redshift.CopyUnload.MaxInputRowBytes, cfg.Services.Redis.Enabled, redisMode(cfg.Services.Redis), cfg.Services.Redis.BinaryPath, cfg.Services.Redis.ExternalURL, defaultString(cfg.Services.Redis.DataDir, "redis"), cfg.Services.Redis.MaxMemoryMB, cfg.Services.Redis.AppendOnly, cfg.Services.SQS.Enabled, cfg.Services.SQS.Region, cfg.Services.SQS.QueueURLHost, cfg.Services.SQS.MaxQueues, cfg.Services.SQS.MaxMessageBytes, cfg.Services.SQS.MaxReceiveBatchSize, cfg.Services.SQS.DefaultVisibilityTimeoutSeconds, cfg.Services.SQS.DefaultDelaySeconds, cfg.Services.SQS.DefaultMessageRetentionSeconds, cfg.Services.SQS.DefaultReceiveWaitTimeSeconds, cfg.Services.SQS.SchedulerIntervalSeconds, cfg.Services.PubSub.Enabled, cfg.Services.PubSub.Project, defaultString(cfg.Services.PubSub.DataDir, filepath.Join(cfg.Storage.Path, "pubsub")), defaultString(cfg.Services.PubSub.MessageDataDir, filepath.Join(cfg.Storage.Path, "message")), cfg.Services.PubSub.DefaultAckDeadlineSeconds, cfg.Services.PubSub.MessageRetentionSeconds, cfg.Services.PubSub.MaxAckDeadlineSeconds, cfg.Services.PubSub.MaxPullMessages, cfg.Services.PubSub.PullWaitTimeoutSeconds, cfg.Services.PubSub.EnableREST, cfg.Services.PubSub.EnableStreamingPull, cfg.Services.PubSub.EnablePush)
+`, cfg.Project, cfg.Server.SMTPPort, cfg.Server.DashboardPort, cfg.Server.S3Port, cfg.Server.GCSPort, cfg.Server.DynamoDBPort, cfg.Server.BigQueryPort, cfg.Server.RedshiftPort, cfg.Server.RedshiftAPIPort, cfg.Server.RedisPort, cfg.Server.SQSPort, cfg.Server.PubSubGRPCPort, cfg.Server.PubSubRESTPort, cfg.Auth.SMTP.Mode, cfg.Auth.SMTP.Username, cfg.Auth.SMTP.Password, cfg.Auth.S3.Mode, cfg.Auth.S3.AccessKeyID, cfg.Auth.S3.SecretAccessKey, cfg.Auth.GCS.Mode, cfg.Auth.GCS.Project, cfg.Auth.DynamoDB.Mode, cfg.Auth.DynamoDB.AccessKeyID, cfg.Auth.DynamoDB.SecretAccessKey, cfg.Auth.BigQuery.Mode, cfg.Auth.BigQuery.Project, cfg.Auth.BigQuery.BearerToken, cfg.Auth.Redshift.Mode, cfg.Auth.Redshift.User, cfg.Auth.Redshift.Password, cfg.Auth.Redshift.AccessKeyID, cfg.Auth.Redshift.SecretAccessKey, cfg.Auth.Redshift.AccountID, cfg.Auth.Redis.Mode, cfg.Auth.Redis.Password, cfg.Auth.SQS.Mode, cfg.Auth.SQS.AccessKeyID, cfg.Auth.SQS.SecretAccessKey, cfg.Auth.SQS.AccountID, cfg.Auth.PubSub.Mode, cfg.Auth.PubSub.ProjectID, cfg.Auth.PubSub.BearerToken, cfg.Storage.Path, cfg.Services.Mail.Enabled, cfg.Services.Mail.MaxMessageBytes, cfg.Services.S3.Enabled, cfg.Services.S3.Region, cfg.Services.S3.PathStyle, cfg.Services.S3.VirtualHostStyle, cfg.Services.S3.MaxObjectBytes, cfg.Services.S3.Multipart.MinPartBytes, cfg.Services.GCS.Enabled, cfg.Services.GCS.Project, cfg.Services.GCS.Location, cfg.Services.DynamoDB.Enabled, cfg.Services.DynamoDB.Region, cfg.Services.DynamoDB.BillingMode, cfg.Services.DynamoDB.MaxItemBytes, cfg.Services.DynamoDB.MaxTables, cfg.Services.DynamoDB.Streams.Enabled, cfg.Services.DynamoDB.TTL.SchedulerIntervalSeconds, cfg.Services.BigQuery.Enabled, cfg.Services.BigQuery.Project, cfg.Services.BigQuery.Location, cfg.Services.BigQuery.MaxRowsPerTable, cfg.Services.BigQuery.MaxRequestBytes, cfg.Services.BigQuery.Query.MaxResultRows, cfg.Services.BigQuery.Query.MaxExecutionSeconds, cfg.Services.BigQuery.Query.DefaultUseLegacySQL, cfg.Services.Redshift.Enabled, cfg.Services.Redshift.Region, cfg.Services.Redshift.ClusterIdentifier, cfg.Services.Redshift.Database, defaultString(cfg.Services.Redshift.DataDir, "redshift"), cfg.Services.Redshift.NodeType, cfg.Services.Redshift.NumberOfNodes, cfg.Services.Redshift.MaxStatementBytes, redshiftBackendKind(cfg.Services.Redshift.Backend), redshiftBackendMode(cfg.Services.Redshift.Backend), cfg.Services.Redshift.Backend.ExternalDSN, redshiftBackendMode(cfg.Services.Redshift.Backend) == "managed", cfg.Services.Redshift.DataAPI.Enabled, cfg.Services.Redshift.DataAPI.MaxResultBytes, cfg.Services.Redshift.DataAPI.MaxResultRows, cfg.Services.Redshift.DataAPI.StatementRetentionSeconds, cfg.Services.Redshift.DataAPI.SessionRetentionSeconds, cfg.Services.Redshift.SQL.EnableExtendedProtocol, cfg.Services.Redshift.SQL.MaxResultRows, cfg.Services.Redshift.SQL.DefaultSearchPath, cfg.Services.Redshift.CopyUnload.EnableLocalS3, cfg.Services.Redshift.CopyUnload.MaxInputRowBytes, cfg.Services.Redis.Enabled, redisMode(cfg.Services.Redis), cfg.Services.Redis.BinaryPath, cfg.Services.Redis.ExternalURL, defaultString(cfg.Services.Redis.DataDir, "redis"), cfg.Services.Redis.MaxMemoryMB, cfg.Services.Redis.AppendOnly, cfg.Services.SQS.Enabled, cfg.Services.SQS.Region, cfg.Services.SQS.QueueURLHost, cfg.Services.SQS.MaxQueues, cfg.Services.SQS.MaxMessageBytes, cfg.Services.SQS.MaxReceiveBatchSize, cfg.Services.SQS.DefaultVisibilityTimeoutSeconds, cfg.Services.SQS.DefaultDelaySeconds, cfg.Services.SQS.DefaultMessageRetentionSeconds, cfg.Services.SQS.DefaultReceiveWaitTimeSeconds, cfg.Services.SQS.SchedulerIntervalSeconds, cfg.Services.PubSub.Enabled, cfg.Services.PubSub.Project, defaultString(cfg.Services.PubSub.DataDir, filepath.Join(cfg.Storage.Path, "pubsub")), defaultString(cfg.Services.PubSub.MessageDataDir, filepath.Join(cfg.Storage.Path, "message")), cfg.Services.PubSub.DefaultAckDeadlineSeconds, cfg.Services.PubSub.MessageRetentionSeconds, cfg.Services.PubSub.MaxAckDeadlineSeconds, cfg.Services.PubSub.MaxPullMessages, cfg.Services.PubSub.PullWaitTimeoutSeconds, cfg.Services.PubSub.EnableREST, cfg.Services.PubSub.EnableStreamingPull, cfg.Services.PubSub.EnablePush)
 }
 
 func ensureFile(path string, data []byte) error {
@@ -842,6 +846,10 @@ func applyConfigValue(cfg *Config, path []string, value string) error {
 		cfg.Server.PubSubRESTPort = port
 	case "auth.smtp.mode":
 		cfg.Auth.SMTP.Mode = value
+	case "auth.smtp.user":
+		cfg.Auth.SMTP.Username = value
+	case "auth.smtp.password":
+		cfg.Auth.SMTP.Password = value
 	case "auth.s3.mode":
 		cfg.Auth.S3.Mode = value
 	case "auth.s3.accessKeyId":

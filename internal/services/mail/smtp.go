@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"net"
@@ -12,9 +13,26 @@ import (
 	"strings"
 )
 
+const (
+	SMTPAuthOff     = "off"
+	SMTPAuthRelaxed = "relaxed"
+	SMTPAuthStrict  = "strict"
+)
+
 type SMTPConfig struct {
 	Addr            string
 	MaxMessageBytes int64
+	AuthMode        string
+	Username        string
+	Password        string
+}
+
+func (c SMTPConfig) authMode() string {
+	mode := strings.ToLower(strings.TrimSpace(c.AuthMode))
+	if mode == "" {
+		return SMTPAuthOff
+	}
+	return mode
 }
 
 type SMTPServer struct {
@@ -51,12 +69,13 @@ func (s *SMTPServer) Run(ctx context.Context) error {
 }
 
 type smtpSession struct {
-	server      *SMTPServer
-	reader      *textproto.Reader
-	writer      *bufio.Writer
-	greeted     bool
-	hasMailFrom bool
-	envelope    Envelope
+	server        *SMTPServer
+	reader        *textproto.Reader
+	writer        *bufio.Writer
+	greeted       bool
+	hasMailFrom   bool
+	authenticated bool
+	envelope      Envelope
 }
 
 func (s *SMTPServer) handleConn(ctx context.Context, conn net.Conn) {
@@ -128,6 +147,17 @@ func (s *smtpSession) handleLine(ctx context.Context, line string) bool {
 			return s.reply(500, "syntax error")
 		}
 		return s.handleData(ctx)
+	case "AUTH":
+		if !s.greeted {
+			return s.reply(503, "bad sequence of commands")
+		}
+		if s.server.config.authMode() == SMTPAuthOff {
+			return s.reply(502, "command not implemented")
+		}
+		if s.authenticated {
+			return s.reply(503, "bad sequence of commands")
+		}
+		return s.handleAuth(arg)
 	case "RSET":
 		if strings.TrimSpace(arg) != "" {
 			return s.reply(500, "syntax error")
@@ -201,13 +231,126 @@ func (s *smtpSession) reply(code int, message string) bool {
 
 func (s *smtpSession) replyEHLO() bool {
 	maxBytes := s.server.config.MaxMessageBytes
-	if maxBytes <= 0 {
-		return s.reply(250, "OK")
+	authEnabled := s.server.config.authMode() != SMTPAuthOff
+
+	lines := []string{"devcloud"}
+	if maxBytes > 0 {
+		lines = append(lines, fmt.Sprintf("SIZE %d", maxBytes))
 	}
-	if _, err := fmt.Fprintf(s.writer, "250-devcloud\r\n250 SIZE %d\r\n", maxBytes); err != nil {
-		return false
+	if authEnabled {
+		lines = append(lines, "AUTH PLAIN LOGIN")
+	}
+
+	for i, payload := range lines {
+		separator := "-"
+		if i == len(lines)-1 {
+			separator = " "
+		}
+		if _, err := fmt.Fprintf(s.writer, "250%s%s\r\n", separator, payload); err != nil {
+			return false
+		}
 	}
 	return s.writer.Flush() == nil
+}
+
+func (s *smtpSession) handleAuth(arg string) bool {
+	mechanism, initial := splitAuthArg(arg)
+	switch strings.ToUpper(mechanism) {
+	case "PLAIN":
+		return s.handleAuthPlain(initial)
+	case "LOGIN":
+		return s.handleAuthLogin(initial)
+	case "":
+		return s.reply(501, "syntax error in AUTH")
+	default:
+		return s.reply(504, "unrecognized authentication type")
+	}
+}
+
+func (s *smtpSession) handleAuthPlain(initial string) bool {
+	encoded := initial
+	if encoded == "" {
+		if !s.reply(334, "") {
+			return false
+		}
+		line, err := s.reader.ReadLine()
+		if err != nil {
+			return false
+		}
+		encoded = line
+	}
+	if encoded == "*" {
+		return s.reply(501, "authentication cancelled")
+	}
+	decoded, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		return s.reply(501, "invalid base64")
+	}
+	parts := strings.SplitN(string(decoded), "\x00", 3)
+	if len(parts) != 3 {
+		return s.reply(501, "malformed PLAIN credentials")
+	}
+	username := parts[1]
+	password := parts[2]
+	return s.completeAuth(username, password)
+}
+
+func (s *smtpSession) handleAuthLogin(initial string) bool {
+	username, ok := s.readAuthLoginField(initial, "VXNlcm5hbWU6")
+	if !ok {
+		return false
+	}
+	password, ok := s.readAuthLoginField("", "UGFzc3dvcmQ6")
+	if !ok {
+		return false
+	}
+	return s.completeAuth(username, password)
+}
+
+func (s *smtpSession) readAuthLoginField(initial string, prompt string) (string, bool) {
+	encoded := initial
+	if encoded == "" {
+		if !s.reply(334, prompt) {
+			return "", false
+		}
+		line, err := s.reader.ReadLine()
+		if err != nil {
+			return "", false
+		}
+		encoded = line
+	}
+	if encoded == "*" {
+		s.reply(501, "authentication cancelled")
+		return "", false
+	}
+	decoded, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		s.reply(501, "invalid base64")
+		return "", false
+	}
+	return string(decoded), true
+}
+
+func (s *smtpSession) completeAuth(username string, password string) bool {
+	if s.server.config.authMode() == SMTPAuthStrict {
+		if username != s.server.config.Username || password != s.server.config.Password {
+			return s.reply(535, "authentication failed")
+		}
+	}
+	s.authenticated = true
+	return s.reply(235, "authentication succeeded")
+}
+
+func splitAuthArg(arg string) (mechanism string, initial string) {
+	arg = strings.TrimSpace(arg)
+	if arg == "" {
+		return "", ""
+	}
+	mechanism, rest, found := strings.Cut(arg, " ")
+	if !found {
+		return mechanism, ""
+	}
+	return mechanism, strings.TrimSpace(rest)
 }
 
 func splitSMTPCommand(line string) (string, string) {

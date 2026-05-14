@@ -55,6 +55,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	smtpServer := mail.NewSMTPServer(mail.SMTPConfig{
 		Addr:            loopbackAddr(d.config.Server.SMTPPort),
 		MaxMessageBytes: d.config.Services.Mail.MaxMessageBytes,
+		AuthMode:        d.config.Auth.SMTP.Mode,
+		Username:        d.config.Auth.SMTP.Username,
+		Password:        d.config.Auth.SMTP.Password,
 	}, mailService)
 	s3Server := s3svc.NewServer(s3svc.Config{
 		Addr:            loopbackAddr(d.config.Server.S3Port),

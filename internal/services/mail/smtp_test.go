@@ -3,6 +3,7 @@ package mail
 import (
 	"bufio"
 	"context"
+	"encoding/base64"
 	"io"
 	"net"
 	"net/textproto"
@@ -517,6 +518,132 @@ func TestSMTPSessionUnstuffsDataLines(t *testing.T) {
 	if len(raw) != 1 || !strings.Contains(raw[0], "\r\n.starts with dot\r\n") {
 		t.Fatalf("raw = %#v", raw)
 	}
+}
+
+func TestSMTPEHLOAdvertisesAuthWhenEnabled(t *testing.T) {
+	store := &recordingStore{}
+	cfg := SMTPConfig{MaxMessageBytes: 1024, AuthMode: SMTPAuthRelaxed, Username: "dev", Password: "dev"}
+	client, done := startSMTPSession(t, cfg, NewService(store))
+	defer client.conn.Close()
+
+	client.expectReply("220")
+	client.sendLine("EHLO localhost")
+	client.expectReplyContaining("250", "AUTH PLAIN LOGIN")
+	client.sendLine("QUIT")
+	client.expectReply("221")
+	client.conn.Close()
+	<-done
+}
+
+func TestSMTPEHLODoesNotAdvertiseAuthWhenOff(t *testing.T) {
+	store := &recordingStore{}
+	client, done := startSMTPSession(t, SMTPConfig{MaxMessageBytes: 1024}, NewService(store))
+	defer client.conn.Close()
+
+	client.expectReply("220")
+	client.sendLine("EHLO localhost")
+	reply := client.readReply()
+	if !strings.HasPrefix(reply, "250") {
+		t.Fatalf("EHLO reply = %q", reply)
+	}
+	if strings.Contains(reply, "AUTH") {
+		t.Fatalf("EHLO advertised AUTH when mode is off: %q", reply)
+	}
+	client.sendLine("QUIT")
+	client.expectReply("221")
+	client.conn.Close()
+	<-done
+}
+
+func TestSMTPAuthOffRejectsAuthCommand(t *testing.T) {
+	store := &recordingStore{}
+	client, done := startSMTPSession(t, SMTPConfig{MaxMessageBytes: 1024}, NewService(store))
+	defer client.conn.Close()
+
+	client.expectReply("220")
+	client.sendLine("EHLO localhost")
+	client.expectReply("250")
+	client.sendLine("AUTH PLAIN " + base64.StdEncoding.EncodeToString([]byte("\x00dev\x00dev")))
+	client.expectReply("502")
+	client.sendLine("QUIT")
+	client.expectReply("221")
+	client.conn.Close()
+	<-done
+}
+
+func TestSMTPAuthRelaxedAcceptsAnyCredentials(t *testing.T) {
+	store := &recordingStore{}
+	cfg := SMTPConfig{MaxMessageBytes: 1024, AuthMode: SMTPAuthRelaxed}
+	client, done := startSMTPSession(t, cfg, NewService(store))
+	defer client.conn.Close()
+
+	client.expectReply("220")
+	client.sendLine("EHLO localhost")
+	client.expectReply("250")
+	plain := base64.StdEncoding.EncodeToString([]byte("\x00anyone@example.com\x00anything-goes"))
+	client.sendLine("AUTH PLAIN " + plain)
+	client.expectReply("235")
+	client.sendLine("QUIT")
+	client.expectReply("221")
+	client.conn.Close()
+	<-done
+}
+
+func TestSMTPAuthStrictAcceptsConfiguredCredentials(t *testing.T) {
+	store := &recordingStore{}
+	cfg := SMTPConfig{MaxMessageBytes: 1024, AuthMode: SMTPAuthStrict, Username: "configured", Password: "secret"}
+	client, done := startSMTPSession(t, cfg, NewService(store))
+	defer client.conn.Close()
+
+	client.expectReply("220")
+	client.sendLine("EHLO localhost")
+	client.expectReply("250")
+	plain := base64.StdEncoding.EncodeToString([]byte("\x00configured\x00secret"))
+	client.sendLine("AUTH PLAIN " + plain)
+	client.expectReply("235")
+	client.sendLine("QUIT")
+	client.expectReply("221")
+	client.conn.Close()
+	<-done
+}
+
+func TestSMTPAuthStrictRejectsWrongCredentials(t *testing.T) {
+	store := &recordingStore{}
+	cfg := SMTPConfig{MaxMessageBytes: 1024, AuthMode: SMTPAuthStrict, Username: "configured", Password: "secret"}
+	client, done := startSMTPSession(t, cfg, NewService(store))
+	defer client.conn.Close()
+
+	client.expectReply("220")
+	client.sendLine("EHLO localhost")
+	client.expectReply("250")
+	plain := base64.StdEncoding.EncodeToString([]byte("\x00configured\x00wrong"))
+	client.sendLine("AUTH PLAIN " + plain)
+	client.expectReply("535")
+	client.sendLine("QUIT")
+	client.expectReply("221")
+	client.conn.Close()
+	<-done
+}
+
+func TestSMTPAuthLoginChallengeResponseFlow(t *testing.T) {
+	store := &recordingStore{}
+	cfg := SMTPConfig{MaxMessageBytes: 1024, AuthMode: SMTPAuthStrict, Username: "alice", Password: "pa55"}
+	client, done := startSMTPSession(t, cfg, NewService(store))
+	defer client.conn.Close()
+
+	client.expectReply("220")
+	client.sendLine("EHLO localhost")
+	client.expectReply("250")
+	client.sendLine("AUTH LOGIN")
+	client.expectReplyContaining("334", "VXNlcm5hbWU6") // base64("Username:")
+	client.sendLine(base64.StdEncoding.EncodeToString([]byte("alice")))
+	client.expectReplyContaining("334", "UGFzc3dvcmQ6") // base64("Password:")
+	client.sendLine(base64.StdEncoding.EncodeToString([]byte("pa55")))
+	client.expectReply("235")
+	client.sendLine("QUIT")
+	client.expectReply("221")
+	client.conn.Close()
+	<-done
 }
 
 type smtpTestClient struct {
