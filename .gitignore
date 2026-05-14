@@ -262,6 +262,16 @@ scripts/redshift-autoloop/progress.md
 scripts/redshift-autoloop/done.md
 scripts/redshift-autoloop/iteration-*.out
 scripts/redshift-autoloop/prompt-*.*
+scripts/redis-autoloop/.run-loop.lock
+scripts/redis-autoloop/.circuit-state
+scripts/redis-autoloop/runner.jsonl
+scripts/redis-autoloop/runner.log
+scripts/redis-autoloop/state.env
+scripts/redis-autoloop/state.env.sha256
+scripts/redis-autoloop/progress.md
+scripts/redis-autoloop/done.md
+scripts/redis-autoloop/iteration-*.out
+scripts/redis-autoloop/prompt-*.*
 scripts/redshift-pgwire-refactor-autoloop/.run-loop.lock
 scripts/redshift-pgwire-refactor-autoloop/.circuit-state
 scripts/redshift-pgwire-refactor-autoloop/runner.jsonl
