@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"devcloud/internal/services/redshift/backend"
+
+	_ "github.com/lib/pq"
 )
 
 const defaultDriverName = "postgres"

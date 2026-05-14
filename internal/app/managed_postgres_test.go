@@ -181,6 +181,7 @@ func TestEnsureManagedPostgresDatabaseCreatesMissingDatabase(t *testing.T) {
 	for _, want := range []string{
 		"select 1 from pg_database where datname = 'dev\"warehouse'",
 		"-h " + socketDir,
+		"-p 15439",
 		"-U " + managedPostgresBootstrapUser,
 		"-v ON_ERROR_STOP=1",
 		"-f -",
@@ -221,7 +222,7 @@ func TestEnsureManagedPostgresUserDoesNotPutPasswordInCommandArgs(t *testing.T) 
 		t.Fatalf("read command log: %v", err)
 	}
 	log := string(contents)
-	for _, want := range []string{"psql", "-h " + socketDir, "-U " + managedPostgresBootstrapUser, "-v ON_ERROR_STOP=1", "-f -"} {
+	for _, want := range []string{"psql", "-h " + socketDir, "-p 15439", "-U " + managedPostgresBootstrapUser, "-v ON_ERROR_STOP=1", "-f -"} {
 		if !strings.Contains(log, want) {
 			t.Fatalf("psql command log missing %q: %s", want, log)
 		}

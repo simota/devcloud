@@ -4,6 +4,7 @@ go 1.22
 
 require (
 	cloud.google.com/go/pubsub v1.40.0
+	github.com/lib/pq v1.12.3
 	google.golang.org/grpc v1.65.0
 	google.golang.org/protobuf v1.34.2
 )

@@ -229,6 +229,7 @@ func ensureManagedPostgresDatabase(ctx context.Context, psqlPath string, cfg man
 	existsSQL := "select 1 from pg_database where datname = " + postgresStringLiteral(cfg.Database)
 	cmd := managedPostgresCommand(ctx, psqlPath,
 		"-h", cfg.SocketDir,
+		"-p", strconv.Itoa(cfg.Port),
 		"-U", managedPostgresBootstrapUser,
 		"-d", "postgres",
 		"-tAc", existsSQL,
@@ -251,6 +252,7 @@ func ensureManagedPostgresDatabase(ctx context.Context, psqlPath string, cfg man
 func runManagedPostgresPSQLScript(ctx context.Context, psqlPath string, cfg managedPostgresConfig, database string, script string) error {
 	cmd := managedPostgresCommand(ctx, psqlPath,
 		"-h", cfg.SocketDir,
+		"-p", strconv.Itoa(cfg.Port),
 		"-U", managedPostgresBootstrapUser,
 		"-d", database,
 		"-v", "ON_ERROR_STOP=1",
