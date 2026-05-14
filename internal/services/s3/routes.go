@@ -2,6 +2,17 @@ package s3
 
 import "strings"
 
+// virtualHostLocalSuffixes lists the trailing host segments under which a
+// virtual-hosted-style request (<bucket>.<suffix>) is treated as local.
+// `.localhost` is the AWS SDK-friendly default; `.127.0.0.1` and `.0.0.0.0`
+// cover the common cases where an SDK or test harness sets a literal-IP Host
+// header without going through DNS.
+var virtualHostLocalSuffixes = []string{
+	".localhost",
+	".127.0.0.1",
+	".0.0.0.0",
+}
+
 func parsePathStyle(path string) (bucket string, key string, ok bool) {
 	trimmed := strings.TrimPrefix(path, "/")
 	if trimmed == "" {
@@ -22,13 +33,16 @@ func parseVirtualHostStyle(host string, path string) (bucket string, key string,
 	if withoutPort, _, found := strings.Cut(host, ":"); found {
 		host = withoutPort
 	}
-	if !strings.HasSuffix(host, ".localhost") {
-		return "", "", false
+	var trimmed string
+	for _, suffix := range virtualHostLocalSuffixes {
+		if strings.HasSuffix(host, suffix) {
+			trimmed = strings.TrimSuffix(host, suffix)
+			break
+		}
 	}
-	bucket = strings.TrimSuffix(host, ".localhost")
-	if bucket == "" || strings.Contains(bucket, ".") {
+	if trimmed == "" || strings.Contains(trimmed, ".") {
 		return "", "", false
 	}
 	key = strings.TrimPrefix(path, "/")
-	return bucket, key, true
+	return trimmed, key, true
 }
