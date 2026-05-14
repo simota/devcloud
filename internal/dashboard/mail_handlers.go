@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"strings"
 
+	"devcloud/internal/events"
 	"devcloud/internal/services/mail"
 )
 
@@ -21,6 +22,9 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 		if err := s.store.DeleteAll(r.Context()); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
+		}
+		if s.eventBus != nil {
+			s.eventBus.Publish(events.Event{Type: "mail.cleared", Service: "mail"})
 		}
 		w.WriteHeader(http.StatusNoContent)
 	default:
@@ -75,6 +79,13 @@ func (s *Server) handleMessage(w http.ResponseWriter, r *http.Request) {
 		if err := s.store.Delete(r.Context(), id); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
+		}
+		if s.eventBus != nil {
+			s.eventBus.Publish(events.Event{
+				Type:    "mail.deleted",
+				Service: "mail",
+				Payload: map[string]any{"messageID": id},
+			})
 		}
 		w.WriteHeader(http.StatusNoContent)
 	default:

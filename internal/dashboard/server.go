@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"time"
 
+	"devcloud/internal/events"
 	bigquerysvc "devcloud/internal/services/bigquery"
 	dynamodbsvc "devcloud/internal/services/dynamodb"
 	pubsubsvc "devcloud/internal/services/pubsub"
@@ -68,6 +69,7 @@ type Server struct {
 	pubsub   *pubsubsvc.Server
 	redis    *redissvc.Server
 	redshift *redshiftsvc.Server
+	eventBus *events.Bus
 }
 
 func NewServer(cfg Config, store mailstore.Store, objectStores ...s3svc.BucketStore) *Server {
@@ -103,6 +105,10 @@ func (s *Server) SetRedshift(server *redshiftsvc.Server) {
 
 func (s *Server) SetRedis(server *redissvc.Server) {
 	s.redis = server
+}
+
+func (s *Server) SetEventBus(bus *events.Bus) {
+	s.eventBus = bus
 }
 
 func (s *Server) Run(ctx context.Context) error {
@@ -176,6 +182,7 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("/api/pubsub/subscriptions", s.handlePubSubSubscriptions)
 	mux.HandleFunc("/api/pubsub/subscriptions/", s.handlePubSubSubscription)
 	mux.HandleFunc("/api/pubsub/messages/", s.handlePubSubMessage)
+	mux.HandleFunc("/api/events", s.handleEvents)
 	return mux
 }
 

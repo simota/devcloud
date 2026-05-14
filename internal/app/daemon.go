@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"devcloud/internal/dashboard"
+	"devcloud/internal/events"
 	bigquerysvc "devcloud/internal/services/bigquery"
 	dynamodbsvc "devcloud/internal/services/dynamodb"
 	gcssvc "devcloud/internal/services/gcs"
@@ -239,6 +240,18 @@ func (d *Daemon) Run(ctx context.Context) error {
 	if redisServiceEnabled {
 		dashboardServer.SetRedis(redisServer)
 	}
+
+	bus := events.NewBus()
+	mailService.SetEventPublisher(bus)
+	s3Server.SetEventPublisher(bus)
+	gcsServer.SetEventPublisher(bus)
+	dynamoDBServer.SetEventPublisher(bus)
+	bigQueryServer.SetEventPublisher(bus)
+	sqsServer.SetEventPublisher(bus)
+	pubSubServer.SetEventPublisher(bus)
+	redshiftServer.SetEventPublisher(bus)
+	redisServer.SetEventPublisher(bus)
+	dashboardServer.SetEventBus(bus)
 
 	errCh := make(chan error, d.enabledServerCount())
 	if d.config.Services.Mail.Enabled {
