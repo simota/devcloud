@@ -1,9 +1,12 @@
 module devcloud
 
-go 1.22
+go 1.23
+
+toolchain go1.24.3
 
 require (
 	cloud.google.com/go/pubsub v1.40.0
+	github.com/coder/websocket v1.8.14
 	github.com/lib/pq v1.12.3
 	github.com/redis/go-redis/v9 v9.18.0
 	google.golang.org/grpc v1.65.0

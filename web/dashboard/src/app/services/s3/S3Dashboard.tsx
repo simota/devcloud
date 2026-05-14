@@ -3,7 +3,7 @@ import { EmptyState } from '../../../ui/EmptyState'
 import { Panel } from '../../../ui/Panel'
 import { Button } from '../../../ui/Button'
 import { dangerConfirm, useConfirm } from '../../../ui/Confirm'
-import { useEventSource } from '../../api/hooks/useEventSource'
+import { useDashboardEvents } from '../../api/hooks/useDashboardEvents'
 import type { DashboardService } from '../dashboard/types'
 import { BucketSidebar } from './BucketSidebar'
 import { ObjectBrowser } from './ObjectBrowser'
@@ -66,7 +66,7 @@ export function S3Dashboard({ service }: S3DashboardProps): JSX.Element {
     [refreshBuckets],
   )
 
-  useEventSource({ topics: ['s3'], onEvent: onS3Event, enabled: !isDisabled })
+  useDashboardEvents({ topics: ['s3'], onEvent: onS3Event, enabled: !isDisabled })
 
   const buckets = bucketsState.status === 'success' ? bucketsState.buckets : []
   const selectedBucket = buckets.find((bucket) => bucket.name === activeBucket)?.name

@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react'
 import { EmptyState } from '../../../ui/EmptyState'
 import { Panel } from '../../../ui/Panel'
 import { Button } from '../../../ui/Button'
-import { useEventSource } from '../../api/hooks/useEventSource'
+import { useDashboardEvents } from '../../api/hooks/useDashboardEvents'
 import type { DashboardService } from '../dashboard/types'
 import {
   getBigQueryStatus,
@@ -70,7 +70,7 @@ export function BigQueryDashboard({ service }: BigQueryDashboardProps): JSX.Elem
     refreshCatalog()
   }, [refreshCatalog])
 
-  useEventSource({ topics: ['bigquery'], onEvent: refreshCatalog, enabled: !isDisabled })
+  useDashboardEvents({ topics: ['bigquery'], onEvent: refreshCatalog, enabled: !isDisabled })
 
   const datasets = catalogState.status === 'success' ? catalogState.datasets : []
   const activeDataset = datasets.find((dataset) => dataset.datasetId === activeDatasetId)

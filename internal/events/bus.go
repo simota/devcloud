@@ -94,6 +94,14 @@ func (b *Bus) Subscribe(buffer int, topics []string) (<-chan Event, func()) {
 	return ch, cancel
 }
 
+// SubscriberCount returns the number of currently registered subscribers.
+// Useful for diagnostics and tests that need to verify cleanup.
+func (b *Bus) SubscriberCount() int {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return len(b.subs)
+}
+
 // Emit calls p.Publish(e) only when p is non-nil.
 func Emit(p Publisher, e Event) {
 	if p != nil {

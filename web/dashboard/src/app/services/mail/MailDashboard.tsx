@@ -3,7 +3,7 @@ import { Button } from '../../../ui/Button'
 import { dangerConfirm, useConfirm } from '../../../ui/Confirm'
 import { EmptyState } from '../../../ui/EmptyState'
 import { Panel } from '../../../ui/Panel'
-import { useEventSource } from '../../api/hooks/useEventSource'
+import { useDashboardEvents } from '../../api/hooks/useDashboardEvents'
 import type { DashboardService } from '../dashboard/types'
 import { deleteAllMailMessages, getMailMessageRaw, listMailMessages } from './api'
 import { decodeMimeAddress, decodeMimeEncodedWord } from './mimeDecoder'
@@ -41,7 +41,7 @@ export function MailDashboard({ service }: MailDashboardProps): JSX.Element {
       })
   }, [isDisabled])
 
-  useEventSource({ topics: ['mail'], onEvent: refreshMessages, enabled: !isDisabled })
+  useDashboardEvents({ topics: ['mail'], onEvent: refreshMessages, enabled: !isDisabled })
 
   async function clearMessages(): Promise<void> {
     if (isDisabled) {

@@ -3,7 +3,7 @@ import { EmptyState } from '../../../ui/EmptyState'
 import { Panel } from '../../../ui/Panel'
 import { Button } from '../../../ui/Button'
 import { dangerConfirm, useConfirm } from '../../../ui/Confirm'
-import { useEventSource } from '../../api/hooks/useEventSource'
+import { useDashboardEvents } from '../../api/hooks/useDashboardEvents'
 import type { DashboardService } from '../dashboard/types'
 import {
   createGCSBucket,
@@ -87,7 +87,7 @@ export function GCSDashboard({ service }: GCSDashboardProps): JSX.Element {
     [refresh],
   )
 
-  useEventSource({ topics: ['gcs'], onEvent: onGCSEvent, enabled: !isDisabled })
+  useDashboardEvents({ topics: ['gcs'], onEvent: onGCSEvent, enabled: !isDisabled })
 
   useEffect(() => {
     setActiveObject(undefined)

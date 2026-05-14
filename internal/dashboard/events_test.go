@@ -1,18 +1,18 @@
 package dashboard
 
 import (
-	"bufio"
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/coder/websocket"
+
 	"devcloud/internal/events"
 )
-
-type sseTextLine struct{ text string }
 
 func newEventTestServer(t *testing.T) (*Server, *events.Bus) {
 	t.Helper()
@@ -22,55 +22,35 @@ func newEventTestServer(t *testing.T) (*Server, *events.Bus) {
 	return server, bus
 }
 
-// waitForLine reads from lines until a line containing substr is found or timeout elapses.
-func waitForLine(t *testing.T, lines <-chan sseTextLine, substr string, timeout time.Duration) {
+func dialEventsWS(t *testing.T, ctx context.Context, baseURL, query string) *websocket.Conn {
 	t.Helper()
-	deadline := time.After(timeout)
-	for {
-		select {
-		case l, ok := <-lines:
-			if !ok {
-				t.Fatalf("SSE stream closed before line containing %q arrived", substr)
-			}
-			if strings.Contains(l.text, substr) {
-				return
-			}
-		case <-deadline:
-			t.Fatalf("timeout waiting for line containing %q", substr)
-		}
+	url := "ws" + strings.TrimPrefix(baseURL, "http") + "/api/events"
+	if query != "" {
+		url += "?" + query
 	}
+	conn, _, err := websocket.Dial(ctx, url, nil)
+	if err != nil {
+		t.Fatalf("websocket dial: %v", err)
+	}
+	return conn
 }
 
-// sseLines opens a GET request to url, reads SSE lines into a channel, and
-// stops when ctx is cancelled. The channel is closed when the goroutine exits.
-func sseLines(ctx context.Context, url string) <-chan sseTextLine {
-	ch := make(chan sseTextLine, 64)
-	go func() {
-		defer close(ch)
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-		if err != nil {
-			return
-		}
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			return
-		}
-		defer resp.Body.Close()
-		sc := bufio.NewScanner(resp.Body)
-		for sc.Scan() {
-			select {
-			case ch <- sseTextLine{sc.Text()}:
-			case <-ctx.Done():
-				return
-			}
-		}
-	}()
-	return ch
+func readEventFrame(t *testing.T, ctx context.Context, conn *websocket.Conn) map[string]any {
+	t.Helper()
+	_, data, err := conn.Read(ctx)
+	if err != nil {
+		t.Fatalf("websocket read: %v", err)
+	}
+	var frame map[string]any
+	if err := json.Unmarshal(data, &frame); err != nil {
+		t.Fatalf("websocket frame %q is not JSON: %v", data, err)
+	}
+	return frame
 }
 
 func TestHandleEventsNoBus(t *testing.T) {
 	server := NewServer(Config{}, newDashboardStore(nil, nil))
-	// No event bus set → 503.
+	// No event bus set → 503 over plain HTTP, no upgrade.
 	rec := performRequest(server.routes(), http.MethodGet, "/api/events")
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("expected 503, got %d", rec.Code)
@@ -90,26 +70,60 @@ func TestHandleEventsReadyAndEvent(t *testing.T) {
 	ts := httptest.NewServer(server.routes())
 	t.Cleanup(ts.Close)
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	t.Cleanup(cancel)
 
-	lines := sseLines(ctx, ts.URL+"/api/events")
+	conn := dialEventsWS(t, ctx, ts.URL, "")
+	t.Cleanup(func() { conn.CloseNow() })
 
-	// Wait for the "ready" event line.
-	waitForLine(t, lines, "event: ready", 3*time.Second)
+	// First frame is the ready marker.
+	ready := readEventFrame(t, ctx, conn)
+	if ready["type"] != "ready" {
+		t.Fatalf("expected ready frame, got %v", ready)
+	}
 
-	// Publish an event through the bus.
 	bus.Publish(events.Event{
 		Type:    "s3.object.put",
 		Service: "s3",
 		Payload: map[string]any{"bucket": "my-bucket", "key": "foo.txt"},
 	})
 
-	// Wait for the "event: s3" line.
-	waitForLine(t, lines, "event: s3", 3*time.Second)
+	frame := readEventFrame(t, ctx, conn)
+	if frame["service"] != "s3" || frame["type"] != "s3.object.put" {
+		t.Fatalf("expected s3.object.put frame, got %v", frame)
+	}
+}
 
-	// Cancel SSE connection before closing the server so ts.Close() doesn't hang.
-	cancel()
+func TestHandleEventsCleansUpOnClientDisconnect(t *testing.T) {
+	server, bus := newEventTestServer(t)
+	ts := httptest.NewServer(server.routes())
+	t.Cleanup(ts.Close)
+
+	if got := bus.SubscriberCount(); got != 0 {
+		t.Fatalf("expected 0 subscribers before connect, got %d", got)
+	}
+
+	// Simulate the user rapidly switching service pages: open and tear
+	// down several WebSocket connections in quick succession.
+	for i := 0; i < 5; i++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		conn := dialEventsWS(t, ctx, ts.URL, "")
+		readEventFrame(t, ctx, conn) // drain "ready"
+		conn.Close(websocket.StatusNormalClosure, "")
+		cancel()
+	}
+
+	// After all clients have disconnected, the bus must drain back to zero.
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if got := bus.SubscriberCount(); got == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("subscribers leaked after disconnect: %d still registered", bus.SubscriberCount())
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 }
 
 func TestHandleEventsTopicFilter(t *testing.T) {
@@ -117,35 +131,24 @@ func TestHandleEventsTopicFilter(t *testing.T) {
 	ts := httptest.NewServer(server.routes())
 	t.Cleanup(ts.Close)
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	t.Cleanup(cancel)
 
-	lines := sseLines(ctx, ts.URL+"/api/events?topics=mail")
+	conn := dialEventsWS(t, ctx, ts.URL, "topics=mail")
+	t.Cleanup(func() { conn.CloseNow() })
 
-	// Drain the ready event.
-	waitForLine(t, lines, "event: ready", 3*time.Second)
+	ready := readEventFrame(t, ctx, conn)
+	if ready["type"] != "ready" {
+		t.Fatalf("expected ready frame, got %v", ready)
+	}
 
-	// Publish an S3 event — must NOT arrive (filtered out).
+	// Publish an S3 event — must NOT arrive (filtered server-side).
 	bus.Publish(events.Event{Type: "s3.object.put", Service: "s3"})
 	// Publish a mail event — MUST arrive.
 	bus.Publish(events.Event{Type: "mail.received", Service: "mail"})
 
-	deadline := time.After(3 * time.Second)
-	for {
-		select {
-		case l, ok := <-lines:
-			if !ok {
-				t.Fatal("SSE stream closed before mail event arrived")
-			}
-			if strings.Contains(l.text, "event: s3") {
-				t.Fatal("received s3 event despite mail-only topic filter")
-			}
-			if strings.Contains(l.text, "event: mail") {
-				cancel() // clean up SSE before ts.Close()
-				return   // success
-			}
-		case <-deadline:
-			t.Fatal("timeout waiting for mail event")
-		}
+	frame := readEventFrame(t, ctx, conn)
+	if frame["service"] != "mail" {
+		t.Fatalf("expected mail event after filter, got %v", frame)
 	}
 }

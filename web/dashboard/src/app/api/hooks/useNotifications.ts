@@ -1,7 +1,7 @@
 import { useCallback, useState } from 'react'
 import { getMailMessage } from '../../services/mail/api'
 import { decodeMimeAddress, decodeMimeEncodedWord } from '../../services/mail/mimeDecoder'
-import { useEventSource, type SSEEvent } from './useEventSource'
+import { useDashboardEvents, type DashboardEvent } from './useDashboardEvents'
 
 const PREFERENCE_STORAGE_KEY = 'devcloud.notifications.enabled'
 
@@ -153,7 +153,7 @@ function excerpt(text: string, max: number): string {
   return `${normalized.slice(0, max).trimEnd()}…`
 }
 
-function mailReceivedFallback(event: SSEEvent): FormattedEvent {
+function mailReceivedFallback(event: DashboardEvent): FormattedEvent {
   const rawFrom = payloadValue(event.payload, 'from') ?? '(unknown sender)'
   const rawSubject = payloadValue(event.payload, 'subject') ?? ''
   const from = decodeMimeAddress(rawFrom) || rawFrom
@@ -173,7 +173,7 @@ function mailReceivedFallback(event: SSEEvent): FormattedEvent {
 // notification with the subject as title and a short body preview. If the
 // fetch fails or the body is empty, falls back to subject + sender from the
 // SSE payload alone.
-async function showMailReceivedNotification(event: SSEEvent): Promise<void> {
+async function showMailReceivedNotification(event: DashboardEvent): Promise<void> {
   if (typeof Notification === 'undefined') return
   const id = payloadValue(event.payload, 'messageID')
   let formatted: FormattedEvent = mailReceivedFallback(event)
@@ -207,7 +207,7 @@ async function showMailReceivedNotification(event: SSEEvent): Promise<void> {
 // formatEvent maps a raw SSE event to a human-readable notification.
 // Type strings and payload keys match exactly what the Go services emit
 // (see internal/services/*/. for the canonical list).
-function formatEvent(event: SSEEvent): FormattedEvent | null {
+function formatEvent(event: DashboardEvent): FormattedEvent | null {
   const p = event.payload
   const get = (key: string): string | undefined => payloadValue(p, key)
   const label = serviceLabel(event.service)
@@ -408,7 +408,7 @@ export function useEventNotifications({
   const active = enabled && permission === 'granted'
 
   const onEvent = useCallback(
-    (event: SSEEvent): void => {
+    (event: DashboardEvent): void => {
       if (typeof Notification === 'undefined') {
         return
       }
@@ -439,5 +439,5 @@ export function useEventNotifications({
 
   // The SSE connection is opened only when notifications are actually active,
   // so users who never grant permission don't keep an open stream.
-  useEventSource({ topics: [], onEvent, enabled: active })
+  useDashboardEvents({ topics: [], onEvent, enabled: active })
 }

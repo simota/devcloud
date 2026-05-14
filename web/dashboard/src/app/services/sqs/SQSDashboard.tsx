@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useState, type FormEvent } from 'react
 import { Button } from '../../../ui/Button'
 import { EmptyState } from '../../../ui/EmptyState'
 import { Panel } from '../../../ui/Panel'
-import { useEventSource } from '../../api/hooks/useEventSource'
+import { useDashboardEvents } from '../../api/hooks/useDashboardEvents'
 import type { DashboardService } from '../dashboard/types'
 import {
   changeSQSMessageVisibility,
@@ -103,7 +103,7 @@ export function SQSDashboard({ service }: SQSDashboardProps): JSX.Element {
     refreshQueues()
   }, [refreshQueues])
 
-  useEventSource({ topics: ['sqs'], onEvent: refreshQueues, enabled: !isDisabled })
+  useDashboardEvents({ topics: ['sqs'], onEvent: refreshQueues, enabled: !isDisabled })
 
   const queues = queuesState.status === 'success' ? queuesState.queues : []
   const activeQueue = queues.find((queue) => queue.name === activeQueueName)
