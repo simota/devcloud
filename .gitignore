@@ -1,5 +1,6 @@
 .DS_Store
 .devcloud/
+bin/
 node_modules/
 dist/
 scripts/mail-autoloop/.run-loop.lock
