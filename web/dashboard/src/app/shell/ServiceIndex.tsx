@@ -52,10 +52,12 @@ export function ServiceIndex({ services }: ServiceIndexProps): JSX.Element {
               </div>
               <p>{service.description}</p>
               {service.endpoint ? (
-                <div className="endpoint-summary">
-                  <span>Endpoint</span>
-                  <code>{service.endpoint}</code>
-                </div>
+                <dl className="endpoint-summary">
+                  <dt>Endpoint</dt>
+                  <dd>
+                    <code>{service.endpoint}</code>
+                  </dd>
+                </dl>
               ) : null}
             </Panel>
           </a>

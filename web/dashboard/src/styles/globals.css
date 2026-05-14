@@ -441,15 +441,28 @@ code {
 
 .endpoint-summary {
   display: grid;
-  gap: 4px;
-  margin-top: 12px;
+  gap: 6px;
+  margin: 14px 0 0;
+  padding-top: 12px;
+  border-top: 1px solid var(--border-default);
 }
 
-.endpoint-summary span {
+.endpoint-summary dt {
+  margin: 0;
   color: var(--text-secondary);
   font-size: 11px;
   font-weight: 700;
+  letter-spacing: 0.04em;
   text-transform: uppercase;
+}
+
+.endpoint-summary dd {
+  margin: 0;
+  min-width: 0;
+}
+
+.endpoint-summary dd code {
+  font-size: 13px;
 }
 
 .inspector-list,
