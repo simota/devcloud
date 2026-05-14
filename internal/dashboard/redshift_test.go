@@ -54,6 +54,30 @@ func TestRedshiftDashboardAPIExposesBackendMode(t *testing.T) {
 	}
 }
 
+func TestRedshiftDashboardCatalogReturnsEmptyArraysWhenNoTables(t *testing.T) {
+	redshiftServer := redshiftsvc.NewServer(redshiftsvc.Config{
+		ClusterIdentifier: "devcloud",
+		Database:          "dev",
+		User:              "dev",
+	})
+	server := NewServer(Config{}, newDashboardStore(nil, nil))
+	server.SetRedshift(redshiftServer)
+
+	catalog := performRequest(server.routes(), http.MethodGet, "/api/redshift/catalog")
+	if catalog.Code != http.StatusOK {
+		t.Fatalf("catalog status = %d body=%s", catalog.Code, catalog.Body.String())
+	}
+	body := catalog.Body.String()
+	for _, field := range []string{`"schemas":`, `"tables":[]`, `"columns":[]`} {
+		if !strings.Contains(body, field) {
+			t.Fatalf("catalog body missing %s, got %s", field, body)
+		}
+	}
+	if strings.Contains(body, `"tables":null`) || strings.Contains(body, `"columns":null`) || strings.Contains(body, `"schemas":null`) {
+		t.Fatalf("catalog body serialized array as null, breaking dashboard array access: %s", body)
+	}
+}
+
 func TestRedshiftDashboardAPIExposesCatalogAndStatementMetadata(t *testing.T) {
 	redshiftServer := redshiftsvc.NewServer(redshiftsvc.Config{
 		SQLAddr:           "127.0.0.1:15439",

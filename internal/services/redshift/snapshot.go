@@ -107,6 +107,9 @@ func (s *Server) CatalogSnapshot() CatalogSnapshot {
 
 	snapshot := CatalogSnapshot{
 		Database: defaultString(s.config.Database, "dev"),
+		Schemas:  []SchemaSnapshot{},
+		Tables:   []TableSnapshot{},
+		Columns:  []TableColumnSnapshot{},
 	}
 	for _, schemaName := range sortedSchemaNames(s.db.schemas) {
 		schemaState := s.db.schemas[schemaName]
@@ -167,6 +170,7 @@ func (s *Server) TableDetailSnapshot(schemaName string, tableName string, limit 
 			DistKey:     tableState.distKey,
 			SortKeys:    append([]string(nil), tableState.sortKeys...),
 		},
+		Columns: []TableColumnSnapshot{},
 	}
 	for i, columnState := range tableState.columns {
 		detail.Columns = append(detail.Columns, TableColumnSnapshot{
