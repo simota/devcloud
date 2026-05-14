@@ -73,6 +73,8 @@ const serviceIndexHTML = `<!doctype html>
     }
     .meta {
       display: inline-flex;
+      align-items: center;
+      gap: 6px;
       margin-top: 18px;
       border-radius: 999px;
       padding: 4px 10px;
@@ -80,6 +82,9 @@ const serviceIndexHTML = `<!doctype html>
       color: var(--accent);
       font-weight: 650;
       font-size: 12px;
+    }
+    .meta-label {
+      letter-spacing: 0.02em;
     }
     code {
       font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
@@ -98,37 +103,42 @@ const serviceIndexHTML = `<!doctype html>
       <a class="service" href="/dashboard/mail">
         <h2>Mail</h2>
         <p>Inspect messages received by the local SMTP server.</p>
-        <span class="meta">SMTP <code>127.0.0.1:1025</code></span>
+        <span class="meta"><span class="meta-label">SMTP</span><code>127.0.0.1:1025</code></span>
       </a>
       <a class="service" href="/dashboard/s3">
         <h2>S3</h2>
         <p>Browse buckets, objects, metadata, and local S3 activity.</p>
-        <span class="meta">S3 <code>127.0.0.1:4566</code></span>
+        <span class="meta"><span class="meta-label">HTTP</span><code>127.0.0.1:4566</code></span>
       </a>
       <a class="service" href="/dashboard/gcs">
         <h2>GCS</h2>
         <p>Browse buckets, objects, metadata, and local GCS activity.</p>
-        <span class="meta">GCS <code>127.0.0.1:4443</code></span>
+        <span class="meta"><span class="meta-label">HTTP</span><code>127.0.0.1:4443</code></span>
       </a>
       <a class="service" href="/dashboard/dynamodb">
         <h2>DynamoDB</h2>
         <p>Inspect local DynamoDB tables, indexes, and item counts.</p>
-        <span class="meta">DynamoDB <code>127.0.0.1:8000</code></span>
+        <span class="meta"><span class="meta-label">HTTP</span><code>127.0.0.1:8000</code></span>
       </a>
       <a class="service" href="/dashboard/bigquery">
         <h2>BigQuery</h2>
         <p>Inspect local BigQuery projects, datasets, tables, rows, and jobs.</p>
-        <span class="meta">BigQuery <code>127.0.0.1:9050</code></span>
+        <span class="meta"><span class="meta-label">HTTP</span><code>127.0.0.1:9050</code></span>
+      </a>
+      <a class="service" href="/dashboard/redshift">
+        <h2>Redshift</h2>
+        <p>Inspect local Redshift clusters, catalog metadata, and statement history.</p>
+        <span class="meta"><span class="meta-label">HTTP</span><code>127.0.0.1:9099</code></span>
       </a>
       <a class="service" href="/dashboard/sqs">
         <h2>SQS</h2>
         <p>Inspect local SQS queues, messages, leases, and attributes.</p>
-        <span class="meta">SQS <code>127.0.0.1:9324</code></span>
+        <span class="meta"><span class="meta-label">HTTP</span><code>127.0.0.1:9324</code></span>
       </a>
       <a class="service" href="/dashboard/pubsub">
         <h2>Pub/Sub</h2>
         <p>Inspect local Pub/Sub topics, subscriptions, backlog, and leases.</p>
-        <span class="meta">Pub/Sub <code>127.0.0.1:8086</code></span>
+        <span class="meta"><span class="meta-label">HTTP</span><code>127.0.0.1:8086</code></span>
       </a>
     </section>
   </main>

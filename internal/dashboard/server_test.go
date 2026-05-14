@@ -125,6 +125,7 @@ func TestIndexServesServiceLinks(t *testing.T) {
 		`href="/dashboard/gcs"`,
 		`href="/dashboard/dynamodb"`,
 		`href="/dashboard/bigquery"`,
+		`href="/dashboard/redshift"`,
 		`href="/dashboard/sqs"`,
 		`href="/dashboard/pubsub"`,
 		"Local service dashboards",
