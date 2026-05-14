@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -238,6 +239,8 @@ func (d *Daemon) Run(ctx context.Context) error {
 		go func() { errCh <- redshiftServer.Run(ctx) }()
 	}
 	go func() { errCh <- dashboardServer.Run(ctx) }()
+
+	printEndpoints(os.Stdout, d.config)
 
 	select {
 	case <-ctx.Done():
