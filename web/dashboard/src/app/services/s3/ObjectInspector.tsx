@@ -1,5 +1,4 @@
 import { type FormEvent, useEffect, useState } from 'react'
-import { EmptyState } from '../../../ui/EmptyState'
 import { Button } from '../../../ui/Button'
 import type { S3ObjectSummary } from './types'
 
@@ -13,35 +12,31 @@ type ObjectInspectorProps = {
 export function ObjectInspector({ bucketName, disabled, object, onCopyObject }: ObjectInspectorProps): JSX.Element {
   if (!object) {
     return (
-      <EmptyState
-        title="Inspector"
-        description={
-          bucketName
-            ? `Select an object in ${bucketName} to inspect metadata and download actions.`
-            : 'Object metadata and download actions will appear here.'
-        }
-      />
+      <div className="s3-inspector-empty">
+        <InspectorIcon />
+        <p className="s3-inspector-empty-title">No object selected</p>
+        <p className="s3-inspector-empty-body">
+          {bucketName
+            ? `Pick an object in ${bucketName} to see metadata, copy, and download actions.`
+            : 'Select a bucket first, then click an object to inspect it here.'}
+        </p>
+      </div>
     )
   }
 
   const metadataEntries = Object.entries(object.metadata ?? {})
 
   return (
-    <div className="object-inspector">
-      <div>
-        <span className="inspector-label">Object key</span>
-        <code>{object.key}</code>
+    <div className="s3-inspector">
+      <div className="s3-inspector-section">
+        <span className="s3-field-label">Object</span>
+        <code className="s3-inspector-key" title={object.key}>{object.key}</code>
+        <code className="s3-inspector-uri" title={object.s3Uri}>{object.s3Uri}</code>
       </div>
-      <dl className="inspector-list">
+      <dl className="s3-inspector-list">
         <div>
           <dt>Size</dt>
           <dd>{formatBytes(object.size)}</dd>
-        </div>
-        <div>
-          <dt>ETag</dt>
-          <dd>
-            <code>{object.etag || 'unknown'}</code>
-          </dd>
         </div>
         <div>
           <dt>Content type</dt>
@@ -51,13 +46,17 @@ export function ObjectInspector({ bucketName, disabled, object, onCopyObject }: 
           <dt>Last modified</dt>
           <dd>{formatDate(object.lastModified)}</dd>
         </div>
+        <div>
+          <dt>ETag</dt>
+          <dd><code>{object.etag || 'unknown'}</code></dd>
+        </div>
       </dl>
-      <div>
-        <span className="inspector-label">Metadata</span>
+      <div className="s3-inspector-section">
+        <span className="s3-field-label">Metadata</span>
         {metadataEntries.length === 0 ? (
-          <p className="inspector-muted">No user metadata.</p>
+          <p className="s3-inspector-muted">No user metadata.</p>
         ) : (
-          <dl className="metadata-list">
+          <dl className="s3-inspector-metadata">
             {metadataEntries.map(([key, value]) => (
               <div key={key}>
                 <dt>{key}</dt>
@@ -67,8 +66,9 @@ export function ObjectInspector({ bucketName, disabled, object, onCopyObject }: 
           </dl>
         )}
       </div>
-      <a className="compat-link inspector-download" href={safeS3DownloadURL(object.downloadUrl)}>
-        Download object
+      <a className="s3-inspector-download" href={safeS3DownloadURL(object.downloadUrl)}>
+        <DownloadIcon />
+        <span>Download object</span>
       </a>
       <CopyObjectForm disabled={disabled} object={object} onCopyObject={onCopyObject} />
     </div>
@@ -104,22 +104,19 @@ function CopyObjectForm({ disabled, object, onCopyObject }: CopyObjectFormProps)
   }
 
   return (
-    <form className="s3-copy-form" onSubmit={submitCopy}>
-      <label className="prefix-filter">
-        <span>Copy source</span>
-        <input aria-label="S3 copy source" disabled value={object.s3Uri} />
-      </label>
-      <label className="prefix-filter">
-        <span>Copy destination key</span>
+    <form className="s3-inspector-copy" onSubmit={submitCopy}>
+      <label className="s3-field">
+        <span>Copy to key</span>
         <input
           aria-label="S3 copy destination key"
+          className="s3-text-input"
           disabled={disabled || busy}
           onChange={(event) => setDestinationKey(event.target.value)}
           value={destinationKey}
         />
       </label>
       <Button disabled={disabled || busy || destinationKey.trim() === ''} type="submit">
-        {busy ? 'Copying' : 'CopyObject'}
+        {busy ? 'Copying…' : 'Copy'}
       </Button>
     </form>
   )
@@ -152,4 +149,24 @@ function formatDate(value: string): string {
 
 function safeS3DownloadURL(value: string): string {
   return value.startsWith('/api/s3/') ? value : '#'
+}
+
+function InspectorIcon(): JSX.Element {
+  return (
+    <svg aria-hidden width="36" height="36" viewBox="0 0 36 36" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M7 11l11-6 11 6v14L18 31 7 25z" />
+      <path d="M7 11l11 6 11-6" />
+      <path d="M18 17v14" />
+    </svg>
+  )
+}
+
+function DownloadIcon(): JSX.Element {
+  return (
+    <svg aria-hidden width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M8 2.5v8" />
+      <path d="M4.5 7L8 10.5 11.5 7" />
+      <path d="M3 13h10" />
+    </svg>
+  )
 }

@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from 'react'
 import { EmptyState } from '../../../ui/EmptyState'
 import { Panel } from '../../../ui/Panel'
 import { Button } from '../../../ui/Button'
+import { dangerConfirm, useConfirm } from '../../../ui/Confirm'
 import type { DashboardService } from '../dashboard/types'
 import { BucketSidebar } from './BucketSidebar'
 import { ObjectBrowser } from './ObjectBrowser'
@@ -26,6 +27,7 @@ export function S3Dashboard({ service }: S3DashboardProps): JSX.Element {
   const [message, setMessage] = useState('')
   const [objectsRefreshNonce, setObjectsRefreshNonce] = useState(0)
   const isDisabled = service?.status === 'disabled'
+  const confirm = useConfirm()
 
   const refreshBuckets = useCallback(() => {
     if (isDisabled) {
@@ -90,8 +92,18 @@ export function S3Dashboard({ service }: S3DashboardProps): JSX.Element {
       .catch((error: Error) => setMessage(error.message))
   }
 
-  function confirmDeleteBucket(bucketName: string): void {
-    if (isDisabled || window.prompt(`Confirm DeleteBucket by typing ${bucketName}`) !== bucketName) {
+  async function confirmDeleteBucket(bucketName: string): Promise<void> {
+    if (isDisabled) {
+      return
+    }
+    const ok = await confirm(
+      dangerConfirm({
+        title: 'Delete bucket',
+        description: 'All objects and metadata in this bucket will be removed. This cannot be undone.',
+        target: bucketName,
+      }),
+    )
+    if (!ok) {
       return
     }
     deleteS3Bucket(bucketName)
@@ -104,8 +116,18 @@ export function S3Dashboard({ service }: S3DashboardProps): JSX.Element {
       .catch((error: Error) => setMessage(error.message))
   }
 
-  function confirmDeleteObject(object: S3ObjectSummary): void {
-    if (!selectedBucket || isDisabled || window.prompt(`Confirm DeleteObject by typing ${object.key}`) !== object.key) {
+  async function confirmDeleteObject(object: S3ObjectSummary): Promise<void> {
+    if (!selectedBucket || isDisabled) {
+      return
+    }
+    const ok = await confirm(
+      dangerConfirm({
+        title: 'Delete object',
+        description: 'This object will be permanently removed from the bucket.',
+        target: object.key,
+      }),
+    )
+    if (!ok) {
       return
     }
     deleteS3Object(selectedBucket, object.key)
@@ -169,10 +191,23 @@ export function S3Dashboard({ service }: S3DashboardProps): JSX.Element {
   return (
     <div className="s3-workspace">
       <Panel title="Buckets">
-        <div className="s3-toolbar">
-          <span>{buckets.length} buckets</span>
-          <Button onClick={refreshBuckets}>Refresh</Button>
+        <div className="s3-bucket-toolbar">
+          <span className="s3-bucket-count">{buckets.length === 1 ? '1 bucket' : `${buckets.length} buckets`}</span>
+          <button
+            aria-label="Refresh buckets"
+            className="s3-icon-button neutral"
+            onClick={refreshBuckets}
+            type="button"
+          >
+            <RefreshIcon />
+          </button>
         </div>
+        <CreateBucketForm
+          bucketName={bucketName}
+          disabled={isDisabled}
+          onChange={setBucketName}
+          onCreate={createBucket}
+        />
         {bucketsState.status === 'loading' ? (
           <EmptyState title="Loading buckets" description="Reading the local S3 bucket registry." />
         ) : null}
@@ -185,19 +220,16 @@ export function S3Dashboard({ service }: S3DashboardProps): JSX.Element {
           />
         ) : null}
         {bucketsState.status === 'success' ? (
-          <div className="gcs-sidebar">
-            <CreateBucketForm bucketName={bucketName} disabled={isDisabled} onChange={setBucketName} onCreate={createBucket} />
-            <BucketSidebar
-              buckets={buckets}
-              activeBucket={selectedBucket}
-              disabled={isDisabled}
-              onDeleteBucket={confirmDeleteBucket}
-              onSelectBucket={selectBucket}
-            />
-          </div>
+          <BucketSidebar
+            buckets={buckets}
+            activeBucket={selectedBucket}
+            disabled={isDisabled}
+            onDeleteBucket={confirmDeleteBucket}
+            onSelectBucket={selectBucket}
+          />
         ) : null}
       </Panel>
-      <Panel title="Object browser">
+      <Panel title={selectedBucket ? `Objects · ${selectedBucket}` : 'Objects'}>
         <ObjectBrowser
           bucketName={selectedBucket}
           activeObjectKey={selectedObject?.key}
@@ -212,7 +244,7 @@ export function S3Dashboard({ service }: S3DashboardProps): JSX.Element {
       <Panel title="Inspector">
         <ObjectInspector bucketName={selectedBucket} disabled={isDisabled} object={selectedObject} onCopyObject={copyObject} />
       </Panel>
-      {message ? <p className="inspector-muted gcs-message">{message}</p> : null}
+      {message ? <p className="s3-status-banner">{message}</p> : null}
     </div>
   )
 }
@@ -226,20 +258,33 @@ type CreateBucketFormProps = {
 
 function CreateBucketForm({ bucketName, disabled, onChange, onCreate }: CreateBucketFormProps): JSX.Element {
   return (
-    <div className="gcs-create-bucket">
-      <label className="prefix-filter">
-        <span>CreateBucket</span>
-        <input
-          aria-label="S3 bucket name"
-          disabled={disabled}
-          onChange={(event) => onChange(event.target.value)}
-          placeholder="local-bucket"
-          value={bucketName}
-        />
-      </label>
-      <Button disabled={disabled || bucketName.trim() === ''} onClick={onCreate}>
+    <form
+      className="s3-bucket-create"
+      onSubmit={(event) => {
+        event.preventDefault()
+        onCreate()
+      }}
+    >
+      <input
+        aria-label="New bucket name"
+        className="s3-text-input"
+        disabled={disabled}
+        onChange={(event) => onChange(event.target.value)}
+        placeholder="New bucket name"
+        value={bucketName}
+      />
+      <Button disabled={disabled || bucketName.trim() === ''} type="submit">
         Create
       </Button>
-    </div>
+    </form>
+  )
+}
+
+function RefreshIcon(): JSX.Element {
+  return (
+    <svg aria-hidden width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M13.5 8a5.5 5.5 0 1 1-1.61-3.89" />
+      <path d="M13.5 3v3h-3" />
+    </svg>
   )
 }
