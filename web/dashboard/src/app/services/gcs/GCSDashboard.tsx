@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from 'react'
 import { EmptyState } from '../../../ui/EmptyState'
 import { Panel } from '../../../ui/Panel'
 import { Button } from '../../../ui/Button'
+import { dangerConfirm, useConfirm } from '../../../ui/Confirm'
 import type { DashboardService } from '../dashboard/types'
 import {
   createGCSBucket,
@@ -40,6 +41,7 @@ export function GCSDashboard({ service }: GCSDashboardProps): JSX.Element {
   const [bucketName, setBucketName] = useState('')
   const [message, setMessage] = useState<string>()
   const isDisabled = service?.status === 'disabled'
+  const confirm = useConfirm()
 
   const refresh = useCallback(() => {
     if (isDisabled) {
@@ -129,8 +131,18 @@ export function GCSDashboard({ service }: GCSDashboardProps): JSX.Element {
       .catch((error: Error) => setMessage(error.message))
   }
 
-  function confirmDeleteBucket(bucket: string): void {
-    if (isDisabled || window.prompt(`Confirm Delete bucket by typing ${bucket}`) !== bucket) {
+  async function confirmDeleteBucket(bucket: string): Promise<void> {
+    if (isDisabled) {
+      return
+    }
+    const ok = await confirm(
+      dangerConfirm({
+        title: 'Delete bucket',
+        description: 'All objects and metadata in this bucket will be removed. This cannot be undone.',
+        target: bucket,
+      }),
+    )
+    if (!ok) {
       return
     }
     deleteGCSBucket(bucket)
@@ -141,8 +153,18 @@ export function GCSDashboard({ service }: GCSDashboardProps): JSX.Element {
       .catch((error: Error) => setMessage(error.message))
   }
 
-  function confirmDeleteObject(object: GCSObjectSummary): void {
-    if (!activeBucket || isDisabled || window.prompt(`Confirm Delete object by typing ${object.name}`) !== object.name) {
+  async function confirmDeleteObject(object: GCSObjectSummary): Promise<void> {
+    if (!activeBucket || isDisabled) {
+      return
+    }
+    const ok = await confirm(
+      dangerConfirm({
+        title: 'Delete object',
+        description: 'This object will be permanently removed from the bucket.',
+        target: object.name,
+      }),
+    )
+    if (!ok) {
       return
     }
     deleteGCSObject(activeBucket, object.name)
@@ -155,8 +177,18 @@ export function GCSDashboard({ service }: GCSDashboardProps): JSX.Element {
       .catch((error: Error) => setMessage(error.message))
   }
 
-  function confirmDeleteSession(session: GCSUploadSessionSummary): void {
-    if (isDisabled || window.prompt(`Confirm Delete session by typing ${session.id}`) !== session.id) {
+  async function confirmDeleteSession(session: GCSUploadSessionSummary): Promise<void> {
+    if (isDisabled) {
+      return
+    }
+    const ok = await confirm(
+      dangerConfirm({
+        title: 'Delete upload session',
+        description: 'In-progress upload state will be discarded.',
+        target: session.id,
+      }),
+    )
+    if (!ok) {
       return
     }
     deleteGCSUploadSession(session.id)

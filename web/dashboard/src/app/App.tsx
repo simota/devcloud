@@ -2,6 +2,7 @@ import { Component, Suspense, type ReactNode } from 'react'
 import { readDashboardServices, resetDashboardServices } from './serviceResource'
 import { renderRoute } from './routes'
 import { AppShell } from './shell/AppShell'
+import { ConfirmProvider } from '../ui/Confirm'
 import { EmptyState } from '../ui/EmptyState'
 import { normalizeDashboardPath } from './dashboardPaths'
 
@@ -45,7 +46,9 @@ export function App(): JSX.Element {
   return (
     <ErrorBoundary>
       <Suspense fallback={<EmptyState title="Loading dashboard" description="Checking local service status." />}>
-        <DashboardApp />
+        <ConfirmProvider>
+          <DashboardApp />
+        </ConfirmProvider>
       </Suspense>
     </ErrorBoundary>
   )
