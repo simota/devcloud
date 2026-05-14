@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+
+	"devcloud/internal/events"
 )
 
 func (s *Server) handlePutItem(w http.ResponseWriter, r *http.Request) {
@@ -78,6 +80,11 @@ func (s *Server) handlePutItem(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "InternalServerError", "failed to persist dynamodb state")
 		return
 	}
+	events.Emit(s.eventPublisher, events.Event{
+		Type:    "dynamodb.item.put",
+		Service: "dynamodb",
+		Payload: map[string]any{"table": request.TableName},
+	})
 	response := map[string]any{}
 	if returnValues == "ALL_OLD" && existed {
 		response["Attributes"] = oldItem
@@ -180,6 +187,11 @@ func (s *Server) handleDeleteItem(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	events.Emit(s.eventPublisher, events.Event{
+		Type:    "dynamodb.item.deleted",
+		Service: "dynamodb",
+		Payload: map[string]any{"table": request.TableName},
+	})
 	response := map[string]any{}
 	if returnValues == "ALL_OLD" && existed {
 		response["Attributes"] = oldItem
@@ -295,6 +307,11 @@ func (s *Server) handleUpdateItem(w http.ResponseWriter, r *http.Request) {
 			response["Attributes"] = attributes
 		}
 	}
+	events.Emit(s.eventPublisher, events.Event{
+		Type:    "dynamodb.item.updated",
+		Service: "dynamodb",
+		Payload: map[string]any{"table": request.TableName},
+	})
 	addConsumedCapacity(response, request.TableName, request.ReturnConsumedCapacity)
 	writeJSON(w, http.StatusOK, response)
 }

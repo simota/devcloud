@@ -1,6 +1,7 @@
 package bigquery
 
 import (
+	"devcloud/internal/events"
 	s3svc "devcloud/internal/services/s3"
 )
 
@@ -19,9 +20,14 @@ type Config struct {
 }
 
 type Server struct {
-	config Config
+	config         Config
+	eventPublisher events.Publisher
 }
 
 func NewServer(cfg Config) *Server {
 	return &Server{config: cfg}
+}
+
+func (s *Server) SetEventPublisher(p events.Publisher) {
+	s.eventPublisher = p
 }

@@ -1,6 +1,10 @@
 package dynamodb
 
-import "sync"
+import (
+	"sync"
+
+	"devcloud/internal/events"
+)
 
 type Config struct {
 	Addr            string
@@ -14,13 +18,18 @@ type Config struct {
 }
 
 type Server struct {
-	config       Config
-	mu           sync.Mutex
-	tables       map[string]*tableState
-	backups      map[string]backupDescription
-	backupTables map[string]tableDescription
-	backupItems  map[string]map[string]item
-	loadErr      error
+	config         Config
+	mu             sync.Mutex
+	tables         map[string]*tableState
+	backups        map[string]backupDescription
+	backupTables   map[string]tableDescription
+	backupItems    map[string]map[string]item
+	loadErr        error
+	eventPublisher events.Publisher
+}
+
+func (s *Server) SetEventPublisher(p events.Publisher) {
+	s.eventPublisher = p
 }
 
 func NewServer(cfg Config) *Server {

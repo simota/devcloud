@@ -4,6 +4,8 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+
+	"devcloud/internal/events"
 )
 
 type Config struct {
@@ -25,12 +27,17 @@ type Config struct {
 }
 
 type Server struct {
-	config    Config
-	mu        sync.Mutex
-	queues    map[string]*queueState
-	moveTasks map[string]moveTaskState
-	waitCh    chan struct{}
-	loadErr   error
+	config         Config
+	mu             sync.Mutex
+	queues         map[string]*queueState
+	moveTasks      map[string]moveTaskState
+	waitCh         chan struct{}
+	loadErr        error
+	eventPublisher events.Publisher
+}
+
+func (s *Server) SetEventPublisher(p events.Publisher) {
+	s.eventPublisher = p
 }
 
 func NewServer(cfg Config) *Server {

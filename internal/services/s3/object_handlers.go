@@ -9,6 +9,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"devcloud/internal/events"
 )
 
 func (s *Server) handleObject(w http.ResponseWriter, r *http.Request, bucket string, key string) {
@@ -156,6 +158,11 @@ func (s *Server) handleObject(w http.ResponseWriter, r *http.Request, bucket str
 				return
 			}
 		}
+		events.Emit(s.eventPublisher, events.Event{
+			Type:    "s3.object.deleted",
+			Service: "s3",
+			Payload: map[string]any{"bucket": bucket, "key": key},
+		})
 		w.WriteHeader(http.StatusNoContent)
 	default:
 		methodNotAllowed(w, "PUT, HEAD, GET, DELETE, POST")
@@ -326,6 +333,16 @@ func (s *Server) handlePutObject(w http.ResponseWriter, r *http.Request, bucket 
 		writeXMLError(w, "InternalError", "internal error", http.StatusInternalServerError)
 		return
 	}
+	events.Emit(s.eventPublisher, events.Event{
+		Type:    "s3.object.put",
+		Service: "s3",
+		Payload: map[string]any{
+			"bucket":        bucket,
+			"key":           key,
+			"etag":          object.ETag,
+			"contentLength": object.Size,
+		},
+	})
 	w.WriteHeader(http.StatusOK)
 }
 

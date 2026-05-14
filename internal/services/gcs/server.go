@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"devcloud/internal/events"
 	s3svc "devcloud/internal/services/s3"
 )
 
@@ -22,16 +23,21 @@ type Config struct {
 }
 
 type Server struct {
-	config   Config
-	store    s3svc.BucketStore
-	mu       sync.Mutex
-	sessions map[string]resumableSession
+	config         Config
+	store          s3svc.BucketStore
+	mu             sync.Mutex
+	sessions       map[string]resumableSession
+	eventPublisher events.Publisher
 }
 
 func NewServer(cfg Config, store s3svc.BucketStore) *Server {
 	server := &Server{config: cfg, store: store, sessions: map[string]resumableSession{}}
 	server.loadResumableSessions()
 	return server
+}
+
+func (s *Server) SetEventPublisher(p events.Publisher) {
+	s.eventPublisher = p
 }
 
 type resumableSession struct {

@@ -6,6 +6,8 @@ import (
 	"errors"
 	"net/http"
 	"time"
+
+	"devcloud/internal/events"
 )
 
 type Config struct {
@@ -18,12 +20,17 @@ type Config struct {
 }
 
 type Server struct {
-	config Config
-	store  BucketStore
+	config         Config
+	store          BucketStore
+	eventPublisher events.Publisher
 }
 
 func NewServer(cfg Config, store BucketStore) *Server {
 	return &Server{config: cfg, store: store}
+}
+
+func (s *Server) SetEventPublisher(p events.Publisher) {
+	s.eventPublisher = p
 }
 
 func (s *Server) Run(ctx context.Context) error {
@@ -164,6 +171,11 @@ func (s *Server) handleBucket(w http.ResponseWriter, r *http.Request, name strin
 			writeXMLError(w, "BucketAlreadyOwnedByYou", "bucket already exists", http.StatusConflict)
 			return
 		}
+		events.Emit(s.eventPublisher, events.Event{
+			Type:    "s3.bucket.created",
+			Service: "s3",
+			Payload: map[string]any{"bucket": name},
+		})
 		w.Header().Set("Location", "/"+name)
 		w.WriteHeader(http.StatusOK)
 	case http.MethodHead:
@@ -261,6 +273,11 @@ func (s *Server) handleBucket(w http.ResponseWriter, r *http.Request, name strin
 			writeXMLError(w, "NoSuchBucket", "bucket does not exist", http.StatusNotFound)
 			return
 		}
+		events.Emit(s.eventPublisher, events.Event{
+			Type:    "s3.bucket.deleted",
+			Service: "s3",
+			Payload: map[string]any{"bucket": name},
+		})
 		w.WriteHeader(http.StatusNoContent)
 	default:
 		methodNotAllowed(w, "PUT, HEAD, GET, DELETE")

@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"devcloud/internal/events"
 	s3svc "devcloud/internal/services/s3"
 )
 
@@ -68,6 +69,11 @@ func (s *Server) handleMediaUpload(w http.ResponseWriter, r *http.Request, bucke
 		writeError(w, http.StatusNotFound, "notFound", err.Error())
 		return
 	}
+	events.Emit(s.eventPublisher, events.Event{
+		Type:    "gcs.object.put",
+		Service: "gcs",
+		Payload: map[string]any{"bucket": bucket, "key": name, "etag": object.ETag, "contentLength": object.Size},
+	})
 	writeJSON(w, http.StatusOK, s.objectResource(object))
 }
 
@@ -108,6 +114,11 @@ func (s *Server) handleMultipartUpload(w http.ResponseWriter, r *http.Request, b
 		writeError(w, http.StatusNotFound, "notFound", err.Error())
 		return
 	}
+	events.Emit(s.eventPublisher, events.Event{
+		Type:    "gcs.object.put",
+		Service: "gcs",
+		Payload: map[string]any{"bucket": bucket, "key": name, "etag": object.ETag, "contentLength": object.Size},
+	})
 	writeJSON(w, http.StatusOK, s.objectResource(object))
 }
 
@@ -265,6 +276,11 @@ func (s *Server) putResumableUpload(w http.ResponseWriter, r *http.Request) {
 	delete(s.sessions, id)
 	s.mu.Unlock()
 	_ = s.deleteResumableSession(id)
+	events.Emit(s.eventPublisher, events.Event{
+		Type:    "gcs.object.put",
+		Service: "gcs",
+		Payload: map[string]any{"bucket": session.Bucket, "key": session.Name, "etag": object.ETag, "contentLength": object.Size},
+	})
 	writeJSON(w, http.StatusOK, s.objectResource(object))
 }
 

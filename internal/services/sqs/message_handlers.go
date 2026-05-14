@@ -5,6 +5,8 @@ import (
 	"net/http"
 	"strconv"
 	"time"
+
+	"devcloud/internal/events"
 )
 
 func (s *Server) handleSendMessage(w http.ResponseWriter, r *http.Request, protocol protocolKind) {
@@ -18,6 +20,11 @@ func (s *Server) handleSendMessage(w http.ResponseWriter, r *http.Request, proto
 		writeProtocolError(w, protocol, errorCode(err), err.Error(), http.StatusBadRequest)
 		return
 	}
+	events.Emit(s.eventPublisher, events.Event{
+		Type:    "sqs.message.sent",
+		Service: "sqs",
+		Payload: map[string]any{"queue": queueNameFromURL(input.QueueURL)},
+	})
 	if protocol == protocolQuery {
 		writeQueryXML(w, http.StatusOK, sendMessageXMLResponse{
 			Xmlns: "http://queue.amazonaws.com/doc/2012-11-05/",
@@ -58,6 +65,13 @@ func (s *Server) handleSendMessageBatch(w http.ResponseWriter, r *http.Request, 
 	if err != nil {
 		writeProtocolError(w, protocol, errorCode(err), err.Error(), http.StatusBadRequest)
 		return
+	}
+	if len(result.Successful) > 0 {
+		events.Emit(s.eventPublisher, events.Event{
+			Type:    "sqs.message.sent",
+			Service: "sqs",
+			Payload: map[string]any{"queue": queueNameFromURL(input.QueueURL), "count": len(result.Successful)},
+		})
 	}
 	if protocol == protocolQuery {
 		writeQueryXML(w, http.StatusOK, sendMessageBatchXMLResponse{
@@ -102,6 +116,11 @@ func (s *Server) handleDeleteMessage(w http.ResponseWriter, r *http.Request, pro
 		writeProtocolError(w, protocol, errorCode(err), err.Error(), http.StatusBadRequest)
 		return
 	}
+	events.Emit(s.eventPublisher, events.Event{
+		Type:    "sqs.message.deleted",
+		Service: "sqs",
+		Payload: map[string]any{"queue": queueNameFromURL(input.QueueURL)},
+	})
 	writeEmptySuccess(w, protocol, "DeleteMessage")
 }
 
@@ -115,6 +134,13 @@ func (s *Server) handleDeleteMessageBatch(w http.ResponseWriter, r *http.Request
 	if err != nil {
 		writeProtocolError(w, protocol, errorCode(err), err.Error(), http.StatusBadRequest)
 		return
+	}
+	if len(result.Successful) > 0 {
+		events.Emit(s.eventPublisher, events.Event{
+			Type:    "sqs.message.deleted",
+			Service: "sqs",
+			Payload: map[string]any{"queue": queueNameFromURL(input.QueueURL), "count": len(result.Successful)},
+		})
 	}
 	if protocol == protocolQuery {
 		writeQueryXML(w, http.StatusOK, deleteMessageBatchXMLResponse{

@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"devcloud/internal/events"
 	"devcloud/internal/services/redshift/backend"
 	"devcloud/internal/services/redshift/backend/memory"
 	"devcloud/internal/services/redshift/translator"
@@ -50,6 +51,11 @@ type Server struct {
 	nextSessionID    int64
 	backend          backend.SQLBackend
 	translator       translator.RedshiftTranslator
+	eventPublisher   events.Publisher
+}
+
+func (s *Server) SetEventPublisher(p events.Publisher) {
+	s.eventPublisher = p
 }
 
 func NewServer(cfg Config) *Server {

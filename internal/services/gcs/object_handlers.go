@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"devcloud/internal/events"
 	s3svc "devcloud/internal/services/s3"
 )
 
@@ -166,6 +167,11 @@ func (s *Server) handleObjectOrCopy(w http.ResponseWriter, r *http.Request, buck
 			writeError(w, http.StatusNotFound, "notFound", "object not found")
 			return
 		}
+		events.Emit(s.eventPublisher, events.Event{
+			Type:    "gcs.object.deleted",
+			Service: "gcs",
+			Payload: map[string]any{"bucket": bucket, "key": key},
+		})
 		w.WriteHeader(http.StatusNoContent)
 	default:
 		methodNotAllowed(w, "GET, PATCH, DELETE")

@@ -3,6 +3,8 @@ package pubsub
 import (
 	"sync"
 	"time"
+
+	"devcloud/internal/events"
 )
 
 type Config struct {
@@ -24,18 +26,23 @@ type Config struct {
 }
 
 type Server struct {
-	config        Config
-	mu            sync.Mutex
-	topics        map[string]topicResource
-	subscriptions map[string]subscriptionResource
-	snapshots     map[string]snapshotResource
-	schemas       map[string]schemaResource
-	messages      map[string]pubsubMessage
-	deliveries    map[string][]deliveryRecord
-	nextMessageID uint64
-	nextAckID     uint64
-	now           func() time.Time
-	loadErr       error
+	config         Config
+	mu             sync.Mutex
+	topics         map[string]topicResource
+	subscriptions  map[string]subscriptionResource
+	snapshots      map[string]snapshotResource
+	schemas        map[string]schemaResource
+	messages       map[string]pubsubMessage
+	deliveries     map[string][]deliveryRecord
+	nextMessageID  uint64
+	nextAckID      uint64
+	now            func() time.Time
+	loadErr        error
+	eventPublisher events.Publisher
+}
+
+func (s *Server) SetEventPublisher(p events.Publisher) {
+	s.eventPublisher = p
 }
 
 func NewServer(cfg Config) *Server {

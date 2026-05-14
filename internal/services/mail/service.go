@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"io"
 	"time"
+
+	"devcloud/internal/events"
 )
 
 type Store interface {
@@ -20,11 +22,16 @@ type Store interface {
 }
 
 type Service struct {
-	store Store
+	store          Store
+	eventPublisher events.Publisher
 }
 
 func NewService(store Store) *Service {
 	return &Service{store: store}
+}
+
+func (s *Service) SetEventPublisher(p events.Publisher) {
+	s.eventPublisher = p
 }
 
 func (s *Service) Receive(ctx context.Context, envelope Envelope, raw io.Reader) (Message, error) {
@@ -36,7 +43,21 @@ func (s *Service) Receive(ctx context.Context, envelope Envelope, raw io.Reader)
 	msg := ParseMessage(data, envelope)
 	msg.ID = newMessageID()
 	msg.ReceivedAt = time.Now().UTC()
-	return s.store.Append(ctx, msg, bytes.NewReader(data))
+	stored, err := s.store.Append(ctx, msg, bytes.NewReader(data))
+	if err != nil {
+		return stored, err
+	}
+	events.Emit(s.eventPublisher, events.Event{
+		Type:    "mail.received",
+		Service: "mail",
+		Payload: map[string]any{
+			"messageID": stored.ID,
+			"from":      stored.From,
+			"to":        stored.To,
+			"subject":   stored.Subject,
+		},
+	})
+	return stored, nil
 }
 
 func newMessageID() string {

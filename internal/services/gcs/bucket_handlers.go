@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"devcloud/internal/events"
 	s3svc "devcloud/internal/services/s3"
 )
 
@@ -69,6 +70,11 @@ func (s *Server) handleBuckets(w http.ResponseWriter, r *http.Request) {
 		if request.StorageClass != "" {
 			resource.StorageClass = request.StorageClass
 		}
+		events.Emit(s.eventPublisher, events.Event{
+			Type:    "gcs.bucket.created",
+			Service: "gcs",
+			Payload: map[string]any{"bucket": bucket.Name},
+		})
 		w.Header().Set("Location", "/storage/v1/b/"+url.PathEscape(bucket.Name))
 		writeJSON(w, http.StatusOK, resource)
 	default:
@@ -105,6 +111,11 @@ func (s *Server) handleBucket(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusNotFound, "notFound", "bucket not found")
 			return
 		}
+		events.Emit(s.eventPublisher, events.Event{
+			Type:    "gcs.bucket.deleted",
+			Service: "gcs",
+			Payload: map[string]any{"bucket": name},
+		})
 		w.WriteHeader(http.StatusNoContent)
 	default:
 		methodNotAllowed(w, "GET, DELETE")

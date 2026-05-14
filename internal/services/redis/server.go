@@ -10,17 +10,25 @@ import (
 	"sync"
 	"time"
 
+	"devcloud/internal/events"
 	goredis "github.com/redis/go-redis/v9"
 )
 
 type Server struct {
-	config Config
-	mu     sync.Mutex
-	client *goredis.Client
+	config         Config
+	mu             sync.Mutex
+	client         *goredis.Client
+	eventPublisher events.Publisher
 }
 
 func NewServer(cfg Config) *Server {
 	return &Server{config: cfg.normalized()}
+}
+
+func (s *Server) SetEventPublisher(p events.Publisher) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.eventPublisher = p
 }
 
 func (s *Server) Run(ctx context.Context) error {
@@ -222,6 +230,20 @@ func (s *Server) Exec(ctx context.Context, command string, args []string) (Comma
 		return result, fmt.Errorf("execute redis command %s: %w", name, err)
 	}
 	result.Rows = redisResultRows(value)
+	if class == CommandClassMutation {
+		payload := map[string]any{"command": name}
+		if len(args) > 0 {
+			payload["key"] = args[0]
+		}
+		s.mu.Lock()
+		pub := s.eventPublisher
+		s.mu.Unlock()
+		events.Emit(pub, events.Event{
+			Type:    "redis.command.mutation",
+			Service: "redis",
+			Payload: payload,
+		})
+	}
 	return result, nil
 }
 

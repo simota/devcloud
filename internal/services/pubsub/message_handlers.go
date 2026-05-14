@@ -10,6 +10,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"devcloud/internal/events"
 )
 
 func (s *Server) handlePublish(w http.ResponseWriter, r *http.Request) {
@@ -91,6 +93,11 @@ func (s *Server) handlePublish(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "INTERNAL", "pubsub resource store unavailable")
 		return
 	}
+	events.Emit(s.eventPublisher, events.Event{
+		Type:    "pubsub.message.published",
+		Service: "pubsub",
+		Payload: map[string]any{"topic": name, "count": len(messageIDs)},
+	})
 	writeJSON(w, http.StatusOK, map[string]any{"messageIds": messageIDs})
 }
 
@@ -223,6 +230,11 @@ func (s *Server) handlePull(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{})
 		return
 	}
+	events.Emit(s.eventPublisher, events.Event{
+		Type:    "pubsub.message.pulled",
+		Service: "pubsub",
+		Payload: map[string]any{"subscription": name, "count": len(received)},
+	})
 	writeJSON(w, http.StatusOK, map[string]any{"receivedMessages": received})
 }
 

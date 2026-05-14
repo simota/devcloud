@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"sort"
 	"time"
+
+	"devcloud/internal/events"
 )
 
 func (s *Server) handleTopics(w http.ResponseWriter, r *http.Request) {
@@ -92,6 +94,11 @@ func (s *Server) handleTopic(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusInternalServerError, "INTERNAL", "pubsub resource store unavailable")
 			return
 		}
+		events.Emit(s.eventPublisher, events.Event{
+			Type:    "pubsub.topic.created",
+			Service: "pubsub",
+			Payload: map[string]any{"topic": name},
+		})
 		writeJSON(w, http.StatusOK, topic)
 	case http.MethodPatch:
 		s.handleTopicPatch(w, r, name)
@@ -122,6 +129,11 @@ func (s *Server) handleTopic(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusInternalServerError, "INTERNAL", "pubsub resource store unavailable")
 			return
 		}
+		events.Emit(s.eventPublisher, events.Event{
+			Type:    "pubsub.topic.deleted",
+			Service: "pubsub",
+			Payload: map[string]any{"topic": name},
+		})
 		w.WriteHeader(http.StatusNoContent)
 	default:
 		methodNotAllowed(w, "GET, PUT, PATCH, DELETE")

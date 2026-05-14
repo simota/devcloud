@@ -5,6 +5,8 @@ import (
 	"net/http"
 	"sort"
 	"time"
+
+	"devcloud/internal/events"
 )
 
 func (s *Server) handleListTables(w http.ResponseWriter, r *http.Request) {
@@ -110,6 +112,11 @@ func (s *Server) handleCreateTable(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.Unlock()
 
+	events.Emit(s.eventPublisher, events.Event{
+		Type:    "dynamodb.table.created",
+		Service: "dynamodb",
+		Payload: map[string]any{"table": request.TableName},
+	})
 	writeJSON(w, http.StatusOK, map[string]any{"TableDescription": description})
 }
 
@@ -159,6 +166,11 @@ func (s *Server) handleDeleteTable(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "ResourceNotFoundException", "table not found")
 		return
 	}
+	events.Emit(s.eventPublisher, events.Event{
+		Type:    "dynamodb.table.deleted",
+		Service: "dynamodb",
+		Payload: map[string]any{"table": request.TableName},
+	})
 	writeJSON(w, http.StatusOK, map[string]any{"TableDescription": state.description})
 }
 

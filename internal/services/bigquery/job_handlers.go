@@ -10,6 +10,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"devcloud/internal/events"
 )
 
 func (s *Server) insertJob(w http.ResponseWriter, r *http.Request, projectID string) {
@@ -29,6 +31,11 @@ func (s *Server) insertJob(w http.ResponseWriter, r *http.Request, projectID str
 			writeError(w, http.StatusBadRequest, "invalidQuery", err.Error())
 			return
 		}
+		events.Emit(s.eventPublisher, events.Event{
+			Type:    "bigquery.job.inserted",
+			Service: "bigquery",
+			Payload: map[string]any{"project": projectID, "jobType": "query"},
+		})
 		writeJSON(w, http.StatusOK, job.Job)
 	case request.Configuration.Copy.DestinationTable.TableID != "":
 		job, err := s.createCopyJob(projectID, request.JobReference, request.Configuration.Copy)
@@ -36,6 +43,11 @@ func (s *Server) insertJob(w http.ResponseWriter, r *http.Request, projectID str
 			writeError(w, http.StatusBadRequest, "invalid", err.Error())
 			return
 		}
+		events.Emit(s.eventPublisher, events.Event{
+			Type:    "bigquery.job.inserted",
+			Service: "bigquery",
+			Payload: map[string]any{"project": projectID, "jobType": "copy"},
+		})
 		writeJSON(w, http.StatusOK, job.Job)
 	case request.Configuration.Load.DestinationTable.TableID != "":
 		job, err := s.createLoadJob(r.Context(), projectID, request.JobReference, request.Configuration.Load)
@@ -43,6 +55,11 @@ func (s *Server) insertJob(w http.ResponseWriter, r *http.Request, projectID str
 			writeError(w, http.StatusBadRequest, "invalid", err.Error())
 			return
 		}
+		events.Emit(s.eventPublisher, events.Event{
+			Type:    "bigquery.job.inserted",
+			Service: "bigquery",
+			Payload: map[string]any{"project": projectID, "jobType": "load"},
+		})
 		writeJSON(w, http.StatusOK, job.Job)
 	case request.Configuration.Extract.SourceTable.TableID != "":
 		job, err := s.createExtractJob(r.Context(), projectID, request.JobReference, request.Configuration.Extract)
@@ -50,6 +67,11 @@ func (s *Server) insertJob(w http.ResponseWriter, r *http.Request, projectID str
 			writeError(w, http.StatusBadRequest, "invalid", err.Error())
 			return
 		}
+		events.Emit(s.eventPublisher, events.Event{
+			Type:    "bigquery.job.inserted",
+			Service: "bigquery",
+			Payload: map[string]any{"project": projectID, "jobType": "extract"},
+		})
 		writeJSON(w, http.StatusOK, job.Job)
 	default:
 		writeError(w, http.StatusBadRequest, "invalid", "configuration.query.query, configuration.copy, configuration.load, or configuration.extract is required")

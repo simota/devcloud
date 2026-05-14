@@ -5,6 +5,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"devcloud/internal/events"
 )
 
 func (s *Server) handleExecuteStatement(w http.ResponseWriter, r *http.Request) {
@@ -70,6 +72,11 @@ func (s *Server) handleExecuteStatement(w http.ResponseWriter, r *http.Request) 
 	_ = s.persistLocked()
 	s.mu.Unlock()
 
+	events.Emit(s.eventPublisher, events.Event{
+		Type:    "redshift.statement.executed",
+		Service: "redshift",
+		Payload: map[string]any{"statementID": stmt.ID},
+	})
 	writeDataAPIJSON(w, http.StatusOK, executeStatementResponseFromStatement(stmt))
 }
 
@@ -142,6 +149,11 @@ func (s *Server) handleBatchExecuteStatement(w http.ResponseWriter, r *http.Requ
 	_ = s.persistLocked()
 	s.mu.Unlock()
 
+	events.Emit(s.eventPublisher, events.Event{
+		Type:    "redshift.statement.batch_executed",
+		Service: "redshift",
+		Payload: map[string]any{"statementID": stmt.ID},
+	})
 	writeDataAPIJSON(w, http.StatusOK, executeStatementResponseFromStatement(stmt))
 }
 

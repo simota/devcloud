@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"sort"
 	"time"
+
+	"devcloud/internal/events"
 )
 
 func (s *Server) handleSubscriptions(w http.ResponseWriter, r *http.Request) {
@@ -127,6 +129,11 @@ func (s *Server) handleSubscription(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusInternalServerError, "INTERNAL", "pubsub resource store unavailable")
 			return
 		}
+		events.Emit(s.eventPublisher, events.Event{
+			Type:    "pubsub.subscription.created",
+			Service: "pubsub",
+			Payload: map[string]any{"subscription": name, "topic": request.Topic},
+		})
 		writeJSON(w, http.StatusOK, request)
 	case http.MethodGet:
 		s.mu.Lock()

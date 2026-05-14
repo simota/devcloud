@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"time"
+
+	"devcloud/internal/events"
 )
 
 func (s *Server) createTable(w http.ResponseWriter, r *http.Request, projectID string, datasetID string) {
@@ -78,6 +80,11 @@ func (s *Server) createTable(w http.ResponseWriter, r *http.Request, projectID s
 		writeError(w, http.StatusInternalServerError, "backendError", "internal error")
 		return
 	}
+	events.Emit(s.eventPublisher, events.Event{
+		Type:    "bigquery.table.created",
+		Service: "bigquery",
+		Payload: map[string]any{"project": projectID, "dataset": datasetID, "table": request.TableReference.TableID},
+	})
 	w.Header().Set("Location", resource.SelfLink)
 	writeJSON(w, http.StatusOK, resource)
 }
@@ -240,5 +247,10 @@ func (s *Server) deleteTable(w http.ResponseWriter, r *http.Request, projectID s
 		writeError(w, http.StatusInternalServerError, "backendError", "internal error")
 		return
 	}
+	events.Emit(s.eventPublisher, events.Event{
+		Type:    "bigquery.table.deleted",
+		Service: "bigquery",
+		Payload: map[string]any{"project": projectID, "dataset": datasetID, "table": tableID},
+	})
 	w.WriteHeader(http.StatusNoContent)
 }
