@@ -360,6 +360,15 @@ code {
   opacity: 0.58;
 }
 
+.notifications-toggle.is-on {
+  border-color: var(--border-accent, var(--border-strong, currentColor));
+  color: var(--accent-primary, currentColor);
+}
+
+.notifications-toggle.is-disabled {
+  opacity: 0.58;
+}
+
 .prefix-filter,
 .mail-filter,
 .compact-filter {
