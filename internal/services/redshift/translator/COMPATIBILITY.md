@@ -56,7 +56,7 @@ devcloud の Redshift サービスは、`translator.RedshiftToPostgres` で Reds
 - [x] **R-only** `COPY <table> FROM 's3://...' IAM_ROLE ...` — 独自実装（`sql_copy_unload.go`）
 - [x] **R-only** `UNLOAD ('SELECT...') TO 's3://...'` — 独自実装
 - [x] **R-only** `TRUNCATE` の即時コミット仕様（Redshift はトランザクション内でロールバック不可）
-- [ ] **R≠P** `INSERT INTO ... VALUES (DEFAULT)` の identity 列挙動
+- [x] **R≠P** `INSERT INTO ... VALUES (DEFAULT)` の identity 列挙動
 - [ ] **R≠P** `INSERT INTO ... SELECT` の `RETURNING` 句（Redshift にはない、PG にはある）
 - [ ] **P-only** `INSERT ... ON CONFLICT DO UPDATE` (UPSERT)
 - [ ] **P-only** `WITH ... DELETE/UPDATE` (writable CTE)

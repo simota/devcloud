@@ -375,6 +375,38 @@ func TestRedshiftToPostgresRewritesMergeIntoUpdateInsert(t *testing.T) {
 	}
 }
 
+func TestRedshiftToPostgresRewritesInsertValuesDefaultIdentity(t *testing.T) {
+	tests := []struct {
+		name string
+		sql  string
+		want string
+	}{
+		{
+			name: "default identity column value",
+			sql:  "insert into analytics.events(event_id) values(default)",
+			want: "insert into analytics.events(event_id) default values",
+		},
+		{
+			name: "uppercase with semicolon",
+			sql:  "INSERT INTO events VALUES ( DEFAULT );",
+			want: "INSERT INTO events default values",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			translated, err := NewRedshiftToPostgres().Translate(context.Background(), Session{}, tc.sql)
+			if err != nil {
+				t.Fatalf("Translate() error = %v", err)
+			}
+
+			if translated.BackendSQL != tc.want {
+				t.Fatalf("BackendSQL = %q, want %q", translated.BackendSQL, tc.want)
+			}
+		})
+	}
+}
+
 func TestRedshiftToPostgresRewritesCreateViewNoSchemaBinding(t *testing.T) {
 	tests := []struct {
 		name string

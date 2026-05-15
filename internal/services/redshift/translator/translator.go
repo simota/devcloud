@@ -95,6 +95,10 @@ func (RedshiftToPostgres) Translate(ctx context.Context, _ Session, sql string) 
 		translated.BackendSQL = rewriteRedshiftFunctions(translated.BackendSQL)
 		return translated, err
 	}
+	if translated, ok, err := translateInsertValuesDefault(sql); ok || err != nil {
+		translated.BackendSQL = rewriteRedshiftFunctions(translated.BackendSQL)
+		return translated, err
+	}
 	if translated, ok, err := translateAlterColumnEncode(sql); ok || err != nil {
 		translated.BackendSQL = rewriteRedshiftFunctions(translated.BackendSQL)
 		return translated, err
@@ -676,6 +680,32 @@ func parseMergeInsertClause(value string) (string, string, bool) {
 		return "", "", false
 	}
 	return columns, strings.TrimSpace(values[1:valuesClose]), true
+}
+
+func translateInsertValuesDefault(sql string) (TranslationResult, bool, error) {
+	statement := strings.TrimSpace(strings.TrimRight(sql, ";"))
+	prefixEnd, ok := matchKeywordSequence(statement, 0, []string{"insert", "into"})
+	if !ok {
+		return TranslationResult{}, false, nil
+	}
+	valuesStart, valuesEnd := findTopLevelKeywordSequence(statement, []string{"values"}, prefixEnd)
+	if valuesStart < 0 {
+		return TranslationResult{BackendSQL: statement}, true, nil
+	}
+	open := skipSpaces(statement, valuesEnd)
+	if open >= len(statement) || statement[open] != '(' {
+		return TranslationResult{BackendSQL: statement}, true, nil
+	}
+	close := matchingParen(statement, open)
+	if close < 0 || strings.TrimSpace(statement[close+1:]) != "" {
+		return TranslationResult{BackendSQL: statement}, true, nil
+	}
+	values := splitCommaSeparated(statement[open+1 : close])
+	if len(values) != 1 || !strings.EqualFold(strings.TrimSpace(values[0]), "default") {
+		return TranslationResult{BackendSQL: statement}, true, nil
+	}
+	backendSQL := strings.TrimSpace(statement[:valuesStart]) + " default values"
+	return TranslationResult{BackendSQL: backendSQL}, true, nil
 }
 
 func translateAlterColumnEncode(sql string) (TranslationResult, bool, error) {
