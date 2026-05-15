@@ -170,24 +170,24 @@ func TestDaemonEnabledServerCountIncludesPubSubRedshiftAndDashboard(t *testing.T
 	cfg.Services.PubSub.Enabled = true
 	cfg.Services.Redshift.Enabled = true
 
-	if got := NewDaemon(cfg).enabledServerCount(); got != 9 {
-		t.Fatalf("enabledServerCount() = %d, want 9", got)
+	if got := NewDaemon(cfg).enabledServerCount(); got != 10 {
+		t.Fatalf("enabledServerCount() = %d, want 10", got)
 	}
 
 	cfg.Services.Redis.Enabled = true
-	if got := NewDaemon(cfg).enabledServerCount(); got != 10 {
-		t.Fatalf("enabledServerCount() with Redis = %d, want 10", got)
+	if got := NewDaemon(cfg).enabledServerCount(); got != 11 {
+		t.Fatalf("enabledServerCount() with Redis = %d, want 11", got)
 	}
 	cfg.Services.Redis.Enabled = false
 
 	cfg.Services.PubSub.Enabled = false
-	if got := NewDaemon(cfg).enabledServerCount(); got != 8 {
-		t.Fatalf("enabledServerCount() without Pub/Sub = %d, want 8", got)
+	if got := NewDaemon(cfg).enabledServerCount(); got != 9 {
+		t.Fatalf("enabledServerCount() without Pub/Sub = %d, want 9", got)
 	}
 
 	cfg.Services.Redshift.Enabled = false
-	if got := NewDaemon(cfg).enabledServerCount(); got != 7 {
-		t.Fatalf("enabledServerCount() without Pub/Sub and Redshift = %d, want 7", got)
+	if got := NewDaemon(cfg).enabledServerCount(); got != 8 {
+		t.Fatalf("enabledServerCount() without Pub/Sub and Redshift = %d, want 8", got)
 	}
 }
 

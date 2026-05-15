@@ -11,6 +11,7 @@ import (
 
 	"devcloud/internal/dashboard"
 	"devcloud/internal/events"
+	appautoscalingsvc "devcloud/internal/services/applicationautoscaling"
 	bigquerysvc "devcloud/internal/services/bigquery"
 	dynamodbsvc "devcloud/internal/services/dynamodb"
 	gcssvc "devcloud/internal/services/gcs"
@@ -115,6 +116,15 @@ func (d *Daemon) Run(ctx context.Context) error {
 		DefaultDelaySeconds:             d.config.Services.SQS.DefaultDelaySeconds,
 		DefaultMessageRetentionSeconds:  d.config.Services.SQS.DefaultMessageRetentionSeconds,
 		DefaultReceiveWaitTimeSeconds:   d.config.Services.SQS.DefaultReceiveWaitTimeSeconds,
+	})
+	appAutoScalingServer := appautoscalingsvc.NewServer(appautoscalingsvc.Config{
+		Addr:            loopbackAddr(d.config.Server.AppAutoScalingPort),
+		Region:          d.config.Services.AppAutoScaling.Region,
+		AccountID:       d.config.Auth.AppAutoScaling.AccountID,
+		AuthMode:        d.config.Auth.AppAutoScaling.Mode,
+		AccessKeyID:     d.config.Auth.AppAutoScaling.AccessKeyID,
+		SecretAccessKey: d.config.Auth.AppAutoScaling.SecretAccessKey,
+		StoragePath:     filepath.Join(d.config.Storage.Path, "applicationautoscaling"),
 	})
 	pubSubServer := pubsubsvc.NewServer(pubsubsvc.Config{
 		GRPCAddr:                  loopbackAddr(d.config.Server.PubSubGRPCPort),
@@ -249,6 +259,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	bigQueryServer.SetEventPublisher(bus)
 	sqsServer.SetEventPublisher(bus)
 	pubSubServer.SetEventPublisher(bus)
+	appAutoScalingServer.SetEventPublisher(bus)
 	redshiftServer.SetEventPublisher(bus)
 	redisServer.SetEventPublisher(bus)
 	dashboardServer.SetEventBus(bus)
@@ -274,6 +285,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	}
 	if d.config.Services.PubSub.Enabled {
 		go func() { errCh <- pubSubServer.Run(ctx) }()
+	}
+	if d.config.Services.AppAutoScaling.Enabled {
+		go func() { errCh <- appAutoScalingServer.Run(ctx) }()
 	}
 	if d.config.Services.Redshift.Enabled {
 		go func() { errCh <- redshiftServer.Run(ctx) }()
@@ -337,6 +351,9 @@ func (d *Daemon) enabledServerCount() int {
 		count++
 	}
 	if d.config.Services.PubSub.Enabled {
+		count++
+	}
+	if d.config.Services.AppAutoScaling.Enabled {
 		count++
 	}
 	if d.config.Services.Redshift.Enabled {
