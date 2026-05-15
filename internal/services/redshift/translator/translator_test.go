@@ -216,6 +216,36 @@ func TestRedshiftToPostgresRewritesCreateExternalTableLocation(t *testing.T) {
 	}
 }
 
+func TestRedshiftToPostgresRewritesCreateExternalSchemaFromDataCatalog(t *testing.T) {
+	tests := []struct {
+		name string
+		sql  string
+		want string
+	}{
+		{
+			name: "data catalog external schema",
+			sql:  "create external schema if not exists spectrum from data catalog database 'analytics' iam_role default",
+			want: "create schema if not exists spectrum",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			translated, err := NewRedshiftToPostgres().Translate(context.Background(), Session{}, tc.sql)
+			if err != nil {
+				t.Fatalf("Translate() error = %v", err)
+			}
+
+			if translated.BackendSQL != tc.want {
+				t.Fatalf("BackendSQL = %q, want %q", translated.BackendSQL, tc.want)
+			}
+			if strings.Contains(strings.ToLower(translated.BackendSQL), "external") || strings.Contains(strings.ToLower(translated.BackendSQL), "data catalog") {
+				t.Fatalf("BackendSQL contains external schema syntax: %q", translated.BackendSQL)
+			}
+		})
+	}
+}
+
 func TestRedshiftToPostgresRewritesSuperColumnTypeToJSONB(t *testing.T) {
 	tests := []struct {
 		name     string

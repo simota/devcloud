@@ -79,6 +79,10 @@ func (RedshiftToPostgres) Translate(ctx context.Context, _ Session, sql string) 
 	if err := ctx.Err(); err != nil {
 		return TranslationResult{}, err
 	}
+	if translated, ok, err := translateCreateExternalSchema(sql); ok || err != nil {
+		translated.BackendSQL = rewriteRedshiftFunctions(translated.BackendSQL)
+		return translated, err
+	}
 	if translated, ok, err := translateCreateExternalTable(sql); ok || err != nil {
 		translated.BackendSQL = rewriteRedshiftFunctions(translated.BackendSQL)
 		return translated, err
@@ -176,6 +180,32 @@ func rewriteRedshiftFunctions(sql string) string {
 		i++
 	}
 	return out.String()
+}
+
+func translateCreateExternalSchema(sql string) (TranslationResult, bool, error) {
+	statement := strings.TrimSpace(strings.TrimRight(sql, ";"))
+	const prefix = "create external schema"
+	if !strings.HasPrefix(strings.ToLower(statement), prefix) {
+		return TranslationResult{}, false, nil
+	}
+
+	tokens := strings.Fields(strings.TrimSpace(statement[len(prefix):]))
+	fromIndex := -1
+	for i := 0; i+2 < len(tokens); i++ {
+		if strings.EqualFold(tokens[i], "from") && strings.EqualFold(tokens[i+1], "data") && strings.EqualFold(tokens[i+2], "catalog") {
+			fromIndex = i
+			break
+		}
+	}
+	if fromIndex < 0 {
+		return TranslationResult{}, false, nil
+	}
+	if fromIndex == 0 {
+		return TranslationResult{}, true, errors.New("CREATE EXTERNAL SCHEMA FROM DATA CATALOG requires a schema name")
+	}
+
+	backendSQL := "create schema " + strings.Join(tokens[:fromIndex], " ")
+	return TranslationResult{BackendSQL: backendSQL}, true, nil
 }
 
 func parseRedshiftBooleanLiteral(sql string, index int) (string, int, bool) {
