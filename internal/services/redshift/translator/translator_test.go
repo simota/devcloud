@@ -97,6 +97,38 @@ func TestRedshiftToPostgresRewritesListAggWithinGroup(t *testing.T) {
 	}
 }
 
+func TestRedshiftToPostgresRewritesApproximateCountDistinct(t *testing.T) {
+	tests := []struct {
+		name string
+		sql  string
+		want string
+	}{
+		{
+			name: "approximate count distinct",
+			sql:  "select approximate count(distinct user_id) as active_users from events",
+			want: "select count(distinct user_id) as active_users from events",
+		},
+		{
+			name: "approximate count inside string literal is ignored",
+			sql:  "select 'approximate count(distinct user_id)' as label, approximate count(distinct user_id) as active_users from events",
+			want: "select 'approximate count(distinct user_id)' as label, count(distinct user_id) as active_users from events",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			translated, err := NewRedshiftToPostgres().Translate(context.Background(), Session{}, tc.sql)
+			if err != nil {
+				t.Fatalf("Translate() error = %v", err)
+			}
+
+			if translated.BackendSQL != tc.want {
+				t.Fatalf("BackendSQL = %q, want %q", translated.BackendSQL, tc.want)
+			}
+		})
+	}
+}
+
 func TestRedshiftToPostgresRewritesLikeDefaultEscape(t *testing.T) {
 	tests := []struct {
 		name string

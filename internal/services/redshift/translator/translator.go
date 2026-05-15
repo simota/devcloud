@@ -210,6 +210,12 @@ func rewriteRedshiftFunctions(sql string) string {
 			name := sql[start:i]
 			lower := strings.ToLower(name)
 			switch lower {
+			case "approximate":
+				if rewritten, next, ok := rewriteApproximateCountDistinct(sql, i); ok {
+					out.WriteString(rewritten)
+					i = next
+					continue
+				}
 			case "boolean":
 				next := skipSpaces(sql, i)
 				if rewritten, literalEnd, ok := parseRedshiftBooleanLiteral(sql, next); ok {
@@ -279,6 +285,28 @@ func rewriteRedshiftFunctions(sql string) string {
 		i++
 	}
 	return out.String()
+}
+
+func rewriteApproximateCountDistinct(sql string, index int) (string, int, bool) {
+	countStart := skipSpaces(sql, index)
+	countEnd, ok := matchKeywordSequence(sql, countStart, []string{"count"})
+	if !ok {
+		return "", index, false
+	}
+	open := skipSpaces(sql, countEnd)
+	if open >= len(sql) || sql[open] != '(' {
+		return "", index, false
+	}
+	close := matchingParen(sql, open)
+	if close < 0 {
+		return "", index, false
+	}
+	args := strings.TrimSpace(sql[open+1 : close])
+	distinctEnd, ok := matchKeywordSequence(args, 0, []string{"distinct"})
+	if !ok || strings.TrimSpace(args[distinctEnd:]) == "" {
+		return "", index, false
+	}
+	return sql[countStart : close+1], close + 1, true
 }
 
 func rewriteLikeDefaultEscape(sql string, keywordStart, keywordEnd int) (string, int, bool) {
