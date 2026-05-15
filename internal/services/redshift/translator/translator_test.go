@@ -276,6 +276,43 @@ func TestRedshiftToPostgresRewritesCreateMaterializedViewAutoRefreshYes(t *testi
 	}
 }
 
+func TestRedshiftToPostgresRewritesCreateViewNoSchemaBinding(t *testing.T) {
+	tests := []struct {
+		name string
+		sql  string
+		want string
+	}{
+		{
+			name: "late binding view",
+			sql:  "create view analytics.recent_events as select id, created_at from events with no schema binding",
+			want: "create view analytics.recent_events as select id, created_at from events",
+		},
+		{
+			name: "quoted literal is unchanged",
+			sql:  "create view analytics.labels as select 'with no schema binding' as label from events with no schema binding",
+			want: "create view analytics.labels as select 'with no schema binding' as label from events",
+		},
+		{
+			name: "uppercase with semicolon",
+			sql:  "create view analytics.recent_events as select id from events WITH NO SCHEMA BINDING;",
+			want: "create view analytics.recent_events as select id from events;",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			translated, err := NewRedshiftToPostgres().Translate(context.Background(), Session{}, tc.sql)
+			if err != nil {
+				t.Fatalf("Translate() error = %v", err)
+			}
+
+			if translated.BackendSQL != tc.want {
+				t.Fatalf("BackendSQL = %q, want %q", translated.BackendSQL, tc.want)
+			}
+		})
+	}
+}
+
 func TestRedshiftToPostgresRewritesSuperColumnTypeToJSONB(t *testing.T) {
 	tests := []struct {
 		name     string

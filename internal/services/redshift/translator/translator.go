@@ -95,7 +95,7 @@ func (RedshiftToPostgres) Translate(ctx context.Context, _ Session, sql string) 
 		translated.BackendSQL = rewriteRedshiftFunctions(translated.BackendSQL)
 		return translated, err
 	}
-	return TranslationResult{BackendSQL: rewriteRedshiftFunctions(sql)}, nil
+	return TranslationResult{BackendSQL: rewriteRedshiftFunctions(rewriteLateBindingView(sql))}, nil
 }
 
 func rewriteRedshiftFunctions(sql string) string {
@@ -184,6 +184,72 @@ func rewriteRedshiftFunctions(sql string) string {
 		i++
 	}
 	return out.String()
+}
+
+func rewriteLateBindingView(sql string) string {
+	keywords := []string{"with", "no", "schema", "binding"}
+	out := make([]byte, 0, len(sql))
+	for i := 0; i < len(sql); {
+		ch := sql[i]
+		if ch == '\'' {
+			var quoted strings.Builder
+			next := copyQuotedString(&quoted, sql, i)
+			out = append(out, quoted.String()...)
+			i = next
+			continue
+		}
+		if ch == '"' {
+			var quoted strings.Builder
+			next := copyQuotedIdentifier(&quoted, sql, i)
+			out = append(out, quoted.String()...)
+			i = next
+			continue
+		}
+		if next, ok := matchKeywordSequence(sql, i, keywords); ok {
+			out = trimRightSpaces(out)
+			i = next
+			continue
+		}
+		out = append(out, ch)
+		i++
+	}
+	return strings.TrimSpace(string(out))
+}
+
+func matchKeywordSequence(sql string, index int, keywords []string) (int, bool) {
+	if index > 0 && isIdentifierPart(sql[index-1]) {
+		return index, false
+	}
+	next := index
+	for keywordIndex, keyword := range keywords {
+		if keywordIndex > 0 {
+			next = skipSpaces(sql, next)
+			if next >= len(sql) {
+				return index, false
+			}
+		}
+		if len(sql[next:]) < len(keyword) || !strings.EqualFold(sql[next:next+len(keyword)], keyword) {
+			return index, false
+		}
+		afterKeyword := next + len(keyword)
+		if afterKeyword < len(sql) && isIdentifierPart(sql[afterKeyword]) {
+			return index, false
+		}
+		next = afterKeyword
+	}
+	return next, true
+}
+
+func trimRightSpaces(value []byte) []byte {
+	for len(value) > 0 {
+		switch value[len(value)-1] {
+		case ' ', '\t', '\n', '\r':
+			value = value[:len(value)-1]
+		default:
+			return value
+		}
+	}
+	return value
 }
 
 func translateCreateExternalSchema(sql string) (TranslationResult, bool, error) {
