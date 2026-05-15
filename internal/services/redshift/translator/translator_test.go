@@ -162,6 +162,12 @@ func TestRedshiftToPostgresRewritesSuperColumnTypeToJSONB(t *testing.T) {
 			want:     "create table metrics(id integer, estimate bytea)",
 			dataType: "hllsketch",
 		},
+		{
+			name:     "create table varbyte column",
+			sql:      "create table events(id integer, digest VARBYTE)",
+			want:     "create table events(id integer, digest bytea)",
+			dataType: "varbyte",
+		},
 	}
 
 	for _, tc := range tests {

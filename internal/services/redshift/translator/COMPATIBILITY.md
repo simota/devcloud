@@ -16,7 +16,7 @@ devcloud の Redshift サービスは、`translator.RedshiftToPostgres` で Reds
 - [x] **R-only** `SUPER` — semi-structured。PG `jsonb` にマップするのが現実的
 - [x] **R-only** `HLLSKETCH` — HyperLogLog スケッチ
 - [x] **R-only** `GEOMETRY` / `GEOGRAPHY` — Redshift 固有実装（PG は PostGIS 拡張別）
-- [ ] **R-only** `VARBYTE` — PG `bytea` にマップ
+- [x] **R-only** `VARBYTE` — PG `bytea` にマップ
 - [ ] **R≠P** `TIMESTAMP` — μs 精度、TZ デフォルトの扱いが微妙に異なる
 - [ ] **R≠P** `TIMESTAMPTZ` — Redshift は UTC 固定保存、PG は session TZ
 - [ ] **R≠P** `TIME` / `TIMETZ` — Redshift は集約・サブクエリで一部使用不可
