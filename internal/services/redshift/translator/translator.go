@@ -487,7 +487,11 @@ func translateColumnDefinitions(value string) ([]string, []ColumnMetadata, strin
 			return nil, nil, "", nil, errors.New("CREATE TABLE column name cannot be empty")
 		}
 		column := ColumnMetadata{Name: columnName, DataType: strings.ToLower(tokens[1])}
-		cleanTokens := []string{tokens[0], postgresColumnType(tokens[1])}
+		columnType := postgresColumnType(tokens[1])
+		cleanTokens := []string{tokens[0], columnType}
+		if byteLimit, ok := redshiftByteLimitedStringType(tokens[1]); ok {
+			cleanTokens = append(cleanTokens, "check", "(octet_length("+tokens[0]+") <= "+byteLimit+")")
+		}
 		for i := 2; i < len(tokens); i++ {
 			token := strings.ToLower(tokens[i])
 			switch {
@@ -546,7 +550,30 @@ func postgresColumnType(value string) string {
 	case strings.EqualFold(value, "geometry"), strings.EqualFold(value, "geography"):
 		return "text"
 	}
+	if _, ok := redshiftByteLimitedStringType(value); ok {
+		return "text"
+	}
 	return value
+}
+
+func redshiftByteLimitedStringType(value string) (string, bool) {
+	lower := strings.ToLower(strings.TrimSpace(value))
+	for _, prefix := range []string{"varchar", "char"} {
+		if !strings.HasPrefix(lower, prefix+"(") || !strings.HasSuffix(lower, ")") {
+			continue
+		}
+		limit := strings.TrimSpace(lower[len(prefix)+1 : len(lower)-1])
+		if limit == "" {
+			return "", false
+		}
+		for i := 0; i < len(limit); i++ {
+			if limit[i] < '0' || limit[i] > '9' {
+				return "", false
+			}
+		}
+		return limit, true
+	}
+	return "", false
 }
 
 func isBooleanColumnType(value string) bool {
