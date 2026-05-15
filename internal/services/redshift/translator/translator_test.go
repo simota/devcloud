@@ -184,6 +184,47 @@ func TestRedshiftToPostgresRewritesSuperColumnTypeToJSONB(t *testing.T) {
 	}
 }
 
+func TestRedshiftToPostgresRewritesSpatialColumnTypesToText(t *testing.T) {
+	tests := []struct {
+		name     string
+		sql      string
+		want     string
+		dataType string
+	}{
+		{
+			name:     "create table geometry column",
+			sql:      "create table places(id integer, shape GEOMETRY)",
+			want:     "create table places(id integer, shape text)",
+			dataType: "geometry",
+		},
+		{
+			name:     "create table geography column",
+			sql:      "create table places(id integer, footprint GEOGRAPHY)",
+			want:     "create table places(id integer, footprint text)",
+			dataType: "geography",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			translated, err := NewRedshiftToPostgres().Translate(context.Background(), Session{}, tc.sql)
+			if err != nil {
+				t.Fatalf("Translate() error = %v", err)
+			}
+
+			if translated.BackendSQL != tc.want {
+				t.Fatalf("BackendSQL = %q, want %q", translated.BackendSQL, tc.want)
+			}
+			if len(translated.MetadataEffects) != 1 || len(translated.MetadataEffects[0].Columns) != 2 {
+				t.Fatalf("MetadataEffects = %#v", translated.MetadataEffects)
+			}
+			if translated.MetadataEffects[0].Columns[1].DataType != tc.dataType {
+				t.Fatalf("column metadata = %#v, want data type %q", translated.MetadataEffects[0].Columns[1], tc.dataType)
+			}
+		})
+	}
+}
+
 func TestRedshiftToPostgresRejectsMalformedCreateTable(t *testing.T) {
 	tests := []struct {
 		name string

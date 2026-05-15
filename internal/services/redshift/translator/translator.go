@@ -460,6 +460,8 @@ func postgresColumnType(value string) string {
 		return "jsonb"
 	case strings.EqualFold(value, "hllsketch"):
 		return "bytea"
+	case strings.EqualFold(value, "geometry"), strings.EqualFold(value, "geography"):
+		return "text"
 	}
 	return value
 }
