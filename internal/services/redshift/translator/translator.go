@@ -109,6 +109,13 @@ func rewriteRedshiftFunctions(sql string) string {
 			name := sql[start:i]
 			lower := strings.ToLower(name)
 			switch lower {
+			case "boolean":
+				next := skipSpaces(sql, i)
+				if rewritten, literalEnd, ok := parseRedshiftBooleanLiteral(sql, next); ok {
+					out.WriteString(rewritten)
+					i = literalEnd
+					continue
+				}
 			case "getdate":
 				next := skipSpaces(sql, i)
 				if next < len(sql) && sql[next] == '(' {
@@ -165,6 +172,66 @@ func rewriteRedshiftFunctions(sql string) string {
 		i++
 	}
 	return out.String()
+}
+
+func parseRedshiftBooleanLiteral(sql string, index int) (string, int, bool) {
+	if index >= len(sql) {
+		return "", index, false
+	}
+	if sql[index] == '\'' {
+		value, next, ok := readQuotedStringValue(sql, index)
+		if !ok {
+			return "", index, false
+		}
+		rewritten, ok := postgresBooleanLiteral(value)
+		return rewritten, next, ok
+	}
+	if sql[index] == '0' || sql[index] == '1' {
+		if index+1 < len(sql) && isIdentifierPart(sql[index+1]) {
+			return "", index, false
+		}
+		rewritten, ok := postgresBooleanLiteral(sql[index : index+1])
+		return rewritten, index + 1, ok
+	}
+	if !isIdentifierStart(sql[index]) {
+		return "", index, false
+	}
+	start := index
+	index++
+	for index < len(sql) && isIdentifierPart(sql[index]) {
+		index++
+	}
+	rewritten, ok := postgresBooleanLiteral(sql[start:index])
+	return rewritten, index, ok
+}
+
+func readQuotedStringValue(value string, start int) (string, int, bool) {
+	var out strings.Builder
+	for i := start + 1; i < len(value); i++ {
+		if value[i] != '\'' {
+			out.WriteByte(value[i])
+			continue
+		}
+		if i+1 < len(value) && value[i+1] == '\'' {
+			out.WriteByte(value[i+1])
+			i++
+			continue
+		}
+		return out.String(), i + 1, true
+	}
+	return "", start, false
+}
+
+func postgresBooleanLiteral(value string) (string, bool) {
+	normalized := strings.Trim(strings.TrimSpace(value), `"'`)
+	switch strings.ToLower(normalized) {
+	case "1", "t", "true", "y", "yes":
+		return "TRUE", true
+	case "0", "f", "false", "n", "no":
+		return "FALSE", true
+	default:
+		return "", false
+	}
 }
 
 func rewriteParenFunction(sql string, index int, rewrite func([]string) (string, bool)) (string, int, bool) {
@@ -428,8 +495,14 @@ func translateColumnDefinitions(value string) ([]string, []ColumnMetadata, strin
 				column.Encoding = cleanIdentifier(tokens[i+1])
 				i++
 			case token == "default" && i+1 < len(tokens) && !strings.EqualFold(tokens[i+1], "as"):
+				defaultValue := tokens[i+1]
+				if isBooleanColumnType(column.DataType) {
+					if rewritten, ok := postgresBooleanLiteral(defaultValue); ok {
+						defaultValue = rewritten
+					}
+				}
 				column.DefaultValue = tokens[i+1]
-				cleanTokens = append(cleanTokens, tokens[i], tokens[i+1])
+				cleanTokens = append(cleanTokens, tokens[i], defaultValue)
 				i++
 			case token == "identity" || strings.HasPrefix(token, "identity("):
 				column.Identity = true
@@ -474,6 +547,10 @@ func postgresColumnType(value string) string {
 		return "text"
 	}
 	return value
+}
+
+func isBooleanColumnType(value string) bool {
+	return strings.EqualFold(value, "bool") || strings.EqualFold(value, "boolean")
 }
 
 func translateTableAttributes(value string) (string, string, string, []string, string) {

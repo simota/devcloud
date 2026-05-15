@@ -97,6 +97,43 @@ func TestRedshiftToPostgresRewritesListAggWithinGroup(t *testing.T) {
 	}
 }
 
+func TestRedshiftToPostgresRewritesBooleanLiterals(t *testing.T) {
+	tests := []struct {
+		name string
+		sql  string
+		want string
+	}{
+		{
+			name: "typed boolean yes literal",
+			sql:  "select boolean 'yes' as enabled",
+			want: "select TRUE as enabled",
+		},
+		{
+			name: "typed boolean numeric literal",
+			sql:  "select boolean 0 as enabled",
+			want: "select FALSE as enabled",
+		},
+		{
+			name: "boolean column default literal",
+			sql:  "create table events(id integer, active boolean default y, archived bool default 0)",
+			want: "create table events(id integer, active boolean default TRUE, archived bool default FALSE)",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			translated, err := NewRedshiftToPostgres().Translate(context.Background(), Session{}, tc.sql)
+			if err != nil {
+				t.Fatalf("Translate() error = %v", err)
+			}
+
+			if translated.BackendSQL != tc.want {
+				t.Fatalf("BackendSQL = %q, want %q", translated.BackendSQL, tc.want)
+			}
+		})
+	}
+}
+
 func TestRedshiftToPostgresLeavesUnsupportedFunctionFormsUnchanged(t *testing.T) {
 	input := "select dateadd(quarter, 1, created_at), datediff(quarter, started_at, ended_at), listagg(name) from events"
 	translated, err := NewRedshiftToPostgres().Translate(context.Background(), Session{}, input)
