@@ -456,6 +456,8 @@ func translateColumnDefinitions(value string) ([]string, []ColumnMetadata, strin
 
 func postgresColumnType(value string) string {
 	switch {
+	case strings.EqualFold(value, "timestamp"):
+		return "timestamp(6) without time zone"
 	case strings.EqualFold(value, "super"):
 		return "jsonb"
 	case strings.EqualFold(value, "hllsketch"):
