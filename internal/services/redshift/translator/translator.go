@@ -95,6 +95,10 @@ func (RedshiftToPostgres) Translate(ctx context.Context, _ Session, sql string) 
 		translated.BackendSQL = rewriteRedshiftFunctions(translated.BackendSQL)
 		return translated, err
 	}
+	if translated, ok, err := translateInsertSelectReturning(sql); ok || err != nil {
+		translated.BackendSQL = rewriteRedshiftFunctions(translated.BackendSQL)
+		return translated, err
+	}
 	if translated, ok, err := translateInsertValuesDefault(sql); ok || err != nil {
 		translated.BackendSQL = rewriteRedshiftFunctions(translated.BackendSQL)
 		return translated, err
@@ -680,6 +684,27 @@ func parseMergeInsertClause(value string) (string, string, bool) {
 		return "", "", false
 	}
 	return columns, strings.TrimSpace(values[1:valuesClose]), true
+}
+
+func translateInsertSelectReturning(sql string) (TranslationResult, bool, error) {
+	statement := strings.TrimSpace(strings.TrimRight(sql, ";"))
+	prefixEnd, ok := matchKeywordSequence(statement, 0, []string{"insert", "into"})
+	if !ok {
+		return TranslationResult{}, false, nil
+	}
+	selectStart, selectEnd := findTopLevelKeywordSequence(statement, []string{"select"}, prefixEnd)
+	if selectStart < 0 {
+		return TranslationResult{}, false, nil
+	}
+	if valuesStart, _ := findTopLevelKeywordSequence(statement, []string{"values"}, prefixEnd); valuesStart >= 0 && valuesStart < selectStart {
+		return TranslationResult{}, false, nil
+	}
+	returningStart, _ := findTopLevelKeywordSequence(statement, []string{"returning"}, selectEnd)
+	if returningStart < 0 {
+		return TranslationResult{}, false, nil
+	}
+	backendSQL := strings.TrimSpace(statement[:returningStart])
+	return TranslationResult{BackendSQL: backendSQL}, true, nil
 }
 
 func translateInsertValuesDefault(sql string) (TranslationResult, bool, error) {

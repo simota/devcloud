@@ -407,6 +407,38 @@ func TestRedshiftToPostgresRewritesInsertValuesDefaultIdentity(t *testing.T) {
 	}
 }
 
+func TestRedshiftToPostgresRemovesInsertSelectReturning(t *testing.T) {
+	tests := []struct {
+		name string
+		sql  string
+		want string
+	}{
+		{
+			name: "insert select returning all columns",
+			sql:  "insert into analytics.events(id, created_at) select id, getdate() from staging.events returning *",
+			want: "insert into analytics.events(id, created_at) select id, CURRENT_TIMESTAMP from staging.events",
+		},
+		{
+			name: "returning inside string literal is ignored",
+			sql:  "insert into audit.messages(message) select 'returning *' from staging.messages returning message;",
+			want: "insert into audit.messages(message) select 'returning *' from staging.messages",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			translated, err := NewRedshiftToPostgres().Translate(context.Background(), Session{}, tc.sql)
+			if err != nil {
+				t.Fatalf("Translate() error = %v", err)
+			}
+
+			if translated.BackendSQL != tc.want {
+				t.Fatalf("BackendSQL = %q, want %q", translated.BackendSQL, tc.want)
+			}
+		})
+	}
+}
+
 func TestRedshiftToPostgresRewritesCreateViewNoSchemaBinding(t *testing.T) {
 	tests := []struct {
 		name string
