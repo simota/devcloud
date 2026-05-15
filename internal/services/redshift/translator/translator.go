@@ -115,6 +115,10 @@ func (RedshiftToPostgres) Translate(ctx context.Context, _ Session, sql string) 
 		translated.BackendSQL = rewriteRedshiftFunctions(translated.BackendSQL)
 		return translated, err
 	}
+	if translated, ok, err := translateQualifySelect(sql); ok || err != nil {
+		translated.BackendSQL = rewriteRedshiftFunctions(translated.BackendSQL)
+		return translated, err
+	}
 	if translated, ok, err := translateCreateTable(sql); ok || err != nil {
 		translated.BackendSQL = rewriteRedshiftFunctions(translated.BackendSQL)
 		return translated, err
@@ -833,6 +837,168 @@ func translateTruncateImmediateCommit(sql string) (TranslationResult, bool, erro
 		return TranslationResult{BackendSQL: statement}, true, nil
 	}
 	return TranslationResult{BackendSQL: "commit; " + statement}, true, nil
+}
+
+func translateQualifySelect(sql string) (TranslationResult, bool, error) {
+	statement := strings.TrimSpace(strings.TrimRight(sql, ";"))
+	prefixEnd, ok := matchKeywordSequence(statement, 0, []string{"select"})
+	if !ok {
+		return TranslationResult{}, false, nil
+	}
+	qualifyStart, qualifyEnd := findTopLevelKeywordSequence(statement, []string{"qualify"}, prefixEnd)
+	if qualifyStart < 0 {
+		return TranslationResult{}, false, nil
+	}
+
+	qualifyClauseEnd := len(statement)
+	suffixStart := -1
+	for _, sequence := range [][]string{
+		{"order", "by"},
+		{"limit"},
+		{"offset"},
+		{"fetch"},
+	} {
+		start, _ := findTopLevelKeywordSequence(statement, sequence, qualifyEnd)
+		if start >= 0 && start < qualifyClauseEnd {
+			qualifyClauseEnd = start
+			suffixStart = start
+		}
+	}
+
+	innerSQL := strings.TrimSpace(statement[:qualifyStart])
+	condition := strings.TrimSpace(statement[qualifyEnd:qualifyClauseEnd])
+	if innerSQL == "" || condition == "" {
+		return TranslationResult{BackendSQL: statement}, true, nil
+	}
+
+	outerSelect := "*"
+	if rewrittenOuterSelect, rewrittenInnerSQL, rewrittenCondition, ok := rewriteQualifyWindowPredicate(innerSQL, condition); ok {
+		outerSelect = rewrittenOuterSelect
+		innerSQL = rewrittenInnerSQL
+		condition = rewrittenCondition
+	}
+
+	backendSQL := "select " + outerSelect + " from (" + innerSQL + ") as devcloud_qualify where " + condition
+	if suffixStart >= 0 {
+		backendSQL += " " + strings.TrimSpace(statement[suffixStart:])
+	}
+	return TranslationResult{BackendSQL: backendSQL}, true, nil
+}
+
+func rewriteQualifyWindowPredicate(innerSQL string, condition string) (string, string, string, bool) {
+	windowStart, windowEnd := findFirstWindowFunctionExpression(condition)
+	if windowStart < 0 {
+		return "", "", "", false
+	}
+
+	selectEnd, ok := matchKeywordSequence(innerSQL, 0, []string{"select"})
+	if !ok {
+		return "", "", "", false
+	}
+	fromStart, _ := findTopLevelKeywordSequence(innerSQL, []string{"from"}, selectEnd)
+	if fromStart < 0 {
+		return "", "", "", false
+	}
+
+	selectList := strings.TrimSpace(innerSQL[selectEnd:fromStart])
+	fromClause := strings.TrimSpace(innerSQL[fromStart:])
+	if selectList == "" || fromClause == "" {
+		return "", "", "", false
+	}
+
+	alias := "__devcloud_qualify_1"
+	windowExpression := strings.TrimSpace(condition[windowStart:windowEnd])
+	outerSelect := qualifyOuterSelectList(selectList)
+	rewrittenInnerSQL := "select " + selectList + ", " + windowExpression + " as " + alias + " " + fromClause
+	rewrittenCondition := condition[:windowStart] + alias + condition[windowEnd:]
+	return outerSelect, rewrittenInnerSQL, rewrittenCondition, true
+}
+
+func findFirstWindowFunctionExpression(value string) (int, int) {
+	inString := false
+	inQuotedIdentifier := false
+	for i := 0; i < len(value); i++ {
+		ch := value[i]
+		if ch == '\'' && !inQuotedIdentifier {
+			if inString && i+1 < len(value) && value[i+1] == '\'' {
+				i++
+				continue
+			}
+			inString = !inString
+			continue
+		}
+		if ch == '"' && !inString {
+			if inQuotedIdentifier && i+1 < len(value) && value[i+1] == '"' {
+				i++
+				continue
+			}
+			inQuotedIdentifier = !inQuotedIdentifier
+			continue
+		}
+		if inString || inQuotedIdentifier || !isIdentifierStart(ch) {
+			continue
+		}
+
+		nameStart := i
+		i++
+		for i < len(value) && isIdentifierPart(value[i]) {
+			i++
+		}
+		open := skipSpaces(value, i)
+		if open >= len(value) || value[open] != '(' {
+			continue
+		}
+		argsClose := matchingParen(value, open)
+		if argsClose < 0 {
+			continue
+		}
+		overStart := skipSpaces(value, argsClose+1)
+		overEnd, ok := matchKeywordSequence(value, overStart, []string{"over"})
+		if !ok {
+			continue
+		}
+		overOpen := skipSpaces(value, overEnd)
+		if overOpen >= len(value) || value[overOpen] != '(' {
+			continue
+		}
+		overClose := matchingParen(value, overOpen)
+		if overClose < 0 {
+			continue
+		}
+		return nameStart, overClose + 1
+	}
+	return -1, -1
+}
+
+func qualifyOuterSelectList(selectList string) string {
+	items := splitCommaSeparated(selectList)
+	outer := make([]string, 0, len(items))
+	for _, item := range items {
+		outer = append(outer, qualifyOuterSelectItem(item))
+	}
+	return strings.Join(outer, ", ")
+}
+
+func qualifyOuterSelectItem(item string) string {
+	item = strings.TrimSpace(item)
+	if item == "*" || strings.HasSuffix(item, ".*") {
+		return item
+	}
+	if asStart, asEnd := findTopLevelKeywordSequence(item, []string{"as"}, 0); asStart >= 0 {
+		alias := strings.TrimSpace(item[asEnd:])
+		if alias != "" {
+			return alias
+		}
+	}
+
+	fields := strings.Fields(item)
+	if len(fields) > 1 {
+		alias := fields[len(fields)-1]
+		if cleanIdentifier(alias) != "" {
+			return alias
+		}
+	}
+	return item
 }
 
 func parseDefaultIdentityClause(tokens []string, defaultIndex int) (string, int, bool) {

@@ -578,6 +578,48 @@ func TestRedshiftToPostgresRewritesTruncateImmediateCommit(t *testing.T) {
 	}
 }
 
+func TestRedshiftToPostgresRewritesQualifyToSubquery(t *testing.T) {
+	tests := []struct {
+		name string
+		sql  string
+		want string
+	}{
+		{
+			name: "window alias predicate",
+			sql:  "select user_id, row_number() over (partition by user_id order by created_at desc) as rn from events qualify rn = 1",
+			want: "select * from (select user_id, row_number() over (partition by user_id order by created_at desc) as rn from events) as devcloud_qualify where rn = 1",
+		},
+		{
+			name: "preserves outer order by",
+			sql:  "select user_id, rank() over (order by score desc) as rank from scores qualify rank <= 10 order by rank",
+			want: "select * from (select user_id, rank() over (order by score desc) as rank from scores) as devcloud_qualify where rank <= 10 order by rank",
+		},
+		{
+			name: "direct window predicate",
+			sql:  "select user_id, event_id from events qualify row_number() over (partition by user_id order by created_at desc) = 1",
+			want: "select user_id, event_id from (select user_id, event_id, row_number() over (partition by user_id order by created_at desc) as __devcloud_qualify_1 from events) as devcloud_qualify where __devcloud_qualify_1 = 1",
+		},
+		{
+			name: "qualify inside string literal is ignored",
+			sql:  "select 'qualify rn = 1' as label, row_number() over (order by id) as rn from events qualify rn = 1",
+			want: "select * from (select 'qualify rn = 1' as label, row_number() over (order by id) as rn from events) as devcloud_qualify where rn = 1",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			translated, err := NewRedshiftToPostgres().Translate(context.Background(), Session{}, tc.sql)
+			if err != nil {
+				t.Fatalf("Translate() error = %v", err)
+			}
+
+			if translated.BackendSQL != tc.want {
+				t.Fatalf("BackendSQL = %q, want %q", translated.BackendSQL, tc.want)
+			}
+		})
+	}
+}
+
 func TestRedshiftToPostgresRewritesSuperColumnTypeToJSONB(t *testing.T) {
 	tests := []struct {
 		name     string

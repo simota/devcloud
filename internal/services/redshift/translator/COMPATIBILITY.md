@@ -66,7 +66,7 @@ devcloud の Redshift サービスは、`translator.RedshiftToPostgres` で Reds
 
 ## 4. SELECT / クエリ構文
 
-- [ ] **R-only** `QUALIFY` 句 — サブクエリで代用
+- [x] **R-only** `QUALIFY` 句 — サブクエリで代用
 - [ ] **R-only** `SELECT TOP n ...` — PG `LIMIT n` に書き換え
 - [ ] **R-only** `LIKE ... ESCAPE` の `\` デフォルトエスケープ挙動
 - [ ] **R-only** `APPROXIMATE COUNT(DISTINCT col)` — 近似不要なら `COUNT(DISTINCT)` に置換可
