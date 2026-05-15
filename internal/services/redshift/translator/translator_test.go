@@ -482,6 +482,38 @@ func TestRedshiftToPostgresRewritesAlterTableAddColumnDefaultIdentity(t *testing
 	}
 }
 
+func TestRedshiftToPostgresRewritesTruncateImmediateCommit(t *testing.T) {
+	tests := []struct {
+		name string
+		sql  string
+		want string
+	}{
+		{
+			name: "truncate table",
+			sql:  "truncate table analytics.events",
+			want: "commit; truncate table analytics.events",
+		},
+		{
+			name: "uppercase with semicolon",
+			sql:  "TRUNCATE events;",
+			want: "commit; TRUNCATE events",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			translated, err := NewRedshiftToPostgres().Translate(context.Background(), Session{}, tc.sql)
+			if err != nil {
+				t.Fatalf("Translate() error = %v", err)
+			}
+
+			if translated.BackendSQL != tc.want {
+				t.Fatalf("BackendSQL = %q, want %q", translated.BackendSQL, tc.want)
+			}
+		})
+	}
+}
+
 func TestRedshiftToPostgresRewritesSuperColumnTypeToJSONB(t *testing.T) {
 	tests := []struct {
 		name     string
