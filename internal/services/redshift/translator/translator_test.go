@@ -313,6 +313,41 @@ func TestRedshiftToPostgresRewritesCreateViewNoSchemaBinding(t *testing.T) {
 	}
 }
 
+func TestRedshiftToPostgresRewritesAlterColumnEncode(t *testing.T) {
+	tests := []struct {
+		name string
+		sql  string
+		want string
+	}{
+		{
+			name: "alter column encode",
+			sql:  "alter table analytics.events alter column payload encode zstd",
+			want: "alter table analytics.events alter column payload set statistics -1",
+		},
+		{
+			name: "if exists without column keyword",
+			sql:  "ALTER TABLE IF EXISTS events ALTER payload ENCODE az64;",
+			want: "alter table if exists events alter column payload set statistics -1",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			translated, err := NewRedshiftToPostgres().Translate(context.Background(), Session{}, tc.sql)
+			if err != nil {
+				t.Fatalf("Translate() error = %v", err)
+			}
+
+			if translated.BackendSQL != tc.want {
+				t.Fatalf("BackendSQL = %q, want %q", translated.BackendSQL, tc.want)
+			}
+			if strings.Contains(strings.ToLower(translated.BackendSQL), "encode") {
+				t.Fatalf("BackendSQL contains Redshift ENCODE syntax: %q", translated.BackendSQL)
+			}
+		})
+	}
+}
+
 func TestRedshiftToPostgresRewritesSuperColumnTypeToJSONB(t *testing.T) {
 	tests := []struct {
 		name     string

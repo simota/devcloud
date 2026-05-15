@@ -91,6 +91,10 @@ func (RedshiftToPostgres) Translate(ctx context.Context, _ Session, sql string) 
 		translated.BackendSQL = rewriteRedshiftFunctions(translated.BackendSQL)
 		return translated, err
 	}
+	if translated, ok, err := translateAlterColumnEncode(sql); ok || err != nil {
+		translated.BackendSQL = rewriteRedshiftFunctions(translated.BackendSQL)
+		return translated, err
+	}
 	if translated, ok, err := translateCreateTable(sql); ok || err != nil {
 		translated.BackendSQL = rewriteRedshiftFunctions(translated.BackendSQL)
 		return translated, err
@@ -580,6 +584,42 @@ func translateCreateMaterializedView(sql string) (TranslationResult, bool, error
 		return TranslationResult{BackendSQL: statement}, true, nil
 	}
 	backendSQL := strings.TrimSpace(header + " " + strings.TrimSpace(statement[asIndex:]))
+	return TranslationResult{BackendSQL: backendSQL}, true, nil
+}
+
+func translateAlterColumnEncode(sql string) (TranslationResult, bool, error) {
+	statement := strings.TrimSpace(strings.TrimRight(sql, ";"))
+	tokens := strings.Fields(statement)
+	if len(tokens) < 7 || !strings.EqualFold(tokens[0], "alter") || !strings.EqualFold(tokens[1], "table") {
+		return TranslationResult{}, false, nil
+	}
+
+	tableIndex := 2
+	if len(tokens) > tableIndex+2 && strings.EqualFold(tokens[tableIndex], "if") && strings.EqualFold(tokens[tableIndex+1], "exists") {
+		tableIndex += 2
+	}
+	alterIndex := tableIndex + 1
+	if alterIndex >= len(tokens) || !strings.EqualFold(tokens[alterIndex], "alter") {
+		return TranslationResult{}, false, nil
+	}
+
+	columnIndex := alterIndex + 1
+	if columnIndex < len(tokens) && strings.EqualFold(tokens[columnIndex], "column") {
+		columnIndex++
+	}
+	encodeIndex := columnIndex + 1
+	if encodeIndex+1 >= len(tokens) || !strings.EqualFold(tokens[encodeIndex], "encode") {
+		return TranslationResult{}, false, nil
+	}
+	if encodeIndex+2 != len(tokens) {
+		return TranslationResult{}, false, nil
+	}
+
+	tablePrefix := "alter table "
+	if tableIndex == 4 {
+		tablePrefix += "if exists "
+	}
+	backendSQL := tablePrefix + tokens[tableIndex] + " alter column " + tokens[columnIndex] + " set statistics -1"
 	return TranslationResult{BackendSQL: backendSQL}, true, nil
 }
 

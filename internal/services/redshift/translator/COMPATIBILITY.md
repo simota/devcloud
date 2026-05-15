@@ -39,7 +39,7 @@ devcloud の Redshift サービスは、`translator.RedshiftToPostgres` で Reds
 - [x] **R-only** `CREATE EXTERNAL SCHEMA FROM DATA CATALOG`
 - [x] **R-only** `CREATE MATERIALIZED VIEW ... AUTO REFRESH YES`
 - [x] **R-only** `WITH NO SCHEMA BINDING` (late-binding view)
-- [ ] **R-only** `ALTER TABLE ... ALTER COLUMN ... ENCODE ...`
+- [x] **R-only** `ALTER TABLE ... ALTER COLUMN ... ENCODE ...`
 - [ ] **R-only** `ALTER TABLE ... ADD COLUMN ... DEFAULT IDENTITY (...)`
 - [ ] **R≠P** `CREATE TABLE ... LIKE` のオプション (`INCLUDING DEFAULTS` 等) の差異
 - [ ] **R≠P** `TEMP` / `TEMPORARY` テーブルのスコープ規則
