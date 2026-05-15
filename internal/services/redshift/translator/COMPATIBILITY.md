@@ -52,7 +52,7 @@ devcloud の Redshift サービスは、`translator.RedshiftToPostgres` で Reds
 
 ## 3. DML
 
-- [ ] **R-only** `MERGE INTO ... WHEN MATCHED THEN UPDATE ... WHEN NOT MATCHED THEN INSERT` — PG 15+ で同名構文あり、それ未満は要書き換え
+- [x] **R-only** `MERGE INTO ... WHEN MATCHED THEN UPDATE ... WHEN NOT MATCHED THEN INSERT` — PG 15+ で同名構文あり、それ未満は要書き換え
 - [x] **R-only** `COPY <table> FROM 's3://...' IAM_ROLE ...` — 独自実装（`sql_copy_unload.go`）
 - [x] **R-only** `UNLOAD ('SELECT...') TO 's3://...'` — 独自実装
 - [ ] **R-only** `TRUNCATE` の即時コミット仕様（Redshift はトランザクション内でロールバック不可）

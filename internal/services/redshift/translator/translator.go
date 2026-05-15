@@ -91,6 +91,10 @@ func (RedshiftToPostgres) Translate(ctx context.Context, _ Session, sql string) 
 		translated.BackendSQL = rewriteRedshiftFunctions(translated.BackendSQL)
 		return translated, err
 	}
+	if translated, ok, err := translateMergeInto(sql); ok || err != nil {
+		translated.BackendSQL = rewriteRedshiftFunctions(translated.BackendSQL)
+		return translated, err
+	}
 	if translated, ok, err := translateAlterColumnEncode(sql); ok || err != nil {
 		translated.BackendSQL = rewriteRedshiftFunctions(translated.BackendSQL)
 		return translated, err
@@ -591,6 +595,85 @@ func translateCreateMaterializedView(sql string) (TranslationResult, bool, error
 	return TranslationResult{BackendSQL: backendSQL}, true, nil
 }
 
+func translateMergeInto(sql string) (TranslationResult, bool, error) {
+	statement := strings.TrimSpace(strings.TrimRight(sql, ";"))
+	prefixEnd, ok := matchKeywordSequence(statement, 0, []string{"merge", "into"})
+	if !ok {
+		return TranslationResult{}, false, nil
+	}
+
+	usingStart, usingEnd := findTopLevelKeywordSequence(statement, []string{"using"}, prefixEnd)
+	if usingStart < 0 {
+		return TranslationResult{BackendSQL: statement}, true, nil
+	}
+	onStart, onEnd := findTopLevelKeywordSequence(statement, []string{"on"}, usingEnd)
+	if onStart < 0 {
+		return TranslationResult{BackendSQL: statement}, true, nil
+	}
+	matchedStart, matchedEnd := findTopLevelKeywordSequence(statement, []string{"when", "matched", "then", "update", "set"}, onEnd)
+	if matchedStart < 0 {
+		return TranslationResult{BackendSQL: statement}, true, nil
+	}
+	notMatchedStart, notMatchedEnd := findTopLevelKeywordSequence(statement, []string{"when", "not", "matched", "then", "insert"}, matchedEnd)
+	if notMatchedStart < 0 {
+		return TranslationResult{BackendSQL: statement}, true, nil
+	}
+
+	target := strings.TrimSpace(statement[prefixEnd:usingStart])
+	source := strings.TrimSpace(statement[usingEnd:onStart])
+	onCondition := strings.TrimSpace(statement[onEnd:matchedStart])
+	updateAssignments := strings.TrimSpace(statement[matchedEnd:notMatchedStart])
+	if target == "" || source == "" || onCondition == "" || updateAssignments == "" {
+		return TranslationResult{BackendSQL: statement}, true, nil
+	}
+
+	insertColumns, insertValues, ok := parseMergeInsertClause(statement[notMatchedEnd:])
+	if !ok {
+		return TranslationResult{BackendSQL: statement}, true, nil
+	}
+	insertTarget := firstSQLToken(target)
+	if insertTarget == "" {
+		return TranslationResult{BackendSQL: statement}, true, nil
+	}
+
+	backendSQL := "with updated as (update " + target +
+		" set " + updateAssignments +
+		" from " + source +
+		" where " + onCondition +
+		" returning 1) insert into " + insertTarget +
+		" " + insertColumns +
+		" select " + insertValues +
+		" from " + source +
+		" where not exists (select 1 from " + target +
+		" where " + onCondition + ")"
+	return TranslationResult{BackendSQL: backendSQL}, true, nil
+}
+
+func parseMergeInsertClause(value string) (string, string, bool) {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" || trimmed[0] != '(' {
+		return "", "", false
+	}
+	columnsClose := matchingParen(trimmed, 0)
+	if columnsClose < 0 {
+		return "", "", false
+	}
+	columns := strings.TrimSpace(trimmed[:columnsClose+1])
+	valuesStart, valuesEnd := findTopLevelKeywordSequence(trimmed, []string{"values"}, columnsClose+1)
+	if valuesStart < 0 || strings.TrimSpace(trimmed[columnsClose+1:valuesStart]) != "" {
+		return "", "", false
+	}
+	values := strings.TrimSpace(trimmed[valuesEnd:])
+	if len(values) < 2 || values[0] != '(' {
+		return "", "", false
+	}
+	valuesClose := matchingParen(values, 0)
+	if valuesClose < 0 || strings.TrimSpace(values[valuesClose+1:]) != "" {
+		return "", "", false
+	}
+	return columns, strings.TrimSpace(values[1:valuesClose]), true
+}
+
 func translateAlterColumnEncode(sql string) (TranslationResult, bool, error) {
 	statement := strings.TrimSpace(strings.TrimRight(sql, ";"))
 	tokens := strings.Fields(statement)
@@ -1076,6 +1159,54 @@ func splitCommaSeparated(value string) []string {
 	return parts
 }
 
+func findTopLevelKeywordSequence(value string, keywords []string, start int) (int, int) {
+	if start < 0 {
+		return -1, -1
+	}
+	depth := 0
+	inString := false
+	inQuotedIdentifier := false
+	for i := start; i < len(value); i++ {
+		ch := value[i]
+		if ch == '\'' && !inQuotedIdentifier {
+			if inString && i+1 < len(value) && value[i+1] == '\'' {
+				i++
+				continue
+			}
+			inString = !inString
+			continue
+		}
+		if ch == '"' && !inString {
+			if inQuotedIdentifier && i+1 < len(value) && value[i+1] == '"' {
+				i++
+				continue
+			}
+			inQuotedIdentifier = !inQuotedIdentifier
+			continue
+		}
+		if inString || inQuotedIdentifier {
+			continue
+		}
+		switch ch {
+		case '(':
+			depth++
+			continue
+		case ')':
+			if depth > 0 {
+				depth--
+			}
+			continue
+		}
+		if depth != 0 {
+			continue
+		}
+		if end, ok := matchKeywordSequence(value, i, keywords); ok {
+			return i, end
+		}
+	}
+	return -1, -1
+}
+
 func findTopLevelKeyword(value string, keyword string, start int) int {
 	depth := 0
 	inString := false
@@ -1125,6 +1256,31 @@ func findTopLevelKeyword(value string, keyword string, start int) int {
 		}
 	}
 	return -1
+}
+
+func firstSQLToken(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	inQuotedIdentifier := false
+	for i := 0; i < len(value); i++ {
+		if value[i] == '"' {
+			if inQuotedIdentifier && i+1 < len(value) && value[i+1] == '"' {
+				i++
+				continue
+			}
+			inQuotedIdentifier = !inQuotedIdentifier
+			continue
+		}
+		if inQuotedIdentifier {
+			continue
+		}
+		if value[i] == ' ' || value[i] == '\t' || value[i] == '\n' || value[i] == '\r' {
+			return value[:i]
+		}
+	}
+	return value
 }
 
 func removeKeywordSequence(value string, sequence []string) (string, bool) {

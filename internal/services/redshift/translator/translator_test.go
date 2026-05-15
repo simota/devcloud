@@ -348,6 +348,33 @@ func TestRedshiftToPostgresRewritesCreateMaterializedViewAutoRefreshYes(t *testi
 	}
 }
 
+func TestRedshiftToPostgresRewritesMergeIntoUpdateInsert(t *testing.T) {
+	tests := []struct {
+		name string
+		sql  string
+		want string
+	}{
+		{
+			name: "matched update and not matched insert",
+			sql:  "merge into analytics.events as target using staging.events as source on target.id = source.id when matched then update set payload = source.payload, updated_at = getdate() when not matched then insert (id, payload, updated_at) values (source.id, source.payload, getdate())",
+			want: "with updated as (update analytics.events as target set payload = source.payload, updated_at = CURRENT_TIMESTAMP from staging.events as source where target.id = source.id returning 1) insert into analytics.events (id, payload, updated_at) select source.id, source.payload, CURRENT_TIMESTAMP from staging.events as source where not exists (select 1 from analytics.events as target where target.id = source.id)",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			translated, err := NewRedshiftToPostgres().Translate(context.Background(), Session{}, tc.sql)
+			if err != nil {
+				t.Fatalf("Translate() error = %v", err)
+			}
+
+			if translated.BackendSQL != tc.want {
+				t.Fatalf("BackendSQL = %q, want %q", translated.BackendSQL, tc.want)
+			}
+		})
+	}
+}
+
 func TestRedshiftToPostgresRewritesCreateViewNoSchemaBinding(t *testing.T) {
 	tests := []struct {
 		name string
