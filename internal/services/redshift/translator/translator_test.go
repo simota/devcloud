@@ -267,6 +267,47 @@ func TestRedshiftToPostgresRewritesTimestampTZColumnType(t *testing.T) {
 	}
 }
 
+func TestRedshiftToPostgresRewritesTimeColumnTypes(t *testing.T) {
+	tests := []struct {
+		name     string
+		sql      string
+		want     string
+		dataType string
+	}{
+		{
+			name:     "create table time column",
+			sql:      "create table events(id integer, started_at TIME)",
+			want:     "create table events(id integer, started_at time(6) without time zone)",
+			dataType: "time",
+		},
+		{
+			name:     "create table timetz column",
+			sql:      "create table events(id integer, started_at TIMETZ)",
+			want:     "create table events(id integer, started_at time(6) with time zone)",
+			dataType: "timetz",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			translated, err := NewRedshiftToPostgres().Translate(context.Background(), Session{}, tc.sql)
+			if err != nil {
+				t.Fatalf("Translate() error = %v", err)
+			}
+
+			if translated.BackendSQL != tc.want {
+				t.Fatalf("BackendSQL = %q, want %q", translated.BackendSQL, tc.want)
+			}
+			if len(translated.MetadataEffects) != 1 || len(translated.MetadataEffects[0].Columns) != 2 {
+				t.Fatalf("MetadataEffects = %#v", translated.MetadataEffects)
+			}
+			if translated.MetadataEffects[0].Columns[1].DataType != tc.dataType {
+				t.Fatalf("column metadata = %#v, want data type %q", translated.MetadataEffects[0].Columns[1], tc.dataType)
+			}
+		})
+	}
+}
+
 func TestRedshiftToPostgresRejectsMalformedCreateTable(t *testing.T) {
 	tests := []struct {
 		name string

@@ -460,6 +460,10 @@ func postgresColumnType(value string) string {
 		return "timestamp(6) without time zone"
 	case strings.EqualFold(value, "timestamptz"):
 		return "timestamp(6) without time zone"
+	case strings.EqualFold(value, "time"):
+		return "time(6) without time zone"
+	case strings.EqualFold(value, "timetz"):
+		return "time(6) with time zone"
 	case strings.EqualFold(value, "super"):
 		return "jsonb"
 	case strings.EqualFold(value, "hllsketch"):
