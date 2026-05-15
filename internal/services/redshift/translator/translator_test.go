@@ -249,6 +249,24 @@ func TestRedshiftToPostgresRewritesTimestampColumnType(t *testing.T) {
 	}
 }
 
+func TestRedshiftToPostgresRewritesTimestampTZColumnType(t *testing.T) {
+	translated, err := NewRedshiftToPostgres().Translate(context.Background(), Session{}, "create table events(id integer, observed_at TIMESTAMPTZ)")
+	if err != nil {
+		t.Fatalf("Translate() error = %v", err)
+	}
+
+	want := "create table events(id integer, observed_at timestamp(6) without time zone)"
+	if translated.BackendSQL != want {
+		t.Fatalf("BackendSQL = %q, want %q", translated.BackendSQL, want)
+	}
+	if len(translated.MetadataEffects) != 1 || len(translated.MetadataEffects[0].Columns) != 2 {
+		t.Fatalf("MetadataEffects = %#v", translated.MetadataEffects)
+	}
+	if translated.MetadataEffects[0].Columns[1].DataType != "timestamptz" {
+		t.Fatalf("column metadata = %#v, want data type %q", translated.MetadataEffects[0].Columns[1], "timestamptz")
+	}
+}
+
 func TestRedshiftToPostgresRejectsMalformedCreateTable(t *testing.T) {
 	tests := []struct {
 		name string
