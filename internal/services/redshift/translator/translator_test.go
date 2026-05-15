@@ -246,6 +246,36 @@ func TestRedshiftToPostgresRewritesCreateExternalSchemaFromDataCatalog(t *testin
 	}
 }
 
+func TestRedshiftToPostgresRewritesCreateMaterializedViewAutoRefreshYes(t *testing.T) {
+	tests := []struct {
+		name string
+		sql  string
+		want string
+	}{
+		{
+			name: "auto refresh yes",
+			sql:  "create materialized view analytics.daily_events auto refresh yes as select event_date, count(*) as count from events group by event_date",
+			want: "create materialized view analytics.daily_events as select event_date, count(*) as count from events group by event_date",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			translated, err := NewRedshiftToPostgres().Translate(context.Background(), Session{}, tc.sql)
+			if err != nil {
+				t.Fatalf("Translate() error = %v", err)
+			}
+
+			if translated.BackendSQL != tc.want {
+				t.Fatalf("BackendSQL = %q, want %q", translated.BackendSQL, tc.want)
+			}
+			if strings.Contains(strings.ToLower(translated.BackendSQL), "auto refresh") {
+				t.Fatalf("BackendSQL contains Redshift materialized view option: %q", translated.BackendSQL)
+			}
+		})
+	}
+}
+
 func TestRedshiftToPostgresRewritesSuperColumnTypeToJSONB(t *testing.T) {
 	tests := []struct {
 		name     string

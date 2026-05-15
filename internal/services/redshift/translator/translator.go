@@ -87,6 +87,10 @@ func (RedshiftToPostgres) Translate(ctx context.Context, _ Session, sql string) 
 		translated.BackendSQL = rewriteRedshiftFunctions(translated.BackendSQL)
 		return translated, err
 	}
+	if translated, ok, err := translateCreateMaterializedView(sql); ok || err != nil {
+		translated.BackendSQL = rewriteRedshiftFunctions(translated.BackendSQL)
+		return translated, err
+	}
 	if translated, ok, err := translateCreateTable(sql); ok || err != nil {
 		translated.BackendSQL = rewriteRedshiftFunctions(translated.BackendSQL)
 		return translated, err
@@ -493,6 +497,26 @@ func translateCreateExternalTable(sql string) (TranslationResult, bool, error) {
 	return TranslationResult{BackendSQL: backendSQL, MetadataEffects: []MetadataEffect{effect}}, true, nil
 }
 
+func translateCreateMaterializedView(sql string) (TranslationResult, bool, error) {
+	statement := strings.TrimSpace(strings.TrimRight(sql, ";"))
+	const prefix = "create materialized view"
+	if !strings.HasPrefix(strings.ToLower(statement), prefix) {
+		return TranslationResult{}, false, nil
+	}
+
+	asIndex := findTopLevelKeyword(statement, "as", len(prefix))
+	if asIndex < 0 {
+		return TranslationResult{BackendSQL: statement}, true, nil
+	}
+
+	header, removed := removeKeywordSequence(statement[:asIndex], []string{"auto", "refresh", "yes"})
+	if !removed {
+		return TranslationResult{BackendSQL: statement}, true, nil
+	}
+	backendSQL := strings.TrimSpace(header + " " + strings.TrimSpace(statement[asIndex:]))
+	return TranslationResult{BackendSQL: backendSQL}, true, nil
+}
+
 func translateCreateTable(sql string) (TranslationResult, bool, error) {
 	statement := strings.TrimSpace(strings.TrimRight(sql, ";"))
 	if !strings.HasPrefix(strings.ToLower(statement), "create table") {
@@ -769,6 +793,76 @@ func splitCommaSeparated(value string) []string {
 		parts = append(parts, part)
 	}
 	return parts
+}
+
+func findTopLevelKeyword(value string, keyword string, start int) int {
+	depth := 0
+	inString := false
+	inQuotedIdentifier := false
+	lowerKeyword := strings.ToLower(keyword)
+	for i := start; i < len(value); i++ {
+		ch := value[i]
+		if ch == '\'' && !inQuotedIdentifier {
+			if inString && i+1 < len(value) && value[i+1] == '\'' {
+				i++
+				continue
+			}
+			inString = !inString
+			continue
+		}
+		if ch == '"' && !inString {
+			if inQuotedIdentifier && i+1 < len(value) && value[i+1] == '"' {
+				i++
+				continue
+			}
+			inQuotedIdentifier = !inQuotedIdentifier
+			continue
+		}
+		if inString || inQuotedIdentifier {
+			continue
+		}
+		switch ch {
+		case '(':
+			depth++
+			continue
+		case ')':
+			if depth > 0 {
+				depth--
+			}
+			continue
+		}
+		if depth != 0 || i+len(keyword) > len(value) {
+			continue
+		}
+		if strings.ToLower(value[i:i+len(keyword)]) != lowerKeyword {
+			continue
+		}
+		beforeOK := i == 0 || !isIdentifierPart(value[i-1])
+		afterOK := i+len(keyword) == len(value) || !isIdentifierPart(value[i+len(keyword)])
+		if beforeOK && afterOK {
+			return i
+		}
+	}
+	return -1
+}
+
+func removeKeywordSequence(value string, sequence []string) (string, bool) {
+	tokens := strings.Fields(value)
+	for i := 0; i+len(sequence) <= len(tokens); i++ {
+		matched := true
+		for j, keyword := range sequence {
+			if !strings.EqualFold(tokens[i+j], keyword) {
+				matched = false
+				break
+			}
+		}
+		if !matched {
+			continue
+		}
+		cleaned := append(append([]string{}, tokens[:i]...), tokens[i+len(sequence):]...)
+		return strings.Join(cleaned, " "), true
+	}
+	return value, false
 }
 
 func parseQualifiedName(value string) (string, string) {

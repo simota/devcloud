@@ -37,7 +37,7 @@ devcloud の Redshift サービスは、`translator.RedshiftToPostgres` で Reds
 - [x] **R-only** `BACKUP {YES|NO}`
 - [x] **R-only** `CREATE EXTERNAL TABLE ... LOCATION 's3://...'` (Spectrum)
 - [x] **R-only** `CREATE EXTERNAL SCHEMA FROM DATA CATALOG`
-- [ ] **R-only** `CREATE MATERIALIZED VIEW ... AUTO REFRESH YES`
+- [x] **R-only** `CREATE MATERIALIZED VIEW ... AUTO REFRESH YES`
 - [ ] **R-only** `WITH NO SCHEMA BINDING` (late-binding view)
 - [ ] **R-only** `ALTER TABLE ... ALTER COLUMN ... ENCODE ...`
 - [ ] **R-only** `ALTER TABLE ... ADD COLUMN ... DEFAULT IDENTITY (...)`
