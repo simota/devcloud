@@ -265,6 +265,12 @@ func rewriteRedshiftFunctions(sql string) string {
 					i = next
 					continue
 				}
+			case "like":
+				if rewritten, next, ok := rewriteLikeDefaultEscape(sql, start, i); ok {
+					out.WriteString(rewritten)
+					i = next
+					continue
+				}
 			}
 			out.WriteString(name)
 			continue
@@ -273,6 +279,22 @@ func rewriteRedshiftFunctions(sql string) string {
 		i++
 	}
 	return out.String()
+}
+
+func rewriteLikeDefaultEscape(sql string, keywordStart, keywordEnd int) (string, int, bool) {
+	patternStart := skipSpaces(sql, keywordEnd)
+	if patternStart >= len(sql) || sql[patternStart] != '\'' {
+		return "", keywordStart, false
+	}
+	patternValue, patternEnd, ok := readQuotedStringValue(sql, patternStart)
+	if !ok || !strings.Contains(patternValue, `\`) {
+		return "", keywordStart, false
+	}
+	next := skipSpaces(sql, patternEnd)
+	if _, ok := matchKeywordSequence(sql, next, []string{"escape"}); ok {
+		return "", keywordStart, false
+	}
+	return sql[keywordStart:patternEnd] + " ESCAPE '\\'", patternEnd, true
 }
 
 func rewriteLateBindingView(sql string) string {

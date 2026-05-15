@@ -97,6 +97,43 @@ func TestRedshiftToPostgresRewritesListAggWithinGroup(t *testing.T) {
 	}
 }
 
+func TestRedshiftToPostgresRewritesLikeDefaultEscape(t *testing.T) {
+	tests := []struct {
+		name string
+		sql  string
+		want string
+	}{
+		{
+			name: "implicit backslash escape",
+			sql:  `select id from events where payload like 'promo\_%'`,
+			want: `select id from events where payload like 'promo\_%' ESCAPE '\'`,
+		},
+		{
+			name: "explicit escape unchanged",
+			sql:  `select id from events where payload like 'promo\_%' escape '\'`,
+			want: `select id from events where payload like 'promo\_%' escape '\'`,
+		},
+		{
+			name: "like inside string literal is ignored",
+			sql:  `select 'payload like ''promo\_%''' as predicate from events`,
+			want: `select 'payload like ''promo\_%''' as predicate from events`,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			translated, err := NewRedshiftToPostgres().Translate(context.Background(), Session{}, tc.sql)
+			if err != nil {
+				t.Fatalf("Translate() error = %v", err)
+			}
+
+			if translated.BackendSQL != tc.want {
+				t.Fatalf("BackendSQL = %q, want %q", translated.BackendSQL, tc.want)
+			}
+		})
+	}
+}
+
 func TestRedshiftToPostgresRewritesBooleanLiterals(t *testing.T) {
 	tests := []struct {
 		name string

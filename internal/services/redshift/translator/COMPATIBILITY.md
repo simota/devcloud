@@ -68,7 +68,7 @@ devcloud の Redshift サービスは、`translator.RedshiftToPostgres` で Reds
 
 - [x] **R-only** `QUALIFY` 句 — サブクエリで代用
 - [x] **R-only** `SELECT TOP n ...` — PG `LIMIT n` に書き換え
-- [ ] **R-only** `LIKE ... ESCAPE` の `\` デフォルトエスケープ挙動
+- [x] **R-only** `LIKE ... ESCAPE` の `\` デフォルトエスケープ挙動
 - [ ] **R-only** `APPROXIMATE COUNT(DISTINCT col)` — 近似不要なら `COUNT(DISTINCT)` に置換可
 - [x] **R-only** `LISTAGG(expr, sep) WITHIN GROUP (ORDER BY ...)` → `string_agg(expr, sep ORDER BY ...)`
 - [ ] **R-only** `MEDIAN(col)` → `percentile_cont(0.5) WITHIN GROUP (ORDER BY col)`
