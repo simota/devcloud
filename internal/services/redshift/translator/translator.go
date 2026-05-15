@@ -455,8 +455,11 @@ func translateColumnDefinitions(value string) ([]string, []ColumnMetadata, strin
 }
 
 func postgresColumnType(value string) string {
-	if strings.EqualFold(value, "super") {
+	switch {
+	case strings.EqualFold(value, "super"):
 		return "jsonb"
+	case strings.EqualFold(value, "hllsketch"):
+		return "bytea"
 	}
 	return value
 }

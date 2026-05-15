@@ -145,14 +145,22 @@ func TestRedshiftToPostgresExtractsMixedTableAttributes(t *testing.T) {
 
 func TestRedshiftToPostgresRewritesSuperColumnTypeToJSONB(t *testing.T) {
 	tests := []struct {
-		name string
-		sql  string
-		want string
+		name     string
+		sql      string
+		want     string
+		dataType string
 	}{
 		{
-			name: "create table column",
-			sql:  "create table events(id integer, payload SUPER)",
-			want: "create table events(id integer, payload jsonb)",
+			name:     "create table super column",
+			sql:      "create table events(id integer, payload SUPER)",
+			want:     "create table events(id integer, payload jsonb)",
+			dataType: "super",
+		},
+		{
+			name:     "create table hllsketch column",
+			sql:      "create table metrics(id integer, estimate HLLSKETCH)",
+			want:     "create table metrics(id integer, estimate bytea)",
+			dataType: "hllsketch",
 		},
 	}
 
@@ -169,8 +177,8 @@ func TestRedshiftToPostgresRewritesSuperColumnTypeToJSONB(t *testing.T) {
 			if len(translated.MetadataEffects) != 1 || len(translated.MetadataEffects[0].Columns) != 2 {
 				t.Fatalf("MetadataEffects = %#v", translated.MetadataEffects)
 			}
-			if translated.MetadataEffects[0].Columns[1].DataType != "super" {
-				t.Fatalf("SUPER column metadata = %#v", translated.MetadataEffects[0].Columns[1])
+			if translated.MetadataEffects[0].Columns[1].DataType != tc.dataType {
+				t.Fatalf("column metadata = %#v, want data type %q", translated.MetadataEffects[0].Columns[1], tc.dataType)
 			}
 		})
 	}
