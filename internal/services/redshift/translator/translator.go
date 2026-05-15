@@ -730,7 +730,8 @@ func parseDefaultIdentityClause(tokens []string, defaultIndex int) (string, int,
 
 func translateCreateTable(sql string) (TranslationResult, bool, error) {
 	statement := strings.TrimSpace(strings.TrimRight(sql, ";"))
-	if !strings.HasPrefix(strings.ToLower(statement), "create table") {
+	prefixEnd, temporary, ok := parseCreateTablePrefix(statement)
+	if !ok {
 		return TranslationResult{}, false, nil
 	}
 	open := strings.IndexByte(statement, '(')
@@ -742,13 +743,14 @@ func translateCreateTable(sql string) (TranslationResult, bool, error) {
 		return TranslationResult{}, true, errors.New("CREATE TABLE has an unterminated column list")
 	}
 
-	namePart := strings.TrimSpace(statement[len("create table"):open])
+	namePart := strings.TrimSpace(statement[prefixEnd:open])
 	if strings.HasPrefix(strings.ToLower(namePart), "if not exists ") {
 		namePart = strings.TrimSpace(namePart[len("if not exists "):])
 	}
 	schemaName, tableName := parseQualifiedName(namePart)
 	if cleanLike, ok := translateCreateTableLikeClause(statement[open+1 : close]); ok {
 		cleanRest, distStyle, distKey, sortKeys, backup := translateTableAttributes(statement[close+1:])
+		cleanRest = ensureTemporaryTableScope(cleanRest, temporary)
 		effect := MetadataEffect{
 			Kind:     MetadataEffectCreateTable,
 			Schema:   schemaName,
@@ -759,6 +761,9 @@ func translateCreateTable(sql string) (TranslationResult, bool, error) {
 			SortKeys: sortKeys,
 		}
 		backendSQL := strings.TrimSpace(statement[:open+1] + cleanLike + ")" + cleanRest)
+		if temporary {
+			return TranslationResult{BackendSQL: backendSQL}, true, nil
+		}
 		return TranslationResult{BackendSQL: backendSQL, MetadataEffects: []MetadataEffect{effect}}, true, nil
 	}
 	cleanColumns, columns, columnDistKey, columnSortKeys, err := translateColumnDefinitions(statement[open+1 : close])
@@ -777,6 +782,7 @@ func translateCreateTable(sql string) (TranslationResult, bool, error) {
 	if distStyle == "" && distKey != "" {
 		distStyle = "key"
 	}
+	cleanRest = ensureTemporaryTableScope(cleanRest, temporary)
 
 	effect := MetadataEffect{
 		Kind:     MetadataEffectCreateTable,
@@ -789,7 +795,33 @@ func translateCreateTable(sql string) (TranslationResult, bool, error) {
 		SortKeys: sortKeys,
 	}
 	backendSQL := strings.TrimSpace(statement[:open+1] + strings.Join(cleanColumns, ", ") + ")" + cleanRest)
+	if temporary {
+		return TranslationResult{BackendSQL: backendSQL}, true, nil
+	}
 	return TranslationResult{BackendSQL: backendSQL, MetadataEffects: []MetadataEffect{effect}}, true, nil
+}
+
+func parseCreateTablePrefix(statement string) (int, bool, bool) {
+	if next, ok := matchKeywordSequence(statement, 0, []string{"create", "temporary", "table"}); ok {
+		return next, true, true
+	}
+	if next, ok := matchKeywordSequence(statement, 0, []string{"create", "temp", "table"}); ok {
+		return next, true, true
+	}
+	if next, ok := matchKeywordSequence(statement, 0, []string{"create", "table"}); ok {
+		return next, false, true
+	}
+	return 0, false, false
+}
+
+func ensureTemporaryTableScope(cleanRest string, temporary bool) string {
+	if !temporary || strings.Contains(strings.ToLower(cleanRest), "on commit") {
+		return cleanRest
+	}
+	if strings.TrimSpace(cleanRest) == "" {
+		return " on commit preserve rows"
+	}
+	return cleanRest + " on commit preserve rows"
 }
 
 func translateCreateTableLikeClause(value string) (string, bool) {

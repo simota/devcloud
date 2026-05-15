@@ -217,6 +217,41 @@ func TestRedshiftToPostgresRewritesCreateTableLikeOptions(t *testing.T) {
 	}
 }
 
+func TestRedshiftToPostgresRewritesTemporaryTableScope(t *testing.T) {
+	tests := []struct {
+		name string
+		sql  string
+		want string
+	}{
+		{
+			name: "temp table",
+			sql:  "create temp table session_events(id integer distkey, payload varchar(16)) diststyle key sortkey(id)",
+			want: "create temp table session_events(id integer, payload text check (octet_length(payload) <= 16)) on commit preserve rows",
+		},
+		{
+			name: "temporary table if not exists",
+			sql:  "create temporary table if not exists session_events(id integer)",
+			want: "create temporary table if not exists session_events(id integer) on commit preserve rows",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			translated, err := NewRedshiftToPostgres().Translate(context.Background(), Session{}, tc.sql)
+			if err != nil {
+				t.Fatalf("Translate() error = %v", err)
+			}
+
+			if translated.BackendSQL != tc.want {
+				t.Fatalf("BackendSQL = %q, want %q", translated.BackendSQL, tc.want)
+			}
+			if len(translated.MetadataEffects) != 0 {
+				t.Fatalf("MetadataEffects = %#v, want none for session-scoped temporary table", translated.MetadataEffects)
+			}
+		})
+	}
+}
+
 func TestRedshiftToPostgresRewritesCreateExternalTableLocation(t *testing.T) {
 	tests := []struct {
 		name string
