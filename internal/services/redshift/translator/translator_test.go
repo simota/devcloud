@@ -180,6 +180,42 @@ func TestRedshiftToPostgresExtractsMixedTableAttributes(t *testing.T) {
 	}
 }
 
+func TestRedshiftToPostgresRewritesCreateExternalTableLocation(t *testing.T) {
+	tests := []struct {
+		name string
+		sql  string
+		want string
+	}{
+		{
+			name: "spectrum location",
+			sql:  "create external table spectrum.events(id integer, payload varchar(16)) stored as parquet location 's3://devcloud/events/'",
+			want: "create table spectrum.events(id integer, payload text check (octet_length(payload) <= 16))",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			translated, err := NewRedshiftToPostgres().Translate(context.Background(), Session{}, tc.sql)
+			if err != nil {
+				t.Fatalf("Translate() error = %v", err)
+			}
+
+			if translated.BackendSQL != tc.want {
+				t.Fatalf("BackendSQL = %q, want %q", translated.BackendSQL, tc.want)
+			}
+			if strings.Contains(strings.ToLower(translated.BackendSQL), "external") || strings.Contains(strings.ToLower(translated.BackendSQL), "location") {
+				t.Fatalf("BackendSQL contains external table syntax: %q", translated.BackendSQL)
+			}
+			if len(translated.MetadataEffects) != 1 || translated.MetadataEffects[0].Schema != "spectrum" || translated.MetadataEffects[0].Table != "events" {
+				t.Fatalf("MetadataEffects = %#v", translated.MetadataEffects)
+			}
+			if len(translated.MetadataEffects[0].Columns) != 2 || translated.MetadataEffects[0].Columns[1].DataType != "varchar(16)" {
+				t.Fatalf("columns = %#v", translated.MetadataEffects[0].Columns)
+			}
+		})
+	}
+}
+
 func TestRedshiftToPostgresRewritesSuperColumnTypeToJSONB(t *testing.T) {
 	tests := []struct {
 		name     string

@@ -79,6 +79,10 @@ func (RedshiftToPostgres) Translate(ctx context.Context, _ Session, sql string) 
 	if err := ctx.Err(); err != nil {
 		return TranslationResult{}, err
 	}
+	if translated, ok, err := translateCreateExternalTable(sql); ok || err != nil {
+		translated.BackendSQL = rewriteRedshiftFunctions(translated.BackendSQL)
+		return translated, err
+	}
 	if translated, ok, err := translateCreateTable(sql); ok || err != nil {
 		translated.BackendSQL = rewriteRedshiftFunctions(translated.BackendSQL)
 		return translated, err
@@ -419,6 +423,44 @@ func isIdentifierStart(ch byte) bool {
 
 func isIdentifierPart(ch byte) bool {
 	return isIdentifierStart(ch) || (ch >= '0' && ch <= '9') || ch == '$'
+}
+
+func translateCreateExternalTable(sql string) (TranslationResult, bool, error) {
+	statement := strings.TrimSpace(strings.TrimRight(sql, ";"))
+	lower := strings.ToLower(statement)
+	if !strings.HasPrefix(lower, "create external table") {
+		return TranslationResult{}, false, nil
+	}
+	open := strings.IndexByte(statement, '(')
+	if open < 0 {
+		return TranslationResult{BackendSQL: statement[:len("create ")] + statement[len("create external "):]}, true, nil
+	}
+	close := matchingParen(statement, open)
+	if close < 0 {
+		return TranslationResult{}, true, errors.New("CREATE EXTERNAL TABLE has an unterminated column list")
+	}
+
+	namePart := strings.TrimSpace(statement[len("create external table"):open])
+	if strings.HasPrefix(strings.ToLower(namePart), "if not exists ") {
+		namePart = strings.TrimSpace(namePart[len("if not exists "):])
+	}
+	schemaName, tableName := parseQualifiedName(namePart)
+	cleanColumns, columns, columnDistKey, columnSortKeys, err := translateColumnDefinitions(statement[open+1 : close])
+	if err != nil {
+		return TranslationResult{}, true, err
+	}
+
+	effect := MetadataEffect{
+		Kind:     MetadataEffectCreateTable,
+		Schema:   schemaName,
+		Table:    tableName,
+		Name:     columnDistKey,
+		Columns:  columns,
+		SortKeys: columnSortKeys,
+	}
+	prefix := statement[:len("create ")] + statement[len("create external "):open+1]
+	backendSQL := strings.TrimSpace(prefix + strings.Join(cleanColumns, ", ") + ")")
+	return TranslationResult{BackendSQL: backendSQL, MetadataEffects: []MetadataEffect{effect}}, true, nil
 }
 
 func translateCreateTable(sql string) (TranslationResult, bool, error) {

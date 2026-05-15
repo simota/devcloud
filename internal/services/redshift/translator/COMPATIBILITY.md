@@ -35,7 +35,7 @@ devcloud の Redshift サービスは、`translator.RedshiftToPostgres` で Reds
 - [x] **R-only** `SORTKEY [COMPOUND|INTERLEAVED] (cols)` / 列レベル `SORTKEY` ※`INTERLEAVED` は記録のみで挙動再現なし
 - [x] **R-only** `ENCODE <type>` (LZO/ZSTD/AZ64/RAW/DELTA/BYTEDICT/MOSTLY8 等)
 - [x] **R-only** `BACKUP {YES|NO}`
-- [ ] **R-only** `CREATE EXTERNAL TABLE ... LOCATION 's3://...'` (Spectrum)
+- [x] **R-only** `CREATE EXTERNAL TABLE ... LOCATION 's3://...'` (Spectrum)
 - [ ] **R-only** `CREATE EXTERNAL SCHEMA FROM DATA CATALOG`
 - [ ] **R-only** `CREATE MATERIALIZED VIEW ... AUTO REFRESH YES`
 - [ ] **R-only** `WITH NO SCHEMA BINDING` (late-binding view)
