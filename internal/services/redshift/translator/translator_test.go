@@ -620,6 +620,38 @@ func TestRedshiftToPostgresRewritesQualifyToSubquery(t *testing.T) {
 	}
 }
 
+func TestRedshiftToPostgresRewritesSelectTopToLimit(t *testing.T) {
+	tests := []struct {
+		name string
+		sql  string
+		want string
+	}{
+		{
+			name: "top rows",
+			sql:  "select top 10 id, created_at from events order by created_at desc",
+			want: "select id, created_at from events order by created_at desc limit 10",
+		},
+		{
+			name: "parenthesized top rows with semicolon",
+			sql:  "SELECT TOP (5) id, getdate() as observed_at FROM events;",
+			want: "SELECT id, CURRENT_TIMESTAMP as observed_at FROM events limit 5",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			translated, err := NewRedshiftToPostgres().Translate(context.Background(), Session{}, tc.sql)
+			if err != nil {
+				t.Fatalf("Translate() error = %v", err)
+			}
+
+			if translated.BackendSQL != tc.want {
+				t.Fatalf("BackendSQL = %q, want %q", translated.BackendSQL, tc.want)
+			}
+		})
+	}
+}
+
 func TestRedshiftToPostgresRewritesSuperColumnTypeToJSONB(t *testing.T) {
 	tests := []struct {
 		name     string

@@ -79,6 +79,7 @@ func (RedshiftToPostgres) Translate(ctx context.Context, _ Session, sql string) 
 	if err := ctx.Err(); err != nil {
 		return TranslationResult{}, err
 	}
+	sql = translateSelectTopLimit(sql)
 	if translated, ok, err := translateCreateExternalSchema(sql); ok || err != nil {
 		translated.BackendSQL = rewriteRedshiftFunctions(translated.BackendSQL)
 		return translated, err
@@ -124,6 +125,66 @@ func (RedshiftToPostgres) Translate(ctx context.Context, _ Session, sql string) 
 		return translated, err
 	}
 	return TranslationResult{BackendSQL: rewriteRedshiftFunctions(rewriteLateBindingView(sql))}, nil
+}
+
+func translateSelectTopLimit(sql string) string {
+	statement := strings.TrimSpace(strings.TrimRight(sql, ";"))
+	selectEnd, ok := matchKeywordSequence(statement, 0, []string{"select"})
+	if !ok {
+		return sql
+	}
+	topStart := skipSpaces(statement, selectEnd)
+	topEnd, ok := matchKeywordSequence(statement, topStart, []string{"top"})
+	if !ok {
+		return sql
+	}
+	limitStart := skipSpaces(statement, topEnd)
+	limit, limitEnd, ok := parseTopLimit(statement, limitStart)
+	if !ok {
+		return sql
+	}
+	selectList := strings.TrimSpace(statement[limitEnd:])
+	if selectList == "" {
+		return sql
+	}
+	return strings.TrimSpace(statement[:selectEnd]) + " " + selectList + " limit " + limit
+}
+
+func parseTopLimit(sql string, index int) (string, int, bool) {
+	if index >= len(sql) {
+		return "", index, false
+	}
+	if sql[index] == '(' {
+		close := matchingParen(sql, index)
+		if close < 0 {
+			return "", index, false
+		}
+		limit := strings.TrimSpace(sql[index+1 : close])
+		if !isUnsignedInteger(limit) {
+			return "", index, false
+		}
+		return limit, close + 1, true
+	}
+	start := index
+	for index < len(sql) && sql[index] >= '0' && sql[index] <= '9' {
+		index++
+	}
+	if index == start || (index < len(sql) && isIdentifierPart(sql[index])) {
+		return "", start, false
+	}
+	return sql[start:index], index, true
+}
+
+func isUnsignedInteger(value string) bool {
+	if value == "" {
+		return false
+	}
+	for i := 0; i < len(value); i++ {
+		if value[i] < '0' || value[i] > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func rewriteRedshiftFunctions(sql string) string {
