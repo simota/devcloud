@@ -13,7 +13,7 @@ devcloud の Redshift サービスは、`translator.RedshiftToPostgres` で Reds
 
 ## 1. データ型
 
-- [ ] **R-only** `SUPER` — semi-structured。PG `jsonb` にマップするのが現実的
+- [x] **R-only** `SUPER` — semi-structured。PG `jsonb` にマップするのが現実的
 - [ ] **R-only** `HLLSKETCH` — HyperLogLog スケッチ
 - [ ] **R-only** `GEOMETRY` / `GEOGRAPHY` — Redshift 固有実装（PG は PostGIS 拡張別）
 - [ ] **R-only** `VARBYTE` — PG `bytea` にマップ

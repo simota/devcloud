@@ -420,7 +420,7 @@ func translateColumnDefinitions(value string) ([]string, []ColumnMetadata, strin
 			return nil, nil, "", nil, errors.New("CREATE TABLE column name cannot be empty")
 		}
 		column := ColumnMetadata{Name: columnName, DataType: strings.ToLower(tokens[1])}
-		cleanTokens := []string{tokens[0], tokens[1]}
+		cleanTokens := []string{tokens[0], postgresColumnType(tokens[1])}
 		for i := 2; i < len(tokens); i++ {
 			token := strings.ToLower(tokens[i])
 			switch {
@@ -452,6 +452,13 @@ func translateColumnDefinitions(value string) ([]string, []ColumnMetadata, strin
 		columns = append(columns, column)
 	}
 	return cleaned, columns, distKey, sortKeys, nil
+}
+
+func postgresColumnType(value string) string {
+	if strings.EqualFold(value, "super") {
+		return "jsonb"
+	}
+	return value
 }
 
 func translateTableAttributes(value string) (string, string, string, []string, string) {

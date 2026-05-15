@@ -143,6 +143,39 @@ func TestRedshiftToPostgresExtractsMixedTableAttributes(t *testing.T) {
 	}
 }
 
+func TestRedshiftToPostgresRewritesSuperColumnTypeToJSONB(t *testing.T) {
+	tests := []struct {
+		name string
+		sql  string
+		want string
+	}{
+		{
+			name: "create table column",
+			sql:  "create table events(id integer, payload SUPER)",
+			want: "create table events(id integer, payload jsonb)",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			translated, err := NewRedshiftToPostgres().Translate(context.Background(), Session{}, tc.sql)
+			if err != nil {
+				t.Fatalf("Translate() error = %v", err)
+			}
+
+			if translated.BackendSQL != tc.want {
+				t.Fatalf("BackendSQL = %q, want %q", translated.BackendSQL, tc.want)
+			}
+			if len(translated.MetadataEffects) != 1 || len(translated.MetadataEffects[0].Columns) != 2 {
+				t.Fatalf("MetadataEffects = %#v", translated.MetadataEffects)
+			}
+			if translated.MetadataEffects[0].Columns[1].DataType != "super" {
+				t.Fatalf("SUPER column metadata = %#v", translated.MetadataEffects[0].Columns[1])
+			}
+		})
+	}
+}
+
 func TestRedshiftToPostgresRejectsMalformedCreateTable(t *testing.T) {
 	tests := []struct {
 		name string
