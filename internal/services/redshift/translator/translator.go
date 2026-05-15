@@ -747,6 +747,20 @@ func translateCreateTable(sql string) (TranslationResult, bool, error) {
 		namePart = strings.TrimSpace(namePart[len("if not exists "):])
 	}
 	schemaName, tableName := parseQualifiedName(namePart)
+	if cleanLike, ok := translateCreateTableLikeClause(statement[open+1 : close]); ok {
+		cleanRest, distStyle, distKey, sortKeys, backup := translateTableAttributes(statement[close+1:])
+		effect := MetadataEffect{
+			Kind:     MetadataEffectCreateTable,
+			Schema:   schemaName,
+			Table:    tableName,
+			Name:     distKey,
+			Value:    distStyle,
+			Backup:   backup,
+			SortKeys: sortKeys,
+		}
+		backendSQL := strings.TrimSpace(statement[:open+1] + cleanLike + ")" + cleanRest)
+		return TranslationResult{BackendSQL: backendSQL, MetadataEffects: []MetadataEffect{effect}}, true, nil
+	}
 	cleanColumns, columns, columnDistKey, columnSortKeys, err := translateColumnDefinitions(statement[open+1 : close])
 	if err != nil {
 		return TranslationResult{}, true, err
@@ -776,6 +790,30 @@ func translateCreateTable(sql string) (TranslationResult, bool, error) {
 	}
 	backendSQL := strings.TrimSpace(statement[:open+1] + strings.Join(cleanColumns, ", ") + ")" + cleanRest)
 	return TranslationResult{BackendSQL: backendSQL, MetadataEffects: []MetadataEffect{effect}}, true, nil
+}
+
+func translateCreateTableLikeClause(value string) (string, bool) {
+	tokens := strings.Fields(strings.TrimSpace(value))
+	if len(tokens) != 2 && len(tokens) != 4 {
+		return "", false
+	}
+	if !strings.EqualFold(tokens[0], "like") {
+		return "", false
+	}
+	if len(tokens) == 2 {
+		return "LIKE " + tokens[1], true
+	}
+	if !strings.EqualFold(tokens[3], "defaults") {
+		return "", false
+	}
+	switch {
+	case strings.EqualFold(tokens[2], "including"):
+		return "LIKE " + tokens[1] + " INCLUDING DEFAULTS", true
+	case strings.EqualFold(tokens[2], "excluding"):
+		return "LIKE " + tokens[1] + " EXCLUDING DEFAULTS", true
+	default:
+		return "", false
+	}
 }
 
 func translateColumnDefinitions(value string) ([]string, []ColumnMetadata, string, []string, error) {

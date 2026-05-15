@@ -180,6 +180,43 @@ func TestRedshiftToPostgresExtractsMixedTableAttributes(t *testing.T) {
 	}
 }
 
+func TestRedshiftToPostgresRewritesCreateTableLikeOptions(t *testing.T) {
+	tests := []struct {
+		name string
+		sql  string
+		want string
+	}{
+		{
+			name: "including defaults",
+			sql:  "create table analytics.events_copy (like analytics.events including defaults) diststyle even",
+			want: "create table analytics.events_copy (LIKE analytics.events INCLUDING DEFAULTS)",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			translated, err := NewRedshiftToPostgres().Translate(context.Background(), Session{}, tc.sql)
+			if err != nil {
+				t.Fatalf("Translate() error = %v", err)
+			}
+
+			if translated.BackendSQL != tc.want {
+				t.Fatalf("BackendSQL = %q, want %q", translated.BackendSQL, tc.want)
+			}
+			if len(translated.MetadataEffects) != 1 {
+				t.Fatalf("MetadataEffects = %#v", translated.MetadataEffects)
+			}
+			effect := translated.MetadataEffects[0]
+			if effect.Schema != "analytics" || effect.Table != "events_copy" || effect.Value != "even" {
+				t.Fatalf("metadata effect = %#v", effect)
+			}
+			if len(effect.Columns) != 0 {
+				t.Fatalf("columns = %#v, want none for LIKE table", effect.Columns)
+			}
+		})
+	}
+}
+
 func TestRedshiftToPostgresRewritesCreateExternalTableLocation(t *testing.T) {
 	tests := []struct {
 		name string
