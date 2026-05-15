@@ -195,11 +195,11 @@ PROMPT
     record_failure
     FINAL_STATUS="EXEC_FAIL"
     ITERATION=$((ITERATION + 1))
-    cat <<EOF | atomic_write "${STATE_FILE}"
-NEXT_ITERATION=${ITERATION}
-LAST_STATUS=${FINAL_STATUS}
-LAST_ITEM=${ITEM_TEXT}
-EOF
+    {
+      printf 'NEXT_ITERATION=%d\n' "${ITERATION}"
+      printf 'LAST_STATUS=%s\n' "${FINAL_STATUS}"
+      printf 'LAST_ITEM=%q\n' "${ITEM_TEXT}"
+    } | atomic_write "${STATE_FILE}"
     IFS='|' read -r CIRCUIT_NOW _ <<<"$(circuit_state)"
     [[ "${CIRCUIT_NOW}" == "OPEN" ]] && { log "circuit tripped — aborting loop"; FINAL_STATUS="CIRCUIT_OPEN"; break; }
     continue
@@ -237,11 +237,11 @@ EOF
   fi
 
   ITERATION=$((ITERATION + 1))
-  cat <<EOF | atomic_write "${STATE_FILE}"
-NEXT_ITERATION=${ITERATION}
-LAST_STATUS=${FINAL_STATUS}
-LAST_ITEM=${ITEM_TEXT}
-EOF
+  {
+    printf 'NEXT_ITERATION=%d\n' "${ITERATION}"
+    printf 'LAST_STATUS=%s\n' "${FINAL_STATUS}"
+    printf 'LAST_ITEM=%q\n' "${ITEM_TEXT}"
+  } | atomic_write "${STATE_FILE}"
   IFS='|' read -r CIRCUIT_NOW _ <<<"$(circuit_state)"
   [[ "${CIRCUIT_NOW}" == "OPEN" ]] && { log "circuit tripped — aborting loop"; FINAL_STATUS="CIRCUIT_OPEN"; break; }
 done
