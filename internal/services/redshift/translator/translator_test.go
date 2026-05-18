@@ -141,6 +141,48 @@ func TestRedshiftToPostgresRewritesRatioToReportOver(t *testing.T) {
 	}
 }
 
+func TestRedshiftToPostgresRewritesLateralColumnAliasReferences(t *testing.T) {
+	tests := []struct {
+		name string
+		sql  string
+		want string
+	}{
+		{
+			name: "select list alias reference",
+			sql:  "select clicks / impressions as probability, round(100 * probability, 1) as percentage from raw_data",
+			want: "select clicks / impressions as probability, round(100 * (clicks / impressions), 1) as percentage from raw_data",
+		},
+		{
+			name: "alias reference chains through later select items",
+			sql:  "select amount as subtotal, subtotal * tax_rate as tax, subtotal + tax as total from invoices",
+			want: "select amount as subtotal, (amount) * tax_rate as tax, (amount) + ((amount) * tax_rate) as total from invoices",
+		},
+		{
+			name: "implicit alias reference",
+			sql:  "select clicks / impressions probability, probability * 100 percentage from raw_data",
+			want: "select clicks / impressions as probability, (clicks / impressions) * 100 as percentage from raw_data",
+		},
+		{
+			name: "string literal and qualified column are unchanged",
+			sql:  "select clicks / impressions as probability, 'probability' as label, raw_data.probability as source_probability from raw_data",
+			want: "select clicks / impressions as probability, 'probability' as label, raw_data.probability as source_probability from raw_data",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			translated, err := NewRedshiftToPostgres().Translate(context.Background(), Session{}, tc.sql)
+			if err != nil {
+				t.Fatalf("Translate() error = %v", err)
+			}
+
+			if translated.BackendSQL != tc.want {
+				t.Fatalf("BackendSQL = %q, want %q", translated.BackendSQL, tc.want)
+			}
+		})
+	}
+}
+
 func TestRedshiftToPostgresRewritesApproximateCountDistinct(t *testing.T) {
 	tests := []struct {
 		name string

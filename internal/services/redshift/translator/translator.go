@@ -80,6 +80,7 @@ func (RedshiftToPostgres) Translate(ctx context.Context, _ Session, sql string) 
 		return TranslationResult{}, err
 	}
 	sql = translateSelectTopLimit(sql)
+	sql = rewriteLateralColumnAliases(sql)
 	if translated, ok, err := translateCreateExternalSchema(sql); ok || err != nil {
 		translated.BackendSQL = rewriteRedshiftFunctions(translated.BackendSQL)
 		return translated, err
@@ -185,6 +186,177 @@ func isUnsignedInteger(value string) bool {
 		}
 	}
 	return true
+}
+
+func rewriteLateralColumnAliases(sql string) string {
+	statement := strings.TrimSpace(strings.TrimRight(sql, ";"))
+	selectEnd, ok := matchKeywordSequence(statement, 0, []string{"select"})
+	if !ok {
+		return sql
+	}
+
+	selectListEnd := len(statement)
+	fromStart, _ := findTopLevelKeywordSequence(statement, []string{"from"}, selectEnd)
+	if fromStart >= 0 {
+		selectListEnd = fromStart
+	}
+	selectList := strings.TrimSpace(statement[selectEnd:selectListEnd])
+	if selectList == "" {
+		return sql
+	}
+	selectModifier := ""
+	for _, keyword := range []string{"all", "distinct"} {
+		if modifierEnd, ok := matchKeywordSequence(selectList, 0, []string{keyword}); ok {
+			selectModifier = strings.TrimSpace(selectList[:modifierEnd])
+			selectList = strings.TrimSpace(selectList[modifierEnd:])
+			break
+		}
+	}
+
+	aliases := map[string]string{}
+	items := splitCommaSeparated(selectList)
+	rewrittenItems := make([]string, 0, len(items))
+	changed := false
+	for _, item := range items {
+		expression, alias, hasAlias := splitSelectAlias(item)
+		rewrittenExpression, expressionChanged := replaceLateralAliasReferences(expression, aliases)
+		changed = changed || expressionChanged
+		if hasAlias {
+			rewrittenItems = append(rewrittenItems, strings.TrimSpace(rewrittenExpression)+" as "+alias)
+			if cleaned := cleanIdentifier(alias); cleaned != "" {
+				aliases[strings.ToLower(cleaned)] = strings.TrimSpace(rewrittenExpression)
+			}
+			continue
+		}
+		rewrittenItems = append(rewrittenItems, strings.TrimSpace(rewrittenExpression))
+	}
+	if !changed {
+		return sql
+	}
+
+	suffix := strings.TrimSpace(statement[selectListEnd:])
+	selectPrefix := "select "
+	if selectModifier != "" {
+		selectPrefix += selectModifier + " "
+	}
+	backendSQL := selectPrefix + strings.Join(rewrittenItems, ", ")
+	if suffix != "" {
+		backendSQL += " " + suffix
+	}
+	return backendSQL
+}
+
+func splitSelectAlias(item string) (string, string, bool) {
+	asStart, asEnd := findTopLevelKeywordSequence(item, []string{"as"}, 0)
+	if asStart < 0 {
+		return splitImplicitSelectAlias(item)
+	}
+	expression := strings.TrimSpace(item[:asStart])
+	alias := strings.TrimSpace(item[asEnd:])
+	if expression == "" || alias == "" || strings.ContainsAny(alias, " \t\n\r") {
+		return item, "", false
+	}
+	return expression, alias, true
+}
+
+func splitImplicitSelectAlias(item string) (string, string, bool) {
+	end := len(item)
+	for end > 0 && (item[end-1] == ' ' || item[end-1] == '\t' || item[end-1] == '\n' || item[end-1] == '\r') {
+		end--
+	}
+	if end == 0 {
+		return item, "", false
+	}
+
+	start := end
+	if item[start-1] == '"' {
+		start--
+		for start > 0 {
+			start--
+			if item[start] != '"' {
+				continue
+			}
+			if start > 0 && item[start-1] == '"' {
+				start--
+				continue
+			}
+			break
+		}
+	} else {
+		for start > 0 && isIdentifierPart(item[start-1]) {
+			start--
+		}
+		if start == end || !isIdentifierStart(item[start]) {
+			return item, "", false
+		}
+	}
+
+	if start == 0 || (item[start-1] != ' ' && item[start-1] != '\t' && item[start-1] != '\n' && item[start-1] != '\r') {
+		return item, "", false
+	}
+	expression := strings.TrimSpace(item[:start])
+	alias := strings.TrimSpace(item[start:end])
+	if expression == "" || alias == "" {
+		return item, "", false
+	}
+	return expression, alias, true
+}
+
+func replaceLateralAliasReferences(value string, aliases map[string]string) (string, bool) {
+	if len(aliases) == 0 {
+		return value, false
+	}
+	var out strings.Builder
+	changed := false
+	for i := 0; i < len(value); {
+		ch := value[i]
+		if ch == '\'' {
+			next := copyQuotedString(&out, value, i)
+			i = next
+			continue
+		}
+		if ch == '"' {
+			next := copyQuotedIdentifier(&out, value, i)
+			i = next
+			continue
+		}
+		if !isIdentifierStart(ch) {
+			out.WriteByte(ch)
+			i++
+			continue
+		}
+
+		start := i
+		i++
+		for i < len(value) && isIdentifierPart(value[i]) {
+			i++
+		}
+		identifier := value[start:i]
+		if expression, ok := aliases[strings.ToLower(identifier)]; ok && !isQualifiedIdentifierPart(value, start, i) {
+			out.WriteByte('(')
+			out.WriteString(expression)
+			out.WriteByte(')')
+			changed = true
+			continue
+		}
+		out.WriteString(identifier)
+	}
+	if !changed {
+		return value, false
+	}
+	return out.String(), true
+}
+
+func isQualifiedIdentifierPart(value string, start, end int) bool {
+	before := start - 1
+	for before >= 0 && (value[before] == ' ' || value[before] == '\t' || value[before] == '\n' || value[before] == '\r') {
+		before--
+	}
+	if before >= 0 && value[before] == '.' {
+		return true
+	}
+	after := skipSpaces(value, end)
+	return after < len(value) && value[after] == '.'
 }
 
 func rewriteRedshiftFunctions(sql string) string {
