@@ -165,7 +165,7 @@ devcloud の Redshift サービスは、`translator.RedshiftToPostgres` で Reds
 
 - [x] **R-only** `GRANT ASSUMEROLE ON 'arn:...' TO ...`
 - [x] **R-only** `CREATE DATASHARE` / `ALTER DATASHARE` / `GRANT USAGE ON DATASHARE`
-- [ ] **R-only** `CREATE MASKING POLICY` / `ATTACH MASKING POLICY`
+- [x] **R-only** `CREATE MASKING POLICY` / `ATTACH MASKING POLICY`
 - [ ] **R-only** `CREATE ROW ACCESS POLICY` — PG は RLS、構文差
 - [ ] **R≠P** `CREATE USER ... PASSWORD DISABLE` 等のパスワード句
 - [ ] **P-only** `CREATE ROLE WITH LOGIN BYPASSRLS`

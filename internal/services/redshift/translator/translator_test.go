@@ -186,6 +186,43 @@ func TestRedshiftToPostgresRewritesDatashareStatementsToNoop(t *testing.T) {
 	}
 }
 
+func TestRedshiftToPostgresRewritesMaskingPolicyStatementsToNoop(t *testing.T) {
+	tests := []struct {
+		name string
+		sql  string
+		want string
+	}{
+		{
+			name: "create masking policy",
+			sql:  "CREATE MASKING POLICY mask_email WITH (email varchar(256)) USING ('***'::varchar(256));",
+			want: "select 1",
+		},
+		{
+			name: "attach masking policy",
+			sql:  "attach masking policy mask_email on users (email) to role analyst priority 10",
+			want: "select 1",
+		},
+		{
+			name: "masking policy inside string literal is ignored",
+			sql:  "select 'CREATE MASKING POLICY mask_email' as statement",
+			want: "select 'CREATE MASKING POLICY mask_email' as statement",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			translated, err := NewRedshiftToPostgres().Translate(context.Background(), Session{}, tc.sql)
+			if err != nil {
+				t.Fatalf("Translate() error = %v", err)
+			}
+
+			if translated.BackendSQL != tc.want {
+				t.Fatalf("BackendSQL = %q, want %q", translated.BackendSQL, tc.want)
+			}
+		})
+	}
+}
+
 func TestRedshiftToPostgresRewritesRandToRandom(t *testing.T) {
 	tests := []struct {
 		name string
