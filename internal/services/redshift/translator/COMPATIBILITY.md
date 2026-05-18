@@ -187,7 +187,7 @@ devcloud の Redshift サービスは、`translator.RedshiftToPostgres` で Reds
 
 - [x] **R-only** `COPY <table> FROM 's3://...' IAM_ROLE ... [JSON 'auto'] [PARQUET]` — `sql_copy_unload.go`
 - [x] **R-only** `UNLOAD ('SELECT...') TO 's3://...' PARALLEL OFF ALLOWOVERWRITE` — `sql_copy_unload.go`
-- [ ] **R-only** `CREATE EXTERNAL FUNCTION ... LAMBDA 'arn:...'`
+- [x] **R-only** `CREATE EXTERNAL FUNCTION ... LAMBDA 'arn:...'`
 
 ---
 

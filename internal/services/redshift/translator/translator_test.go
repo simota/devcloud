@@ -341,6 +341,11 @@ func TestRedshiftToPostgresRewritesCreateExternalFunctionToNoop(t *testing.T) {
 			want: "select 1",
 		},
 		{
+			name: "lowercase create external function lambda",
+			sql:  "create external function f_lambda(integer) returns integer volatile lambda 'arn:aws:lambda:us-east-1:123456789012:function:redshift-fn'",
+			want: "select 1",
+		},
+		{
 			name: "create external function inside string literal is ignored",
 			sql:  "select 'CREATE EXTERNAL FUNCTION f_lambda(varchar) RETURNS varchar LAMBDA ''arn:aws:lambda:us-east-1:123456789012:function:redshift-fn''' as statement",
 			want: "select 'CREATE EXTERNAL FUNCTION f_lambda(varchar) RETURNS varchar LAMBDA ''arn:aws:lambda:us-east-1:123456789012:function:redshift-fn''' as statement",
