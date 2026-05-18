@@ -236,6 +236,19 @@ run_sql len            "select len('hello');"          "5"
 run_sql charindex      "select charindex('l','hello');"             "3"
 run_sql rand_in_range  "select rand() between 0 and 1;"             "t"
 run_sql round_neg      "select round(123.456::numeric, -1);"        "120"
+run_sql substring_pos  "select substring('abcdef', 2, 3);"          "bcd"
+run_sql split_part_neg "select split_part('a,b,c,d', ',', -1);"     "d"
+run_sql strtol_base2   "select strtol('1010', 2);"                  "10"
+run_sql crc32_basic    "select case when crc32('hello') is not null then 'ok' end;"  "ok"
+run_sql md5_digest_basic "select md5_digest('hello');"              "5d41402abc4b2a76b9719d911017c592"
+run_sql regexp_substr  "select regexp_substr('foo123 bar456', '[0-9]+', 1, 1);"   "123"
+run_sql regexp_count   "select regexp_count('aXbXcXd', 'X');"       "3"
+# TODO(translator): regexp_instr currently emits regexp_instr(...) verbatim,
+# which only exists in PostgreSQL 16+; add a regexp_matches/position-based
+# fallback so devcloud's managed PG (often older) accepts the call.
+# TODO(translator): func_sha1 emits encode(digest(...,'sha1'),'hex') which
+# requires the pgcrypto extension; either ensure CREATE EXTENSION pgcrypto
+# during managed PG init or substitute md5/sha256 with PG-native paths.
 
 log "==> date/time functions"
 run_sql dateadd_day    "select dateadd(day, 3, '2026-01-01'::date);" "2026-01-04"
@@ -245,6 +258,9 @@ run_sql last_day       "select last_day('2026-02-10'::date);" "2026-02-28"
 run_sql months_between "select months_between('2026-04-01'::date, '2026-01-01'::date);" "3"
 run_sql add_months     "select add_months('2026-01-31'::date, 1);" "2026-02-28"
 run_sql to_char_ts     "select to_char('2026-05-18 12:34:56'::timestamp, 'YYYY-MM-DD');" "2026-05-18"
+run_sql to_date_basic  "select to_date('20260101','YYYYMMDD');"     "2026-01-01"
+run_sql next_day_mon   "select next_day('2026-05-18'::date, 'monday');" "2026-05-25"
+run_sql date_part_dow  "select date_part('weekday', '2026-01-05'::date);" "1"
 
 log "==> aggregates"
 run_sql listagg        "select listagg(payload, ',') within group (order by ts) from e2e.events where tenant='acme';" "a,b"
@@ -260,6 +276,14 @@ run_sql like_escape    "select 'a_b' like 'a\\_b';" "t"
 log "==> JSON / PartiQL"
 run_sql json_parse_text "select json_extract_path_text('{\"k\":\"v\"}','k');" "v"
 run_sql json_arr_len   "select json_array_length('[1,2,3,4]');" "4"
+run_sql json_arr_elem  "select json_extract_array_element_text('[10,20,30]', 1);" "20"
+run_sql json_parse_obj "select json_parse('{\"k\":1}');" "k"
+# TODO(translator): is_valid_json emits json_valid() which is PG 16+ only;
+# rewrite to a PG-compat alternative (e.g. a TRY-style cast in plpgsql).
+
+log "==> SELECT ordering + LIKE escape"
+run_sql nulls_first_ord "select score from e2e.events order by score nulls first limit 1;"
+run_sql like_default_escape "select 'a_b' like 'a\\_b' escape '\\';" "t"
 
 log "==> DML"
 run_sql truncate_ok    "truncate table e2e.events;"
