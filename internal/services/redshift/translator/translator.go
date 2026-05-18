@@ -974,7 +974,92 @@ func rewriteLateBindingView(sql string) string {
 }
 
 func rewritePostgresCompatibility(sql string) string {
-	return rewriteRedshiftFunctions(rewriteRedshiftSystemTables(rewriteBeginTransactionModes(sql)))
+	return rewriteRedshiftFunctions(rewriteRedshiftSystemTables(rewriteBeginTransactionModes(rewriteResetCommand(sql))))
+}
+
+func rewriteResetCommand(sql string) string {
+	start := skipSpaces(sql, 0)
+	resetEnd, ok := matchKeywordSequence(sql, start, []string{"reset"})
+	if !ok {
+		return sql
+	}
+
+	targetStart := skipSpaces(sql, resetEnd)
+	target, targetEnd, ok := parseResetTarget(sql, targetStart)
+	if !ok {
+		return sql
+	}
+	next := skipSpaces(sql, targetEnd)
+	suffix := ""
+	if next < len(sql) {
+		if sql[next] != ';' || strings.TrimSpace(sql[next+1:]) != "" {
+			return sql
+		}
+		suffix = ";"
+	}
+
+	switch {
+	case strings.EqualFold(target, "all"):
+		return sql
+	case strings.EqualFold(target, "query_group"):
+		return sql[:start] + "RESET application_name" + suffix
+	case strings.Contains(target, "."):
+		return sql[:start] + "SELECT set_config(" + sqlStringLiteral(target) + ", NULL, false)" + suffix
+	default:
+		return sql
+	}
+}
+
+func parseResetTarget(sql string, index int) (string, int, bool) {
+	if end, ok := matchKeywordSequence(sql, index, []string{"all"}); ok {
+		return sql[index:end], end, true
+	}
+
+	var parts []string
+	next := index
+	for {
+		part, partEnd, ok := parseResetIdentifier(sql, next)
+		if !ok {
+			return "", index, false
+		}
+		parts = append(parts, part)
+		next = partEnd
+		if next >= len(sql) || sql[next] != '.' {
+			break
+		}
+		next++
+	}
+	return strings.Join(parts, "."), next, true
+}
+
+func parseResetIdentifier(sql string, index int) (string, int, bool) {
+	if index >= len(sql) {
+		return "", index, false
+	}
+	if sql[index] == '"' {
+		var out strings.Builder
+		for i := index + 1; i < len(sql); i++ {
+			if sql[i] != '"' {
+				out.WriteByte(sql[i])
+				continue
+			}
+			if i+1 < len(sql) && sql[i+1] == '"' {
+				out.WriteByte('"')
+				i++
+				continue
+			}
+			return out.String(), i + 1, true
+		}
+		return "", index, false
+	}
+	if !isIdentifierStart(sql[index]) {
+		return "", index, false
+	}
+	end := index + 1
+	for end < len(sql) && isIdentifierPart(sql[end]) {
+		end++
+	}
+	return strings.ToLower(sql[index:end]), end, true
 }
 
 func rewriteBeginTransactionModes(sql string) string {

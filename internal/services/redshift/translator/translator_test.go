@@ -65,6 +65,48 @@ func TestRedshiftToPostgresRewritesBeginTransactionModes(t *testing.T) {
 	}
 }
 
+func TestRedshiftToPostgresRewritesResetCommands(t *testing.T) {
+	tests := []struct {
+		name string
+		sql  string
+		want string
+	}{
+		{
+			name: "session context variable",
+			sql:  "RESET app_context.user_id;",
+			want: "SELECT set_config('app_context.user_id', NULL, false);",
+		},
+		{
+			name: "query group",
+			sql:  "reset query_group",
+			want: "RESET application_name",
+		},
+		{
+			name: "all is unchanged",
+			sql:  "RESET ALL;",
+			want: "RESET ALL;",
+		},
+		{
+			name: "reset inside string literal is ignored",
+			sql:  "select 'RESET app_context.user_id' as statement",
+			want: "select 'RESET app_context.user_id' as statement",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			translated, err := NewRedshiftToPostgres().Translate(context.Background(), Session{}, tc.sql)
+			if err != nil {
+				t.Fatalf("Translate() error = %v", err)
+			}
+
+			if translated.BackendSQL != tc.want {
+				t.Fatalf("BackendSQL = %q, want %q", translated.BackendSQL, tc.want)
+			}
+		})
+	}
+}
+
 func TestRedshiftToPostgresRewritesRandToRandom(t *testing.T) {
 	tests := []struct {
 		name string
