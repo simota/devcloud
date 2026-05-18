@@ -974,7 +974,53 @@ func rewriteLateBindingView(sql string) string {
 }
 
 func rewritePostgresCompatibility(sql string) string {
-	return rewriteRedshiftFunctions(rewriteRedshiftSystemTables(sql))
+	return rewriteRedshiftFunctions(rewriteRedshiftSystemTables(rewriteBeginTransactionModes(sql)))
+}
+
+func rewriteBeginTransactionModes(sql string) string {
+	start := skipSpaces(sql, 0)
+	beginEnd, ok := matchKeywordSequence(sql, start, []string{"begin"})
+	if !ok {
+		return sql
+	}
+
+	next := skipSpaces(sql, beginEnd)
+	readStart := next
+	readEnd, hasReadMode := matchBeginReadMode(sql, readStart)
+	if hasReadMode {
+		next = skipSpaces(sql, readEnd)
+	}
+
+	isolationStart := next
+	isolationEnd, hasIsolationMode := matchKeywordSequence(sql, isolationStart, []string{"isolation", "level", "serializable"})
+	if hasIsolationMode {
+		next = skipSpaces(sql, isolationEnd)
+	}
+	if !hasReadMode || !hasIsolationMode {
+		return sql
+	}
+
+	suffix := ""
+	if next < len(sql) {
+		if sql[next] != ';' || strings.TrimSpace(sql[next+1:]) != "" {
+			return sql
+		}
+		suffix = ";"
+	}
+
+	readMode := strings.TrimSpace(sql[readStart:readEnd])
+	isolationMode := strings.TrimSpace(sql[isolationStart:isolationEnd])
+	return sql[:start] + sql[start:beginEnd] + " " + readMode + ", " + isolationMode + suffix
+}
+
+func matchBeginReadMode(sql string, index int) (int, bool) {
+	if end, ok := matchKeywordSequence(sql, index, []string{"read", "only"}); ok {
+		return end, true
+	}
+	if end, ok := matchKeywordSequence(sql, index, []string{"read", "write"}); ok {
+		return end, true
+	}
+	return index, false
 }
 
 func rewriteRedshiftSystemTables(sql string) string {

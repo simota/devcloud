@@ -152,7 +152,7 @@ devcloud の Redshift サービスは、`translator.RedshiftToPostgres` で Reds
 
 ## 10. トランザクション / セッション
 
-- [ ] **R-only** `BEGIN [READ ONLY|READ WRITE] [ISOLATION LEVEL SERIALIZABLE]` — Redshift は SERIALIZABLE のみ
+- [x] **R-only** `BEGIN [READ ONLY|READ WRITE] [ISOLATION LEVEL SERIALIZABLE]` — Redshift は SERIALIZABLE のみ
 - [x] **same** `SET search_path` の有効範囲
 - [ ] **R≠P** `RESET` コマンドの一部挙動差
 - [ ] **P-only** `SAVEPOINT`

@@ -28,6 +28,43 @@ func TestRedshiftToPostgresRewritesNVLToCoalesce(t *testing.T) {
 	}
 }
 
+func TestRedshiftToPostgresRewritesBeginTransactionModes(t *testing.T) {
+	tests := []struct {
+		name string
+		sql  string
+		want string
+	}{
+		{
+			name: "read only serializable",
+			sql:  "BEGIN READ ONLY ISOLATION LEVEL SERIALIZABLE;",
+			want: "BEGIN READ ONLY, ISOLATION LEVEL SERIALIZABLE;",
+		},
+		{
+			name: "read write serializable",
+			sql:  "begin read write isolation level serializable",
+			want: "begin read write, isolation level serializable",
+		},
+		{
+			name: "begin inside string literal is ignored",
+			sql:  "select 'BEGIN READ ONLY ISOLATION LEVEL SERIALIZABLE' as statement",
+			want: "select 'BEGIN READ ONLY ISOLATION LEVEL SERIALIZABLE' as statement",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			translated, err := NewRedshiftToPostgres().Translate(context.Background(), Session{}, tc.sql)
+			if err != nil {
+				t.Fatalf("Translate() error = %v", err)
+			}
+
+			if translated.BackendSQL != tc.want {
+				t.Fatalf("BackendSQL = %q, want %q", translated.BackendSQL, tc.want)
+			}
+		})
+	}
+}
+
 func TestRedshiftToPostgresRewritesRandToRandom(t *testing.T) {
 	tests := []struct {
 		name string
