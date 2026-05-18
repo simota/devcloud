@@ -73,7 +73,7 @@ devcloud の Redshift サービスは、`translator.RedshiftToPostgres` で Reds
 - [x] **R-only** `LISTAGG(expr, sep) WITHIN GROUP (ORDER BY ...)` → `string_agg(expr, sep ORDER BY ...)`
 - [x] **R-only** `MEDIAN(col)` → `percentile_cont(0.5) WITHIN GROUP (ORDER BY col)`
 - [x] **R-only** `RATIO_TO_REPORT(col) OVER (...)` → `col / SUM(col) OVER (...)`
-- [x] **R-only** `LATERAL` の制限 — PG はフル LATERAL
+- [x] **R-only** `LATERAL` column aliases — select-list 内 alias 参照（`LATERAL` JOIN キーワード自体は PG と等価で無加工）
 - [x] **R≠P** `NULLS FIRST/LAST` 既定の差（実際は同じだが要確認）
 - [x] **R≠P** `BIT_AND/BIT_OR(boolean)` 集約 → PG `bool_and/bool_or`
 - [x] **R≠P** `LISTAGG` の Window 形 — PG `string_agg` は Window 非対応、要 workaround
@@ -187,7 +187,6 @@ devcloud の Redshift サービスは、`translator.RedshiftToPostgres` で Reds
 
 - [x] **R-only** `COPY <table> FROM 's3://...' IAM_ROLE ... [JSON 'auto'] [PARQUET]` — `sql_copy_unload.go`
 - [x] **R-only** `UNLOAD ('SELECT...') TO 's3://...' PARALLEL OFF ALLOWOVERWRITE` — `sql_copy_unload.go`
-- [x] **R-only** `CREATE EXTERNAL FUNCTION ... LAMBDA 'arn:...'`
 
 ---
 
