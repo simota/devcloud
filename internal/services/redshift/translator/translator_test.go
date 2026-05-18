@@ -475,6 +475,43 @@ func TestRedshiftToPostgresRewritesDecodeToCase(t *testing.T) {
 	}
 }
 
+func TestRedshiftToPostgresRewritesGreatestLeastToIgnoreNulls(t *testing.T) {
+	tests := []struct {
+		name string
+		sql  string
+		want string
+	}{
+		{
+			name: "greatest",
+			sql:  "select greatest(score_a, score_b, score_c) as best_score from events",
+			want: "select (select max(greatest_value) from (values (score_a), (score_b), (score_c)) as redshift_greatest_values(greatest_value)) as best_score from events",
+		},
+		{
+			name: "least",
+			sql:  "select LEAST(score_a, score_b, 0) as worst_score from events",
+			want: "select (select min(least_value) from (values (score_a), (score_b), (0)) as redshift_least_values(least_value)) as worst_score from events",
+		},
+		{
+			name: "greatest and least inside string literal are ignored",
+			sql:  "select 'greatest(score_a, score_b), least(score_a, score_b)' as label, GREATEST(score_a, score_b) as best_score from events",
+			want: "select 'greatest(score_a, score_b), least(score_a, score_b)' as label, (select max(greatest_value) from (values (score_a), (score_b)) as redshift_greatest_values(greatest_value)) as best_score from events",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			translated, err := NewRedshiftToPostgres().Translate(context.Background(), Session{}, tc.sql)
+			if err != nil {
+				t.Fatalf("Translate() error = %v", err)
+			}
+
+			if translated.BackendSQL != tc.want {
+				t.Fatalf("BackendSQL = %q, want %q", translated.BackendSQL, tc.want)
+			}
+		})
+	}
+}
+
 func TestRedshiftToPostgresRewritesDateAddAndDateDiff(t *testing.T) {
 	translated, err := NewRedshiftToPostgres().Translate(context.Background(), Session{}, "select dateadd(day, 7, created_at) as expires_at, datediff(hour, started_at, ended_at) as hours from events")
 	if err != nil {

@@ -636,6 +636,18 @@ func rewriteRedshiftFunctions(sql string) string {
 					i = next
 					continue
 				}
+			case "greatest":
+				if rewritten, next, ok := rewriteParenFunction(sql, i, rewriteGreatest); ok {
+					out.WriteString(rewritten)
+					i = next
+					continue
+				}
+			case "least":
+				if rewritten, next, ok := rewriteParenFunction(sql, i, rewriteLeast); ok {
+					out.WriteString(rewritten)
+					i = next
+					continue
+				}
 			case "dateadd":
 				if rewritten, next, ok := rewriteParenFunction(sql, i, rewriteDateAdd); ok {
 					out.WriteString(rewritten)
@@ -968,6 +980,29 @@ func rewriteDecode(args []string) (string, bool) {
 	}
 	out.WriteString(" END")
 	return out.String(), true
+}
+
+func rewriteGreatest(args []string) (string, bool) {
+	return rewriteNullIgnoringExtremum("max", "greatest_value", args)
+}
+
+func rewriteLeast(args []string) (string, bool) {
+	return rewriteNullIgnoringExtremum("min", "least_value", args)
+}
+
+func rewriteNullIgnoringExtremum(aggregate string, column string, args []string) (string, bool) {
+	if len(args) == 0 {
+		return "", false
+	}
+	values := make([]string, 0, len(args))
+	for _, arg := range args {
+		value := strings.TrimSpace(arg)
+		if value == "" {
+			return "", false
+		}
+		values = append(values, "("+value+")")
+	}
+	return "(select " + aggregate + "(" + column + ") from (values " + strings.Join(values, ", ") + ") as redshift_" + column + "s(" + column + "))", true
 }
 
 func rewriteNVL2(args []string) (string, bool) {
