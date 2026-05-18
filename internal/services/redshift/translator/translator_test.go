@@ -193,6 +193,43 @@ func TestRedshiftToPostgresRewritesDigestFunctions(t *testing.T) {
 	}
 }
 
+func TestRedshiftToPostgresRewritesRegexpSubstr(t *testing.T) {
+	tests := []struct {
+		name string
+		sql  string
+		want string
+	}{
+		{
+			name: "first match",
+			sql:  "select regexp_substr(payload, '[0-9]+', 1, 1) as payload_match from events",
+			want: "select regexp_match(payload, '[0-9]+') as payload_match from events",
+		},
+		{
+			name: "later occurrence",
+			sql:  "select REGEXP_SUBSTR(payload, '[0-9]+', 3, 2) as payload_match from events",
+			want: "select (select regexp_substr_match from regexp_matches(substring(payload from 3), '[0-9]+', 'g') with ordinality as regexp_substr_matches(regexp_substr_match, regexp_substr_ordinality) where regexp_substr_ordinality = 2) as payload_match from events",
+		},
+		{
+			name: "regexp_substr inside string literal is ignored",
+			sql:  "select 'regexp_substr(payload, ''[0-9]+'', 1, 1)' as label, REGEXP_SUBSTR(trim(payload), pattern, start_pos, occurrence) as payload_match from events",
+			want: "select 'regexp_substr(payload, ''[0-9]+'', 1, 1)' as label, (select regexp_substr_match from regexp_matches(substring(trim(payload) from start_pos), pattern, 'g') with ordinality as regexp_substr_matches(regexp_substr_match, regexp_substr_ordinality) where regexp_substr_ordinality = occurrence) as payload_match from events",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			translated, err := NewRedshiftToPostgres().Translate(context.Background(), Session{}, tc.sql)
+			if err != nil {
+				t.Fatalf("Translate() error = %v", err)
+			}
+
+			if translated.BackendSQL != tc.want {
+				t.Fatalf("BackendSQL = %q, want %q", translated.BackendSQL, tc.want)
+			}
+		})
+	}
+}
+
 func TestRedshiftToPostgresDoesNotRewriteFunctionsInsideStringLiterals(t *testing.T) {
 	translated, err := NewRedshiftToPostgres().Translate(context.Background(), Session{}, `select 'getdate() sysdate nvl(a,b)' as literal, "nvl" as quoted_name, getdate() as now`)
 	if err != nil {

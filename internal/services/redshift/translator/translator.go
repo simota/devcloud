@@ -588,6 +588,12 @@ func rewriteRedshiftFunctions(sql string) string {
 					i = next
 					continue
 				}
+			case "regexp_substr":
+				if rewritten, next, ok := rewriteParenFunction(sql, i, rewriteRegexpSubstr); ok {
+					out.WriteString(rewritten)
+					i = next
+					continue
+				}
 			case "decode":
 				if rewritten, next, ok := rewriteParenFunction(sql, i, rewriteDecode); ok {
 					out.WriteString(rewritten)
@@ -1001,6 +1007,23 @@ func rewriteFuncSHA1(args []string) (string, bool) {
 		return "", false
 	}
 	return "encode(digest((" + value + ")::text, 'sha1'), 'hex')", true
+}
+
+func rewriteRegexpSubstr(args []string) (string, bool) {
+	if len(args) != 4 {
+		return "", false
+	}
+	value := strings.TrimSpace(args[0])
+	pattern := strings.TrimSpace(args[1])
+	start := strings.TrimSpace(args[2])
+	occurrence := strings.TrimSpace(args[3])
+	if value == "" || pattern == "" || start == "" || occurrence == "" {
+		return "", false
+	}
+	if start == "1" && occurrence == "1" {
+		return "regexp_match(" + value + ", " + pattern + ")", true
+	}
+	return "(select regexp_substr_match from regexp_matches(substring(" + value + " from " + start + "), " + pattern + ", 'g') with ordinality as regexp_substr_matches(regexp_substr_match, regexp_substr_ordinality) where regexp_substr_ordinality = " + occurrence + ")", true
 }
 
 func rewriteDateAdd(args []string) (string, bool) {
