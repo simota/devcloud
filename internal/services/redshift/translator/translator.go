@@ -570,6 +570,12 @@ func rewriteRedshiftFunctions(sql string) string {
 					i = next
 					continue
 				}
+			case "crc32":
+				if rewritten, next, ok := rewriteParenFunction(sql, i, rewriteCRC32); ok {
+					out.WriteString(rewritten)
+					i = next
+					continue
+				}
 			case "decode":
 				if rewritten, next, ok := rewriteParenFunction(sql, i, rewriteDecode); ok {
 					out.WriteString(rewritten)
@@ -945,6 +951,22 @@ func rewriteStrtol(args []string) (string, bool) {
 
 	normalized := "regexp_replace(trim(" + value + "), '^[+-]', '')"
 	return "(select (case when left(trim(" + value + "), 1) = '-' then -1 else 1 end) * coalesce(sum((strpos('0123456789abcdefghijklmnopqrstuvwxyz', digit) - 1)::numeric * power((" + base + ")::numeric, (length(" + normalized + ") - ordinality)::numeric)), 0)::bigint from regexp_split_to_table(lower(" + normalized + "), '') with ordinality as strtol_digits(digit, ordinality))", true
+}
+
+func rewriteCRC32(args []string) (string, bool) {
+	if len(args) != 1 {
+		return "", false
+	}
+	value := strings.TrimSpace(args[0])
+	if value == "" {
+		return "", false
+	}
+
+	seed := "4294967295"
+	polynomial := "3988292384"
+	crcInput := "(case when step % 8 = 0 then crc # get_byte(data, step / 8) else crc end)"
+	crcStep := "(case when (" + crcInput + " & 1) = 1 then ((" + crcInput + " >> 1) # " + polynomial + ") else (" + crcInput + " >> 1) end)"
+	return "(with recursive crc32_input(data) as (select convert_to((" + value + ")::text, 'UTF8')), crc32_state(step, crc) as (select 0, " + seed + "::bigint union all select step + 1, " + crcStep + " from crc32_state, crc32_input where step < length(data) * 8) select case when data is null then null else (crc # " + seed + ")::bigint end from crc32_state, crc32_input order by step desc limit 1)", true
 }
 
 func rewriteDateAdd(args []string) (string, bool) {

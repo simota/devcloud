@@ -124,6 +124,38 @@ func TestRedshiftToPostgresRewritesStrtol(t *testing.T) {
 	}
 }
 
+func TestRedshiftToPostgresRewritesCRC32(t *testing.T) {
+	tests := []struct {
+		name string
+		sql  string
+		want string
+	}{
+		{
+			name: "crc32",
+			sql:  "select crc32(payload) as payload_crc from events",
+			want: "select (with recursive crc32_input(data) as (select convert_to((payload)::text, 'UTF8')), crc32_state(step, crc) as (select 0, 4294967295::bigint union all select step + 1, (case when ((case when step % 8 = 0 then crc # get_byte(data, step / 8) else crc end) & 1) = 1 then (((case when step % 8 = 0 then crc # get_byte(data, step / 8) else crc end) >> 1) # 3988292384) else ((case when step % 8 = 0 then crc # get_byte(data, step / 8) else crc end) >> 1) end) from crc32_state, crc32_input where step < length(data) * 8) select case when data is null then null else (crc # 4294967295)::bigint end from crc32_state, crc32_input order by step desc limit 1) as payload_crc from events",
+		},
+		{
+			name: "crc32 inside string literal is ignored",
+			sql:  "select 'crc32(payload)' as label, CRC32(trim(payload)) as payload_crc from events",
+			want: "select 'crc32(payload)' as label, (with recursive crc32_input(data) as (select convert_to((trim(payload))::text, 'UTF8')), crc32_state(step, crc) as (select 0, 4294967295::bigint union all select step + 1, (case when ((case when step % 8 = 0 then crc # get_byte(data, step / 8) else crc end) & 1) = 1 then (((case when step % 8 = 0 then crc # get_byte(data, step / 8) else crc end) >> 1) # 3988292384) else ((case when step % 8 = 0 then crc # get_byte(data, step / 8) else crc end) >> 1) end) from crc32_state, crc32_input where step < length(data) * 8) select case when data is null then null else (crc # 4294967295)::bigint end from crc32_state, crc32_input order by step desc limit 1) as payload_crc from events",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			translated, err := NewRedshiftToPostgres().Translate(context.Background(), Session{}, tc.sql)
+			if err != nil {
+				t.Fatalf("Translate() error = %v", err)
+			}
+
+			if translated.BackendSQL != tc.want {
+				t.Fatalf("BackendSQL = %q, want %q", translated.BackendSQL, tc.want)
+			}
+		})
+	}
+}
+
 func TestRedshiftToPostgresDoesNotRewriteFunctionsInsideStringLiterals(t *testing.T) {
 	translated, err := NewRedshiftToPostgres().Translate(context.Background(), Session{}, `select 'getdate() sysdate nvl(a,b)' as literal, "nvl" as quoted_name, getdate() as now`)
 	if err != nil {
