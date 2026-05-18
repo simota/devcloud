@@ -262,6 +262,43 @@ func TestRedshiftToPostgresRewritesRegexpCount(t *testing.T) {
 	}
 }
 
+func TestRedshiftToPostgresRewritesRegexpInstr(t *testing.T) {
+	tests := []struct {
+		name string
+		sql  string
+		want string
+	}{
+		{
+			name: "regexp instr",
+			sql:  "select REGEXP_INSTR(payload, '[0-9]+', 1, 2, 0, 'i') as number_position from events",
+			want: "select regexp_instr(payload, '[0-9]+', 1, 2, 0, 'i') as number_position from events",
+		},
+		{
+			name: "subexpression parameter",
+			sql:  "select REGEXP_INSTR(payload, '([0-9]+)', 1, 1, 0, 'ie') as number_position from events",
+			want: "select regexp_instr(payload, '([0-9]+)', 1, 1, 0, 'i', 1) as number_position from events",
+		},
+		{
+			name: "regexp_instr inside string literal is ignored",
+			sql:  "select 'regexp_instr(payload, ''[0-9]+'')' as label, REGEXP_INSTR(trim(payload), pattern) as number_position from events",
+			want: "select 'regexp_instr(payload, ''[0-9]+'')' as label, regexp_instr(trim(payload), pattern) as number_position from events",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			translated, err := NewRedshiftToPostgres().Translate(context.Background(), Session{}, tc.sql)
+			if err != nil {
+				t.Fatalf("Translate() error = %v", err)
+			}
+
+			if translated.BackendSQL != tc.want {
+				t.Fatalf("BackendSQL = %q, want %q", translated.BackendSQL, tc.want)
+			}
+		})
+	}
+}
+
 func TestRedshiftToPostgresDoesNotRewriteFunctionsInsideStringLiterals(t *testing.T) {
 	translated, err := NewRedshiftToPostgres().Translate(context.Background(), Session{}, `select 'getdate() sysdate nvl(a,b)' as literal, "nvl" as quoted_name, getdate() as now`)
 	if err != nil {

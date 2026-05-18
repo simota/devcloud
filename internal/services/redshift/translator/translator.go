@@ -600,6 +600,12 @@ func rewriteRedshiftFunctions(sql string) string {
 					i = next
 					continue
 				}
+			case "regexp_instr":
+				if rewritten, next, ok := rewriteParenFunction(sql, i, rewriteRegexpInstr); ok {
+					out.WriteString(rewritten)
+					i = next
+					continue
+				}
 			case "decode":
 				if rewritten, next, ok := rewriteParenFunction(sql, i, rewriteDecode); ok {
 					out.WriteString(rewritten)
@@ -1042,6 +1048,34 @@ func rewriteRegexpCount(args []string) (string, bool) {
 		return "", false
 	}
 	return "(case when " + value + " is null or " + pattern + " is null then null else (select count(*)::int from regexp_matches(" + value + ", " + pattern + ", 'g')) end)", true
+}
+
+func rewriteRegexpInstr(args []string) (string, bool) {
+	if len(args) < 2 || len(args) > 6 {
+		return "", false
+	}
+	rewrittenArgs := make([]string, 0, len(args)+1)
+	for _, arg := range args {
+		trimmed := strings.TrimSpace(arg)
+		if trimmed == "" {
+			return "", false
+		}
+		rewrittenArgs = append(rewrittenArgs, trimmed)
+	}
+	if len(rewrittenArgs) == 6 {
+		parameters, ok := sqlStringLiteralValue(rewrittenArgs[5])
+		if ok && strings.ContainsAny(parameters, "eE") {
+			pgParameters := strings.Map(func(ch rune) rune {
+				if ch == 'e' || ch == 'E' {
+					return -1
+				}
+				return ch
+			}, parameters)
+			rewrittenArgs[5] = sqlStringLiteral(pgParameters)
+			rewrittenArgs = append(rewrittenArgs, "1")
+		}
+	}
+	return "regexp_instr(" + strings.Join(rewrittenArgs, ", ") + ")", true
 }
 
 func rewriteDateAdd(args []string) (string, bool) {
