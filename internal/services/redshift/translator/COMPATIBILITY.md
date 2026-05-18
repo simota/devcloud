@@ -134,7 +134,7 @@ devcloud の Redshift サービスは、`translator.RedshiftToPostgres` で Reds
 - [x] **R-only** `JSON_ARRAY_LENGTH(json)` → `jsonb_array_length(json::jsonb)`
 - [x] **R-only** `JSON_PARSE(text)` → `text::jsonb`
 - [x] **R-only** `OBJECT_TRANSFORM(super_value, ...)` — PG に同等なし
-- [ ] **R-only** `IS_VALID_JSON` / `IS_VALID_JSON_ARRAY` — PG 16+ `json_valid()`
+- [x] **R-only** `IS_VALID_JSON` / `IS_VALID_JSON_ARRAY` — PG 16+ `json_valid()`
 - [ ] **R-only** PartiQL ドット記法 (`super_col.key.subkey`) / 添字 (`super_col[0]`) → PG `->`, `->>`
 
 ---

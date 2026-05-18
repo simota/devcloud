@@ -678,6 +678,18 @@ func rewriteRedshiftFunctions(sql string) string {
 					i = next
 					continue
 				}
+			case "is_valid_json":
+				if rewritten, next, ok := rewriteParenFunction(sql, i, rewriteIsValidJSON); ok {
+					out.WriteString(rewritten)
+					i = next
+					continue
+				}
+			case "is_valid_json_array":
+				if rewritten, next, ok := rewriteParenFunction(sql, i, rewriteIsValidJSONArray); ok {
+					out.WriteString(rewritten)
+					i = next
+					continue
+				}
 			case "object_transform":
 				if rewritten, next, ok := rewriteObjectTransformCall(sql, i); ok {
 					out.WriteString(rewritten)
@@ -1110,6 +1122,29 @@ func rewriteJSONParse(args []string) (string, bool) {
 		return "", false
 	}
 	return "(" + value + ")::jsonb", true
+}
+
+func rewriteIsValidJSON(args []string) (string, bool) {
+	if len(args) != 1 {
+		return "", false
+	}
+	value := strings.TrimSpace(args[0])
+	if value == "" {
+		return "", false
+	}
+	return "coalesce(json_valid((" + value + ")::text), false)", true
+}
+
+func rewriteIsValidJSONArray(args []string) (string, bool) {
+	if len(args) != 1 {
+		return "", false
+	}
+	value := strings.TrimSpace(args[0])
+	if value == "" {
+		return "", false
+	}
+	validJSON := "coalesce(json_valid((" + value + ")::text), false)"
+	return "(case when " + validJSON + " then jsonb_typeof((" + value + ")::jsonb) = 'array' else false end)", true
 }
 
 func rewriteObjectTransformCall(sql string, index int) (string, int, bool) {

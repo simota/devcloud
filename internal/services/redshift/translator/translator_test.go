@@ -682,6 +682,43 @@ func TestRedshiftToPostgresRewritesJSONParse(t *testing.T) {
 	}
 }
 
+func TestRedshiftToPostgresRewritesIsValidJSON(t *testing.T) {
+	tests := []struct {
+		name string
+		sql  string
+		want string
+	}{
+		{
+			name: "valid json",
+			sql:  "select is_valid_json(payload) as payload_is_json from events",
+			want: "select coalesce(json_valid((payload)::text), false) as payload_is_json from events",
+		},
+		{
+			name: "valid json array",
+			sql:  "select IS_VALID_JSON_ARRAY(payload) as payload_is_json_array from events",
+			want: "select (case when coalesce(json_valid((payload)::text), false) then jsonb_typeof((payload)::jsonb) = 'array' else false end) as payload_is_json_array from events",
+		},
+		{
+			name: "is_valid_json inside string literal is ignored",
+			sql:  "select 'is_valid_json(payload)' as label, IS_VALID_JSON(trim(payload)) as payload_is_json from events",
+			want: "select 'is_valid_json(payload)' as label, coalesce(json_valid((trim(payload))::text), false) as payload_is_json from events",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			translated, err := NewRedshiftToPostgres().Translate(context.Background(), Session{}, tc.sql)
+			if err != nil {
+				t.Fatalf("Translate() error = %v", err)
+			}
+
+			if translated.BackendSQL != tc.want {
+				t.Fatalf("BackendSQL = %q, want %q", translated.BackendSQL, tc.want)
+			}
+		})
+	}
+}
+
 func TestRedshiftToPostgresRewritesObjectTransform(t *testing.T) {
 	tests := []struct {
 		name string
