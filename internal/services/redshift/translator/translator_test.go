@@ -223,6 +223,43 @@ func TestRedshiftToPostgresRewritesCreateProcedureArgumentModes(t *testing.T) {
 	}
 }
 
+func TestRedshiftToPostgresRewritesCreateFunctionPLPythonLanguage(t *testing.T) {
+	tests := []struct {
+		name string
+		sql  string
+		want string
+	}{
+		{
+			name: "python udf language",
+			sql:  "CREATE FUNCTION f_py(x int) RETURNS int IMMUTABLE AS $$ return x + 1 $$ LANGUAGE plpythonu;",
+			want: "CREATE FUNCTION f_py(x int) RETURNS int IMMUTABLE AS $$ return x + 1 $$ LANGUAGE plpython3u;",
+		},
+		{
+			name: "or replace python udf language with body mention",
+			sql:  "create or replace function f_py(x int) returns int stable as $$ label = 'LANGUAGE plpythonu'; return x $$ language PLPYTHONU",
+			want: "create or replace function f_py(x int) returns int stable as $$ label = 'LANGUAGE plpythonu'; return x $$ language plpython3u",
+		},
+		{
+			name: "create function inside string literal is ignored",
+			sql:  "select 'CREATE FUNCTION f_py(x int) RETURNS int AS $$ return x $$ LANGUAGE plpythonu' as statement",
+			want: "select 'CREATE FUNCTION f_py(x int) RETURNS int AS $$ return x $$ LANGUAGE plpythonu' as statement",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			translated, err := NewRedshiftToPostgres().Translate(context.Background(), Session{}, tc.sql)
+			if err != nil {
+				t.Fatalf("Translate() error = %v", err)
+			}
+
+			if translated.BackendSQL != tc.want {
+				t.Fatalf("BackendSQL = %q, want %q", translated.BackendSQL, tc.want)
+			}
+		})
+	}
+}
+
 func TestRedshiftToPostgresRewritesDatashareStatementsToNoop(t *testing.T) {
 	tests := []struct {
 		name string

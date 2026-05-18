@@ -990,7 +990,123 @@ func rewriteLateBindingView(sql string) string {
 }
 
 func rewritePostgresCompatibility(sql string) string {
-	return rewriteRedshiftFunctions(rewriteRedshiftSystemTables(rewriteBeginTransactionModes(rewriteResetCommand(rewriteCreateProcedureArgumentModes(rewriteCreateUserPasswordClauses(sql))))))
+	return rewriteRedshiftFunctions(rewriteRedshiftSystemTables(rewriteBeginTransactionModes(rewriteResetCommand(rewriteCreateProcedureArgumentModes(rewriteCreateFunctionPLPythonLanguage(rewriteCreateUserPasswordClauses(sql)))))))
+}
+
+func rewriteCreateFunctionPLPythonLanguage(sql string) string {
+	start := skipSpaces(sql, 0)
+	functionEnd, ok := matchKeywordSequence(sql, start, []string{"create", "or", "replace", "function"})
+	if !ok {
+		functionEnd, ok = matchKeywordSequence(sql, start, []string{"create", "function"})
+	}
+	if !ok {
+		return sql
+	}
+
+	languageStart, languageEnd := findCreateFunctionLanguage(sql, functionEnd)
+	if languageStart < 0 {
+		return sql
+	}
+	languageNameStart := skipSpaces(sql, languageEnd)
+	languageName, languageNameEnd, ok := readSQLIdentifier(sql, languageNameStart)
+	if !ok || !strings.EqualFold(languageName, "plpythonu") {
+		return sql
+	}
+	return sql[:languageNameStart] + "plpython3u" + sql[languageNameEnd:]
+}
+
+func findCreateFunctionLanguage(sql string, start int) (int, int) {
+	depth := 0
+	for i := start; i < len(sql); {
+		switch sql[i] {
+		case '\'':
+			var quoted strings.Builder
+			i = copyQuotedString(&quoted, sql, i)
+			continue
+		case '"':
+			var quoted strings.Builder
+			i = copyQuotedIdentifier(&quoted, sql, i)
+			continue
+		case '$':
+			if next, ok := skipDollarQuotedString(sql, i); ok {
+				i = next
+				continue
+			}
+		case '-':
+			if i+1 < len(sql) && sql[i+1] == '-' {
+				i = skipLineComment(sql, i+2)
+				continue
+			}
+		case '/':
+			if i+1 < len(sql) && sql[i+1] == '*' {
+				i = skipBlockComment(sql, i+2)
+				continue
+			}
+		case '(':
+			depth++
+			i++
+			continue
+		case ')':
+			if depth > 0 {
+				depth--
+			}
+			i++
+			continue
+		}
+		if depth == 0 {
+			if end, ok := matchKeywordSequence(sql, i, []string{"language"}); ok {
+				return i, end
+			}
+		}
+		i++
+	}
+	return -1, -1
+}
+
+func readSQLIdentifier(sql string, index int) (string, int, bool) {
+	if index >= len(sql) || !isIdentifierStart(sql[index]) {
+		return "", index, false
+	}
+	start := index
+	index++
+	for index < len(sql) && isIdentifierPart(sql[index]) {
+		index++
+	}
+	return sql[start:index], index, true
+}
+
+func skipDollarQuotedString(sql string, start int) (int, bool) {
+	if start >= len(sql) || sql[start] != '$' {
+		return start, false
+	}
+	endTag := start + 1
+	for endTag < len(sql) && isIdentifierPart(sql[endTag]) {
+		endTag++
+	}
+	if endTag >= len(sql) || sql[endTag] != '$' {
+		return start, false
+	}
+	tag := sql[start : endTag+1]
+	close := strings.Index(sql[endTag+1:], tag)
+	if close < 0 {
+		return len(sql), true
+	}
+	return endTag + 1 + close + len(tag), true
+}
+
+func skipLineComment(sql string, start int) int {
+	for start < len(sql) && sql[start] != '\n' {
+		start++
+	}
+	return start
+}
+
+func skipBlockComment(sql string, start int) int {
+	close := strings.Index(sql[start:], "*/")
+	if close < 0 {
+		return len(sql)
+	}
+	return start + close + len("*/")
 }
 
 func rewriteCreateProcedureArgumentModes(sql string) string {
