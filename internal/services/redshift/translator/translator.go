@@ -1019,7 +1019,7 @@ func rewriteRedshiftSystemTables(sql string) string {
 
 func rewriteRedshiftSystemTableReference(sql string, index int) (string, int, bool) {
 	_, referenceEnd, tableName, ok := readRelationIdentifier(sql, index)
-	if !ok || !strings.HasPrefix(strings.ToLower(tableName), "stv_") {
+	if !ok || !isRedshiftReadOnlySystemTable(tableName) {
 		return "", index, false
 	}
 	afterReferenceSpaces := skipSpaces(sql, referenceEnd)
@@ -1039,6 +1039,11 @@ func rewriteRedshiftSystemTableReference(sql string, index int) (string, int, bo
 	}
 
 	return postgresRedshiftSystemTableStub() + " as " + alias, next, true
+}
+
+func isRedshiftReadOnlySystemTable(tableName string) bool {
+	normalized := strings.ToLower(tableName)
+	return strings.HasPrefix(normalized, "stv_") || strings.HasPrefix(normalized, "stl_")
 }
 
 func readRelationIdentifier(sql string, index int) (string, int, string, bool) {
