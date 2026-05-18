@@ -666,6 +666,12 @@ func rewriteRedshiftFunctions(sql string) string {
 					i = next
 					continue
 				}
+			case "json_array_length":
+				if rewritten, next, ok := rewriteParenFunction(sql, i, rewriteJSONArrayLength); ok {
+					out.WriteString(rewritten)
+					i = next
+					continue
+				}
 			case "dateadd":
 				if rewritten, next, ok := rewriteParenFunction(sql, i, rewriteDateAdd); ok {
 					out.WriteString(rewritten)
@@ -1070,6 +1076,17 @@ func rewriteJSONExtractArrayElementText(args []string) (string, bool) {
 		return "", false
 	}
 	return "((" + value + ")::jsonb -> " + index + ")::text", true
+}
+
+func rewriteJSONArrayLength(args []string) (string, bool) {
+	if len(args) != 1 {
+		return "", false
+	}
+	value := strings.TrimSpace(args[0])
+	if value == "" {
+		return "", false
+	}
+	return "jsonb_array_length((" + value + ")::jsonb)", true
 }
 
 func rewriteNVL2(args []string) (string, bool) {

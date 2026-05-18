@@ -618,6 +618,38 @@ func TestRedshiftToPostgresRewritesJSONExtractArrayElementText(t *testing.T) {
 	}
 }
 
+func TestRedshiftToPostgresRewritesJSONArrayLength(t *testing.T) {
+	tests := []struct {
+		name string
+		sql  string
+		want string
+	}{
+		{
+			name: "array length",
+			sql:  "select json_array_length(payload) as event_count from events",
+			want: "select jsonb_array_length((payload)::jsonb) as event_count from events",
+		},
+		{
+			name: "json_array_length inside string literal is ignored",
+			sql:  "select 'json_array_length(payload)' as label, JSON_ARRAY_LENGTH(trim(payload)) as event_count from events",
+			want: "select 'json_array_length(payload)' as label, jsonb_array_length((trim(payload))::jsonb) as event_count from events",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			translated, err := NewRedshiftToPostgres().Translate(context.Background(), Session{}, tc.sql)
+			if err != nil {
+				t.Fatalf("Translate() error = %v", err)
+			}
+
+			if translated.BackendSQL != tc.want {
+				t.Fatalf("BackendSQL = %q, want %q", translated.BackendSQL, tc.want)
+			}
+		})
+	}
+}
+
 func TestRedshiftToPostgresRewritesDateAddAndDateDiff(t *testing.T) {
 	translated, err := NewRedshiftToPostgres().Translate(context.Background(), Session{}, "select dateadd(day, 7, created_at) as expires_at, datediff(hour, started_at, ended_at) as hours from events")
 	if err != nil {
