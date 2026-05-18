@@ -361,6 +361,38 @@ func TestRedshiftToPostgresRewritesCreateExternalFunctionToNoop(t *testing.T) {
 	}
 }
 
+func TestRedshiftToPostgresRewritesExplainVerbose(t *testing.T) {
+	tests := []struct {
+		name string
+		sql  string
+		want string
+	}{
+		{
+			name: "verbose annotation option",
+			sql:  "EXPLAIN VERBOSE SELECT * FROM events;",
+			want: "EXPLAIN (VERBOSE) SELECT * FROM events;",
+		},
+		{
+			name: "explain inside string literal is ignored",
+			sql:  "select 'EXPLAIN VERBOSE SELECT * FROM events' as statement",
+			want: "select 'EXPLAIN VERBOSE SELECT * FROM events' as statement",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			translated, err := NewRedshiftToPostgres().Translate(context.Background(), Session{}, tc.sql)
+			if err != nil {
+				t.Fatalf("Translate() error = %v", err)
+			}
+
+			if translated.BackendSQL != tc.want {
+				t.Fatalf("BackendSQL = %q, want %q", translated.BackendSQL, tc.want)
+			}
+		})
+	}
+}
+
 func TestRedshiftToPostgresRewritesDatashareStatementsToNoop(t *testing.T) {
 	tests := []struct {
 		name string

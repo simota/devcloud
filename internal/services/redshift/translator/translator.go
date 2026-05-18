@@ -998,7 +998,21 @@ func rewriteLateBindingView(sql string) string {
 }
 
 func rewritePostgresCompatibility(sql string) string {
-	return rewriteRedshiftFunctions(rewriteRedshiftSystemTables(rewriteBeginTransactionModes(rewriteResetCommand(rewriteCreateProcedureArgumentModes(rewriteCreateFunctionSQLStable(rewriteCreateFunctionPLPythonLanguage(rewriteCreateUserPasswordClauses(sql))))))))
+	return rewriteRedshiftFunctions(rewriteRedshiftSystemTables(rewriteBeginTransactionModes(rewriteResetCommand(rewriteCreateProcedureArgumentModes(rewriteCreateFunctionSQLStable(rewriteCreateFunctionPLPythonLanguage(rewriteCreateUserPasswordClauses(rewriteExplainVerbose(sql)))))))))
+}
+
+func rewriteExplainVerbose(sql string) string {
+	start := skipSpaces(sql, 0)
+	explainEnd, ok := matchKeywordSequence(sql, start, []string{"explain"})
+	if !ok {
+		return sql
+	}
+	verboseStart := skipSpaces(sql, explainEnd)
+	verboseEnd, ok := matchKeywordSequence(sql, verboseStart, []string{"verbose"})
+	if !ok || strings.TrimSpace(sql[verboseEnd:]) == "" {
+		return sql
+	}
+	return sql[:explainEnd] + " (VERBOSE)" + sql[verboseEnd:]
 }
 
 func rewriteCreateFunctionPLPythonLanguage(sql string) string {
