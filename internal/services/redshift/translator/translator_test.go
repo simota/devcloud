@@ -2305,7 +2305,26 @@ func TestRedshiftToPostgresRewritesMergeIntoUpdateInsert(t *testing.T) {
 		{
 			name: "matched update and not matched insert",
 			sql:  "merge into analytics.events as target using staging.events as source on target.id = source.id when matched then update set payload = source.payload, updated_at = getdate() when not matched then insert (id, payload, updated_at) values (source.id, source.payload, getdate())",
-			want: "with updated as (update analytics.events as target set payload = source.payload, updated_at = CURRENT_TIMESTAMP from staging.events as source where target.id = source.id returning 1) insert into analytics.events (id, payload, updated_at) select source.id, source.payload, CURRENT_TIMESTAMP from staging.events as source where not exists (select 1 from analytics.events as target where target.id = source.id)",
+			want: "insert into analytics.events (id, payload, updated_at) select source.id, source.payload, CURRENT_TIMESTAMP from staging.events as source where not exists (select 1 from analytics.events as target where target.id = source.id); update analytics.events as target set payload = source.payload, updated_at = CURRENT_TIMESTAMP from staging.events as source where target.id = source.id",
+		},
+		{
+			// ON condition references the column that the UPDATE rewrites.
+			// With the old `with updated as (update ...) insert ... where not exists`
+			// rewrite, updating `k` to `k_new` could cause the post-UPDATE row to
+			// look "absent" to the NOT EXISTS check, risking a duplicate insert.
+			// Emitting INSERT first guarantees the membership check sees the
+			// pre-update state, so this class of MERGE remains correct.
+			name: "on clause references updated column",
+			sql:  "merge into target using source on target.k = source.k when matched then update set k = source.k_new when not matched then insert (k, v) values (source.k, source.v)",
+			want: "insert into target (k, v) select source.k, source.v from source where not exists (select 1 from target where target.k = source.k); update target set k = source.k_new from source where target.k = source.k",
+		},
+		{
+			// Uppercase / mixed-case MERGE keywords — exercises the
+			// case-insensitive keyword matcher and ensures the rewrite path
+			// does not depend on lower-cased input.
+			name: "uppercase merge keywords",
+			sql:  "MERGE INTO analytics.events AS target USING staging.events AS source ON target.id = source.id WHEN MATCHED THEN UPDATE SET payload = source.payload WHEN NOT MATCHED THEN INSERT (id, payload) VALUES (source.id, source.payload)",
+			want: "insert into analytics.events (id, payload) select source.id, source.payload from staging.events AS source where not exists (select 1 from analytics.events AS target where target.id = source.id); update analytics.events AS target set payload = source.payload from staging.events AS source where target.id = source.id",
 		},
 	}
 

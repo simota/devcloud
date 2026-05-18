@@ -3047,16 +3047,23 @@ func translateMergeInto(sql string) (TranslationResult, bool, error) {
 		return TranslationResult{BackendSQL: statement}, true, nil
 	}
 
-	backendSQL := "with updated as (update " + target +
-		" set " + updateAssignments +
-		" from " + source +
-		" where " + onCondition +
-		" returning 1) insert into " + insertTarget +
-		" " + insertColumns +
+	// Emit INSERT first, then UPDATE, as two semicolon-separated statements.
+	// Running INSERT before UPDATE guarantees that rows updated by the MATCHED
+	// branch are not re-evaluated by the NOT MATCHED branch's NOT EXISTS check
+	// — important when the UPDATE rewrites a column that participates in the
+	// ON condition. The single-CTE rewrite previously used here left an unused
+	// `with updated as (...)` CTE that PostgreSQL still executed for its side
+	// effects but obscured intent and could not be reasoned about in isolation.
+	insertStmt := "insert into " + insertTarget + " " + insertColumns +
 		" select " + insertValues +
 		" from " + source +
 		" where not exists (select 1 from " + target +
 		" where " + onCondition + ")"
+	updateStmt := "update " + target +
+		" set " + updateAssignments +
+		" from " + source +
+		" where " + onCondition
+	backendSQL := insertStmt + "; " + updateStmt
 	return TranslationResult{BackendSQL: backendSQL}, true, nil
 }
 
