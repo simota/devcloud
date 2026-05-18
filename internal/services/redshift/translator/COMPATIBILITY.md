@@ -130,7 +130,7 @@ devcloud の Redshift サービスは、`translator.RedshiftToPostgres` で Reds
 ## 8. JSON / SUPER
 
 - [x] **R≠P** `JSON_EXTRACT_PATH_TEXT(json, p1, p2, ..., [null_if_invalid])` — 第 N+1 引数 boolean の有無で型不一致
-- [ ] **R-only** `JSON_EXTRACT_ARRAY_ELEMENT_TEXT(json, idx)` → `(json::jsonb -> idx)::text`
+- [x] **R-only** `JSON_EXTRACT_ARRAY_ELEMENT_TEXT(json, idx)` → `(json::jsonb -> idx)::text`
 - [ ] **R-only** `JSON_ARRAY_LENGTH(json)` → `jsonb_array_length(json::jsonb)`
 - [ ] **R-only** `JSON_PARSE(text)` → `text::jsonb`
 - [ ] **R-only** `OBJECT_TRANSFORM(super_value, ...)` — PG に同等なし
