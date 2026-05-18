@@ -600,6 +600,12 @@ func rewriteRedshiftFunctions(sql string) string {
 					i = next
 					continue
 				}
+			case "add_months":
+				if rewritten, next, ok := rewriteParenFunction(sql, i, rewriteAddMonths); ok {
+					out.WriteString(rewritten)
+					i = next
+					continue
+				}
 			case "next_day":
 				if rewritten, next, ok := rewriteParenFunction(sql, i, rewriteNextDay); ok {
 					out.WriteString(rewritten)
@@ -988,6 +994,18 @@ func rewriteMonthsBetween(args []string) (string, bool) {
 		return "", false
 	}
 	return "(extract(year from age(" + end + ", " + start + ")) * 12 + extract(month from age(" + end + ", " + start + ")))", true
+}
+
+func rewriteAddMonths(args []string) (string, bool) {
+	if len(args) != 2 {
+		return "", false
+	}
+	value := strings.TrimSpace(args[0])
+	months := strings.TrimSpace(args[1])
+	if value == "" || months == "" {
+		return "", false
+	}
+	return value + " + (" + months + " * interval '1 month')", true
 }
 
 func rewriteNextDay(args []string) (string, bool) {

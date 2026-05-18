@@ -250,6 +250,38 @@ func TestRedshiftToPostgresRewritesMonthsBetween(t *testing.T) {
 	}
 }
 
+func TestRedshiftToPostgresRewritesAddMonths(t *testing.T) {
+	tests := []struct {
+		name string
+		sql  string
+		want string
+	}{
+		{
+			name: "add months",
+			sql:  "select add_months(created_at, 2) as renewal_at from events",
+			want: "select created_at + (2 * interval '1 month') as renewal_at from events",
+		},
+		{
+			name: "add months inside string literal is ignored",
+			sql:  "select 'add_months(created_at, 2)' as label, ADD_MONTHS(created_at::date, months_to_add) as renewal_at from events",
+			want: "select 'add_months(created_at, 2)' as label, created_at::date + (months_to_add * interval '1 month') as renewal_at from events",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			translated, err := NewRedshiftToPostgres().Translate(context.Background(), Session{}, tc.sql)
+			if err != nil {
+				t.Fatalf("Translate() error = %v", err)
+			}
+
+			if translated.BackendSQL != tc.want {
+				t.Fatalf("BackendSQL = %q, want %q", translated.BackendSQL, tc.want)
+			}
+		})
+	}
+}
+
 func TestRedshiftToPostgresRewritesNextDay(t *testing.T) {
 	tests := []struct {
 		name string
