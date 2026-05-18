@@ -624,6 +624,12 @@ func rewriteRedshiftFunctions(sql string) string {
 					i = next
 					continue
 				}
+			case "to_char":
+				if rewritten, next, ok := rewriteParenFunction(sql, i, rewriteToChar); ok {
+					out.WriteString(rewritten)
+					i = next
+					continue
+				}
 			case "listagg":
 				if rewritten, next, ok := rewriteListAgg(sql, i); ok {
 					out.WriteString(rewritten)
@@ -1069,6 +1075,25 @@ func rewriteToTimestamp(args []string) (string, bool) {
 	return rewriteDateTimeFormatFunction("to_timestamp", args)
 }
 
+func rewriteToChar(args []string) (string, bool) {
+	if len(args) != 2 {
+		return "", false
+	}
+	value := strings.TrimSpace(args[0])
+	if value == "" {
+		return "", false
+	}
+	format, ok := sqlStringLiteralValue(args[1])
+	if !ok {
+		return "", false
+	}
+	rewrittenFormat, ok := rewriteRedshiftToCharFormat(format)
+	if !ok {
+		return "", false
+	}
+	return "to_char(" + value + ", " + sqlStringLiteral(rewrittenFormat) + ")", true
+}
+
 func rewriteDateTimeFormatFunction(functionName string, args []string) (string, bool) {
 	if len(args) != 2 {
 		return "", false
@@ -1086,6 +1111,65 @@ func rewriteDateTimeFormatFunction(functionName string, args []string) (string, 
 		return "", false
 	}
 	return functionName + "(regexp_replace(" + value + ", '[[:space:]]*([[:alpha:]_/]+|[+-][0-9]{2}(:?[0-9]{2})?)$', ''), " + sqlStringLiteral(rewrittenFormat) + ")", true
+}
+
+func rewriteRedshiftToCharFormat(format string) (string, bool) {
+	var out strings.Builder
+	changed := false
+	for i := 0; i < len(format); {
+		if format[i] == '"' {
+			start := i
+			i++
+			for i < len(format) {
+				if format[i] == '\\' && i+1 < len(format) {
+					i += 2
+					continue
+				}
+				if format[i] == '"' {
+					i++
+					break
+				}
+				i++
+			}
+			out.WriteString(format[start:i])
+			continue
+		}
+		if hasFormatToken(format, i, "TZ") {
+			out.WriteString(`"UTC"`)
+			i += len("TZ")
+			changed = true
+			continue
+		}
+		if hasFormatToken(format, i, "tz") {
+			out.WriteString(`"utc"`)
+			i += len("tz")
+			changed = true
+			continue
+		}
+		if hasFormatToken(format, i, "OF") {
+			out.WriteString(`"+00"`)
+			i += len("OF")
+			changed = true
+			continue
+		}
+		out.WriteByte(format[i])
+		i++
+	}
+	if !changed {
+		return format, false
+	}
+	return out.String(), true
+}
+
+func hasFormatToken(format string, index int, token string) bool {
+	if index > 0 && isFormatLetter(format[index-1]) {
+		return false
+	}
+	if !strings.HasPrefix(format[index:], token) {
+		return false
+	}
+	end := index + len(token)
+	return end == len(format) || !isFormatLetter(format[end])
 }
 
 func removeTrailingRedshiftTimezoneFormat(format string) (string, bool) {

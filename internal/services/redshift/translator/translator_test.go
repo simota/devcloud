@@ -346,6 +346,38 @@ func TestRedshiftToPostgresRewritesToDateAndToTimestampTimezoneFormats(t *testin
 	}
 }
 
+func TestRedshiftToPostgresRewritesToCharTimezoneFormats(t *testing.T) {
+	tests := []struct {
+		name string
+		sql  string
+		want string
+	}{
+		{
+			name: "timezone abbreviation",
+			sql:  "select to_char(observed_at, 'YYYY-MM-DD HH24:MI:SS TZ') as observed_at_text from events",
+			want: `select to_char(observed_at, 'YYYY-MM-DD HH24:MI:SS "UTC"') as observed_at_text from events`,
+		},
+		{
+			name: "timezone offset inside string literal is ignored",
+			sql:  "select 'to_char(observed_at, ''YYYY-MM-DD OF'')' as label, TO_CHAR(observed_at, 'YYYY-MM-DD OF') as observed_at_text from events",
+			want: `select 'to_char(observed_at, ''YYYY-MM-DD OF'')' as label, to_char(observed_at, 'YYYY-MM-DD "+00"') as observed_at_text from events`,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			translated, err := NewRedshiftToPostgres().Translate(context.Background(), Session{}, tc.sql)
+			if err != nil {
+				t.Fatalf("Translate() error = %v", err)
+			}
+
+			if translated.BackendSQL != tc.want {
+				t.Fatalf("BackendSQL = %q, want %q", translated.BackendSQL, tc.want)
+			}
+		})
+	}
+}
+
 func TestRedshiftToPostgresRewritesListAggWithinGroup(t *testing.T) {
 	translated, err := NewRedshiftToPostgres().Translate(context.Background(), Session{}, "select listagg(name, ',') within group (order by created_at desc) as names from events")
 	if err != nil {

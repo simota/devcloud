@@ -97,7 +97,7 @@ devcloud の Redshift サービスは、`translator.RedshiftToPostgres` で Reds
 - [x] **R-only** `NEXT_DAY(date, dow_string)`
 - [x] **R-only** `ADD_MONTHS(date, n)` → `date + n * interval '1 month'`
 - [x] **R≠P** `TO_DATE` / `TO_TIMESTAMP` の書式コード差（`TZ` 等）
-- [ ] **R≠P** `TO_CHAR(ts, fmt)` の書式コード差
+- [x] **R≠P** `TO_CHAR(ts, fmt)` の書式コード差
 
 ---
 
