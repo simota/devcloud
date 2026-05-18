@@ -85,6 +85,38 @@ func TestRedshiftToPostgresRewritesDateAddAndDateDiff(t *testing.T) {
 	}
 }
 
+func TestRedshiftToPostgresRewritesTimeOfDay(t *testing.T) {
+	tests := []struct {
+		name string
+		sql  string
+		want string
+	}{
+		{
+			name: "timeofday",
+			sql:  "select timeofday() as current_time_text",
+			want: "select clock_timestamp()::text as current_time_text",
+		},
+		{
+			name: "timeofday inside string literal is ignored",
+			sql:  "select 'timeofday()' as label, TIMEOFDAY() as current_time_text",
+			want: "select 'timeofday()' as label, clock_timestamp()::text as current_time_text",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			translated, err := NewRedshiftToPostgres().Translate(context.Background(), Session{}, tc.sql)
+			if err != nil {
+				t.Fatalf("Translate() error = %v", err)
+			}
+
+			if translated.BackendSQL != tc.want {
+				t.Fatalf("BackendSQL = %q, want %q", translated.BackendSQL, tc.want)
+			}
+		})
+	}
+}
+
 func TestRedshiftToPostgresRewritesConvertTimezone(t *testing.T) {
 	tests := []struct {
 		name string
