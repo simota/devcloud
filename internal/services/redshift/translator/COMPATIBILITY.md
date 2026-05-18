@@ -109,7 +109,7 @@ devcloud の Redshift サービスは、`translator.RedshiftToPostgres` で Reds
 - [x] **R-only** `CRC32(text)` — PG に同等なし
 - [x] **R-only** `FUNC_SHA1` / `MD5_DIGEST` — PG は `md5()` のみ、SHA は拡張
 - [x] **R-only** `REGEXP_SUBSTR(s, pattern, start, occurrence)` → `regexp_match(s, pattern)` 配列返し
-- [ ] **R-only** `REGEXP_COUNT(s, pattern)`
+- [x] **R-only** `REGEXP_COUNT(s, pattern)`
 - [ ] **R-only** `REGEXP_INSTR(s, pattern, ...)`
 - [ ] **R≠P** `SPLIT_PART(s, sep, n)` 負数 n の挙動（PG 14+ で対応）
 - [ ] **R≠P** `SUBSTRING(s, start, len)` 負の `start` の扱い

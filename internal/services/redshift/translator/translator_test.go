@@ -230,6 +230,38 @@ func TestRedshiftToPostgresRewritesRegexpSubstr(t *testing.T) {
 	}
 }
 
+func TestRedshiftToPostgresRewritesRegexpCount(t *testing.T) {
+	tests := []struct {
+		name string
+		sql  string
+		want string
+	}{
+		{
+			name: "regexp count",
+			sql:  "select regexp_count(payload, '[0-9]+') as number_count from events",
+			want: "select (case when payload is null or '[0-9]+' is null then null else (select count(*)::int from regexp_matches(payload, '[0-9]+', 'g')) end) as number_count from events",
+		},
+		{
+			name: "regexp_count inside string literal is ignored",
+			sql:  "select 'regexp_count(payload, ''[0-9]+'')' as label, REGEXP_COUNT(trim(payload), pattern) as number_count from events",
+			want: "select 'regexp_count(payload, ''[0-9]+'')' as label, (case when trim(payload) is null or pattern is null then null else (select count(*)::int from regexp_matches(trim(payload), pattern, 'g')) end) as number_count from events",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			translated, err := NewRedshiftToPostgres().Translate(context.Background(), Session{}, tc.sql)
+			if err != nil {
+				t.Fatalf("Translate() error = %v", err)
+			}
+
+			if translated.BackendSQL != tc.want {
+				t.Fatalf("BackendSQL = %q, want %q", translated.BackendSQL, tc.want)
+			}
+		})
+	}
+}
+
 func TestRedshiftToPostgresDoesNotRewriteFunctionsInsideStringLiterals(t *testing.T) {
 	translated, err := NewRedshiftToPostgres().Translate(context.Background(), Session{}, `select 'getdate() sysdate nvl(a,b)' as literal, "nvl" as quoted_name, getdate() as now`)
 	if err != nil {

@@ -594,6 +594,12 @@ func rewriteRedshiftFunctions(sql string) string {
 					i = next
 					continue
 				}
+			case "regexp_count":
+				if rewritten, next, ok := rewriteParenFunction(sql, i, rewriteRegexpCount); ok {
+					out.WriteString(rewritten)
+					i = next
+					continue
+				}
 			case "decode":
 				if rewritten, next, ok := rewriteParenFunction(sql, i, rewriteDecode); ok {
 					out.WriteString(rewritten)
@@ -1024,6 +1030,18 @@ func rewriteRegexpSubstr(args []string) (string, bool) {
 		return "regexp_match(" + value + ", " + pattern + ")", true
 	}
 	return "(select regexp_substr_match from regexp_matches(substring(" + value + " from " + start + "), " + pattern + ", 'g') with ordinality as regexp_substr_matches(regexp_substr_match, regexp_substr_ordinality) where regexp_substr_ordinality = " + occurrence + ")", true
+}
+
+func rewriteRegexpCount(args []string) (string, bool) {
+	if len(args) != 2 {
+		return "", false
+	}
+	value := strings.TrimSpace(args[0])
+	pattern := strings.TrimSpace(args[1])
+	if value == "" || pattern == "" {
+		return "", false
+	}
+	return "(case when " + value + " is null or " + pattern + " is null then null else (select count(*)::int from regexp_matches(" + value + ", " + pattern + ", 'g')) end)", true
 }
 
 func rewriteDateAdd(args []string) (string, bool) {
