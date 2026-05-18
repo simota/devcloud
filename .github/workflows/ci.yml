@@ -39,3 +39,33 @@ jobs:
 
       - name: Test
         run: go test ./...
+
+  redshift-translator-e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: build
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
+      - name: Set up Go
+        uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5  # v5.5.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install PostgreSQL
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends postgresql postgresql-client
+          PG_BIN_DIR="$(ls -d /usr/lib/postgresql/*/bin | tail -1)"
+          echo "${PG_BIN_DIR}" >> "${GITHUB_PATH}"
+          # Stop the system PostgreSQL so the managed-by-devcloud instance can bind freely.
+          sudo systemctl stop postgresql || true
+
+      - name: Run Redshift translator e2e
+        run: bash scripts/redshift-translator-e2e.sh
