@@ -564,6 +564,12 @@ func rewriteRedshiftFunctions(sql string) string {
 					i = next
 					continue
 				}
+			case "strtol":
+				if rewritten, next, ok := rewriteParenFunction(sql, i, rewriteStrtol); ok {
+					out.WriteString(rewritten)
+					i = next
+					continue
+				}
 			case "decode":
 				if rewritten, next, ok := rewriteParenFunction(sql, i, rewriteDecode); ok {
 					out.WriteString(rewritten)
@@ -925,6 +931,20 @@ func rewriteCharIndex(args []string) (string, bool) {
 		return "", false
 	}
 	return "position(" + substring + " in " + value + ")", true
+}
+
+func rewriteStrtol(args []string) (string, bool) {
+	if len(args) != 2 {
+		return "", false
+	}
+	value := strings.TrimSpace(args[0])
+	base := strings.TrimSpace(args[1])
+	if value == "" || base == "" {
+		return "", false
+	}
+
+	normalized := "regexp_replace(trim(" + value + "), '^[+-]', '')"
+	return "(select (case when left(trim(" + value + "), 1) = '-' then -1 else 1 end) * coalesce(sum((strpos('0123456789abcdefghijklmnopqrstuvwxyz', digit) - 1)::numeric * power((" + base + ")::numeric, (length(" + normalized + ") - ordinality)::numeric)), 0)::bigint from regexp_split_to_table(lower(" + normalized + "), '') with ordinality as strtol_digits(digit, ordinality))", true
 }
 
 func rewriteDateAdd(args []string) (string, bool) {

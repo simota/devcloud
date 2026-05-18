@@ -92,6 +92,38 @@ func TestRedshiftToPostgresRewritesCharIndexToPosition(t *testing.T) {
 	}
 }
 
+func TestRedshiftToPostgresRewritesStrtol(t *testing.T) {
+	tests := []struct {
+		name string
+		sql  string
+		want string
+	}{
+		{
+			name: "strtol",
+			sql:  "select strtol(hex_payload, 16) as payload_id from events",
+			want: "select (select (case when left(trim(hex_payload), 1) = '-' then -1 else 1 end) * coalesce(sum((strpos('0123456789abcdefghijklmnopqrstuvwxyz', digit) - 1)::numeric * power((16)::numeric, (length(regexp_replace(trim(hex_payload), '^[+-]', '')) - ordinality)::numeric)), 0)::bigint from regexp_split_to_table(lower(regexp_replace(trim(hex_payload), '^[+-]', '')), '') with ordinality as strtol_digits(digit, ordinality)) as payload_id from events",
+		},
+		{
+			name: "strtol inside string literal is ignored",
+			sql:  "select 'strtol(hex_payload, 16)' as label, STRTOL(trim(hex_payload), target_base) as payload_id from events",
+			want: "select 'strtol(hex_payload, 16)' as label, (select (case when left(trim(trim(hex_payload)), 1) = '-' then -1 else 1 end) * coalesce(sum((strpos('0123456789abcdefghijklmnopqrstuvwxyz', digit) - 1)::numeric * power((target_base)::numeric, (length(regexp_replace(trim(trim(hex_payload)), '^[+-]', '')) - ordinality)::numeric)), 0)::bigint from regexp_split_to_table(lower(regexp_replace(trim(trim(hex_payload)), '^[+-]', '')), '') with ordinality as strtol_digits(digit, ordinality)) as payload_id from events",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			translated, err := NewRedshiftToPostgres().Translate(context.Background(), Session{}, tc.sql)
+			if err != nil {
+				t.Fatalf("Translate() error = %v", err)
+			}
+
+			if translated.BackendSQL != tc.want {
+				t.Fatalf("BackendSQL = %q, want %q", translated.BackendSQL, tc.want)
+			}
+		})
+	}
+}
+
 func TestRedshiftToPostgresDoesNotRewriteFunctionsInsideStringLiterals(t *testing.T) {
 	translated, err := NewRedshiftToPostgres().Translate(context.Background(), Session{}, `select 'getdate() sysdate nvl(a,b)' as literal, "nvl" as quoted_name, getdate() as now`)
 	if err != nil {
