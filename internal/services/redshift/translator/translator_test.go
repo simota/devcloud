@@ -107,6 +107,43 @@ func TestRedshiftToPostgresRewritesResetCommands(t *testing.T) {
 	}
 }
 
+func TestRedshiftToPostgresRewritesGrantAssumeRoleToNoop(t *testing.T) {
+	tests := []struct {
+		name string
+		sql  string
+		want string
+	}{
+		{
+			name: "grant assumerole to user",
+			sql:  "GRANT ASSUMEROLE ON 'arn:aws:iam::123456789012:role/redshift-copy' TO user analytics_loader;",
+			want: "select 1",
+		},
+		{
+			name: "grant assumerole with operation scope",
+			sql:  "grant assumerole on 'arn:aws:iam::123456789012:role/redshift-unload' to role analytics_role for unload",
+			want: "select 1",
+		},
+		{
+			name: "grant assumerole inside string literal is ignored",
+			sql:  "select 'GRANT ASSUMEROLE ON ''arn:aws:iam::123456789012:role/redshift-copy'' TO user analytics_loader' as statement",
+			want: "select 'GRANT ASSUMEROLE ON ''arn:aws:iam::123456789012:role/redshift-copy'' TO user analytics_loader' as statement",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			translated, err := NewRedshiftToPostgres().Translate(context.Background(), Session{}, tc.sql)
+			if err != nil {
+				t.Fatalf("Translate() error = %v", err)
+			}
+
+			if translated.BackendSQL != tc.want {
+				t.Fatalf("BackendSQL = %q, want %q", translated.BackendSQL, tc.want)
+			}
+		})
+	}
+}
+
 func TestRedshiftToPostgresRewritesRandToRandom(t *testing.T) {
 	tests := []struct {
 		name string

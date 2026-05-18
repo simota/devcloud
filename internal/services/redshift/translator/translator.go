@@ -122,6 +122,10 @@ func (RedshiftToPostgres) Translate(ctx context.Context, _ Session, sql string) 
 		translated.BackendSQL = rewritePostgresCompatibility(translated.BackendSQL)
 		return translated, err
 	}
+	if translated, ok, err := translateGrantAssumeRole(sql); ok || err != nil {
+		translated.BackendSQL = rewritePostgresCompatibility(translated.BackendSQL)
+		return translated, err
+	}
 	if translated, ok, err := translateCreateTable(sql); ok || err != nil {
 		translated.BackendSQL = rewritePostgresCompatibility(translated.BackendSQL)
 		return translated, err
@@ -2813,6 +2817,26 @@ func translateQualifySelect(sql string) (TranslationResult, bool, error) {
 		backendSQL += " " + strings.TrimSpace(statement[suffixStart:])
 	}
 	return TranslationResult{BackendSQL: backendSQL}, true, nil
+}
+
+func translateGrantAssumeRole(sql string) (TranslationResult, bool, error) {
+	statement := strings.TrimSpace(strings.TrimRight(sql, ";"))
+	prefixEnd, ok := matchKeywordSequence(statement, 0, []string{"grant", "assumerole", "on"})
+	if !ok {
+		return TranslationResult{}, false, nil
+	}
+
+	roleStart := skipSpaces(statement, prefixEnd)
+	_, roleEnd, ok := readQuotedStringValue(statement, roleStart)
+	if !ok {
+		return TranslationResult{BackendSQL: statement}, true, nil
+	}
+	toEnd, ok := matchKeywordSequence(statement, skipSpaces(statement, roleEnd), []string{"to"})
+	if !ok || strings.TrimSpace(statement[toEnd:]) == "" {
+		return TranslationResult{BackendSQL: statement}, true, nil
+	}
+
+	return TranslationResult{BackendSQL: "select 1"}, true, nil
 }
 
 func rewriteQualifyWindowPredicate(innerSQL string, condition string) (string, string, string, bool) {
