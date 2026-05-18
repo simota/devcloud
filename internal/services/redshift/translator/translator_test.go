@@ -218,6 +218,38 @@ func TestRedshiftToPostgresRewritesLastDay(t *testing.T) {
 	}
 }
 
+func TestRedshiftToPostgresRewritesMonthsBetween(t *testing.T) {
+	tests := []struct {
+		name string
+		sql  string
+		want string
+	}{
+		{
+			name: "months between",
+			sql:  "select months_between(ended_at, started_at) as months_elapsed from events",
+			want: "select (extract(year from age(ended_at, started_at)) * 12 + extract(month from age(ended_at, started_at))) as months_elapsed from events",
+		},
+		{
+			name: "months between inside string literal is ignored",
+			sql:  "select 'months_between(ended_at, started_at)' as label, MONTHS_BETWEEN(ended_at::date, started_at::date) as months_elapsed from events",
+			want: "select 'months_between(ended_at, started_at)' as label, (extract(year from age(ended_at::date, started_at::date)) * 12 + extract(month from age(ended_at::date, started_at::date))) as months_elapsed from events",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			translated, err := NewRedshiftToPostgres().Translate(context.Background(), Session{}, tc.sql)
+			if err != nil {
+				t.Fatalf("Translate() error = %v", err)
+			}
+
+			if translated.BackendSQL != tc.want {
+				t.Fatalf("BackendSQL = %q, want %q", translated.BackendSQL, tc.want)
+			}
+		})
+	}
+}
+
 func TestRedshiftToPostgresRewritesListAggWithinGroup(t *testing.T) {
 	translated, err := NewRedshiftToPostgres().Translate(context.Background(), Session{}, "select listagg(name, ',') within group (order by created_at desc) as names from events")
 	if err != nil {
