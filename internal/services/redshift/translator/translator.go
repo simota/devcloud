@@ -564,6 +564,12 @@ func rewriteRedshiftFunctions(sql string) string {
 					i = next
 					continue
 				}
+			case "substring":
+				if rewritten, next, ok := rewriteParenFunction(sql, i, rewriteSubstring); ok {
+					out.WriteString(rewritten)
+					i = next
+					continue
+				}
 			case "split_part":
 				if rewritten, next, ok := rewriteParenFunction(sql, i, rewriteSplitPart); ok {
 					out.WriteString(rewritten)
@@ -973,6 +979,23 @@ func rewriteCharIndex(args []string) (string, bool) {
 		return "", false
 	}
 	return "position(" + substring + " in " + value + ")", true
+}
+
+func rewriteSubstring(args []string) (string, bool) {
+	if len(args) != 3 {
+		return "", false
+	}
+	value := strings.TrimSpace(args[0])
+	start := strings.TrimSpace(args[1])
+	length := strings.TrimSpace(args[2])
+	if value == "" || start == "" || length == "" {
+		return "", false
+	}
+
+	postgresStart := "(case when " + start + " < 1 then 1 else " + start + " end)"
+	redshiftLength := start + " + " + length + " - 1"
+	postgresLength := "(case when " + start + " <= 0 then case when " + redshiftLength + " <= 0 then 0 else " + redshiftLength + " end else " + length + " end)"
+	return "substring(" + value + " from " + postgresStart + " for " + postgresLength + ")", true
 }
 
 func rewriteSplitPart(args []string) (string, bool) {

@@ -112,7 +112,7 @@ devcloud の Redshift サービスは、`translator.RedshiftToPostgres` で Reds
 - [x] **R-only** `REGEXP_COUNT(s, pattern)`
 - [x] **R-only** `REGEXP_INSTR(s, pattern, ...)`
 - [x] **R≠P** `SPLIT_PART(s, sep, n)` 負数 n の挙動（PG 14+ で対応）
-- [ ] **R≠P** `SUBSTRING(s, start, len)` 負の `start` の扱い
+- [x] **R≠P** `SUBSTRING(s, start, len)` 負の `start` の扱い
 
 ---
 

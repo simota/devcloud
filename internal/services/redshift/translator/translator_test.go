@@ -92,6 +92,38 @@ func TestRedshiftToPostgresRewritesCharIndexToPosition(t *testing.T) {
 	}
 }
 
+func TestRedshiftToPostgresRewritesSubstringNegativeStart(t *testing.T) {
+	tests := []struct {
+		name string
+		sql  string
+		want string
+	}{
+		{
+			name: "negative start",
+			sql:  "select substring(payload, -2, 6) as payload_prefix from events",
+			want: "select substring(payload from (case when -2 < 1 then 1 else -2 end) for (case when -2 <= 0 then case when -2 + 6 - 1 <= 0 then 0 else -2 + 6 - 1 end else 6 end)) as payload_prefix from events",
+		},
+		{
+			name: "substring inside string literal is ignored",
+			sql:  "select 'substring(payload, -2, 6)' as label, SUBSTRING(trim(payload), start_pos, payload_length) as payload_part from events",
+			want: "select 'substring(payload, -2, 6)' as label, substring(trim(payload) from (case when start_pos < 1 then 1 else start_pos end) for (case when start_pos <= 0 then case when start_pos + payload_length - 1 <= 0 then 0 else start_pos + payload_length - 1 end else payload_length end)) as payload_part from events",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			translated, err := NewRedshiftToPostgres().Translate(context.Background(), Session{}, tc.sql)
+			if err != nil {
+				t.Fatalf("Translate() error = %v", err)
+			}
+
+			if translated.BackendSQL != tc.want {
+				t.Fatalf("BackendSQL = %q, want %q", translated.BackendSQL, tc.want)
+			}
+		})
+	}
+}
+
 func TestRedshiftToPostgresRewritesStrtol(t *testing.T) {
 	tests := []struct {
 		name string
