@@ -94,7 +94,7 @@ devcloud の Redshift サービスは、`translator.RedshiftToPostgres` で Reds
 - [x] **R-only** `TIMEOFDAY()` — PG `clock_timestamp()` を文字列化
 - [x] **R-only** `LAST_DAY(date)` → `(date_trunc('month', date) + interval '1 month - 1 day')::date`
 - [x] **R-only** `MONTHS_BETWEEN(a, b)` → `extract(year from age(a, b)) * 12 + extract(month from age(a, b))`
-- [ ] **R-only** `NEXT_DAY(date, dow_string)`
+- [x] **R-only** `NEXT_DAY(date, dow_string)`
 - [ ] **R-only** `ADD_MONTHS(date, n)` → `date + n * interval '1 month'`
 - [ ] **R≠P** `TO_DATE` / `TO_TIMESTAMP` の書式コード差（`TZ` 等）
 - [ ] **R≠P** `TO_CHAR(ts, fmt)` の書式コード差

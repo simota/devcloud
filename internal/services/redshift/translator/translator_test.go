@@ -250,6 +250,38 @@ func TestRedshiftToPostgresRewritesMonthsBetween(t *testing.T) {
 	}
 }
 
+func TestRedshiftToPostgresRewritesNextDay(t *testing.T) {
+	tests := []struct {
+		name string
+		sql  string
+		want string
+	}{
+		{
+			name: "next day",
+			sql:  "select next_day(created_at, 'Tuesday') as next_tuesday from events",
+			want: "select ((created_at)::date + ((2 - extract(dow from (created_at)::date)::int + 6) % 7 + 1))::date as next_tuesday from events",
+		},
+		{
+			name: "next day inside string literal is ignored",
+			sql:  "select 'next_day(created_at, ''Tue'')' as label, NEXT_DAY(created_at::date, 'Tue') as next_tuesday from events",
+			want: "select 'next_day(created_at, ''Tue'')' as label, ((created_at::date)::date + ((2 - extract(dow from (created_at::date)::date)::int + 6) % 7 + 1))::date as next_tuesday from events",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			translated, err := NewRedshiftToPostgres().Translate(context.Background(), Session{}, tc.sql)
+			if err != nil {
+				t.Fatalf("Translate() error = %v", err)
+			}
+
+			if translated.BackendSQL != tc.want {
+				t.Fatalf("BackendSQL = %q, want %q", translated.BackendSQL, tc.want)
+			}
+		})
+	}
+}
+
 func TestRedshiftToPostgresRewritesListAggWithinGroup(t *testing.T) {
 	translated, err := NewRedshiftToPostgres().Translate(context.Background(), Session{}, "select listagg(name, ',') within group (order by created_at desc) as names from events")
 	if err != nil {

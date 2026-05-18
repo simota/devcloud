@@ -600,6 +600,12 @@ func rewriteRedshiftFunctions(sql string) string {
 					i = next
 					continue
 				}
+			case "next_day":
+				if rewritten, next, ok := rewriteParenFunction(sql, i, rewriteNextDay); ok {
+					out.WriteString(rewritten)
+					i = next
+					continue
+				}
 			case "listagg":
 				if rewritten, next, ok := rewriteListAgg(sql, i); ok {
 					out.WriteString(rewritten)
@@ -982,6 +988,47 @@ func rewriteMonthsBetween(args []string) (string, bool) {
 		return "", false
 	}
 	return "(extract(year from age(" + end + ", " + start + ")) * 12 + extract(month from age(" + end + ", " + start + ")))", true
+}
+
+func rewriteNextDay(args []string) (string, bool) {
+	if len(args) != 2 {
+		return "", false
+	}
+	value := strings.TrimSpace(args[0])
+	if value == "" {
+		return "", false
+	}
+	day, ok := sqlStringLiteralValue(args[1])
+	if !ok {
+		return "", false
+	}
+	targetDow, ok := redshiftNextDayNumber(day)
+	if !ok {
+		return "", false
+	}
+	dateValue := "(" + value + ")::date"
+	return "(" + dateValue + " + ((" + targetDow + " - extract(dow from " + dateValue + ")::int + 6) % 7 + 1))::date", true
+}
+
+func redshiftNextDayNumber(value string) (string, bool) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "su", "sun", "sunday":
+		return "0", true
+	case "m", "mo", "mon", "monday":
+		return "1", true
+	case "tu", "tue", "tues", "tuesday":
+		return "2", true
+	case "w", "we", "wed", "wednesday":
+		return "3", true
+	case "th", "thu", "thurs", "thursday":
+		return "4", true
+	case "f", "fr", "fri", "friday":
+		return "5", true
+	case "sa", "sat", "saturday":
+		return "6", true
+	default:
+		return "", false
+	}
 }
 
 func rewriteMedian(args []string) (string, bool) {
