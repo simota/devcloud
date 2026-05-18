@@ -1043,7 +1043,11 @@ func rewriteRedshiftSystemTableReference(sql string, index int) (string, int, bo
 
 func isRedshiftReadOnlySystemTable(tableName string) bool {
 	normalized := strings.ToLower(tableName)
-	return strings.HasPrefix(normalized, "stv_") || strings.HasPrefix(normalized, "stl_")
+	return strings.HasPrefix(normalized, "stv_") ||
+		strings.HasPrefix(normalized, "stl_") ||
+		strings.HasPrefix(normalized, "svv_") ||
+		strings.HasPrefix(normalized, "svl_") ||
+		strings.HasPrefix(normalized, "sys_")
 }
 
 func readRelationIdentifier(sql string, index int) (string, int, string, bool) {

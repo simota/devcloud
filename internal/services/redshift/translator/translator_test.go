@@ -530,6 +530,49 @@ func TestRedshiftToPostgresRewritesSTLTablesToReadOnlyStubs(t *testing.T) {
 	}
 }
 
+func TestRedshiftToPostgresRewritesMetadataViewsToReadOnlyStubs(t *testing.T) {
+	systemStub := postgresRedshiftSystemTableStub()
+	tests := []struct {
+		name string
+		sql  string
+		want string
+	}{
+		{
+			name: "from svv view",
+			sql:  "select * from svv_table_info",
+			want: "select * from " + systemStub + " as svv_table_info",
+		},
+		{
+			name: "join svl view with alias",
+			sql:  "select q.query from events e join SVL_QUERY_SUMMARY as q on q.query = e.query_id",
+			want: "select q.query from events e join " + systemStub + " as q on q.query = e.query_id",
+		},
+		{
+			name: "from sys view",
+			sql:  "select query_id from sys_query_history where status = 'success'",
+			want: "select query_id from " + systemStub + " as sys_query_history where status = 'success'",
+		},
+		{
+			name: "metadata view inside string literal is ignored",
+			sql:  "select 'from svv_table_info join svl_query_summary' as label from events",
+			want: "select 'from svv_table_info join svl_query_summary' as label from events",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			translated, err := NewRedshiftToPostgres().Translate(context.Background(), Session{}, tc.sql)
+			if err != nil {
+				t.Fatalf("Translate() error = %v", err)
+			}
+
+			if translated.BackendSQL != tc.want {
+				t.Fatalf("BackendSQL = %q, want %q", translated.BackendSQL, tc.want)
+			}
+		})
+	}
+}
+
 func TestRedshiftToPostgresRewritesDefaultFunctionInCreateTableBackendSQL(t *testing.T) {
 	translated, err := NewRedshiftToPostgres().Translate(context.Background(), Session{}, "create table events(id int, created_at timestamp default getdate())")
 	if err != nil {
