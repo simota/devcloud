@@ -109,6 +109,38 @@ func TestRedshiftToPostgresRewritesMedianToPercentileCont(t *testing.T) {
 	}
 }
 
+func TestRedshiftToPostgresRewritesBooleanBitAggregates(t *testing.T) {
+	tests := []struct {
+		name string
+		sql  string
+		want string
+	}{
+		{
+			name: "boolean bit aggregates",
+			sql:  "select bit_and(is_ready) as all_ready, bit_or(is_ready) as any_ready from events",
+			want: "select bool_and(is_ready) as all_ready, bool_or(is_ready) as any_ready from events",
+		},
+		{
+			name: "boolean bit aggregates inside string literal are ignored",
+			sql:  "select 'bit_and(is_ready), bit_or(is_ready)' as label, BIT_AND(is_ready) as all_ready from events",
+			want: "select 'bit_and(is_ready), bit_or(is_ready)' as label, bool_and(is_ready) as all_ready from events",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			translated, err := NewRedshiftToPostgres().Translate(context.Background(), Session{}, tc.sql)
+			if err != nil {
+				t.Fatalf("Translate() error = %v", err)
+			}
+
+			if translated.BackendSQL != tc.want {
+				t.Fatalf("BackendSQL = %q, want %q", translated.BackendSQL, tc.want)
+			}
+		})
+	}
+}
+
 func TestRedshiftToPostgresRewritesRatioToReportOver(t *testing.T) {
 	tests := []struct {
 		name string

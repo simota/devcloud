@@ -503,6 +503,18 @@ func rewriteRedshiftFunctions(sql string) string {
 					i = next
 					continue
 				}
+			case "bit_and":
+				next := skipSpaces(sql, i)
+				if next < len(sql) && sql[next] == '(' && matchingParen(sql, next) > next {
+					out.WriteString(PostgresBoolAnd)
+					continue
+				}
+			case "bit_or":
+				next := skipSpaces(sql, i)
+				if next < len(sql) && sql[next] == '(' && matchingParen(sql, next) > next {
+					out.WriteString(PostgresBoolOr)
+					continue
+				}
 			case "boolean":
 				next := skipSpaces(sql, i)
 				if rewritten, literalEnd, ok := parseRedshiftBooleanLiteral(sql, next); ok {
@@ -2073,5 +2085,7 @@ const (
 
 	PostgresCoalesce         = "COALESCE"
 	PostgresCurrentTimestamp = "CURRENT_TIMESTAMP"
+	PostgresBoolAnd          = "bool_and"
+	PostgresBoolOr           = "bool_or"
 	PostgresStringAgg        = "string_agg"
 )
