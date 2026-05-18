@@ -648,6 +648,12 @@ func rewriteRedshiftFunctions(sql string) string {
 					i = next
 					continue
 				}
+			case "round":
+				if rewritten, next, ok := rewriteParenFunction(sql, i, rewriteRound); ok {
+					out.WriteString(rewritten)
+					i = next
+					continue
+				}
 			case "dateadd":
 				if rewritten, next, ok := rewriteParenFunction(sql, i, rewriteDateAdd); ok {
 					out.WriteString(rewritten)
@@ -1003,6 +1009,22 @@ func rewriteNullIgnoringExtremum(aggregate string, column string, args []string)
 		values = append(values, "("+value+")")
 	}
 	return "(select " + aggregate + "(" + column + ") from (values " + strings.Join(values, ", ") + ") as redshift_" + column + "s(" + column + "))", true
+}
+
+func rewriteRound(args []string) (string, bool) {
+	if len(args) != 2 {
+		return "", false
+	}
+	value := strings.TrimSpace(args[0])
+	scale := strings.TrimSpace(args[1])
+	if value == "" || scale == "" {
+		return "", false
+	}
+	magnitude, ok := negativeIntegerLiteralMagnitude(scale)
+	if !ok {
+		return "", false
+	}
+	return "round((" + value + ")::numeric, -" + magnitude + ")", true
 }
 
 func rewriteNVL2(args []string) (string, bool) {

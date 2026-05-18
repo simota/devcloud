@@ -512,6 +512,43 @@ func TestRedshiftToPostgresRewritesGreatestLeastToIgnoreNulls(t *testing.T) {
 	}
 }
 
+func TestRedshiftToPostgresRewritesRoundNegativeScale(t *testing.T) {
+	tests := []struct {
+		name string
+		sql  string
+		want string
+	}{
+		{
+			name: "negative scale",
+			sql:  "select round(amount, -2) as rounded_amount from events",
+			want: "select round((amount)::numeric, -2) as rounded_amount from events",
+		},
+		{
+			name: "round inside string literal is ignored",
+			sql:  "select 'round(amount, -2)' as label, ROUND(total_amount, -3) as rounded_amount from events",
+			want: "select 'round(amount, -2)' as label, round((total_amount)::numeric, -3) as rounded_amount from events",
+		},
+		{
+			name: "non-negative scale is unchanged",
+			sql:  "select round(amount, 2) as rounded_amount from events",
+			want: "select round(amount, 2) as rounded_amount from events",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			translated, err := NewRedshiftToPostgres().Translate(context.Background(), Session{}, tc.sql)
+			if err != nil {
+				t.Fatalf("Translate() error = %v", err)
+			}
+
+			if translated.BackendSQL != tc.want {
+				t.Fatalf("BackendSQL = %q, want %q", translated.BackendSQL, tc.want)
+			}
+		})
+	}
+}
+
 func TestRedshiftToPostgresRewritesDateAddAndDateDiff(t *testing.T) {
 	translated, err := NewRedshiftToPostgres().Translate(context.Background(), Session{}, "select dateadd(day, 7, created_at) as expires_at, datediff(hour, started_at, ended_at) as hours from events")
 	if err != nil {
