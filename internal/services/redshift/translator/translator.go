@@ -912,11 +912,15 @@ func rewriteRatioToReport(sql string, index int) (string, int, bool) {
 }
 
 func rewriteListAgg(sql string, index int) (string, int, bool) {
+	var listAggExpression string
+	var listAggDelimiter string
 	rewritten, next, ok := rewriteParenFunction(sql, index, func(args []string) (string, bool) {
 		if len(args) != 2 {
 			return "", false
 		}
-		return PostgresStringAgg + "(" + strings.TrimSpace(args[0]) + ", " + strings.TrimSpace(args[1]), true
+		listAggExpression = strings.TrimSpace(args[0])
+		listAggDelimiter = strings.TrimSpace(args[1])
+		return PostgresStringAgg + "(" + listAggExpression + ", " + listAggDelimiter, true
 	})
 	if !ok {
 		return "", index, false
@@ -941,10 +945,28 @@ func rewriteListAgg(sql string, index int) (string, int, bool) {
 	if strings.HasPrefix(strings.ToLower(orderBy), "order by") {
 		orderBy = strings.TrimSpace(orderBy[len("order by"):])
 		if orderBy != "" {
+			overStart := skipSpaces(sql, close+1)
+			if overEnd, ok := matchKeywordSequence(sql, overStart, []string{"over"}); ok {
+				overOpen := skipSpaces(sql, overEnd)
+				if overOpen < len(sql) && sql[overOpen] == '(' {
+					overClose := matchingParen(sql, overOpen)
+					if overClose > overOpen {
+						overClause := addOrderToListAggWindow(strings.TrimSpace(sql[overOpen+1:overClose]), orderBy)
+						return "array_to_string(array_agg(" + listAggExpression + ") OVER (" + overClause + "), " + listAggDelimiter + ")", overClose + 1, true
+					}
+				}
+			}
 			return rewritten + " ORDER BY " + orderBy + ")", close + 1, true
 		}
 	}
 	return rewritten + ")", next, true
+}
+
+func addOrderToListAggWindow(overClause string, orderBy string) string {
+	if overClause == "" {
+		return "ORDER BY " + orderBy + " ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING"
+	}
+	return overClause + " ORDER BY " + orderBy + " ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING"
 }
 
 func postgresIntervalPart(value string) (string, bool) {

@@ -97,6 +97,38 @@ func TestRedshiftToPostgresRewritesListAggWithinGroup(t *testing.T) {
 	}
 }
 
+func TestRedshiftToPostgresRewritesListAggWindowWithinGroup(t *testing.T) {
+	tests := []struct {
+		name string
+		sql  string
+		want string
+	}{
+		{
+			name: "partitioned window",
+			sql:  "select listagg(name, ',') within group (order by created_at desc) over (partition by account_id) as names from events",
+			want: "select array_to_string(array_agg(name) OVER (partition by account_id ORDER BY created_at desc ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING), ',') as names from events",
+		},
+		{
+			name: "empty over window",
+			sql:  "select LISTAGG(name, ',') WITHIN GROUP (ORDER BY created_at) OVER () as names from events",
+			want: "select array_to_string(array_agg(name) OVER (ORDER BY created_at ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING), ',') as names from events",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			translated, err := NewRedshiftToPostgres().Translate(context.Background(), Session{}, tc.sql)
+			if err != nil {
+				t.Fatalf("Translate() error = %v", err)
+			}
+
+			if translated.BackendSQL != tc.want {
+				t.Fatalf("BackendSQL = %q, want %q", translated.BackendSQL, tc.want)
+			}
+		})
+	}
+}
+
 func TestRedshiftToPostgresRewritesMedianToPercentileCont(t *testing.T) {
 	translated, err := NewRedshiftToPostgres().Translate(context.Background(), Session{}, "select median(duration_ms) as p50_duration from events")
 	if err != nil {

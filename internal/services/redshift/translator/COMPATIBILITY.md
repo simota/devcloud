@@ -76,7 +76,7 @@ devcloud の Redshift サービスは、`translator.RedshiftToPostgres` で Reds
 - [x] **R-only** `LATERAL` の制限 — PG はフル LATERAL
 - [x] **R≠P** `NULLS FIRST/LAST` 既定の差（実際は同じだが要確認）
 - [x] **R≠P** `BIT_AND/BIT_OR(boolean)` 集約 → PG `bool_and/bool_or`
-- [ ] **R≠P** `LISTAGG` の Window 形 — PG `string_agg` は Window 非対応、要 workaround
+- [x] **R≠P** `LISTAGG` の Window 形 — PG `string_agg` は Window 非対応、要 workaround
 - [ ] **P-only** `FETCH FIRST n ROWS WITH TIES`
 - [ ] **P-only** `TABLESAMPLE`
 - [ ] **P-only** Window 関数の `EXCLUDE GROUP/TIES/CURRENT ROW` 句
