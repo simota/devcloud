@@ -156,6 +156,43 @@ func TestRedshiftToPostgresRewritesCRC32(t *testing.T) {
 	}
 }
 
+func TestRedshiftToPostgresRewritesDigestFunctions(t *testing.T) {
+	tests := []struct {
+		name string
+		sql  string
+		want string
+	}{
+		{
+			name: "md5 digest",
+			sql:  "select md5_digest(payload) as payload_md5 from events",
+			want: "select md5((payload)::text) as payload_md5 from events",
+		},
+		{
+			name: "func sha1",
+			sql:  "select func_sha1(payload) as payload_sha1 from events",
+			want: "select encode(digest((payload)::text, 'sha1'), 'hex') as payload_sha1 from events",
+		},
+		{
+			name: "digest functions inside string literal are ignored",
+			sql:  "select 'md5_digest(payload), func_sha1(payload)' as label, MD5_DIGEST(trim(payload)) as payload_md5 from events",
+			want: "select 'md5_digest(payload), func_sha1(payload)' as label, md5((trim(payload))::text) as payload_md5 from events",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			translated, err := NewRedshiftToPostgres().Translate(context.Background(), Session{}, tc.sql)
+			if err != nil {
+				t.Fatalf("Translate() error = %v", err)
+			}
+
+			if translated.BackendSQL != tc.want {
+				t.Fatalf("BackendSQL = %q, want %q", translated.BackendSQL, tc.want)
+			}
+		})
+	}
+}
+
 func TestRedshiftToPostgresDoesNotRewriteFunctionsInsideStringLiterals(t *testing.T) {
 	translated, err := NewRedshiftToPostgres().Translate(context.Background(), Session{}, `select 'getdate() sysdate nvl(a,b)' as literal, "nvl" as quoted_name, getdate() as now`)
 	if err != nil {
