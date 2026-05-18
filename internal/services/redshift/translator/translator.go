@@ -498,18 +498,76 @@ func isQualifiedIdentifierPart(value string, start, end int) bool {
 	return after < len(value) && value[after] == '.'
 }
 
+// redshiftFunctionRewriter inspects a function-style identifier in `sql`
+// spanning [identStart, identEnd) and optionally rewrites it plus the
+// following arguments. On match it returns (rewritten, nextIndex, true);
+// the caller emits rewritten and resumes at nextIndex. On no match it
+// returns ("", 0, false) and the caller emits the original identifier.
+type redshiftFunctionRewriter func(sql string, identStart, identEnd int) (string, int, bool)
+
+// redshiftFunctionRewrites dispatches lower-cased identifiers to their
+// per-construct rewriter. Adding a new translation is a single map entry.
+var redshiftFunctionRewrites = map[string]redshiftFunctionRewriter{
+	"approximate":                     adaptIdentEnd(rewriteApproximateCountDistinct),
+	"bit_and":                         emitWhenParenFollows(PostgresBoolAnd),
+	"bit_or":                          emitWhenParenFollows(PostgresBoolOr),
+	"boolean":                         rewriteBooleanLiteralAfterKeyword,
+	"getdate":                         rewriteGetDateEmptyParens,
+	"timeofday":                       adaptParenFn(rewriteTimeOfDay),
+	"rand":                            adaptParenFn(rewriteRand),
+	"sysdate":                         emitConstantNoConsume(PostgresCurrentTimestamp),
+	"nvl":                             rewriteNVLAsCoalesce,
+	"nvl2":                            adaptParenFn(rewriteNVL2),
+	"len":                             adaptParenFn(rewriteLen),
+	"charindex":                       adaptParenFn(rewriteCharIndex),
+	"substring":                       adaptParenFn(rewriteSubstring),
+	"split_part":                      adaptParenFn(rewriteSplitPart),
+	"strtol":                          adaptParenFn(rewriteStrtol),
+	"crc32":                           adaptParenFn(rewriteCRC32),
+	"md5_digest":                      adaptParenFn(rewriteMD5Digest),
+	"func_sha1":                       adaptParenFn(rewriteFuncSHA1),
+	"regexp_substr":                   adaptParenFn(rewriteRegexpSubstr),
+	"regexp_count":                    adaptParenFn(rewriteRegexpCount),
+	"regexp_instr":                    adaptParenFn(rewriteRegexpInstr),
+	"decode":                          adaptParenFn(rewriteDecode),
+	"greatest":                        adaptParenFn(rewriteGreatest),
+	"least":                           adaptParenFn(rewriteLeast),
+	"round":                           adaptParenFn(rewriteRound),
+	"json_extract_path_text":          adaptParenFn(rewriteJSONExtractPathText),
+	"json_extract_array_element_text": adaptParenFn(rewriteJSONExtractArrayElementText),
+	"json_array_length":               adaptParenFn(rewriteJSONArrayLength),
+	"json_parse":                      adaptParenFn(rewriteJSONParse),
+	"is_valid_json":                   adaptParenFn(rewriteIsValidJSON),
+	"is_valid_json_array":             adaptParenFn(rewriteIsValidJSONArray),
+	"object_transform":                adaptIdentEnd(rewriteObjectTransformCall),
+	"dateadd":                         adaptParenFn(rewriteDateAdd),
+	"datediff":                        adaptParenFn(rewriteDateDiff),
+	"convert_timezone":                adaptParenFn(rewriteConvertTimezone),
+	"date_part":                       adaptParenFn(rewriteDatePartFunction),
+	"date_trunc":                      adaptParenFn(rewriteDateTruncFunction),
+	"last_day":                        adaptParenFn(rewriteLastDay),
+	"months_between":                  adaptParenFn(rewriteMonthsBetween),
+	"add_months":                      adaptParenFn(rewriteAddMonths),
+	"next_day":                        adaptParenFn(rewriteNextDay),
+	"to_date":                         adaptParenFn(rewriteToDate),
+	"to_timestamp":                    adaptParenFn(rewriteToTimestamp),
+	"to_char":                         adaptParenFn(rewriteToChar),
+	"listagg":                         adaptIdentEnd(rewriteListAgg),
+	"median":                          adaptParenFn(rewriteMedian),
+	"ratio_to_report":                 adaptIdentEnd(rewriteRatioToReport),
+	"like":                            rewriteLikeDefaultEscape,
+}
+
 func rewriteRedshiftFunctions(sql string) string {
 	var out strings.Builder
 	for i := 0; i < len(sql); {
 		ch := sql[i]
 		if ch == '\'' {
-			next := copyQuotedString(&out, sql, i)
-			i = next
+			i = copyQuotedString(&out, sql, i)
 			continue
 		}
 		if ch == '"' {
-			next := copyQuotedIdentifier(&out, sql, i)
-			i = next
+			i = copyQuotedIdentifier(&out, sql, i)
 			continue
 		}
 		if isIdentifierStart(ch) {
@@ -524,299 +582,8 @@ func rewriteRedshiftFunctions(sql string) string {
 				i = next
 				continue
 			}
-			lower := strings.ToLower(name)
-			switch lower {
-			case "approximate":
-				if rewritten, next, ok := rewriteApproximateCountDistinct(sql, i); ok {
-					out.WriteString(rewritten)
-					i = next
-					continue
-				}
-			case "bit_and":
-				next := skipSpaces(sql, i)
-				if next < len(sql) && sql[next] == '(' && matchingParen(sql, next) > next {
-					out.WriteString(PostgresBoolAnd)
-					continue
-				}
-			case "bit_or":
-				next := skipSpaces(sql, i)
-				if next < len(sql) && sql[next] == '(' && matchingParen(sql, next) > next {
-					out.WriteString(PostgresBoolOr)
-					continue
-				}
-			case "boolean":
-				next := skipSpaces(sql, i)
-				if rewritten, literalEnd, ok := parseRedshiftBooleanLiteral(sql, next); ok {
-					out.WriteString(rewritten)
-					i = literalEnd
-					continue
-				}
-			case "getdate":
-				next := skipSpaces(sql, i)
-				if next < len(sql) && sql[next] == '(' {
-					close := matchingParen(sql, next)
-					if close > next && strings.TrimSpace(sql[next+1:close]) == "" {
-						out.WriteString(PostgresCurrentTimestamp)
-						i = close + 1
-						continue
-					}
-				}
-			case "timeofday":
-				if rewritten, next, ok := rewriteParenFunction(sql, i, rewriteTimeOfDay); ok {
-					out.WriteString(rewritten)
-					i = next
-					continue
-				}
-			case "rand":
-				if rewritten, next, ok := rewriteParenFunction(sql, i, rewriteRand); ok {
-					out.WriteString(rewritten)
-					i = next
-					continue
-				}
-			case "sysdate":
-				out.WriteString(PostgresCurrentTimestamp)
-				continue
-			case "nvl":
-				next := skipSpaces(sql, i)
-				if next < len(sql) && sql[next] == '(' {
-					close := matchingParen(sql, next)
-					if close > next {
-						out.WriteString(PostgresCoalesce)
-						out.WriteString(sql[next : close+1])
-						i = close + 1
-						continue
-					}
-				}
-			case "nvl2":
-				if rewritten, next, ok := rewriteParenFunction(sql, i, rewriteNVL2); ok {
-					out.WriteString(rewritten)
-					i = next
-					continue
-				}
-			case "len":
-				if rewritten, next, ok := rewriteParenFunction(sql, i, rewriteLen); ok {
-					out.WriteString(rewritten)
-					i = next
-					continue
-				}
-			case "charindex":
-				if rewritten, next, ok := rewriteParenFunction(sql, i, rewriteCharIndex); ok {
-					out.WriteString(rewritten)
-					i = next
-					continue
-				}
-			case "substring":
-				if rewritten, next, ok := rewriteParenFunction(sql, i, rewriteSubstring); ok {
-					out.WriteString(rewritten)
-					i = next
-					continue
-				}
-			case "split_part":
-				if rewritten, next, ok := rewriteParenFunction(sql, i, rewriteSplitPart); ok {
-					out.WriteString(rewritten)
-					i = next
-					continue
-				}
-			case "strtol":
-				if rewritten, next, ok := rewriteParenFunction(sql, i, rewriteStrtol); ok {
-					out.WriteString(rewritten)
-					i = next
-					continue
-				}
-			case "crc32":
-				if rewritten, next, ok := rewriteParenFunction(sql, i, rewriteCRC32); ok {
-					out.WriteString(rewritten)
-					i = next
-					continue
-				}
-			case "md5_digest":
-				if rewritten, next, ok := rewriteParenFunction(sql, i, rewriteMD5Digest); ok {
-					out.WriteString(rewritten)
-					i = next
-					continue
-				}
-			case "func_sha1":
-				if rewritten, next, ok := rewriteParenFunction(sql, i, rewriteFuncSHA1); ok {
-					out.WriteString(rewritten)
-					i = next
-					continue
-				}
-			case "regexp_substr":
-				if rewritten, next, ok := rewriteParenFunction(sql, i, rewriteRegexpSubstr); ok {
-					out.WriteString(rewritten)
-					i = next
-					continue
-				}
-			case "regexp_count":
-				if rewritten, next, ok := rewriteParenFunction(sql, i, rewriteRegexpCount); ok {
-					out.WriteString(rewritten)
-					i = next
-					continue
-				}
-			case "regexp_instr":
-				if rewritten, next, ok := rewriteParenFunction(sql, i, rewriteRegexpInstr); ok {
-					out.WriteString(rewritten)
-					i = next
-					continue
-				}
-			case "decode":
-				if rewritten, next, ok := rewriteParenFunction(sql, i, rewriteDecode); ok {
-					out.WriteString(rewritten)
-					i = next
-					continue
-				}
-			case "greatest":
-				if rewritten, next, ok := rewriteParenFunction(sql, i, rewriteGreatest); ok {
-					out.WriteString(rewritten)
-					i = next
-					continue
-				}
-			case "least":
-				if rewritten, next, ok := rewriteParenFunction(sql, i, rewriteLeast); ok {
-					out.WriteString(rewritten)
-					i = next
-					continue
-				}
-			case "round":
-				if rewritten, next, ok := rewriteParenFunction(sql, i, rewriteRound); ok {
-					out.WriteString(rewritten)
-					i = next
-					continue
-				}
-			case "json_extract_path_text":
-				if rewritten, next, ok := rewriteParenFunction(sql, i, rewriteJSONExtractPathText); ok {
-					out.WriteString(rewritten)
-					i = next
-					continue
-				}
-			case "json_extract_array_element_text":
-				if rewritten, next, ok := rewriteParenFunction(sql, i, rewriteJSONExtractArrayElementText); ok {
-					out.WriteString(rewritten)
-					i = next
-					continue
-				}
-			case "json_array_length":
-				if rewritten, next, ok := rewriteParenFunction(sql, i, rewriteJSONArrayLength); ok {
-					out.WriteString(rewritten)
-					i = next
-					continue
-				}
-			case "json_parse":
-				if rewritten, next, ok := rewriteParenFunction(sql, i, rewriteJSONParse); ok {
-					out.WriteString(rewritten)
-					i = next
-					continue
-				}
-			case "is_valid_json":
-				if rewritten, next, ok := rewriteParenFunction(sql, i, rewriteIsValidJSON); ok {
-					out.WriteString(rewritten)
-					i = next
-					continue
-				}
-			case "is_valid_json_array":
-				if rewritten, next, ok := rewriteParenFunction(sql, i, rewriteIsValidJSONArray); ok {
-					out.WriteString(rewritten)
-					i = next
-					continue
-				}
-			case "object_transform":
-				if rewritten, next, ok := rewriteObjectTransformCall(sql, i); ok {
-					out.WriteString(rewritten)
-					i = next
-					continue
-				}
-			case "dateadd":
-				if rewritten, next, ok := rewriteParenFunction(sql, i, rewriteDateAdd); ok {
-					out.WriteString(rewritten)
-					i = next
-					continue
-				}
-			case "datediff":
-				if rewritten, next, ok := rewriteParenFunction(sql, i, rewriteDateDiff); ok {
-					out.WriteString(rewritten)
-					i = next
-					continue
-				}
-			case "convert_timezone":
-				if rewritten, next, ok := rewriteParenFunction(sql, i, rewriteConvertTimezone); ok {
-					out.WriteString(rewritten)
-					i = next
-					continue
-				}
-			case "date_part":
-				if rewritten, next, ok := rewriteParenFunction(sql, i, rewriteDatePartFunction); ok {
-					out.WriteString(rewritten)
-					i = next
-					continue
-				}
-			case "date_trunc":
-				if rewritten, next, ok := rewriteParenFunction(sql, i, rewriteDateTruncFunction); ok {
-					out.WriteString(rewritten)
-					i = next
-					continue
-				}
-			case "last_day":
-				if rewritten, next, ok := rewriteParenFunction(sql, i, rewriteLastDay); ok {
-					out.WriteString(rewritten)
-					i = next
-					continue
-				}
-			case "months_between":
-				if rewritten, next, ok := rewriteParenFunction(sql, i, rewriteMonthsBetween); ok {
-					out.WriteString(rewritten)
-					i = next
-					continue
-				}
-			case "add_months":
-				if rewritten, next, ok := rewriteParenFunction(sql, i, rewriteAddMonths); ok {
-					out.WriteString(rewritten)
-					i = next
-					continue
-				}
-			case "next_day":
-				if rewritten, next, ok := rewriteParenFunction(sql, i, rewriteNextDay); ok {
-					out.WriteString(rewritten)
-					i = next
-					continue
-				}
-			case "to_date":
-				if rewritten, next, ok := rewriteParenFunction(sql, i, rewriteToDate); ok {
-					out.WriteString(rewritten)
-					i = next
-					continue
-				}
-			case "to_timestamp":
-				if rewritten, next, ok := rewriteParenFunction(sql, i, rewriteToTimestamp); ok {
-					out.WriteString(rewritten)
-					i = next
-					continue
-				}
-			case "to_char":
-				if rewritten, next, ok := rewriteParenFunction(sql, i, rewriteToChar); ok {
-					out.WriteString(rewritten)
-					i = next
-					continue
-				}
-			case "listagg":
-				if rewritten, next, ok := rewriteListAgg(sql, i); ok {
-					out.WriteString(rewritten)
-					i = next
-					continue
-				}
-			case "median":
-				if rewritten, next, ok := rewriteParenFunction(sql, i, rewriteMedian); ok {
-					out.WriteString(rewritten)
-					i = next
-					continue
-				}
-			case "ratio_to_report":
-				if rewritten, next, ok := rewriteRatioToReport(sql, i); ok {
-					out.WriteString(rewritten)
-					i = next
-					continue
-				}
-			case "like":
-				if rewritten, next, ok := rewriteLikeDefaultEscape(sql, start, i); ok {
+			if rewrite, ok := redshiftFunctionRewrites[strings.ToLower(name)]; ok {
+				if rewritten, next, ok := rewrite(sql, start, i); ok {
 					out.WriteString(rewritten)
 					i = next
 					continue
@@ -829,6 +596,71 @@ func rewriteRedshiftFunctions(sql string) string {
 		i++
 	}
 	return out.String()
+}
+
+// adaptParenFn lifts an argument-list rewriter into a redshiftFunctionRewriter.
+func adaptParenFn(rewrite func([]string) (string, bool)) redshiftFunctionRewriter {
+	return func(sql string, _, end int) (string, int, bool) {
+		return rewriteParenFunction(sql, end, rewrite)
+	}
+}
+
+// adaptIdentEnd lifts a (sql, identEnd) rewriter into a redshiftFunctionRewriter.
+func adaptIdentEnd(rewrite func(string, int) (string, int, bool)) redshiftFunctionRewriter {
+	return func(sql string, _, end int) (string, int, bool) {
+		return rewrite(sql, end)
+	}
+}
+
+// emitWhenParenFollows replaces the identifier with `name` when an argument list follows.
+// The arguments themselves are left intact for the outer loop to process.
+func emitWhenParenFollows(name string) redshiftFunctionRewriter {
+	return func(sql string, _, end int) (string, int, bool) {
+		next := skipSpaces(sql, end)
+		if next < len(sql) && sql[next] == '(' && matchingParen(sql, next) > next {
+			return name, end, true
+		}
+		return "", 0, false
+	}
+}
+
+// emitConstantNoConsume swaps the identifier for `name` with no argument list (e.g. SYSDATE).
+func emitConstantNoConsume(name string) redshiftFunctionRewriter {
+	return func(_ string, _, end int) (string, int, bool) {
+		return name, end, true
+	}
+}
+
+// rewriteGetDateEmptyParens handles GETDATE() -> CURRENT_TIMESTAMP; only the empty-parens form matches.
+func rewriteGetDateEmptyParens(sql string, _, end int) (string, int, bool) {
+	next := skipSpaces(sql, end)
+	if next >= len(sql) || sql[next] != '(' {
+		return "", 0, false
+	}
+	close := matchingParen(sql, next)
+	if close > next && strings.TrimSpace(sql[next+1:close]) == "" {
+		return PostgresCurrentTimestamp, close + 1, true
+	}
+	return "", 0, false
+}
+
+// rewriteNVLAsCoalesce swaps NVL(...) for COALESCE(...) preserving the original argument list.
+func rewriteNVLAsCoalesce(sql string, _, end int) (string, int, bool) {
+	next := skipSpaces(sql, end)
+	if next >= len(sql) || sql[next] != '(' {
+		return "", 0, false
+	}
+	close := matchingParen(sql, next)
+	if close > next {
+		return PostgresCoalesce + sql[next:close+1], close + 1, true
+	}
+	return "", 0, false
+}
+
+// rewriteBooleanLiteralAfterKeyword consumes the literal token after the BOOLEAN keyword.
+func rewriteBooleanLiteralAfterKeyword(sql string, _, end int) (string, int, bool) {
+	next := skipSpaces(sql, end)
+	return parseRedshiftBooleanLiteral(sql, next)
 }
 
 type partiQLNavigationStep struct {
