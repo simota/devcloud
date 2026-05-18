@@ -144,6 +144,48 @@ func TestRedshiftToPostgresRewritesGrantAssumeRoleToNoop(t *testing.T) {
 	}
 }
 
+func TestRedshiftToPostgresRewritesDatashareStatementsToNoop(t *testing.T) {
+	tests := []struct {
+		name string
+		sql  string
+		want string
+	}{
+		{
+			name: "create datashare",
+			sql:  "CREATE DATASHARE sales_share;",
+			want: "select 1",
+		},
+		{
+			name: "alter datashare",
+			sql:  "alter datashare sales_share add schema analytics",
+			want: "select 1",
+		},
+		{
+			name: "grant usage on datashare",
+			sql:  "grant usage on datashare sales_share to namespace '12345678-1234-1234-1234-123456789012'",
+			want: "select 1",
+		},
+		{
+			name: "datashare inside string literal is ignored",
+			sql:  "select 'CREATE DATASHARE sales_share' as statement",
+			want: "select 'CREATE DATASHARE sales_share' as statement",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			translated, err := NewRedshiftToPostgres().Translate(context.Background(), Session{}, tc.sql)
+			if err != nil {
+				t.Fatalf("Translate() error = %v", err)
+			}
+
+			if translated.BackendSQL != tc.want {
+				t.Fatalf("BackendSQL = %q, want %q", translated.BackendSQL, tc.want)
+			}
+		})
+	}
+}
+
 func TestRedshiftToPostgresRewritesRandToRandom(t *testing.T) {
 	tests := []struct {
 		name string

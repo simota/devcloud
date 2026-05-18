@@ -122,6 +122,10 @@ func (RedshiftToPostgres) Translate(ctx context.Context, _ Session, sql string) 
 		translated.BackendSQL = rewritePostgresCompatibility(translated.BackendSQL)
 		return translated, err
 	}
+	if translated, ok, err := translateDatashare(sql); ok || err != nil {
+		translated.BackendSQL = rewritePostgresCompatibility(translated.BackendSQL)
+		return translated, err
+	}
 	if translated, ok, err := translateGrantAssumeRole(sql); ok || err != nil {
 		translated.BackendSQL = rewritePostgresCompatibility(translated.BackendSQL)
 		return translated, err
@@ -2836,6 +2840,33 @@ func translateGrantAssumeRole(sql string) (TranslationResult, bool, error) {
 		return TranslationResult{BackendSQL: statement}, true, nil
 	}
 
+	return TranslationResult{BackendSQL: "select 1"}, true, nil
+}
+
+func translateDatashare(sql string) (TranslationResult, bool, error) {
+	statement := strings.TrimSpace(strings.TrimRight(sql, ";"))
+	for _, keywords := range [][]string{
+		{"create", "datashare"},
+		{"alter", "datashare"},
+	} {
+		prefixEnd, ok := matchKeywordSequence(statement, 0, keywords)
+		if !ok {
+			continue
+		}
+		if strings.TrimSpace(statement[prefixEnd:]) == "" {
+			return TranslationResult{BackendSQL: statement}, true, nil
+		}
+		return TranslationResult{BackendSQL: "select 1"}, true, nil
+	}
+
+	prefixEnd, ok := matchKeywordSequence(statement, 0, []string{"grant", "usage", "on", "datashare"})
+	if !ok {
+		return TranslationResult{}, false, nil
+	}
+	toStart, toEnd := findTopLevelKeywordSequence(statement, []string{"to"}, prefixEnd)
+	if toStart < 0 || strings.TrimSpace(statement[prefixEnd:toStart]) == "" || strings.TrimSpace(statement[toEnd:]) == "" {
+		return TranslationResult{BackendSQL: statement}, true, nil
+	}
 	return TranslationResult{BackendSQL: "select 1"}, true, nil
 }
 
