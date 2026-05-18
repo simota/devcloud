@@ -449,6 +449,49 @@ func TestRedshiftToPostgresDoesNotRewriteFunctionsInsideStringLiterals(t *testin
 	}
 }
 
+func TestRedshiftToPostgresRewritesSTVTablesToReadOnlyStubs(t *testing.T) {
+	stvStub := postgresRedshiftSystemTableStub()
+	tests := []struct {
+		name string
+		sql  string
+		want string
+	}{
+		{
+			name: "from stv table",
+			sql:  "select * from stv_recents",
+			want: "select * from " + stvStub + " as stv_recents",
+		},
+		{
+			name: "join stv table with alias",
+			sql:  "select r.query from events e join STV_RECENTS as r on r.query = e.query_id",
+			want: "select r.query from events e join " + stvStub + " as r on r.query = e.query_id",
+		},
+		{
+			name: "from stv table with where clause",
+			sql:  "select query from stv_recents where userid = 100",
+			want: "select query from " + stvStub + " as stv_recents where userid = 100",
+		},
+		{
+			name: "stv table inside string literal is ignored",
+			sql:  "select 'from stv_recents' as label from events",
+			want: "select 'from stv_recents' as label from events",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			translated, err := NewRedshiftToPostgres().Translate(context.Background(), Session{}, tc.sql)
+			if err != nil {
+				t.Fatalf("Translate() error = %v", err)
+			}
+
+			if translated.BackendSQL != tc.want {
+				t.Fatalf("BackendSQL = %q, want %q", translated.BackendSQL, tc.want)
+			}
+		})
+	}
+}
+
 func TestRedshiftToPostgresRewritesDefaultFunctionInCreateTableBackendSQL(t *testing.T) {
 	translated, err := NewRedshiftToPostgres().Translate(context.Background(), Session{}, "create table events(id int, created_at timestamp default getdate())")
 	if err != nil {

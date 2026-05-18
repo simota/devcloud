@@ -83,50 +83,50 @@ func (RedshiftToPostgres) Translate(ctx context.Context, _ Session, sql string) 
 	sql = rewriteLateralColumnAliases(sql)
 	sql = rewriteNullOrderingDefaults(sql)
 	if translated, ok, err := translateCreateExternalSchema(sql); ok || err != nil {
-		translated.BackendSQL = rewriteRedshiftFunctions(translated.BackendSQL)
+		translated.BackendSQL = rewritePostgresCompatibility(translated.BackendSQL)
 		return translated, err
 	}
 	if translated, ok, err := translateCreateExternalTable(sql); ok || err != nil {
-		translated.BackendSQL = rewriteRedshiftFunctions(translated.BackendSQL)
+		translated.BackendSQL = rewritePostgresCompatibility(translated.BackendSQL)
 		return translated, err
 	}
 	if translated, ok, err := translateCreateMaterializedView(sql); ok || err != nil {
-		translated.BackendSQL = rewriteRedshiftFunctions(translated.BackendSQL)
+		translated.BackendSQL = rewritePostgresCompatibility(translated.BackendSQL)
 		return translated, err
 	}
 	if translated, ok, err := translateMergeInto(sql); ok || err != nil {
-		translated.BackendSQL = rewriteRedshiftFunctions(translated.BackendSQL)
+		translated.BackendSQL = rewritePostgresCompatibility(translated.BackendSQL)
 		return translated, err
 	}
 	if translated, ok, err := translateInsertSelectReturning(sql); ok || err != nil {
-		translated.BackendSQL = rewriteRedshiftFunctions(translated.BackendSQL)
+		translated.BackendSQL = rewritePostgresCompatibility(translated.BackendSQL)
 		return translated, err
 	}
 	if translated, ok, err := translateInsertValuesDefault(sql); ok || err != nil {
-		translated.BackendSQL = rewriteRedshiftFunctions(translated.BackendSQL)
+		translated.BackendSQL = rewritePostgresCompatibility(translated.BackendSQL)
 		return translated, err
 	}
 	if translated, ok, err := translateAlterColumnEncode(sql); ok || err != nil {
-		translated.BackendSQL = rewriteRedshiftFunctions(translated.BackendSQL)
+		translated.BackendSQL = rewritePostgresCompatibility(translated.BackendSQL)
 		return translated, err
 	}
 	if translated, ok, err := translateAlterAddColumnDefaultIdentity(sql); ok || err != nil {
-		translated.BackendSQL = rewriteRedshiftFunctions(translated.BackendSQL)
+		translated.BackendSQL = rewritePostgresCompatibility(translated.BackendSQL)
 		return translated, err
 	}
 	if translated, ok, err := translateTruncateImmediateCommit(sql); ok || err != nil {
-		translated.BackendSQL = rewriteRedshiftFunctions(translated.BackendSQL)
+		translated.BackendSQL = rewritePostgresCompatibility(translated.BackendSQL)
 		return translated, err
 	}
 	if translated, ok, err := translateQualifySelect(sql); ok || err != nil {
-		translated.BackendSQL = rewriteRedshiftFunctions(translated.BackendSQL)
+		translated.BackendSQL = rewritePostgresCompatibility(translated.BackendSQL)
 		return translated, err
 	}
 	if translated, ok, err := translateCreateTable(sql); ok || err != nil {
-		translated.BackendSQL = rewriteRedshiftFunctions(translated.BackendSQL)
+		translated.BackendSQL = rewritePostgresCompatibility(translated.BackendSQL)
 		return translated, err
 	}
-	return TranslationResult{BackendSQL: rewriteRedshiftFunctions(rewriteLateBindingView(sql))}, nil
+	return TranslationResult{BackendSQL: rewritePostgresCompatibility(rewriteLateBindingView(sql))}, nil
 }
 
 func translateSelectTopLimit(sql string) string {
@@ -971,6 +971,147 @@ func rewriteLateBindingView(sql string) string {
 		i++
 	}
 	return strings.TrimSpace(string(out))
+}
+
+func rewritePostgresCompatibility(sql string) string {
+	return rewriteRedshiftFunctions(rewriteRedshiftSystemTables(sql))
+}
+
+func rewriteRedshiftSystemTables(sql string) string {
+	var out strings.Builder
+	for i := 0; i < len(sql); {
+		ch := sql[i]
+		if ch == '\'' {
+			i = copyQuotedString(&out, sql, i)
+			continue
+		}
+		if ch == '"' {
+			i = copyQuotedIdentifier(&out, sql, i)
+			continue
+		}
+		if end, ok := matchKeywordSequence(sql, i, []string{"from"}); ok {
+			out.WriteString(sql[i:end])
+			next := copySpaces(&out, sql, end)
+			if rewritten, rewrittenEnd, ok := rewriteRedshiftSystemTableReference(sql, next); ok {
+				out.WriteString(rewritten)
+				i = rewrittenEnd
+				continue
+			}
+			i = next
+			continue
+		}
+		if end, ok := matchKeywordSequence(sql, i, []string{"join"}); ok {
+			out.WriteString(sql[i:end])
+			next := copySpaces(&out, sql, end)
+			if rewritten, rewrittenEnd, ok := rewriteRedshiftSystemTableReference(sql, next); ok {
+				out.WriteString(rewritten)
+				i = rewrittenEnd
+				continue
+			}
+			i = next
+			continue
+		}
+		out.WriteByte(ch)
+		i++
+	}
+	return out.String()
+}
+
+func rewriteRedshiftSystemTableReference(sql string, index int) (string, int, bool) {
+	_, referenceEnd, tableName, ok := readRelationIdentifier(sql, index)
+	if !ok || !strings.HasPrefix(strings.ToLower(tableName), "stv_") {
+		return "", index, false
+	}
+	afterReferenceSpaces := skipSpaces(sql, referenceEnd)
+	alias := tableName
+	next := referenceEnd
+	if asEnd, ok := matchKeywordSequence(sql, afterReferenceSpaces, []string{"as"}); ok {
+		aliasStart := skipSpaces(sql, asEnd)
+		parsedAlias, aliasEnd, ok := readAliasIdentifier(sql, aliasStart)
+		if !ok {
+			return "", index, false
+		}
+		alias = parsedAlias
+		next = aliasEnd
+	} else if parsedAlias, aliasEnd, ok := readAliasIdentifier(sql, afterReferenceSpaces); ok && !isRelationAliasStopWord(parsedAlias) {
+		alias = parsedAlias
+		next = aliasEnd
+	}
+
+	return postgresRedshiftSystemTableStub() + " as " + alias, next, true
+}
+
+func readRelationIdentifier(sql string, index int) (string, int, string, bool) {
+	if index >= len(sql) || !isIdentifierStart(sql[index]) {
+		return "", index, "", false
+	}
+	start := index
+	lastStart := index
+	for {
+		if index >= len(sql) || !isIdentifierStart(sql[index]) {
+			return "", start, "", false
+		}
+		partStart := index
+		index++
+		for index < len(sql) && isIdentifierPart(sql[index]) {
+			index++
+		}
+		lastStart = partStart
+		if index >= len(sql) || sql[index] != '.' {
+			break
+		}
+		index++
+	}
+	return sql[start:index], index, sql[lastStart:index], true
+}
+
+func readAliasIdentifier(sql string, index int) (string, int, bool) {
+	if index >= len(sql) {
+		return "", index, false
+	}
+	if sql[index] == '"' {
+		var alias strings.Builder
+		next := copyQuotedIdentifier(&alias, sql, index)
+		if next <= index {
+			return "", index, false
+		}
+		return alias.String(), next, true
+	}
+	if !isIdentifierStart(sql[index]) {
+		return "", index, false
+	}
+	start := index
+	index++
+	for index < len(sql) && isIdentifierPart(sql[index]) {
+		index++
+	}
+	return sql[start:index], index, true
+}
+
+func isRelationAliasStopWord(value string) bool {
+	switch strings.ToLower(strings.Trim(value, `"`)) {
+	case "cross", "except", "fetch", "full", "group", "having", "inner", "intersect", "join", "left", "limit", "offset", "on", "order", "outer", "qualify", "right", "union", "using", "where":
+		return true
+	default:
+		return false
+	}
+}
+
+func postgresRedshiftSystemTableStub() string {
+	return "(select null::integer as node, null::integer as slice, null::integer as userid, null::text as user_name, null::integer as pid, null::bigint as xid, null::bigint as query, null::text as label, null::timestamp as starttime, null::timestamp as endtime, null::text as status, null::text as text, null::bigint as rows, null::bigint as bytes, null::bigint as cpu_time, null::boolean as is_diskbased, null::bigint as workmem, null::text as type, null::text as name, null::text as value where false)"
+}
+
+func copySpaces(out *strings.Builder, value string, index int) int {
+	for index < len(value) {
+		switch value[index] {
+		case ' ', '\t', '\n', '\r':
+			out.WriteByte(value[index])
+			index++
+		default:
+			return index
+		}
+	}
+	return index
 }
 
 func matchKeywordSequence(sql string, index int, keywords []string) (int, bool) {

@@ -141,7 +141,7 @@ devcloud の Redshift サービスは、`translator.RedshiftToPostgres` で Reds
 
 ## 9. システムカタログ / メタデータ
 
-- [ ] **R-only** `STV_*` (運用統計、リアルタイム) — read-only スタブの実装余地あり
+- [x] **R-only** `STV_*` (運用統計、リアルタイム) — read-only スタブの実装余地あり
 - [ ] **R-only** `STL_*` (ログ、過去)
 - [ ] **R-only** `SVV_*` / `SVL_*` / `SYS_*` ビュー
 - [ ] **R-only** `PG_TABLE_DEF` / `PG_TABLE_INFO` (Redshift 拡張カラム)
