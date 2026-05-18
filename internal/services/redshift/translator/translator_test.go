@@ -28,6 +28,38 @@ func TestRedshiftToPostgresRewritesNVLToCoalesce(t *testing.T) {
 	}
 }
 
+func TestRedshiftToPostgresRewritesLenToLength(t *testing.T) {
+	tests := []struct {
+		name string
+		sql  string
+		want string
+	}{
+		{
+			name: "len",
+			sql:  "select len(payload) as payload_length from events",
+			want: "select length(payload) as payload_length from events",
+		},
+		{
+			name: "len inside string literal is ignored",
+			sql:  "select 'len(payload)' as label, LEN(trim(payload)) as payload_length from events",
+			want: "select 'len(payload)' as label, length(trim(payload)) as payload_length from events",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			translated, err := NewRedshiftToPostgres().Translate(context.Background(), Session{}, tc.sql)
+			if err != nil {
+				t.Fatalf("Translate() error = %v", err)
+			}
+
+			if translated.BackendSQL != tc.want {
+				t.Fatalf("BackendSQL = %q, want %q", translated.BackendSQL, tc.want)
+			}
+		})
+	}
+}
+
 func TestRedshiftToPostgresDoesNotRewriteFunctionsInsideStringLiterals(t *testing.T) {
 	translated, err := NewRedshiftToPostgres().Translate(context.Background(), Session{}, `select 'getdate() sysdate nvl(a,b)' as literal, "nvl" as quoted_name, getdate() as now`)
 	if err != nil {
