@@ -260,6 +260,43 @@ func TestRedshiftToPostgresRewritesCreateFunctionPLPythonLanguage(t *testing.T) 
 	}
 }
 
+func TestRedshiftToPostgresRewritesCreateFunctionSQLStable(t *testing.T) {
+	tests := []struct {
+		name string
+		sql  string
+		want string
+	}{
+		{
+			name: "sql udf stable before body",
+			sql:  "CREATE FUNCTION f_sql_greater(float, float) RETURNS float STABLE AS $$ SELECT CASE WHEN $1 > $2 THEN $1 ELSE $2 END $$ LANGUAGE sql;",
+			want: "CREATE FUNCTION f_sql_greater(float, float) RETURNS float AS $$ SELECT CASE WHEN $1 > $2 THEN $1 ELSE $2 END $$ LANGUAGE sql STABLE;",
+		},
+		{
+			name: "sql udf already postgres option order",
+			sql:  "create function f_sql_identity(integer) returns integer as $$ select $1 $$ language sql stable",
+			want: "create function f_sql_identity(integer) returns integer as $$ select $1 $$ language sql stable",
+		},
+		{
+			name: "create function inside string literal is ignored",
+			sql:  "select 'CREATE FUNCTION f_sql_identity(integer) RETURNS integer STABLE AS $$ SELECT $1 $$ LANGUAGE sql' as statement",
+			want: "select 'CREATE FUNCTION f_sql_identity(integer) RETURNS integer STABLE AS $$ SELECT $1 $$ LANGUAGE sql' as statement",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			translated, err := NewRedshiftToPostgres().Translate(context.Background(), Session{}, tc.sql)
+			if err != nil {
+				t.Fatalf("Translate() error = %v", err)
+			}
+
+			if translated.BackendSQL != tc.want {
+				t.Fatalf("BackendSQL = %q, want %q", translated.BackendSQL, tc.want)
+			}
+		})
+	}
+}
+
 func TestRedshiftToPostgresRewritesDatashareStatementsToNoop(t *testing.T) {
 	tests := []struct {
 		name string

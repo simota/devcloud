@@ -990,7 +990,7 @@ func rewriteLateBindingView(sql string) string {
 }
 
 func rewritePostgresCompatibility(sql string) string {
-	return rewriteRedshiftFunctions(rewriteRedshiftSystemTables(rewriteBeginTransactionModes(rewriteResetCommand(rewriteCreateProcedureArgumentModes(rewriteCreateFunctionPLPythonLanguage(rewriteCreateUserPasswordClauses(sql)))))))
+	return rewriteRedshiftFunctions(rewriteRedshiftSystemTables(rewriteBeginTransactionModes(rewriteResetCommand(rewriteCreateProcedureArgumentModes(rewriteCreateFunctionSQLStable(rewriteCreateFunctionPLPythonLanguage(rewriteCreateUserPasswordClauses(sql))))))))
 }
 
 func rewriteCreateFunctionPLPythonLanguage(sql string) string {
@@ -1013,6 +1013,95 @@ func rewriteCreateFunctionPLPythonLanguage(sql string) string {
 		return sql
 	}
 	return sql[:languageNameStart] + "plpython3u" + sql[languageNameEnd:]
+}
+
+func rewriteCreateFunctionSQLStable(sql string) string {
+	start := skipSpaces(sql, 0)
+	functionEnd, ok := matchKeywordSequence(sql, start, []string{"create", "or", "replace", "function"})
+	if !ok {
+		functionEnd, ok = matchKeywordSequence(sql, start, []string{"create", "function"})
+	}
+	if !ok {
+		return sql
+	}
+
+	languageStart, languageEnd := findCreateFunctionLanguage(sql, functionEnd)
+	if languageStart < 0 {
+		return sql
+	}
+	languageNameStart := skipSpaces(sql, languageEnd)
+	languageName, languageNameEnd, ok := readSQLIdentifier(sql, languageNameStart)
+	if !ok || !strings.EqualFold(languageName, "sql") {
+		return sql
+	}
+	if stableStart, _ := findCreateFunctionTopLevelKeyword(sql, languageNameEnd, len(sql), []string{"stable"}); stableStart >= 0 {
+		return sql
+	}
+
+	asStart, _ := findCreateFunctionTopLevelKeyword(sql, functionEnd, languageStart, []string{"as"})
+	if asStart < 0 {
+		return sql
+	}
+	stableStart, stableEnd := findCreateFunctionTopLevelKeyword(sql, functionEnd, asStart, []string{"stable"})
+	if stableStart < 0 {
+		return sql
+	}
+
+	return sql[:stableStart] + strings.TrimLeft(sql[stableEnd:languageNameEnd], " \t\n\r") + " STABLE" + sql[languageNameEnd:]
+}
+
+func findCreateFunctionTopLevelKeyword(sql string, start, end int, keywords []string) (int, int) {
+	if start < 0 {
+		start = 0
+	}
+	if end > len(sql) {
+		end = len(sql)
+	}
+	depth := 0
+	for i := start; i < end; {
+		switch sql[i] {
+		case '\'':
+			var quoted strings.Builder
+			i = copyQuotedString(&quoted, sql, i)
+			continue
+		case '"':
+			var quoted strings.Builder
+			i = copyQuotedIdentifier(&quoted, sql, i)
+			continue
+		case '$':
+			if next, ok := skipDollarQuotedString(sql, i); ok {
+				i = next
+				continue
+			}
+		case '-':
+			if i+1 < end && sql[i+1] == '-' {
+				i = skipLineComment(sql, i+2)
+				continue
+			}
+		case '/':
+			if i+1 < end && sql[i+1] == '*' {
+				i = skipBlockComment(sql, i+2)
+				continue
+			}
+		case '(':
+			depth++
+			i++
+			continue
+		case ')':
+			if depth > 0 {
+				depth--
+			}
+			i++
+			continue
+		}
+		if depth == 0 {
+			if keywordEnd, ok := matchKeywordSequence(sql, i, keywords); ok && keywordEnd <= end {
+				return i, keywordEnd
+			}
+		}
+		i++
+	}
+	return -1, -1
 }
 
 func findCreateFunctionLanguage(sql string, start int) (int, int) {
