@@ -552,6 +552,12 @@ func rewriteRedshiftFunctions(sql string) string {
 						continue
 					}
 				}
+			case "nvl2":
+				if rewritten, next, ok := rewriteParenFunction(sql, i, rewriteNVL2); ok {
+					out.WriteString(rewritten)
+					i = next
+					continue
+				}
 			case "len":
 				if rewritten, next, ok := rewriteParenFunction(sql, i, rewriteLen); ok {
 					out.WriteString(rewritten)
@@ -956,6 +962,19 @@ func rewriteDecode(args []string) (string, bool) {
 	}
 	out.WriteString(" END")
 	return out.String(), true
+}
+
+func rewriteNVL2(args []string) (string, bool) {
+	if len(args) != 3 {
+		return "", false
+	}
+	expr := strings.TrimSpace(args[0])
+	valIfNotNull := strings.TrimSpace(args[1])
+	valIfNull := strings.TrimSpace(args[2])
+	if expr == "" || valIfNotNull == "" || valIfNull == "" {
+		return "", false
+	}
+	return "CASE WHEN " + expr + " IS NOT NULL THEN " + valIfNotNull + " ELSE " + valIfNull + " END", true
 }
 
 func rewriteLen(args []string) (string, bool) {

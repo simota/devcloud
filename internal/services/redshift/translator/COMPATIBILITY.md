@@ -119,7 +119,7 @@ devcloud の Redshift サービスは、`translator.RedshiftToPostgres` で Reds
 ## 7. スカラー関数 — 数値・条件
 
 - [x] **R-only** `NVL(a, b)` → `COALESCE(a, b)`
-- [ ] **R-only** `NVL2(expr, val_if_not_null, val_if_null)` → `CASE WHEN expr IS NOT NULL THEN ... ELSE ... END`
+- [x] **R-only** `NVL2(expr, val_if_not_null, val_if_null)` → `CASE WHEN expr IS NOT NULL THEN ... ELSE ... END`
 - [x] **R-only** `DECODE(expr, k1, v1, k2, v2, default)` → `CASE`
 - [ ] **R-only** `RAND()` 大文字 → PG `random()`
 - [ ] **R≠P** `GREATEST` / `LEAST` の NULL 扱い（Redshift は NULL 無視、PG は NULL 返す）

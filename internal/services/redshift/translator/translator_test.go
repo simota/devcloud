@@ -28,6 +28,38 @@ func TestRedshiftToPostgresRewritesNVLToCoalesce(t *testing.T) {
 	}
 }
 
+func TestRedshiftToPostgresRewritesNVL2ToCase(t *testing.T) {
+	tests := []struct {
+		name string
+		sql  string
+		want string
+	}{
+		{
+			name: "nvl2",
+			sql:  "select nvl2(payload, 'present', 'missing') as payload_state from events",
+			want: "select CASE WHEN payload IS NOT NULL THEN 'present' ELSE 'missing' END as payload_state from events",
+		},
+		{
+			name: "nvl2 inside string literal is ignored",
+			sql:  "select 'nvl2(payload, ''present'', ''missing'')' as label, NVL2(trim(payload), payload, 'missing') as payload_value from events",
+			want: "select 'nvl2(payload, ''present'', ''missing'')' as label, CASE WHEN trim(payload) IS NOT NULL THEN payload ELSE 'missing' END as payload_value from events",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			translated, err := NewRedshiftToPostgres().Translate(context.Background(), Session{}, tc.sql)
+			if err != nil {
+				t.Fatalf("Translate() error = %v", err)
+			}
+
+			if translated.BackendSQL != tc.want {
+				t.Fatalf("BackendSQL = %q, want %q", translated.BackendSQL, tc.want)
+			}
+		})
+	}
+}
+
 func TestRedshiftToPostgresRewritesLenToLength(t *testing.T) {
 	tests := []struct {
 		name string
