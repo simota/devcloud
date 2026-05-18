@@ -277,6 +277,12 @@ func rewriteRedshiftFunctions(sql string) string {
 					i = next
 					continue
 				}
+			case "ratio_to_report":
+				if rewritten, next, ok := rewriteRatioToReport(sql, i); ok {
+					out.WriteString(rewritten)
+					i = next
+					continue
+				}
 			case "like":
 				if rewritten, next, ok := rewriteLikeDefaultEscape(sql, start, i); ok {
 					out.WriteString(rewritten)
@@ -569,6 +575,41 @@ func rewriteMedian(args []string) (string, bool) {
 		return "", false
 	}
 	return "percentile_cont(0.5) WITHIN GROUP (ORDER BY " + value + ")", true
+}
+
+func rewriteRatioToReport(sql string, index int) (string, int, bool) {
+	open := skipSpaces(sql, index)
+	if open >= len(sql) || sql[open] != '(' {
+		return "", index, false
+	}
+	close := matchingParen(sql, open)
+	if close < 0 {
+		return "", index, false
+	}
+	args := splitCommaSeparated(sql[open+1 : close])
+	if len(args) != 1 {
+		return "", index, false
+	}
+	value := strings.TrimSpace(args[0])
+	if value == "" {
+		return "", index, false
+	}
+
+	overStart := skipSpaces(sql, close+1)
+	overEnd, ok := matchKeywordSequence(sql, overStart, []string{"over"})
+	if !ok {
+		return "", index, false
+	}
+	overOpen := skipSpaces(sql, overEnd)
+	if overOpen >= len(sql) || sql[overOpen] != '(' {
+		return "", index, false
+	}
+	overClose := matchingParen(sql, overOpen)
+	if overClose < 0 {
+		return "", index, false
+	}
+
+	return value + " / SUM(" + value + ") OVER " + sql[overOpen:overClose+1], overClose + 1, true
 }
 
 func rewriteListAgg(sql string, index int) (string, int, bool) {

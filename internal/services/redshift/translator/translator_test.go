@@ -109,6 +109,38 @@ func TestRedshiftToPostgresRewritesMedianToPercentileCont(t *testing.T) {
 	}
 }
 
+func TestRedshiftToPostgresRewritesRatioToReportOver(t *testing.T) {
+	tests := []struct {
+		name string
+		sql  string
+		want string
+	}{
+		{
+			name: "partitioned window",
+			sql:  "select ratio_to_report(revenue) over (partition by category) as revenue_share from sales",
+			want: "select revenue / SUM(revenue) OVER (partition by category) as revenue_share from sales",
+		},
+		{
+			name: "ratio_to_report inside string literal is ignored",
+			sql:  "select 'ratio_to_report(revenue) over ()' as label, RATIO_TO_REPORT(revenue) OVER () as revenue_share from sales",
+			want: "select 'ratio_to_report(revenue) over ()' as label, revenue / SUM(revenue) OVER () as revenue_share from sales",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			translated, err := NewRedshiftToPostgres().Translate(context.Background(), Session{}, tc.sql)
+			if err != nil {
+				t.Fatalf("Translate() error = %v", err)
+			}
+
+			if translated.BackendSQL != tc.want {
+				t.Fatalf("BackendSQL = %q, want %q", translated.BackendSQL, tc.want)
+			}
+		})
+	}
+}
+
 func TestRedshiftToPostgresRewritesApproximateCountDistinct(t *testing.T) {
 	tests := []struct {
 		name string
