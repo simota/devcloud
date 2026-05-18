@@ -223,6 +223,38 @@ func TestRedshiftToPostgresRewritesMaskingPolicyStatementsToNoop(t *testing.T) {
 	}
 }
 
+func TestRedshiftToPostgresRewritesRowAccessPolicyStatementsToNoop(t *testing.T) {
+	tests := []struct {
+		name string
+		sql  string
+		want string
+	}{
+		{
+			name: "create row access policy",
+			sql:  "CREATE ROW ACCESS POLICY tenant_filter WITH (tenant_id int) USING (tenant_id = current_setting('app.tenant_id')::int);",
+			want: "select 1",
+		},
+		{
+			name: "row access policy inside string literal is ignored",
+			sql:  "select 'CREATE ROW ACCESS POLICY tenant_filter' as statement",
+			want: "select 'CREATE ROW ACCESS POLICY tenant_filter' as statement",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			translated, err := NewRedshiftToPostgres().Translate(context.Background(), Session{}, tc.sql)
+			if err != nil {
+				t.Fatalf("Translate() error = %v", err)
+			}
+
+			if translated.BackendSQL != tc.want {
+				t.Fatalf("BackendSQL = %q, want %q", translated.BackendSQL, tc.want)
+			}
+		})
+	}
+}
+
 func TestRedshiftToPostgresRewritesRandToRandom(t *testing.T) {
 	tests := []struct {
 		name string

@@ -130,6 +130,10 @@ func (RedshiftToPostgres) Translate(ctx context.Context, _ Session, sql string) 
 		translated.BackendSQL = rewritePostgresCompatibility(translated.BackendSQL)
 		return translated, err
 	}
+	if translated, ok, err := translateRowAccessPolicy(sql); ok || err != nil {
+		translated.BackendSQL = rewritePostgresCompatibility(translated.BackendSQL)
+		return translated, err
+	}
 	if translated, ok, err := translateGrantAssumeRole(sql); ok || err != nil {
 		translated.BackendSQL = rewritePostgresCompatibility(translated.BackendSQL)
 		return translated, err
@@ -2890,6 +2894,18 @@ func translateMaskingPolicy(sql string) (TranslationResult, bool, error) {
 		return TranslationResult{BackendSQL: "select 1"}, true, nil
 	}
 	return TranslationResult{}, false, nil
+}
+
+func translateRowAccessPolicy(sql string) (TranslationResult, bool, error) {
+	statement := strings.TrimSpace(strings.TrimRight(sql, ";"))
+	prefixEnd, ok := matchKeywordSequence(statement, 0, []string{"create", "row", "access", "policy"})
+	if !ok {
+		return TranslationResult{}, false, nil
+	}
+	if strings.TrimSpace(statement[prefixEnd:]) == "" {
+		return TranslationResult{BackendSQL: statement}, true, nil
+	}
+	return TranslationResult{BackendSQL: "select 1"}, true, nil
 }
 
 func rewriteQualifyWindowPredicate(innerSQL string, condition string) (string, string, string, bool) {
