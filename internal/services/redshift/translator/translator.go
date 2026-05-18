@@ -271,6 +271,12 @@ func rewriteRedshiftFunctions(sql string) string {
 					i = next
 					continue
 				}
+			case "median":
+				if rewritten, next, ok := rewriteParenFunction(sql, i, rewriteMedian); ok {
+					out.WriteString(rewritten)
+					i = next
+					continue
+				}
 			case "like":
 				if rewritten, next, ok := rewriteLikeDefaultEscape(sql, start, i); ok {
 					out.WriteString(rewritten)
@@ -552,6 +558,17 @@ func rewriteDateDiff(args []string) (string, bool) {
 	default:
 		return "", false
 	}
+}
+
+func rewriteMedian(args []string) (string, bool) {
+	if len(args) != 1 {
+		return "", false
+	}
+	value := strings.TrimSpace(args[0])
+	if value == "" {
+		return "", false
+	}
+	return "percentile_cont(0.5) WITHIN GROUP (ORDER BY " + value + ")", true
 }
 
 func rewriteListAgg(sql string, index int) (string, int, bool) {

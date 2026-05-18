@@ -71,7 +71,7 @@ devcloud の Redshift サービスは、`translator.RedshiftToPostgres` で Reds
 - [x] **R-only** `LIKE ... ESCAPE` の `\` デフォルトエスケープ挙動
 - [x] **R-only** `APPROXIMATE COUNT(DISTINCT col)` — 近似不要なら `COUNT(DISTINCT)` に置換可
 - [x] **R-only** `LISTAGG(expr, sep) WITHIN GROUP (ORDER BY ...)` → `string_agg(expr, sep ORDER BY ...)`
-- [ ] **R-only** `MEDIAN(col)` → `percentile_cont(0.5) WITHIN GROUP (ORDER BY col)`
+- [x] **R-only** `MEDIAN(col)` → `percentile_cont(0.5) WITHIN GROUP (ORDER BY col)`
 - [ ] **R-only** `RATIO_TO_REPORT(col) OVER (...)` → `col / SUM(col) OVER (...)`
 - [ ] **R-only** `LATERAL` の制限 — PG はフル LATERAL
 - [ ] **R≠P** `NULLS FIRST/LAST` 既定の差（実際は同じだが要確認）

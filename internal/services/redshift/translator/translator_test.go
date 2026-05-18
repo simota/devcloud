@@ -97,6 +97,18 @@ func TestRedshiftToPostgresRewritesListAggWithinGroup(t *testing.T) {
 	}
 }
 
+func TestRedshiftToPostgresRewritesMedianToPercentileCont(t *testing.T) {
+	translated, err := NewRedshiftToPostgres().Translate(context.Background(), Session{}, "select median(duration_ms) as p50_duration from events")
+	if err != nil {
+		t.Fatalf("Translate() error = %v", err)
+	}
+
+	want := "select percentile_cont(0.5) WITHIN GROUP (ORDER BY duration_ms) as p50_duration from events"
+	if translated.BackendSQL != want {
+		t.Fatalf("BackendSQL = %q, want %q", translated.BackendSQL, want)
+	}
+}
+
 func TestRedshiftToPostgresRewritesApproximateCountDistinct(t *testing.T) {
 	tests := []struct {
 		name string
