@@ -297,6 +297,38 @@ func TestRedshiftToPostgresRewritesCreateFunctionSQLStable(t *testing.T) {
 	}
 }
 
+func TestRedshiftToPostgresRewritesCreateModelToNoop(t *testing.T) {
+	tests := []struct {
+		name string
+		sql  string
+		want string
+	}{
+		{
+			name: "create model from table target function iam role",
+			sql:  "CREATE MODEL churn_model FROM training.customers TARGET churned FUNCTION predict_churn IAM_ROLE 'arn:aws:iam::123456789012:role/redshift-ml';",
+			want: "select 1",
+		},
+		{
+			name: "create model inside string literal is ignored",
+			sql:  "select 'CREATE MODEL churn_model FROM training.customers TARGET churned FUNCTION predict_churn IAM_ROLE ''arn:aws:iam::123456789012:role/redshift-ml''' as statement",
+			want: "select 'CREATE MODEL churn_model FROM training.customers TARGET churned FUNCTION predict_churn IAM_ROLE ''arn:aws:iam::123456789012:role/redshift-ml''' as statement",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			translated, err := NewRedshiftToPostgres().Translate(context.Background(), Session{}, tc.sql)
+			if err != nil {
+				t.Fatalf("Translate() error = %v", err)
+			}
+
+			if translated.BackendSQL != tc.want {
+				t.Fatalf("BackendSQL = %q, want %q", translated.BackendSQL, tc.want)
+			}
+		})
+	}
+}
+
 func TestRedshiftToPostgresRewritesDatashareStatementsToNoop(t *testing.T) {
 	tests := []struct {
 		name string
