@@ -549,6 +549,43 @@ func TestRedshiftToPostgresRewritesRoundNegativeScale(t *testing.T) {
 	}
 }
 
+func TestRedshiftToPostgresRewritesJSONExtractPathText(t *testing.T) {
+	tests := []struct {
+		name string
+		sql  string
+		want string
+	}{
+		{
+			name: "path text",
+			sql:  "select json_extract_path_text(payload, 'user', 'name') as user_name from events",
+			want: "select jsonb_extract_path_text((payload)::jsonb, 'user', 'name') as user_name from events",
+		},
+		{
+			name: "trailing null_if_invalid boolean",
+			sql:  "select JSON_EXTRACT_PATH_TEXT(payload, 'user', 'name', true) as user_name from events",
+			want: "select jsonb_extract_path_text((payload)::jsonb, 'user', 'name') as user_name from events",
+		},
+		{
+			name: "json_extract_path_text inside string literal is ignored",
+			sql:  "select 'json_extract_path_text(payload, ''user'', true)' as label, JSON_EXTRACT_PATH_TEXT(trim(payload), 'user', 'name', false) as user_name from events",
+			want: "select 'json_extract_path_text(payload, ''user'', true)' as label, jsonb_extract_path_text((trim(payload))::jsonb, 'user', 'name') as user_name from events",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			translated, err := NewRedshiftToPostgres().Translate(context.Background(), Session{}, tc.sql)
+			if err != nil {
+				t.Fatalf("Translate() error = %v", err)
+			}
+
+			if translated.BackendSQL != tc.want {
+				t.Fatalf("BackendSQL = %q, want %q", translated.BackendSQL, tc.want)
+			}
+		})
+	}
+}
+
 func TestRedshiftToPostgresRewritesDateAddAndDateDiff(t *testing.T) {
 	translated, err := NewRedshiftToPostgres().Translate(context.Background(), Session{}, "select dateadd(day, 7, created_at) as expires_at, datediff(hour, started_at, ended_at) as hours from events")
 	if err != nil {

@@ -654,6 +654,12 @@ func rewriteRedshiftFunctions(sql string) string {
 					i = next
 					continue
 				}
+			case "json_extract_path_text":
+				if rewritten, next, ok := rewriteParenFunction(sql, i, rewriteJSONExtractPathText); ok {
+					out.WriteString(rewritten)
+					i = next
+					continue
+				}
 			case "dateadd":
 				if rewritten, next, ok := rewriteParenFunction(sql, i, rewriteDateAdd); ok {
 					out.WriteString(rewritten)
@@ -1025,6 +1031,27 @@ func rewriteRound(args []string) (string, bool) {
 		return "", false
 	}
 	return "round((" + value + ")::numeric, -" + magnitude + ")", true
+}
+
+func rewriteJSONExtractPathText(args []string) (string, bool) {
+	if len(args) < 2 {
+		return "", false
+	}
+	rewrittenArgs := make([]string, 0, len(args))
+	for _, arg := range args {
+		trimmed := strings.TrimSpace(arg)
+		if trimmed == "" {
+			return "", false
+		}
+		rewrittenArgs = append(rewrittenArgs, trimmed)
+	}
+	if _, ok := postgresBooleanLiteral(rewrittenArgs[len(rewrittenArgs)-1]); ok {
+		rewrittenArgs = rewrittenArgs[:len(rewrittenArgs)-1]
+	}
+	if len(rewrittenArgs) < 2 {
+		return "", false
+	}
+	return "jsonb_extract_path_text((" + rewrittenArgs[0] + ")::jsonb, " + strings.Join(rewrittenArgs[1:], ", ") + ")", true
 }
 
 func rewriteNVL2(args []string) (string, bool) {
