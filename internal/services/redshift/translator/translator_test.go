@@ -1491,7 +1491,17 @@ func TestRedshiftToPostgresRewritesConvertTimezone(t *testing.T) {
 		{
 			name: "convert_timezone inside string literal is ignored",
 			sql:  "select 'convert_timezone(''UTC'', ''JST'', created_at)' as label, CONVERT_TIMEZONE('utc', 'jst', created_at) as created_at_jst from events",
-			want: "select 'convert_timezone(''UTC'', ''JST'', created_at)' as label, created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Tokyo' as created_at_jst from events",
+			want: "select 'convert_timezone(''UTC'', ''JST'', created_at)' as label, created_at AT TIME ZONE 'utc' AT TIME ZONE 'Asia/Tokyo' as created_at_jst from events",
+		},
+		{
+			name: "arbitrary iana zones pass through",
+			sql:  "select convert_timezone('UTC', 'America/New_York', ts) as local_ts from events",
+			want: "select ts AT TIME ZONE 'UTC' AT TIME ZONE 'America/New_York' as local_ts from events",
+		},
+		{
+			name: "expression argument is preserved",
+			sql:  "select convert_timezone('UTC', 'Europe/London', current_timestamp) as ts",
+			want: "select current_timestamp AT TIME ZONE 'UTC' AT TIME ZONE 'Europe/London' as ts",
 		},
 	}
 

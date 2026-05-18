@@ -2271,19 +2271,27 @@ func rewriteConvertTimezone(args []string) (string, bool) {
 	if len(args) != 3 {
 		return "", false
 	}
-	source, ok := sqlStringLiteralValue(args[0])
-	if !ok || !strings.EqualFold(source, "UTC") {
-		return "", false
-	}
-	target, ok := sqlStringLiteralValue(args[1])
-	if !ok || !strings.EqualFold(target, "JST") {
-		return "", false
-	}
+	source := normalizeTimezoneArg(args[0])
+	target := normalizeTimezoneArg(args[1])
 	timestamp := strings.TrimSpace(args[2])
-	if timestamp == "" {
+	if source == "" || target == "" || timestamp == "" {
 		return "", false
 	}
-	return timestamp + " AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Tokyo'", true
+	return timestamp + " AT TIME ZONE " + source + " AT TIME ZONE " + target, true
+}
+
+// normalizeTimezoneArg trims whitespace and remaps timezone abbreviations
+// that PostgreSQL does not always recognize (e.g. JST) to their IANA
+// equivalents so AT TIME ZONE resolves correctly across PG installations.
+func normalizeTimezoneArg(value string) string {
+	trimmed := strings.TrimSpace(value)
+	if literal, ok := sqlStringLiteralValue(trimmed); ok {
+		switch strings.ToUpper(literal) {
+		case "JST":
+			return "'Asia/Tokyo'"
+		}
+	}
+	return trimmed
 }
 
 func sqlStringLiteralValue(value string) (string, bool) {
