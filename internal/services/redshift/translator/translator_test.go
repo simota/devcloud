@@ -28,6 +28,38 @@ func TestRedshiftToPostgresRewritesNVLToCoalesce(t *testing.T) {
 	}
 }
 
+func TestRedshiftToPostgresRewritesRandToRandom(t *testing.T) {
+	tests := []struct {
+		name string
+		sql  string
+		want string
+	}{
+		{
+			name: "uppercase rand",
+			sql:  "select RAND() as sample_value from events",
+			want: "select random() as sample_value from events",
+		},
+		{
+			name: "rand inside string literal is ignored",
+			sql:  "select 'RAND()' as label, RAND() as sample_value from events",
+			want: "select 'RAND()' as label, random() as sample_value from events",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			translated, err := NewRedshiftToPostgres().Translate(context.Background(), Session{}, tc.sql)
+			if err != nil {
+				t.Fatalf("Translate() error = %v", err)
+			}
+
+			if translated.BackendSQL != tc.want {
+				t.Fatalf("BackendSQL = %q, want %q", translated.BackendSQL, tc.want)
+			}
+		})
+	}
+}
+
 func TestRedshiftToPostgresRewritesNVL2ToCase(t *testing.T) {
 	tests := []struct {
 		name string

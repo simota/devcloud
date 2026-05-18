@@ -538,6 +538,12 @@ func rewriteRedshiftFunctions(sql string) string {
 					i = next
 					continue
 				}
+			case "rand":
+				if rewritten, next, ok := rewriteParenFunction(sql, i, rewriteRand); ok {
+					out.WriteString(rewritten)
+					i = next
+					continue
+				}
 			case "sysdate":
 				out.WriteString(PostgresCurrentTimestamp)
 				continue
@@ -1198,6 +1204,13 @@ func rewriteTimeOfDay(args []string) (string, bool) {
 		return "", false
 	}
 	return PostgresClockTimestamp + "::text", true
+}
+
+func rewriteRand(args []string) (string, bool) {
+	if len(args) != 0 {
+		return "", false
+	}
+	return PostgresRandom, true
 }
 
 func rewriteConvertTimezone(args []string) (string, bool) {
@@ -2778,6 +2791,7 @@ const (
 	PostgresCoalesce         = "COALESCE"
 	PostgresCurrentTimestamp = "CURRENT_TIMESTAMP"
 	PostgresClockTimestamp   = "clock_timestamp()"
+	PostgresRandom           = "random()"
 	PostgresBoolAnd          = "bool_and"
 	PostgresBoolOr           = "bool_or"
 	PostgresStringAgg        = "string_agg"
