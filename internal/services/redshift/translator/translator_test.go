@@ -181,6 +181,48 @@ func TestRedshiftToPostgresRewritesCreateUserPasswordDisable(t *testing.T) {
 	}
 }
 
+func TestRedshiftToPostgresRewritesCreateProcedureArgumentModes(t *testing.T) {
+	tests := []struct {
+		name string
+		sql  string
+		want string
+	}{
+		{
+			name: "redshift argument mode after name",
+			sql:  "CREATE OR REPLACE PROCEDURE test_sp2(f1 IN int, f2 INOUT varchar(256), out_var OUT varchar(256)) AS $$ BEGIN f2 := f2 || '+'; SELECT count(*) INTO out_var FROM my_etl; END; $$ LANGUAGE plpgsql;",
+			want: "CREATE OR REPLACE PROCEDURE test_sp2(IN f1 int, INOUT f2 varchar(256), OUT out_var varchar(256) DEFAULT NULL) AS $$ BEGIN f2 := f2 || '+'; SELECT count(*) INTO out_var FROM my_etl; END; $$ LANGUAGE plpgsql;",
+		},
+		{
+			name: "postgres argument mode before name is unchanged",
+			sql:  "create procedure update_counter(INOUT value integer) language plpgsql as $$ begin value := value + 1; end; $$",
+			want: "create procedure update_counter(INOUT value integer) language plpgsql as $$ begin value := value + 1; end; $$",
+		},
+		{
+			name: "postgres out argument receives default",
+			sql:  "create procedure read_counter(OUT value integer) language plpgsql as $$ begin value := 1; end; $$",
+			want: "create procedure read_counter(OUT value integer DEFAULT NULL) language plpgsql as $$ begin value := 1; end; $$",
+		},
+		{
+			name: "create procedure inside string literal is ignored",
+			sql:  "select 'CREATE OR REPLACE PROCEDURE test_sp2(f1 IN int, out_var OUT varchar(256)) LANGUAGE plpgsql' as statement",
+			want: "select 'CREATE OR REPLACE PROCEDURE test_sp2(f1 IN int, out_var OUT varchar(256)) LANGUAGE plpgsql' as statement",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			translated, err := NewRedshiftToPostgres().Translate(context.Background(), Session{}, tc.sql)
+			if err != nil {
+				t.Fatalf("Translate() error = %v", err)
+			}
+
+			if translated.BackendSQL != tc.want {
+				t.Fatalf("BackendSQL = %q, want %q", translated.BackendSQL, tc.want)
+			}
+		})
+	}
+}
+
 func TestRedshiftToPostgresRewritesDatashareStatementsToNoop(t *testing.T) {
 	tests := []struct {
 		name string

@@ -990,7 +990,186 @@ func rewriteLateBindingView(sql string) string {
 }
 
 func rewritePostgresCompatibility(sql string) string {
-	return rewriteRedshiftFunctions(rewriteRedshiftSystemTables(rewriteBeginTransactionModes(rewriteResetCommand(rewriteCreateUserPasswordClauses(sql)))))
+	return rewriteRedshiftFunctions(rewriteRedshiftSystemTables(rewriteBeginTransactionModes(rewriteResetCommand(rewriteCreateProcedureArgumentModes(rewriteCreateUserPasswordClauses(sql))))))
+}
+
+func rewriteCreateProcedureArgumentModes(sql string) string {
+	start := skipSpaces(sql, 0)
+	procedureEnd, ok := matchKeywordSequence(sql, start, []string{"create", "or", "replace", "procedure"})
+	if !ok {
+		procedureEnd, ok = matchKeywordSequence(sql, start, []string{"create", "procedure"})
+	}
+	if !ok {
+		return sql
+	}
+
+	open := findCreateProcedureArgumentsOpen(sql, procedureEnd)
+	if open < 0 {
+		return sql
+	}
+	close := matchingParen(sql, open)
+	if close < 0 {
+		return sql
+	}
+
+	args, changed := rewriteCreateProcedureArgumentList(sql[open+1 : close])
+	if !changed {
+		return sql
+	}
+	return sql[:open+1] + args + sql[close:]
+}
+
+func findCreateProcedureArgumentsOpen(sql string, index int) int {
+	for i := index; i < len(sql); {
+		switch sql[i] {
+		case '\'':
+			var quoted strings.Builder
+			i = copyQuotedString(&quoted, sql, i)
+			continue
+		case '"':
+			var quoted strings.Builder
+			i = copyQuotedIdentifier(&quoted, sql, i)
+			continue
+		case '(':
+			return i
+		default:
+			i++
+		}
+	}
+	return -1
+}
+
+func rewriteCreateProcedureArgumentList(value string) (string, bool) {
+	args := splitCommaSeparated(value)
+	if len(args) == 0 {
+		return value, false
+	}
+
+	rewrittenArgs := make([]string, 0, len(args))
+	changed := false
+	for _, arg := range args {
+		rewritten, argChanged := rewriteCreateProcedureArgument(arg)
+		rewrittenArgs = append(rewrittenArgs, rewritten)
+		changed = changed || argChanged
+	}
+	if !changed {
+		return value, false
+	}
+	return strings.Join(rewrittenArgs, ", "), true
+}
+
+func rewriteCreateProcedureArgument(value string) (string, bool) {
+	trimmed := strings.TrimSpace(value)
+	name, nameEnd, ok := readSQLToken(trimmed, 0)
+	if !ok {
+		return trimmed, false
+	}
+	if isProcedureArgumentMode(name) {
+		rest := strings.TrimSpace(trimmed[nameEnd:])
+		if strings.EqualFold(name, "out") && !procedureArgumentHasDefault(rest) {
+			return strings.ToUpper(name) + " " + rest + " DEFAULT NULL", true
+		}
+		return trimmed, false
+	}
+	modeStart := skipSpaces(trimmed, nameEnd)
+	mode, modeEnd, ok := readSQLToken(trimmed, modeStart)
+	if !ok || !isProcedureArgumentMode(mode) {
+		return trimmed, false
+	}
+	argType := strings.TrimSpace(trimmed[modeEnd:])
+	if argType == "" {
+		return trimmed, false
+	}
+	rewritten := strings.ToUpper(mode) + " " + name + " " + argType
+	if strings.EqualFold(mode, "out") && !procedureArgumentHasDefault(argType) {
+		rewritten += " DEFAULT NULL"
+	}
+	return rewritten, true
+}
+
+func readSQLToken(value string, index int) (string, int, bool) {
+	index = skipSpaces(value, index)
+	if index >= len(value) {
+		return "", index, false
+	}
+	if value[index] == '"' {
+		for i := index + 1; i < len(value); i++ {
+			if value[i] != '"' {
+				continue
+			}
+			if i+1 < len(value) && value[i+1] == '"' {
+				i++
+				continue
+			}
+			return value[index : i+1], i + 1, true
+		}
+		return "", index, false
+	}
+	start := index
+	for index < len(value) && value[index] != ' ' && value[index] != '\t' && value[index] != '\n' && value[index] != '\r' {
+		index++
+	}
+	return value[start:index], index, true
+}
+
+func isProcedureArgumentMode(value string) bool {
+	if strings.HasPrefix(value, `"`) {
+		return false
+	}
+	switch strings.ToLower(value) {
+	case "in", "out", "inout":
+		return true
+	default:
+		return false
+	}
+}
+
+func procedureArgumentHasDefault(value string) bool {
+	if start, _ := findTopLevelKeywordSequence(value, []string{"default"}, 0); start >= 0 {
+		return true
+	}
+	return findTopLevelEquals(value) >= 0
+}
+
+func findTopLevelEquals(value string) int {
+	depth := 0
+	inString := false
+	inQuotedIdentifier := false
+	for i := 0; i < len(value); i++ {
+		ch := value[i]
+		if ch == '\'' && !inQuotedIdentifier {
+			if inString && i+1 < len(value) && value[i+1] == '\'' {
+				i++
+				continue
+			}
+			inString = !inString
+			continue
+		}
+		if ch == '"' && !inString {
+			if inQuotedIdentifier && i+1 < len(value) && value[i+1] == '"' {
+				i++
+				continue
+			}
+			inQuotedIdentifier = !inQuotedIdentifier
+			continue
+		}
+		if inString || inQuotedIdentifier {
+			continue
+		}
+		switch ch {
+		case '(':
+			depth++
+		case ')':
+			if depth > 0 {
+				depth--
+			}
+		case '=':
+			if depth == 0 {
+				return i
+			}
+		}
+	}
+	return -1
 }
 
 func rewriteCreateUserPasswordClauses(sql string) string {
