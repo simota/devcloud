@@ -1038,7 +1038,7 @@ func rewriteRedshiftSystemTableReference(sql string, index int) (string, int, bo
 		next = aliasEnd
 	}
 
-	return postgresRedshiftSystemTableStub() + " as " + alias, next, true
+	return postgresRedshiftSystemTable(tableName) + " as " + alias, next, true
 }
 
 func isRedshiftReadOnlySystemTable(tableName string) bool {
@@ -1047,7 +1047,9 @@ func isRedshiftReadOnlySystemTable(tableName string) bool {
 		strings.HasPrefix(normalized, "stl_") ||
 		strings.HasPrefix(normalized, "svv_") ||
 		strings.HasPrefix(normalized, "svl_") ||
-		strings.HasPrefix(normalized, "sys_")
+		strings.HasPrefix(normalized, "sys_") ||
+		normalized == "pg_table_def" ||
+		normalized == "pg_table_info"
 }
 
 func readRelationIdentifier(sql string, index int) (string, int, string, bool) {
@@ -1108,6 +1110,25 @@ func isRelationAliasStopWord(value string) bool {
 
 func postgresRedshiftSystemTableStub() string {
 	return "(select null::integer as node, null::integer as slice, null::integer as userid, null::text as user_name, null::integer as pid, null::bigint as xid, null::bigint as query, null::text as label, null::timestamp as starttime, null::timestamp as endtime, null::text as status, null::text as text, null::bigint as rows, null::bigint as bytes, null::bigint as cpu_time, null::boolean as is_diskbased, null::bigint as workmem, null::text as type, null::text as name, null::text as value where false)"
+}
+
+func postgresRedshiftSystemTable(tableName string) string {
+	switch strings.ToLower(tableName) {
+	case "pg_table_def":
+		return postgresPGTableDef()
+	case "pg_table_info":
+		return postgresPGTableInfo()
+	default:
+		return postgresRedshiftSystemTableStub()
+	}
+}
+
+func postgresPGTableDef() string {
+	return "(select table_schema::text as schemaname, table_name::text as tablename, column_name::text as \"column\", data_type::text as type, null::text as encoding, false as distkey, 0::integer as sortkey, (is_nullable = 'NO') as notnull from information_schema.columns)"
+}
+
+func postgresPGTableInfo() string {
+	return "(select current_database()::text as database, n.nspname::text as schema, c.relname::text as \"table\", c.oid::integer as table_id, 'N'::text as encoded, null::text as diststyle, 0::integer as sortkey1, 0::integer as max_varchar, null::text as sortkey1_enc, 0::integer as sortkey_num, 0::bigint as size, 0::numeric as pct_used, 0::bigint as empty, 0::numeric as unsorted, 0::numeric as stats_off, c.reltuples::bigint as tbl_rows, 0::numeric as skew_sortkey1, 0::numeric as skew_rows, c.reltuples::bigint as estimated_visible_rows, null::text as risk_event, 0::numeric as vacuum_sort_benefit from pg_catalog.pg_class c join pg_catalog.pg_namespace n on n.oid = c.relnamespace where c.relkind in ('r', 'p'))"
 }
 
 func copySpaces(out *strings.Builder, value string, index int) int {

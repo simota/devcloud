@@ -1381,6 +1381,45 @@ func TestRedshiftToPostgresRewritesLateralColumnAliasReferences(t *testing.T) {
 	}
 }
 
+func TestRedshiftToPostgresRewritesPGTableMetadataViews(t *testing.T) {
+	tableDef := postgresPGTableDef()
+	tableInfo := postgresPGTableInfo()
+	tests := []struct {
+		name string
+		sql  string
+		want string
+	}{
+		{
+			name: "from pg_table_def",
+			sql:  "select schemaname, tablename, \"column\", encoding, distkey, sortkey, notnull from pg_table_def where tablename = 'events'",
+			want: "select schemaname, tablename, \"column\", encoding, distkey, sortkey, notnull from " + tableDef + " as pg_table_def where tablename = 'events'",
+		},
+		{
+			name: "join pg_table_info with alias",
+			sql:  "select i.schema, i.\"table\", i.tbl_rows from events e join PG_TABLE_INFO as i on i.\"table\" = e.table_name",
+			want: "select i.schema, i.\"table\", i.tbl_rows from events e join " + tableInfo + " as i on i.\"table\" = e.table_name",
+		},
+		{
+			name: "pg table metadata inside string literal is ignored",
+			sql:  "select 'from pg_table_def join pg_table_info' as label from events",
+			want: "select 'from pg_table_def join pg_table_info' as label from events",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			translated, err := NewRedshiftToPostgres().Translate(context.Background(), Session{}, tc.sql)
+			if err != nil {
+				t.Fatalf("Translate() error = %v", err)
+			}
+
+			if translated.BackendSQL != tc.want {
+				t.Fatalf("BackendSQL = %q, want %q", translated.BackendSQL, tc.want)
+			}
+		})
+	}
+}
+
 func TestRedshiftToPostgresRewritesApproximateCountDistinct(t *testing.T) {
 	tests := []struct {
 		name string
