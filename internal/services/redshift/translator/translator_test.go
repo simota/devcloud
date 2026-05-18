@@ -329,6 +329,38 @@ func TestRedshiftToPostgresRewritesCreateModelToNoop(t *testing.T) {
 	}
 }
 
+func TestRedshiftToPostgresRewritesCreateExternalFunctionToNoop(t *testing.T) {
+	tests := []struct {
+		name string
+		sql  string
+		want string
+	}{
+		{
+			name: "create external function lambda",
+			sql:  "CREATE EXTERNAL FUNCTION f_lambda(varchar) RETURNS varchar STABLE LAMBDA 'arn:aws:lambda:us-east-1:123456789012:function:redshift-fn' IAM_ROLE 'arn:aws:iam::123456789012:role/redshift-lambda';",
+			want: "select 1",
+		},
+		{
+			name: "create external function inside string literal is ignored",
+			sql:  "select 'CREATE EXTERNAL FUNCTION f_lambda(varchar) RETURNS varchar LAMBDA ''arn:aws:lambda:us-east-1:123456789012:function:redshift-fn''' as statement",
+			want: "select 'CREATE EXTERNAL FUNCTION f_lambda(varchar) RETURNS varchar LAMBDA ''arn:aws:lambda:us-east-1:123456789012:function:redshift-fn''' as statement",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			translated, err := NewRedshiftToPostgres().Translate(context.Background(), Session{}, tc.sql)
+			if err != nil {
+				t.Fatalf("Translate() error = %v", err)
+			}
+
+			if translated.BackendSQL != tc.want {
+				t.Fatalf("BackendSQL = %q, want %q", translated.BackendSQL, tc.want)
+			}
+		})
+	}
+}
+
 func TestRedshiftToPostgresRewritesDatashareStatementsToNoop(t *testing.T) {
 	tests := []struct {
 		name string

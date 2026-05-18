@@ -126,6 +126,10 @@ func (RedshiftToPostgres) Translate(ctx context.Context, _ Session, sql string) 
 		translated.BackendSQL = rewritePostgresCompatibility(translated.BackendSQL)
 		return translated, err
 	}
+	if translated, ok, err := translateCreateExternalFunction(sql); ok || err != nil {
+		translated.BackendSQL = rewritePostgresCompatibility(translated.BackendSQL)
+		return translated, err
+	}
 	if translated, ok, err := translateDatashare(sql); ok || err != nil {
 		translated.BackendSQL = rewritePostgresCompatibility(translated.BackendSQL)
 		return translated, err
@@ -3301,6 +3305,26 @@ func translateCreateModel(sql string) (TranslationResult, bool, error) {
 		strings.TrimSpace(statement[targetEnd:functionStart]) == "" ||
 		strings.TrimSpace(statement[functionEnd:iamRoleStart]) == "" ||
 		strings.TrimSpace(statement[iamRoleEnd:]) == "" {
+		return TranslationResult{BackendSQL: statement}, true, nil
+	}
+	return TranslationResult{BackendSQL: "select 1"}, true, nil
+}
+
+func translateCreateExternalFunction(sql string) (TranslationResult, bool, error) {
+	statement := strings.TrimSpace(strings.TrimRight(sql, ";"))
+	prefixEnd, ok := matchKeywordSequence(statement, 0, []string{"create", "external", "function"})
+	if !ok {
+		return TranslationResult{}, false, nil
+	}
+
+	lambdaStart, lambdaEnd := findTopLevelKeywordSequence(statement, []string{"lambda"}, prefixEnd)
+	if lambdaStart < 0 || strings.TrimSpace(statement[prefixEnd:lambdaStart]) == "" {
+		return TranslationResult{BackendSQL: statement}, true, nil
+	}
+
+	arnStart := skipSpaces(statement, lambdaEnd)
+	arn, _, ok := readQuotedStringValue(statement, arnStart)
+	if !ok || !strings.HasPrefix(strings.ToLower(arn), "arn:") {
 		return TranslationResult{BackendSQL: statement}, true, nil
 	}
 	return TranslationResult{BackendSQL: "select 1"}, true, nil

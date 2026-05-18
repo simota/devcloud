@@ -178,7 +178,7 @@ devcloud の Redshift サービスは、`translator.RedshiftToPostgres` で Reds
 - [x] **R-only** `CREATE FUNCTION ... LANGUAGE plpythonu` (Python UDF)
 - [x] **R-only** `CREATE FUNCTION ... LANGUAGE sql STABLE` の制約差
 - [x] **R-only** `CREATE MODEL ... FROM ... TARGET ... FUNCTION ... IAM_ROLE ...` (Redshift ML)
-- [ ] **R-only** `CREATE EXTERNAL FUNCTION ... LAMBDA 'arn:...'`
+- [x] **R-only** `CREATE EXTERNAL FUNCTION ... LAMBDA 'arn:...'`
 - [ ] **R≠P** `EXPLAIN` の Redshift 専用注釈
 
 ---
