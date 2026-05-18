@@ -564,6 +564,18 @@ func rewriteRedshiftFunctions(sql string) string {
 					i = next
 					continue
 				}
+			case "date_part":
+				if rewritten, next, ok := rewriteParenFunction(sql, i, rewriteDatePartFunction); ok {
+					out.WriteString(rewritten)
+					i = next
+					continue
+				}
+			case "date_trunc":
+				if rewritten, next, ok := rewriteParenFunction(sql, i, rewriteDateTruncFunction); ok {
+					out.WriteString(rewritten)
+					i = next
+					continue
+				}
 			case "listagg":
 				if rewritten, next, ok := rewriteListAgg(sql, i); ok {
 					out.WriteString(rewritten)
@@ -865,6 +877,28 @@ func rewriteDateDiff(args []string) (string, bool) {
 	}
 }
 
+func rewriteDatePartFunction(args []string) (string, bool) {
+	if len(args) != 2 {
+		return "", false
+	}
+	part, ok := postgresDatePartFunctionPart(args[0])
+	if !ok {
+		return "", false
+	}
+	return "date_part('" + part + "', " + strings.TrimSpace(args[1]) + ")", true
+}
+
+func rewriteDateTruncFunction(args []string) (string, bool) {
+	if len(args) != 2 {
+		return "", false
+	}
+	part, ok := postgresDateTruncPart(args[0])
+	if !ok {
+		return "", false
+	}
+	return "date_trunc('" + part + "', " + strings.TrimSpace(args[1]) + ")", true
+}
+
 func rewriteMedian(args []string) (string, bool) {
 	if len(args) != 1 {
 		return "", false
@@ -990,6 +1024,82 @@ func postgresDatePart(value string) (string, bool) {
 	default:
 		return "", false
 	}
+}
+
+func postgresDatePartFunctionPart(value string) (string, bool) {
+	switch strings.ToLower(cleanDatePartIdentifier(value)) {
+	case "millennium", "millennia":
+		return "millennium", true
+	case "century", "c", "centuries":
+		return "century", true
+	case "decade", "dec", "decades":
+		return "decade", true
+	case "year", "y", "yr", "yrs", "yy", "yyyy":
+		return "year", true
+	case "quarter", "qtr", "q":
+		return "quarter", true
+	case "month", "mon", "mons", "mm":
+		return "month", true
+	case "week", "w":
+		return "week", true
+	case "day", "d", "dd":
+		return "day", true
+	case "dayofweek", "dow", "dw", "weekday":
+		return "dow", true
+	case "dayofyear", "doy":
+		return "doy", true
+	case "hour", "h", "hr", "hrs", "hh":
+		return "hour", true
+	case "minute", "m", "min", "mins", "mi", "n":
+		return "minute", true
+	case "second", "s", "sec", "secs", "ss":
+		return "second", true
+	case "millisecond", "milliseconds", "msec", "msecs", "ms":
+		return "milliseconds", true
+	case "microsecond", "microseconds", "usec", "usecs", "us":
+		return "microseconds", true
+	case "epoch":
+		return "epoch", true
+	default:
+		return "", false
+	}
+}
+
+func postgresDateTruncPart(value string) (string, bool) {
+	switch strings.ToLower(cleanDatePartIdentifier(value)) {
+	case "millennium", "millennia":
+		return "millennium", true
+	case "century", "c", "centuries":
+		return "century", true
+	case "decade", "dec", "decades":
+		return "decade", true
+	case "year", "y", "yr", "yrs", "yy", "yyyy":
+		return "year", true
+	case "quarter", "qtr", "q":
+		return "quarter", true
+	case "month", "mon", "mons", "mm":
+		return "month", true
+	case "week", "w":
+		return "week", true
+	case "day", "d", "dd":
+		return "day", true
+	case "hour", "h", "hr", "hrs", "hh":
+		return "hour", true
+	case "minute", "m", "min", "mins", "mi", "n":
+		return "minute", true
+	case "second", "s", "sec", "secs", "ss":
+		return "second", true
+	case "millisecond", "milliseconds", "msec", "msecs", "ms":
+		return "milliseconds", true
+	case "microsecond", "microseconds", "usec", "usecs", "us":
+		return "microseconds", true
+	default:
+		return "", false
+	}
+}
+
+func cleanDatePartIdentifier(value string) string {
+	return strings.Trim(strings.TrimSpace(value), `"'`)
 }
 
 func copyQuotedString(out *strings.Builder, value string, start int) int {

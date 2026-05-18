@@ -85,6 +85,43 @@ func TestRedshiftToPostgresRewritesDateAddAndDateDiff(t *testing.T) {
 	}
 }
 
+func TestRedshiftToPostgresRewritesDatePartAndDateTruncPartAliases(t *testing.T) {
+	tests := []struct {
+		name string
+		sql  string
+		want string
+	}{
+		{
+			name: "date_part weekday alias",
+			sql:  "select date_part(weekday, created_at) as weekday from events",
+			want: "select date_part('dow', created_at) as weekday from events",
+		},
+		{
+			name: "date_trunc quarter alias",
+			sql:  "select date_trunc(qtr, created_at) as quarter_start from events",
+			want: "select date_trunc('quarter', created_at) as quarter_start from events",
+		},
+		{
+			name: "aliases inside string literal are ignored",
+			sql:  "select 'date_part(weekday, created_at)' as label, DATE_PART(dw, created_at) as weekday from events",
+			want: "select 'date_part(weekday, created_at)' as label, date_part('dow', created_at) as weekday from events",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			translated, err := NewRedshiftToPostgres().Translate(context.Background(), Session{}, tc.sql)
+			if err != nil {
+				t.Fatalf("Translate() error = %v", err)
+			}
+
+			if translated.BackendSQL != tc.want {
+				t.Fatalf("BackendSQL = %q, want %q", translated.BackendSQL, tc.want)
+			}
+		})
+	}
+}
+
 func TestRedshiftToPostgresRewritesListAggWithinGroup(t *testing.T) {
 	translated, err := NewRedshiftToPostgres().Translate(context.Background(), Session{}, "select listagg(name, ',') within group (order by created_at desc) as names from events")
 	if err != nil {
