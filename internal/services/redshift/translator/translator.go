@@ -1018,8 +1018,16 @@ func rewriteRedshiftSystemTables(sql string) string {
 }
 
 func rewriteRedshiftSystemTableReference(sql string, index int) (string, int, bool) {
-	_, referenceEnd, tableName, ok := readRelationIdentifier(sql, index)
-	if !ok || !isRedshiftReadOnlySystemTable(tableName) {
+	reference, referenceEnd, tableName, ok := readRelationIdentifier(sql, index)
+	if !ok {
+		return "", index, false
+	}
+	replacement := ""
+	if isRedshiftReadOnlySystemTable(tableName) {
+		replacement = postgresRedshiftSystemTable(tableName)
+	} else if isRedshiftInformationSchemaRelation(reference) {
+		replacement = postgresRedshiftInformationSchemaRelation(reference)
+	} else {
 		return "", index, false
 	}
 	afterReferenceSpaces := skipSpaces(sql, referenceEnd)
@@ -1038,7 +1046,7 @@ func rewriteRedshiftSystemTableReference(sql string, index int) (string, int, bo
 		next = aliasEnd
 	}
 
-	return postgresRedshiftSystemTable(tableName) + " as " + alias, next, true
+	return replacement + " as " + alias, next, true
 }
 
 func isRedshiftReadOnlySystemTable(tableName string) bool {
@@ -1129,6 +1137,23 @@ func postgresPGTableDef() string {
 
 func postgresPGTableInfo() string {
 	return "(select current_database()::text as database, n.nspname::text as schema, c.relname::text as \"table\", c.oid::integer as table_id, 'N'::text as encoded, null::text as diststyle, 0::integer as sortkey1, 0::integer as max_varchar, null::text as sortkey1_enc, 0::integer as sortkey_num, 0::bigint as size, 0::numeric as pct_used, 0::bigint as empty, 0::numeric as unsorted, 0::numeric as stats_off, c.reltuples::bigint as tbl_rows, 0::numeric as skew_sortkey1, 0::numeric as skew_rows, c.reltuples::bigint as estimated_visible_rows, null::text as risk_event, 0::numeric as vacuum_sort_benefit from pg_catalog.pg_class c join pg_catalog.pg_namespace n on n.oid = c.relnamespace where c.relkind in ('r', 'p'))"
+}
+
+func isRedshiftInformationSchemaRelation(reference string) bool {
+	return strings.EqualFold(reference, "information_schema.columns")
+}
+
+func postgresRedshiftInformationSchemaRelation(reference string) string {
+	switch strings.ToLower(reference) {
+	case "information_schema.columns":
+		return postgresInformationSchemaColumns()
+	default:
+		return ""
+	}
+}
+
+func postgresInformationSchemaColumns() string {
+	return "(select table_catalog::text as table_catalog, table_schema::text as table_schema, table_name::text as table_name, column_name::text as column_name, ordinal_position::integer as ordinal_position, column_default::text as column_default, is_nullable::text as is_nullable, data_type::text as data_type, character_maximum_length::integer as character_maximum_length, numeric_precision::integer as numeric_precision, numeric_precision_radix::integer as numeric_precision_radix, numeric_scale::integer as numeric_scale, datetime_precision::integer as datetime_precision, interval_type::text as interval_type, interval_precision::text as interval_precision, character_set_catalog::text as character_set_catalog, character_set_schema::text as character_set_schema, character_set_name::text as character_set_name, collation_catalog::text as collation_catalog, collation_schema::text as collation_schema, collation_name::text as collation_name, domain_name::text as domain_name, null::text as remarks from information_schema.columns)"
 }
 
 func copySpaces(out *strings.Builder, value string, index int) int {

@@ -146,7 +146,7 @@ devcloud の Redshift サービスは、`translator.RedshiftToPostgres` で Reds
 - [x] **R-only** `SVV_*` / `SVL_*` / `SYS_*` ビュー
 - [x] **R-only** `PG_TABLE_DEF` / `PG_TABLE_INFO` (Redshift 拡張カラム)
 - [x] **same** `pg_catalog.pg_class` / `pg_namespace` / `pg_attribute`
-- [ ] **R≠P** `information_schema.*` の列差異
+- [x] **R≠P** `information_schema.*` の列差異
 
 ---
 

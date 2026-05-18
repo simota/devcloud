@@ -573,6 +573,44 @@ func TestRedshiftToPostgresRewritesMetadataViewsToReadOnlyStubs(t *testing.T) {
 	}
 }
 
+func TestRedshiftToPostgresRewritesInformationSchemaColumnsToRedshiftProjection(t *testing.T) {
+	columnsProjection := postgresInformationSchemaColumns()
+	tests := []struct {
+		name string
+		sql  string
+		want string
+	}{
+		{
+			name: "from information schema columns",
+			sql:  "select column_name, remarks from information_schema.columns where table_schema = 'public'",
+			want: "select column_name, remarks from " + columnsProjection + " as columns where table_schema = 'public'",
+		},
+		{
+			name: "join information schema columns with alias",
+			sql:  "select c.column_name, c.remarks from events e join information_schema.columns as c on c.table_name = e.table_name",
+			want: "select c.column_name, c.remarks from events e join " + columnsProjection + " as c on c.table_name = e.table_name",
+		},
+		{
+			name: "information schema columns inside string literal is ignored",
+			sql:  "select 'from information_schema.columns' as label from events",
+			want: "select 'from information_schema.columns' as label from events",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			translated, err := NewRedshiftToPostgres().Translate(context.Background(), Session{}, tc.sql)
+			if err != nil {
+				t.Fatalf("Translate() error = %v", err)
+			}
+
+			if translated.BackendSQL != tc.want {
+				t.Fatalf("BackendSQL = %q, want %q", translated.BackendSQL, tc.want)
+			}
+		})
+	}
+}
+
 func TestRedshiftToPostgresRewritesDefaultFunctionInCreateTableBackendSQL(t *testing.T) {
 	translated, err := NewRedshiftToPostgres().Translate(context.Background(), Session{}, "create table events(id int, created_at timestamp default getdate())")
 	if err != nil {
