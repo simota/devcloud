@@ -678,6 +678,12 @@ func rewriteRedshiftFunctions(sql string) string {
 					i = next
 					continue
 				}
+			case "object_transform":
+				if rewritten, next, ok := rewriteObjectTransformCall(sql, i); ok {
+					out.WriteString(rewritten)
+					i = next
+					continue
+				}
 			case "dateadd":
 				if rewritten, next, ok := rewriteParenFunction(sql, i, rewriteDateAdd); ok {
 					out.WriteString(rewritten)
@@ -1104,6 +1110,156 @@ func rewriteJSONParse(args []string) (string, bool) {
 		return "", false
 	}
 	return "(" + value + ")::jsonb", true
+}
+
+func rewriteObjectTransformCall(sql string, index int) (string, int, bool) {
+	open := skipSpaces(sql, index)
+	if open >= len(sql) || sql[open] != '(' {
+		return "", index, false
+	}
+	close := matchingParen(sql, open)
+	if close < 0 {
+		return "", index, false
+	}
+	rewritten, ok := rewriteObjectTransform(sql[open+1 : close])
+	if !ok {
+		return "", index, false
+	}
+	return rewritten, close + 1, true
+}
+
+func rewriteObjectTransform(value string) (string, bool) {
+	keepStart, keepEnd := findTopLevelKeywordSequence(value, []string{"keep"}, 0)
+	setStart, setEnd := findTopLevelKeywordSequence(value, []string{"set"}, 0)
+	if keepStart >= 0 && setStart >= 0 && setStart < keepStart {
+		return "", false
+	}
+
+	inputEnd := len(value)
+	if keepStart >= 0 {
+		inputEnd = keepStart
+	}
+	if setStart >= 0 && setStart < inputEnd {
+		inputEnd = setStart
+	}
+	input := strings.TrimSpace(value[:inputEnd])
+	if input == "" {
+		return "", false
+	}
+	inputJSON := "(" + input + ")::jsonb"
+	if keepStart < 0 && setStart < 0 {
+		return inputJSON, true
+	}
+
+	current := "'{}'::jsonb"
+	ensuredPaths := make(map[string]bool)
+	if keepStart >= 0 {
+		keepEndAt := len(value)
+		if setStart >= 0 {
+			keepEndAt = setStart
+		}
+		keepPaths := splitCommaSeparated(value[keepEnd:keepEndAt])
+		if len(keepPaths) == 0 {
+			return "", false
+		}
+		for _, keepPath := range keepPaths {
+			path, components, ok := objectTransformPath(keepPath)
+			if !ok {
+				return "", false
+			}
+			current = ensureObjectTransformPath(current, components, ensuredPaths)
+			current = "jsonb_set(" + current + ", " + path + ", (" + inputJSON + " #> " + path + "), true)"
+		}
+	}
+	if setStart >= 0 {
+		setArgs := splitCommaSeparated(value[setEnd:])
+		if len(setArgs) == 0 || len(setArgs)%2 != 0 {
+			return "", false
+		}
+		for i := 0; i < len(setArgs); i += 2 {
+			path, components, ok := objectTransformPath(setArgs[i])
+			setValue := strings.TrimSpace(setArgs[i+1])
+			if !ok || setValue == "" {
+				return "", false
+			}
+			current = ensureObjectTransformPath(current, components, ensuredPaths)
+			current = "jsonb_set(" + current + ", " + path + ", to_jsonb(" + setValue + "), true)"
+		}
+	}
+	return current, true
+}
+
+func ensureObjectTransformPath(current string, components []string, ensuredPaths map[string]bool) string {
+	for i := 1; i < len(components); i++ {
+		key := strings.Join(components[:i], "\x00")
+		if ensuredPaths[key] {
+			continue
+		}
+		path := objectTransformPathArray(components[:i])
+		current = "jsonb_set(" + current + ", " + path + ", coalesce(" + current + " #> " + path + ", '{}'::jsonb), true)"
+		ensuredPaths[key] = true
+	}
+	return current
+}
+
+func objectTransformPath(value string) (string, []string, bool) {
+	path, ok := sqlStringLiteralValue(value)
+	if !ok {
+		return "", nil, false
+	}
+	components, ok := objectTransformPathComponents(path)
+	if !ok {
+		return "", nil, false
+	}
+	return objectTransformPathArray(components), components, true
+}
+
+func objectTransformPathArray(components []string) string {
+	literals := make([]string, 0, len(components))
+	for _, component := range components {
+		literals = append(literals, sqlStringLiteral(component))
+	}
+	return "ARRAY[" + strings.Join(literals, ", ") + "]"
+}
+
+func objectTransformPathComponents(path string) ([]string, bool) {
+	var components []string
+	for i := 0; i < len(path); {
+		if path[i] != '"' {
+			return nil, false
+		}
+		i++
+		var component strings.Builder
+		for i < len(path) {
+			if path[i] != '"' {
+				component.WriteByte(path[i])
+				i++
+				continue
+			}
+			if i+1 < len(path) && path[i+1] == '"' {
+				component.WriteByte(path[i+1])
+				i += 2
+				continue
+			}
+			break
+		}
+		if i >= len(path) || path[i] != '"' || component.Len() == 0 {
+			return nil, false
+		}
+		components = append(components, component.String())
+		i++
+		if i == len(path) {
+			break
+		}
+		if path[i] != '.' {
+			return nil, false
+		}
+		i++
+	}
+	if len(components) == 0 {
+		return nil, false
+	}
+	return components, true
 }
 
 func rewriteNVL2(args []string) (string, bool) {

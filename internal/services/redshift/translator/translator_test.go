@@ -682,6 +682,38 @@ func TestRedshiftToPostgresRewritesJSONParse(t *testing.T) {
 	}
 }
 
+func TestRedshiftToPostgresRewritesObjectTransform(t *testing.T) {
+	tests := []struct {
+		name string
+		sql  string
+		want string
+	}{
+		{
+			name: "keep and set paths",
+			sql:  `select object_transform(payload KEEP '"user"."name"' SET '"user"."active"', true, '"event_count"', 3) as transformed_payload from events`,
+			want: `select jsonb_set(jsonb_set(jsonb_set(jsonb_set('{}'::jsonb, ARRAY['user'], coalesce('{}'::jsonb #> ARRAY['user'], '{}'::jsonb), true), ARRAY['user', 'name'], ((payload)::jsonb #> ARRAY['user', 'name']), true), ARRAY['user', 'active'], to_jsonb(true), true), ARRAY['event_count'], to_jsonb(3), true) as transformed_payload from events`,
+		},
+		{
+			name: "object_transform inside string literal is ignored",
+			sql:  `select 'object_transform(payload KEEP ''"user"'')' as label, OBJECT_TRANSFORM(trim(payload) SET '"user"."name"', username) as transformed_payload from events`,
+			want: `select 'object_transform(payload KEEP ''"user"'')' as label, jsonb_set(jsonb_set('{}'::jsonb, ARRAY['user'], coalesce('{}'::jsonb #> ARRAY['user'], '{}'::jsonb), true), ARRAY['user', 'name'], to_jsonb(username), true) as transformed_payload from events`,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			translated, err := NewRedshiftToPostgres().Translate(context.Background(), Session{}, tc.sql)
+			if err != nil {
+				t.Fatalf("Translate() error = %v", err)
+			}
+
+			if translated.BackendSQL != tc.want {
+				t.Fatalf("BackendSQL = %q, want %q", translated.BackendSQL, tc.want)
+			}
+		})
+	}
+}
+
 func TestRedshiftToPostgresRewritesDateAddAndDateDiff(t *testing.T) {
 	translated, err := NewRedshiftToPostgres().Translate(context.Background(), Session{}, "select dateadd(day, 7, created_at) as expires_at, datediff(hour, started_at, ended_at) as hours from events")
 	if err != nil {
