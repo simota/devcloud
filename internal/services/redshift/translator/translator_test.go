@@ -252,6 +252,43 @@ func TestRedshiftToPostgresRewritesLikeDefaultEscape(t *testing.T) {
 	}
 }
 
+func TestRedshiftToPostgresRewritesNullOrderingDefaults(t *testing.T) {
+	tests := []struct {
+		name string
+		sql  string
+		want string
+	}{
+		{
+			name: "ascending and descending defaults",
+			sql:  "select id from events order by priority desc, created_at asc, id limit 10",
+			want: "select id from events order by priority desc NULLS FIRST, created_at asc NULLS LAST, id NULLS LAST limit 10",
+		},
+		{
+			name: "explicit null ordering unchanged",
+			sql:  "select id from events order by priority desc nulls last, created_at nulls first",
+			want: "select id from events order by priority desc nulls last, created_at nulls first",
+		},
+		{
+			name: "order by inside string literal is ignored",
+			sql:  "select 'order by created_at desc' as label from events order by id",
+			want: "select 'order by created_at desc' as label from events order by id NULLS LAST",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			translated, err := NewRedshiftToPostgres().Translate(context.Background(), Session{}, tc.sql)
+			if err != nil {
+				t.Fatalf("Translate() error = %v", err)
+			}
+
+			if translated.BackendSQL != tc.want {
+				t.Fatalf("BackendSQL = %q, want %q", translated.BackendSQL, tc.want)
+			}
+		})
+	}
+}
+
 func TestRedshiftToPostgresRewritesBooleanLiterals(t *testing.T) {
 	tests := []struct {
 		name string
@@ -747,7 +784,7 @@ func TestRedshiftToPostgresRewritesQualifyToSubquery(t *testing.T) {
 		{
 			name: "preserves outer order by",
 			sql:  "select user_id, rank() over (order by score desc) as rank from scores qualify rank <= 10 order by rank",
-			want: "select * from (select user_id, rank() over (order by score desc) as rank from scores) as devcloud_qualify where rank <= 10 order by rank",
+			want: "select * from (select user_id, rank() over (order by score desc) as rank from scores) as devcloud_qualify where rank <= 10 order by rank NULLS LAST",
 		},
 		{
 			name: "direct window predicate",
@@ -784,7 +821,7 @@ func TestRedshiftToPostgresRewritesSelectTopToLimit(t *testing.T) {
 		{
 			name: "top rows",
 			sql:  "select top 10 id, created_at from events order by created_at desc",
-			want: "select id, created_at from events order by created_at desc limit 10",
+			want: "select id, created_at from events order by created_at desc NULLS FIRST limit 10",
 		},
 		{
 			name: "parenthesized top rows with semicolon",

@@ -81,6 +81,7 @@ func (RedshiftToPostgres) Translate(ctx context.Context, _ Session, sql string) 
 	}
 	sql = translateSelectTopLimit(sql)
 	sql = rewriteLateralColumnAliases(sql)
+	sql = rewriteNullOrderingDefaults(sql)
 	if translated, ok, err := translateCreateExternalSchema(sql); ok || err != nil {
 		translated.BackendSQL = rewriteRedshiftFunctions(translated.BackendSQL)
 		return translated, err
@@ -186,6 +187,120 @@ func isUnsignedInteger(value string) bool {
 		}
 	}
 	return true
+}
+
+func rewriteNullOrderingDefaults(sql string) string {
+	orderStart, orderEnd := findTopLevelKeywordSequence(sql, []string{"order", "by"}, 0)
+	if orderStart < 0 {
+		return sql
+	}
+	orderListEnd := findTopLevelOrderByEnd(sql, orderEnd)
+	orderList := strings.TrimSpace(sql[orderEnd:orderListEnd])
+	if orderList == "" {
+		return sql
+	}
+
+	items := splitCommaSeparated(orderList)
+	rewrittenItems := make([]string, 0, len(items))
+	changed := false
+	for _, item := range items {
+		rewritten, itemChanged := rewriteOrderByNullDefault(item)
+		rewrittenItems = append(rewrittenItems, rewritten)
+		changed = changed || itemChanged
+	}
+	if !changed {
+		return sql
+	}
+
+	prefix := strings.TrimRight(sql[:orderEnd], " \t\n\r")
+	suffix := sql[orderListEnd:]
+	separator := ""
+	if suffix != "" && !strings.ContainsAny(suffix[:1], " \t\n\r;,)") {
+		separator = " "
+	}
+	return prefix + " " + strings.Join(rewrittenItems, ", ") + separator + suffix
+}
+
+func rewriteOrderByNullDefault(item string) (string, bool) {
+	trimmed := strings.TrimSpace(item)
+	if trimmed == "" {
+		return item, false
+	}
+	if _, end := findTopLevelKeywordSequence(trimmed, []string{"nulls", "first"}, 0); end >= 0 {
+		return trimmed, false
+	}
+	if _, end := findTopLevelKeywordSequence(trimmed, []string{"nulls", "last"}, 0); end >= 0 {
+		return trimmed, false
+	}
+	if _, end := findTopLevelKeywordSequence(trimmed, []string{"desc"}, 0); end >= 0 {
+		return trimmed + " NULLS FIRST", true
+	}
+	return trimmed + " NULLS LAST", true
+}
+
+func findTopLevelOrderByEnd(sql string, start int) int {
+	end := len(sql)
+	if semicolon := findTopLevelKeywordTerminator(sql, start, []string{";"}); semicolon >= 0 {
+		end = semicolon
+	}
+	for _, sequence := range [][]string{
+		{"limit"},
+		{"offset"},
+		{"fetch"},
+		{"for"},
+	} {
+		if sequenceStart, _ := findTopLevelKeywordSequence(sql, sequence, start); sequenceStart >= 0 && sequenceStart < end {
+			end = sequenceStart
+		}
+	}
+	return end
+}
+
+func findTopLevelKeywordTerminator(sql string, start int, terminators []string) int {
+	depth := 0
+	inString := false
+	inQuotedIdentifier := false
+	for i := start; i < len(sql); i++ {
+		ch := sql[i]
+		if ch == '\'' && !inQuotedIdentifier {
+			if inString && i+1 < len(sql) && sql[i+1] == '\'' {
+				i++
+				continue
+			}
+			inString = !inString
+			continue
+		}
+		if ch == '"' && !inString {
+			if inQuotedIdentifier && i+1 < len(sql) && sql[i+1] == '"' {
+				i++
+				continue
+			}
+			inQuotedIdentifier = !inQuotedIdentifier
+			continue
+		}
+		if inString || inQuotedIdentifier {
+			continue
+		}
+		switch ch {
+		case '(':
+			depth++
+			continue
+		case ')':
+			if depth > 0 {
+				depth--
+			}
+			continue
+		}
+		if depth != 0 {
+			continue
+		}
+		for _, terminator := range terminators {
+			if sql[i:i+1] == terminator {
+				return i
+			}
+		}
+	}
+	return -1
 }
 
 func rewriteLateralColumnAliases(sql string) string {

@@ -74,7 +74,7 @@ devcloud の Redshift サービスは、`translator.RedshiftToPostgres` で Reds
 - [x] **R-only** `MEDIAN(col)` → `percentile_cont(0.5) WITHIN GROUP (ORDER BY col)`
 - [x] **R-only** `RATIO_TO_REPORT(col) OVER (...)` → `col / SUM(col) OVER (...)`
 - [x] **R-only** `LATERAL` の制限 — PG はフル LATERAL
-- [ ] **R≠P** `NULLS FIRST/LAST` 既定の差（実際は同じだが要確認）
+- [x] **R≠P** `NULLS FIRST/LAST` 既定の差（実際は同じだが要確認）
 - [ ] **R≠P** `BIT_AND/BIT_OR(boolean)` 集約 → PG `bool_and/bool_or`
 - [ ] **R≠P** `LISTAGG` の Window 形 — PG `string_agg` は Window 非対応、要 workaround
 - [ ] **P-only** `FETCH FIRST n ROWS WITH TIES`
