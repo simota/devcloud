@@ -990,7 +990,50 @@ func rewriteLateBindingView(sql string) string {
 }
 
 func rewritePostgresCompatibility(sql string) string {
-	return rewriteRedshiftFunctions(rewriteRedshiftSystemTables(rewriteBeginTransactionModes(rewriteResetCommand(sql))))
+	return rewriteRedshiftFunctions(rewriteRedshiftSystemTables(rewriteBeginTransactionModes(rewriteResetCommand(rewriteCreateUserPasswordClauses(sql)))))
+}
+
+func rewriteCreateUserPasswordClauses(sql string) string {
+	start := skipSpaces(sql, 0)
+	createUserEnd, ok := matchKeywordSequence(sql, start, []string{"create", "user"})
+	if !ok {
+		return sql
+	}
+
+	var out strings.Builder
+	out.WriteString(sql[:createUserEnd])
+	changed := false
+	for i := createUserEnd; i < len(sql); {
+		ch := sql[i]
+		if ch == '\'' {
+			i = copyQuotedString(&out, sql, i)
+			continue
+		}
+		if ch == '"' {
+			i = copyQuotedIdentifier(&out, sql, i)
+			continue
+		}
+		passwordEnd, ok := matchKeywordSequence(sql, i, []string{"password"})
+		if !ok {
+			out.WriteByte(ch)
+			i++
+			continue
+		}
+		out.WriteString(sql[i:passwordEnd])
+		next := copySpaces(&out, sql, passwordEnd)
+		disableEnd, ok := matchKeywordSequence(sql, next, []string{"disable"})
+		if !ok {
+			i = next
+			continue
+		}
+		out.WriteString("NULL")
+		i = disableEnd
+		changed = true
+	}
+	if !changed {
+		return sql
+	}
+	return out.String()
 }
 
 func rewriteResetCommand(sql string) string {
