@@ -612,6 +612,18 @@ func rewriteRedshiftFunctions(sql string) string {
 					i = next
 					continue
 				}
+			case "to_date":
+				if rewritten, next, ok := rewriteParenFunction(sql, i, rewriteToDate); ok {
+					out.WriteString(rewritten)
+					i = next
+					continue
+				}
+			case "to_timestamp":
+				if rewritten, next, ok := rewriteParenFunction(sql, i, rewriteToTimestamp); ok {
+					out.WriteString(rewritten)
+					i = next
+					continue
+				}
 			case "listagg":
 				if rewritten, next, ok := rewriteListAgg(sql, i); ok {
 					out.WriteString(rewritten)
@@ -1047,6 +1059,58 @@ func redshiftNextDayNumber(value string) (string, bool) {
 	default:
 		return "", false
 	}
+}
+
+func rewriteToDate(args []string) (string, bool) {
+	return rewriteDateTimeFormatFunction("to_date", args)
+}
+
+func rewriteToTimestamp(args []string) (string, bool) {
+	return rewriteDateTimeFormatFunction("to_timestamp", args)
+}
+
+func rewriteDateTimeFormatFunction(functionName string, args []string) (string, bool) {
+	if len(args) != 2 {
+		return "", false
+	}
+	value := strings.TrimSpace(args[0])
+	if value == "" {
+		return "", false
+	}
+	format, ok := sqlStringLiteralValue(args[1])
+	if !ok {
+		return "", false
+	}
+	rewrittenFormat, ok := removeTrailingRedshiftTimezoneFormat(format)
+	if !ok {
+		return "", false
+	}
+	return functionName + "(regexp_replace(" + value + ", '[[:space:]]*([[:alpha:]_/]+|[+-][0-9]{2}(:?[0-9]{2})?)$', ''), " + sqlStringLiteral(rewrittenFormat) + ")", true
+}
+
+func removeTrailingRedshiftTimezoneFormat(format string) (string, bool) {
+	trimmed := strings.TrimRight(format, " \t\n\r")
+	lower := strings.ToLower(trimmed)
+	for _, token := range []string{"tz", "of"} {
+		if !strings.HasSuffix(lower, token) {
+			continue
+		}
+		start := len(trimmed) - len(token)
+		if start > 0 && isFormatLetter(trimmed[start-1]) {
+			continue
+		}
+		end := strings.TrimRight(trimmed[:start], " \t\n\r")
+		return end + format[len(trimmed):], true
+	}
+	return format, false
+}
+
+func isFormatLetter(ch byte) bool {
+	return (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z')
+}
+
+func sqlStringLiteral(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "''") + "'"
 }
 
 func rewriteMedian(args []string) (string, bool) {
