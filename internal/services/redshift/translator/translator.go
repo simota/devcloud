@@ -558,6 +558,12 @@ func rewriteRedshiftFunctions(sql string) string {
 					i = next
 					continue
 				}
+			case "charindex":
+				if rewritten, next, ok := rewriteParenFunction(sql, i, rewriteCharIndex); ok {
+					out.WriteString(rewritten)
+					i = next
+					continue
+				}
 			case "decode":
 				if rewritten, next, ok := rewriteParenFunction(sql, i, rewriteDecode); ok {
 					out.WriteString(rewritten)
@@ -907,6 +913,18 @@ func rewriteLen(args []string) (string, bool) {
 		return "", false
 	}
 	return "length(" + value + ")", true
+}
+
+func rewriteCharIndex(args []string) (string, bool) {
+	if len(args) != 2 {
+		return "", false
+	}
+	substring := strings.TrimSpace(args[0])
+	value := strings.TrimSpace(args[1])
+	if substring == "" || value == "" {
+		return "", false
+	}
+	return "position(" + substring + " in " + value + ")", true
 }
 
 func rewriteDateAdd(args []string) (string, bool) {

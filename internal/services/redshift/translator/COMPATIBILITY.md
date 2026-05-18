@@ -104,7 +104,7 @@ devcloud の Redshift サービスは、`translator.RedshiftToPostgres` で Reds
 ## 6. スカラー関数 — 文字列
 
 - [x] **R-only** `LEN(s)` → `length(s)` または `char_length(s)`
-- [ ] **R-only** `CHARINDEX(substring, string)` → `position(substring in string)`
+- [x] **R-only** `CHARINDEX(substring, string)` → `position(substring in string)`
 - [ ] **R-only** `STRTOL(text, base)` — 代用式
 - [ ] **R-only** `CRC32(text)` — PG に同等なし
 - [ ] **R-only** `FUNC_SHA1` / `MD5_DIGEST` — PG は `md5()` のみ、SHA は拡張
