@@ -719,6 +719,43 @@ func TestRedshiftToPostgresRewritesIsValidJSON(t *testing.T) {
 	}
 }
 
+func TestRedshiftToPostgresRewritesPartiQLNavigation(t *testing.T) {
+	tests := []struct {
+		name string
+		sql  string
+		want string
+	}{
+		{
+			name: "dot path",
+			sql:  "select payload.user.name as user_name from events",
+			want: "select (payload)::jsonb -> 'user' ->> 'name' as user_name from events",
+		},
+		{
+			name: "subscript path",
+			sql:  "select payload.events[0].type as first_event_type from events",
+			want: "select (payload)::jsonb -> 'events' -> 0 ->> 'type' as first_event_type from events",
+		},
+		{
+			name: "partiql navigation inside string literal is ignored",
+			sql:  "select 'payload.user.name payload[0]' as label, payload.items[0] as first_item from events",
+			want: "select 'payload.user.name payload[0]' as label, (payload)::jsonb -> 'items' ->> 0 as first_item from events",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			translated, err := NewRedshiftToPostgres().Translate(context.Background(), Session{}, tc.sql)
+			if err != nil {
+				t.Fatalf("Translate() error = %v", err)
+			}
+
+			if translated.BackendSQL != tc.want {
+				t.Fatalf("BackendSQL = %q, want %q", translated.BackendSQL, tc.want)
+			}
+		})
+	}
+}
+
 func TestRedshiftToPostgresRewritesObjectTransform(t *testing.T) {
 	tests := []struct {
 		name string

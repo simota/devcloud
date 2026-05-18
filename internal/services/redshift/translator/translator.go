@@ -495,6 +495,11 @@ func rewriteRedshiftFunctions(sql string) string {
 				i++
 			}
 			name := sql[start:i]
+			if rewritten, next, ok := rewritePartiQLNavigation(sql, start, i); ok {
+				out.WriteString(rewritten)
+				i = next
+				continue
+			}
 			lower := strings.ToLower(name)
 			switch lower {
 			case "approximate":
@@ -800,6 +805,104 @@ func rewriteRedshiftFunctions(sql string) string {
 		i++
 	}
 	return out.String()
+}
+
+type partiQLNavigationStep struct {
+	value     string
+	subscript bool
+}
+
+func rewritePartiQLNavigation(sql string, start, end int) (string, int, bool) {
+	next := end
+	steps := []partiQLNavigationStep{}
+	hasSubscript := false
+	for next < len(sql) {
+		switch sql[next] {
+		case '.':
+			keyStart := next + 1
+			if keyStart >= len(sql) || !isIdentifierStart(sql[keyStart]) {
+				return "", start, false
+			}
+			keyEnd := keyStart + 1
+			for keyEnd < len(sql) && isIdentifierPart(sql[keyEnd]) {
+				keyEnd++
+			}
+			steps = append(steps, partiQLNavigationStep{value: sql[keyStart:keyEnd]})
+			next = keyEnd
+		case '[':
+			close := matchingBracket(sql, next)
+			if close < 0 {
+				return "", start, false
+			}
+			index := strings.TrimSpace(sql[next+1 : close])
+			if index == "" {
+				return "", start, false
+			}
+			steps = append(steps, partiQLNavigationStep{value: index, subscript: true})
+			hasSubscript = true
+			next = close + 1
+		default:
+			if len(steps) == 0 || (!hasSubscript && len(steps) < 2) {
+				return "", start, false
+			}
+			return postgresPartiQLNavigation(sql[start:end], steps), next, true
+		}
+	}
+	if len(steps) == 0 || (!hasSubscript && len(steps) < 2) {
+		return "", start, false
+	}
+	return postgresPartiQLNavigation(sql[start:end], steps), next, true
+}
+
+func postgresPartiQLNavigation(base string, steps []partiQLNavigationStep) string {
+	var out strings.Builder
+	out.WriteByte('(')
+	out.WriteString(base)
+	out.WriteString(")::jsonb")
+	for i, step := range steps {
+		if i == len(steps)-1 {
+			out.WriteString(" ->> ")
+		} else {
+			out.WriteString(" -> ")
+		}
+		if step.subscript {
+			out.WriteString(step.value)
+			continue
+		}
+		out.WriteString(sqlStringLiteral(step.value))
+	}
+	return out.String()
+}
+
+func matchingBracket(value string, open int) int {
+	if open < 0 || open >= len(value) || value[open] != '[' {
+		return -1
+	}
+	depth := 0
+	inString := false
+	for i := open; i < len(value); i++ {
+		ch := value[i]
+		if ch == '\'' {
+			if inString && i+1 < len(value) && value[i+1] == '\'' {
+				i++
+				continue
+			}
+			inString = !inString
+		}
+		if inString {
+			continue
+		}
+		switch ch {
+		case '[':
+			depth++
+		case ']':
+			depth--
+			if depth == 0 {
+				return i
+			}
+		}
+	}
+	return -1
 }
 
 func rewriteApproximateCountDistinct(sql string, index int) (string, int, bool) {
