@@ -299,6 +299,43 @@ func TestRedshiftToPostgresRewritesRegexpInstr(t *testing.T) {
 	}
 }
 
+func TestRedshiftToPostgresRewritesSplitPartNegativePosition(t *testing.T) {
+	tests := []struct {
+		name string
+		sql  string
+		want string
+	}{
+		{
+			name: "negative position",
+			sql:  "select split_part(payload, '/', -2) as parent_segment from events",
+			want: "select reverse(split_part(reverse(payload), reverse('/'), 2)) as parent_segment from events",
+		},
+		{
+			name: "split_part inside string literal is ignored",
+			sql:  "select 'split_part(payload, ''/'', -1)' as label, SPLIT_PART(trim(payload), delimiter, -1) as last_segment from events",
+			want: "select 'split_part(payload, ''/'', -1)' as label, reverse(split_part(reverse(trim(payload)), reverse(delimiter), 1)) as last_segment from events",
+		},
+		{
+			name: "positive position is unchanged",
+			sql:  "select split_part(payload, '/', 2) as child_segment from events",
+			want: "select split_part(payload, '/', 2) as child_segment from events",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			translated, err := NewRedshiftToPostgres().Translate(context.Background(), Session{}, tc.sql)
+			if err != nil {
+				t.Fatalf("Translate() error = %v", err)
+			}
+
+			if translated.BackendSQL != tc.want {
+				t.Fatalf("BackendSQL = %q, want %q", translated.BackendSQL, tc.want)
+			}
+		})
+	}
+}
+
 func TestRedshiftToPostgresDoesNotRewriteFunctionsInsideStringLiterals(t *testing.T) {
 	translated, err := NewRedshiftToPostgres().Translate(context.Background(), Session{}, `select 'getdate() sysdate nvl(a,b)' as literal, "nvl" as quoted_name, getdate() as now`)
 	if err != nil {

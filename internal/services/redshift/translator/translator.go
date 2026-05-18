@@ -564,6 +564,12 @@ func rewriteRedshiftFunctions(sql string) string {
 					i = next
 					continue
 				}
+			case "split_part":
+				if rewritten, next, ok := rewriteParenFunction(sql, i, rewriteSplitPart); ok {
+					out.WriteString(rewritten)
+					i = next
+					continue
+				}
 			case "strtol":
 				if rewritten, next, ok := rewriteParenFunction(sql, i, rewriteStrtol); ok {
 					out.WriteString(rewritten)
@@ -967,6 +973,34 @@ func rewriteCharIndex(args []string) (string, bool) {
 		return "", false
 	}
 	return "position(" + substring + " in " + value + ")", true
+}
+
+func rewriteSplitPart(args []string) (string, bool) {
+	if len(args) != 3 {
+		return "", false
+	}
+	value := strings.TrimSpace(args[0])
+	separator := strings.TrimSpace(args[1])
+	position := strings.TrimSpace(args[2])
+	if value == "" || separator == "" || position == "" {
+		return "", false
+	}
+	magnitude, ok := negativeIntegerLiteralMagnitude(position)
+	if !ok {
+		return "", false
+	}
+	return "reverse(split_part(reverse(" + value + "), reverse(" + separator + "), " + magnitude + "))", true
+}
+
+func negativeIntegerLiteralMagnitude(value string) (string, bool) {
+	if len(value) < 2 || value[0] != '-' {
+		return "", false
+	}
+	magnitude := value[1:]
+	if !isUnsignedInteger(magnitude) || strings.TrimLeft(magnitude, "0") == "" {
+		return "", false
+	}
+	return magnitude, true
 }
 
 func rewriteStrtol(args []string) (string, bool) {
