@@ -90,7 +90,7 @@ devcloud の Redshift サービスは、`translator.RedshiftToPostgres` で Reds
 - [x] **R-only** `DATEADD(part, n, ts)` → `ts + n * interval '1 part'`
 - [x] **R-only** `DATEDIFF(part, a, b)` → `date_part` / `age` / `extract(epoch)` の組み合わせ
 - [x] **R≠P** `DATE_PART(part, ts)` / `DATE_TRUNC(part, ts)` の `part` 許容名（`weekday`/`dow` 等のマッピング拡張）
-- [ ] **R-only** `CONVERT_TIMEZONE('UTC', 'JST', ts)` → `ts AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Tokyo'`
+- [x] **R-only** `CONVERT_TIMEZONE('UTC', 'JST', ts)` → `ts AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Tokyo'`
 - [ ] **R-only** `TIMEOFDAY()` — PG `clock_timestamp()` を文字列化
 - [ ] **R-only** `LAST_DAY(date)` → `(date_trunc('month', date) + interval '1 month - 1 day')::date`
 - [ ] **R-only** `MONTHS_BETWEEN(a, b)` → `extract(year from age(a, b)) * 12 + extract(month from age(a, b))`

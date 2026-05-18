@@ -85,6 +85,38 @@ func TestRedshiftToPostgresRewritesDateAddAndDateDiff(t *testing.T) {
 	}
 }
 
+func TestRedshiftToPostgresRewritesConvertTimezone(t *testing.T) {
+	tests := []struct {
+		name string
+		sql  string
+		want string
+	}{
+		{
+			name: "utc to jst",
+			sql:  "select convert_timezone('UTC', 'JST', created_at) as created_at_jst from events",
+			want: "select created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Tokyo' as created_at_jst from events",
+		},
+		{
+			name: "convert_timezone inside string literal is ignored",
+			sql:  "select 'convert_timezone(''UTC'', ''JST'', created_at)' as label, CONVERT_TIMEZONE('utc', 'jst', created_at) as created_at_jst from events",
+			want: "select 'convert_timezone(''UTC'', ''JST'', created_at)' as label, created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Tokyo' as created_at_jst from events",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			translated, err := NewRedshiftToPostgres().Translate(context.Background(), Session{}, tc.sql)
+			if err != nil {
+				t.Fatalf("Translate() error = %v", err)
+			}
+
+			if translated.BackendSQL != tc.want {
+				t.Fatalf("BackendSQL = %q, want %q", translated.BackendSQL, tc.want)
+			}
+		})
+	}
+}
+
 func TestRedshiftToPostgresRewritesDatePartAndDateTruncPartAliases(t *testing.T) {
 	tests := []struct {
 		name string

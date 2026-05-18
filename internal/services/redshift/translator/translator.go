@@ -564,6 +564,12 @@ func rewriteRedshiftFunctions(sql string) string {
 					i = next
 					continue
 				}
+			case "convert_timezone":
+				if rewritten, next, ok := rewriteParenFunction(sql, i, rewriteConvertTimezone); ok {
+					out.WriteString(rewritten)
+					i = next
+					continue
+				}
 			case "date_part":
 				if rewritten, next, ok := rewriteParenFunction(sql, i, rewriteDatePartFunction); ok {
 					out.WriteString(rewritten)
@@ -875,6 +881,37 @@ func rewriteDateDiff(args []string) (string, bool) {
 	default:
 		return "", false
 	}
+}
+
+func rewriteConvertTimezone(args []string) (string, bool) {
+	if len(args) != 3 {
+		return "", false
+	}
+	source, ok := sqlStringLiteralValue(args[0])
+	if !ok || !strings.EqualFold(source, "UTC") {
+		return "", false
+	}
+	target, ok := sqlStringLiteralValue(args[1])
+	if !ok || !strings.EqualFold(target, "JST") {
+		return "", false
+	}
+	timestamp := strings.TrimSpace(args[2])
+	if timestamp == "" {
+		return "", false
+	}
+	return timestamp + " AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Tokyo'", true
+}
+
+func sqlStringLiteralValue(value string) (string, bool) {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" || trimmed[0] != '\'' {
+		return "", false
+	}
+	unquoted, end, ok := readQuotedStringValue(trimmed, 0)
+	if !ok || strings.TrimSpace(trimmed[end:]) != "" {
+		return "", false
+	}
+	return unquoted, true
 }
 
 func rewriteDatePartFunction(args []string) (string, bool) {
