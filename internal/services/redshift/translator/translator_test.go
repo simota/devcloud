@@ -186,6 +186,38 @@ func TestRedshiftToPostgresRewritesDatePartAndDateTruncPartAliases(t *testing.T)
 	}
 }
 
+func TestRedshiftToPostgresRewritesLastDay(t *testing.T) {
+	tests := []struct {
+		name string
+		sql  string
+		want string
+	}{
+		{
+			name: "last day",
+			sql:  "select last_day(created_at) as month_end from events",
+			want: "select (date_trunc('month', created_at) + interval '1 month - 1 day')::date as month_end from events",
+		},
+		{
+			name: "last day inside string literal is ignored",
+			sql:  "select 'last_day(created_at)' as label, LAST_DAY(created_at::date) as month_end from events",
+			want: "select 'last_day(created_at)' as label, (date_trunc('month', created_at::date) + interval '1 month - 1 day')::date as month_end from events",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			translated, err := NewRedshiftToPostgres().Translate(context.Background(), Session{}, tc.sql)
+			if err != nil {
+				t.Fatalf("Translate() error = %v", err)
+			}
+
+			if translated.BackendSQL != tc.want {
+				t.Fatalf("BackendSQL = %q, want %q", translated.BackendSQL, tc.want)
+			}
+		})
+	}
+}
+
 func TestRedshiftToPostgresRewritesListAggWithinGroup(t *testing.T) {
 	translated, err := NewRedshiftToPostgres().Translate(context.Background(), Session{}, "select listagg(name, ',') within group (order by created_at desc) as names from events")
 	if err != nil {
