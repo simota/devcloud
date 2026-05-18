@@ -48,15 +48,47 @@ var (
 )
 
 func startManagedRedshiftPostgresProcess(ctx context.Context, cfg Config) (managedPostgresLifecycle, error) {
+	port, err := managedRedshiftPostgresPort(cfg.Server.RedshiftPort)
+	if err != nil {
+		return nil, err
+	}
 	pgCfg := managedPostgresConfig{
 		DataDir:  filepath.Join(redshiftDataDir(cfg), "postgres"),
 		Host:     "127.0.0.1",
-		Port:     cfg.Server.RedshiftPort + 10000,
+		Port:     port,
 		Database: cfg.Services.Redshift.Database,
 		User:     cfg.Auth.Redshift.User,
 		Password: cfg.Auth.Redshift.Password,
 	}
 	return startManagedPostgres(ctx, pgCfg)
+}
+
+// managedRedshiftPostgresPort returns the TCP port the in-process managed
+// PostgreSQL backend should bind. The deterministic default is
+// RedshiftPort+10000 so test reproducibility is preserved; if that would
+// exceed the TCP ceiling (RedshiftPort > 55535, common when callers free a
+// port via macOS's high-numbered ephemeral range) we fall back to an
+// OS-assigned ephemeral port. Tests can override the strategy by stubbing
+// managedRedshiftPostgresEphemeralPort.
+func managedRedshiftPostgresPort(redshiftPort int) (int, error) {
+	port := redshiftPort + 10000
+	if port >= 1 && port <= 65535 {
+		return port, nil
+	}
+	return managedRedshiftPostgresEphemeralPort()
+}
+
+var managedRedshiftPostgresEphemeralPort = func() (int, error) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return 0, fmt.Errorf("allocate managed redshift postgres port: %w", err)
+	}
+	defer listener.Close()
+	addr, ok := listener.Addr().(*net.TCPAddr)
+	if !ok {
+		return 0, fmt.Errorf("allocate managed redshift postgres port: unexpected addr type %T", listener.Addr())
+	}
+	return addr.Port, nil
 }
 
 func startManagedPostgres(ctx context.Context, cfg managedPostgresConfig) (*managedPostgres, error) {

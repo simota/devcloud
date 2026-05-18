@@ -469,3 +469,31 @@ func appendHelperLog(path string, value string) error {
 	_, err = file.WriteString(value)
 	return err
 }
+
+func TestManagedRedshiftPostgresPort(t *testing.T) {
+	original := managedRedshiftPostgresEphemeralPort
+	defer func() { managedRedshiftPostgresEphemeralPort = original }()
+	managedRedshiftPostgresEphemeralPort = func() (int, error) { return 24680, nil }
+
+	cases := []struct {
+		name         string
+		redshiftPort int
+		want         int
+	}{
+		{name: "deterministic offset", redshiftPort: 5439, want: 15439},
+		{name: "upper deterministic boundary", redshiftPort: 55535, want: 65535},
+		{name: "overflow falls back to ephemeral", redshiftPort: 55536, want: 24680},
+		{name: "lower bound overflow falls back to ephemeral", redshiftPort: -10001, want: 24680},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := managedRedshiftPostgresPort(tc.redshiftPort)
+			if err != nil {
+				t.Fatalf("managedRedshiftPostgresPort(%d) error = %v", tc.redshiftPort, err)
+			}
+			if got != tc.want {
+				t.Fatalf("managedRedshiftPostgresPort(%d) = %d, want %d", tc.redshiftPort, got, tc.want)
+			}
+		})
+	}
+}

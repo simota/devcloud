@@ -18,27 +18,11 @@ DATABASE="dev"
 log() { printf '[redshift-translator-e2e] %s\n' "$1"; }
 
 free_port() {
-  # Sweep a low-numbered range so daemon code paths that compute
-  # RedshiftPort+10000 (managed PostgreSQL backend) stay below the
-  # 65535 TCP ceiling. macOS ephemeral allocation starts at 49152 and
-  # often returns ports too high for that offset.
   python3 - <<'PY'
-import random
 import socket
-
-attempts = list(range(15000, 35000))
-random.shuffle(attempts)
-for port in attempts:
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 0)
-            sock.bind(("127.0.0.1", port))
-        print(port)
-        break
-    except OSError:
-        continue
-else:
-    raise SystemExit("could not allocate a port in 15000-35000")
+with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+    sock.bind(("127.0.0.1", 0))
+    print(sock.getsockname()[1])
 PY
 }
 
