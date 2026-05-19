@@ -15,6 +15,7 @@ import {
   listRedisKeys,
   runRedisCommand,
 } from './api'
+import { highlightJSON, tryPrettyJSON } from './jsonHighlight'
 import type { RedisCommandResponse, RedisKeyDetail, RedisKeySummary, RedisStatus } from './types'
 
 const COMMAND_HISTORY_LIMIT = 8
@@ -504,9 +505,9 @@ function renderValueByType(detail: RedisKeyDetail): JSX.Element {
 }
 
 function StringValueView({ raw }: { raw: string }): JSX.Element {
-  const pretty = useMemo(() => tryFormatJSON(raw), [raw])
+  const pretty = useMemo(() => tryPrettyJSON(raw), [raw])
   const [mode, setMode] = useState<'pretty' | 'raw'>(pretty ? 'pretty' : 'raw')
-  const display = mode === 'pretty' && pretty ? pretty : raw
+  const showPretty = mode === 'pretty' && pretty !== undefined
   return (
     <div className="redis-value-string">
       <div className="redis-value-toolbar">
@@ -534,7 +535,9 @@ function StringValueView({ raw }: { raw: string }): JSX.Element {
           </div>
         ) : null}
       </div>
-      <pre className="redis-value-pre">{display}</pre>
+      <pre className="redis-value-pre json-code">
+        {showPretty ? highlightJSON(pretty!) : raw}
+      </pre>
     </div>
   )
 }
@@ -567,13 +570,21 @@ function HashValueView({ entries }: { entries: string[] }): JSX.Element {
           return (
             <tr key={index}>
               <th scope="row"><code>{field}</code></th>
-              <td><code>{value}</code></td>
+              <td><HashFieldValue raw={value} /></td>
             </tr>
           )
         })}
       </tbody>
     </table>
   )
+}
+
+function HashFieldValue({ raw }: { raw: string }): JSX.Element {
+  const pretty = useMemo(() => tryPrettyJSON(raw), [raw])
+  if (pretty === undefined) {
+    return <code>{raw}</code>
+  }
+  return <pre className="redis-value-pre json-code redis-value-pre-inline">{highlightJSON(pretty)}</pre>
 }
 
 function SetValueView({ members }: { members: string[] }): JSX.Element {
@@ -847,18 +858,6 @@ function parseCommand(value: string): { command: string; args: string[] } {
   const tokens = value.trim().split(/\s+/).filter((token) => token.length > 0)
   const [command = '', ...args] = tokens
   return { command, args }
-}
-
-function tryFormatJSON(value: string): string | undefined {
-  const trimmed = value.trim()
-  if (trimmed === '' || (trimmed[0] !== '{' && trimmed[0] !== '[' && trimmed[0] !== '"')) {
-    return undefined
-  }
-  try {
-    return JSON.stringify(JSON.parse(trimmed), null, 2)
-  } catch {
-    return undefined
-  }
 }
 
 function splitFirst(value: string, separator: string): [string, string] {

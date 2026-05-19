@@ -90,7 +90,7 @@ export function RedshiftDashboard({ service }: RedshiftDashboardProps): JSX.Elem
   }
 
   return (
-    <div className="dynamodb-workspace">
+    <div className="redshift-workspace">
       <Panel title="Clusters">
         <div className="dynamodb-toolbar">
           <span className="toolbar-count">{state.status === 'success' ? `${state.clusters.length} clusters` : 'Loading'}</span>
