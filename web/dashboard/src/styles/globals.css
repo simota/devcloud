@@ -284,6 +284,17 @@ code {
   align-items: start;
 }
 
+.redshift-workspace {
+  display: grid;
+  grid-template-columns: minmax(260px, 340px) minmax(320px, 1fr);
+  align-items: start;
+  gap: 12px;
+}
+
+.redshift-workspace > .panel:nth-of-type(3) {
+  grid-column: 1 / -1;
+}
+
 .service-card {
   color: inherit;
   text-decoration: none;
@@ -545,6 +556,8 @@ code {
   border-bottom: 1px solid var(--border-default);
   text-align: left;
   vertical-align: top;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .object-table th,
@@ -1135,6 +1148,7 @@ code {
   .s3-workspace,
   .gcs-workspace,
   .dynamodb-workspace,
+  .redshift-workspace,
   .mail-workspace {
     grid-template-columns: 1fr;
   }
@@ -2210,6 +2224,7 @@ textarea.s3-text-input {
   display: flex;
   flex-direction: column;
   gap: 16px;
+  min-width: 0;
 }
 
 .redis-inspector-header {
@@ -2303,6 +2318,7 @@ textarea.s3-text-input {
   display: flex;
   flex-direction: column;
   gap: 8px;
+  min-width: 0;
 }
 
 .redis-section-head {
@@ -2403,6 +2419,7 @@ textarea.s3-text-input {
 .redis-hash-table,
 .redis-zset-table {
   width: 100%;
+  table-layout: fixed;
   border-collapse: collapse;
   font-size: 13px;
 }
@@ -2416,8 +2433,63 @@ textarea.s3-text-input {
   border-bottom: 1px solid var(--border-default);
   vertical-align: top;
   word-break: break-all;
+  overflow-wrap: anywhere;
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 12.5px;
+}
+
+.redis-hash-table th:first-child,
+.redis-hash-table td:first-child {
+  width: 34%;
+}
+
+.redis-zset-table th:last-child,
+.redis-zset-table td:last-child {
+  width: 96px;
+}
+
+.redis-hash-table code,
+.redis-zset-table code {
+  display: inline-block;
+  max-width: 100%;
+  overflow: visible;
+  white-space: normal;
+  text-overflow: clip;
+  word-break: break-all;
+  overflow-wrap: anywhere;
+}
+
+.redis-value-pre-inline {
+  margin: 0;
+  max-height: 240px;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.json-code {
+  color: var(--code-text);
+}
+
+.json-code .json-token-key {
+  color: #9ad1ff;
+  font-weight: 600;
+}
+
+.json-code .json-token-string {
+  color: #b6e7a8;
+}
+
+.json-code .json-token-number {
+  color: #f2c97d;
+}
+
+.json-code .json-token-bool {
+  color: #f4a8c2;
+}
+
+.json-code .json-token-null {
+  color: #b6bec8;
+  font-style: italic;
 }
 
 .redis-hash-table thead th,
