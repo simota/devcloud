@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"devcloud/internal/app"
@@ -28,6 +29,10 @@ func run(args []string) error {
 		return app.InitWorkspace(cfg)
 	case "up":
 		cfg, err := app.LoadConfig(".devcloud/config.yaml")
+		if err != nil {
+			return err
+		}
+		cfg, err = app.ApplyServiceSelection(cfg, args[1:])
 		if err != nil {
 			return err
 		}
@@ -62,8 +67,14 @@ func usage() error {
 func usageText() string {
 	return `Usage:
   devcloud init
-  devcloud up
+  devcloud up [service ...]
   devcloud reset
   devcloud dashboard
+
+When one or more service names are passed to "up", only those services are
+started (overriding services.*.enabled in .devcloud/config.yaml). The
+dashboard always starts.
+
+Known services: ` + strings.Join(app.ServiceNames(), ", ") + `
 `
 }
