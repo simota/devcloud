@@ -1,0 +1,7 @@
+# Rust workspace for the Go→Rust strangler-fig transmute of devcloud.
+#
+# Each migrated service lives under `services/<svc>` as a workspace member and
+# shares this root's `target/` directory. Increment #1 is `mail`.
+[workspace]
+resolver = "2"
+members = ["services/mail"]
