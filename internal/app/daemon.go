@@ -266,7 +266,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 
 	errCh := make(chan error, d.enabledServerCount())
 	if d.config.Services.Mail.Enabled {
-		go func() { errCh <- smtpServer.Run(ctx) }()
+		if binPath, ok := mailRustEngine(); ok {
+			go func() { errCh <- runMailRust(ctx, d.config, binPath) }()
+		} else {
+			go func() { errCh <- smtpServer.Run(ctx) }()
+		}
 	}
 	if d.config.Services.S3.Enabled {
 		go func() { errCh <- s3Server.Run(ctx) }()
