@@ -11,6 +11,9 @@
 pub mod hashing;
 pub mod model;
 pub mod persistence;
+pub mod policy;
+pub mod server;
+pub mod time_fmt;
 pub mod validation;
 
 pub use hashing::{md5_hex, md5_of_message_attributes};
@@ -18,6 +21,10 @@ pub use model::{
     DeduplicationState, MessageAttributeValue, MessageState, MoveTaskState, ZERO_TIME,
 };
 pub use persistence::{PersistedQueue, PersistedState};
+pub use policy::{
+    normalized_permission_actions, parse_redrive_allow_policy, parse_redrive_policy, QueuePolicy,
+};
+pub use server::{queue_name_from_url, Config, QueueState, Server};
 pub use validation::{
     valid_batch_entry_id, valid_message_body, valid_queue_name, validate_message_attribute_name,
     validate_message_attribute_value, validate_message_system_attribute,
