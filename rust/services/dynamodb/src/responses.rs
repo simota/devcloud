@@ -67,6 +67,29 @@ pub struct DescribeEndpointsResponse {
     pub endpoints: Vec<EndpointEntry>,
 }
 
+/// A PartiQL batch/transaction statement error, mirroring Go
+/// `batchStatementError` (field order `Code`, `Message`).
+#[derive(Debug, Clone, Serialize)]
+pub struct BatchStatementError {
+    #[serde(rename = "Code")]
+    pub code: String,
+    #[serde(rename = "Message")]
+    pub message: String,
+}
+
+/// One PartiQL batch/transaction statement result, mirroring Go
+/// `batchStatementResponse`. Field declaration order is `Error`, `Item`,
+/// `TableName`; all three are `omitempty`.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct BatchStatementResponse {
+    #[serde(rename = "Error", skip_serializing_if = "Option::is_none")]
+    pub error: Option<BatchStatementError>,
+    #[serde(rename = "Item", skip_serializing_if = "Option::is_none")]
+    pub item: Option<crate::model::Item>,
+    #[serde(rename = "TableName", skip_serializing_if = "String::is_empty")]
+    pub table_name: String,
+}
+
 /// Serializes any response envelope to the Go wire bytes.
 pub fn encode<T: Serialize>(value: &T) -> Vec<u8> {
     crate::go_json::to_vec(value)

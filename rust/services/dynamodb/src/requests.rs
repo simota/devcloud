@@ -159,6 +159,52 @@ pub struct GetItemRequest {
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
+pub struct ExecuteStatementRequest {
+    #[serde(rename = "Statement")]
+    pub statement: String,
+    #[serde(rename = "Parameters")]
+    pub parameters: Vec<AttributeValue>,
+    #[serde(rename = "ConsistentRead")]
+    pub consistent_read: bool,
+    #[serde(rename = "Limit")]
+    pub limit: i64,
+    #[serde(rename = "ReturnConsumedCapacity")]
+    pub return_consumed_capacity: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct BatchStatementRequest {
+    #[serde(rename = "Statement")]
+    pub statement: String,
+    #[serde(rename = "Parameters")]
+    pub parameters: Vec<AttributeValue>,
+    #[serde(rename = "ConsistentRead")]
+    pub consistent_read: bool,
+    #[serde(rename = "ReturnValuesOnConditionCheckFailure")]
+    pub return_values_on_condition_check_failure: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct BatchExecuteStatementRequest {
+    #[serde(rename = "Statements")]
+    pub statements: Vec<BatchStatementRequest>,
+    #[serde(rename = "ReturnConsumedCapacity")]
+    pub return_consumed_capacity: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct ExecuteTransactionRequest {
+    #[serde(rename = "TransactStatements")]
+    pub transact_statements: Vec<BatchStatementRequest>,
+    #[serde(rename = "ReturnConsumedCapacity")]
+    pub return_consumed_capacity: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
 pub struct BatchGetTableRequest {
     #[serde(rename = "Keys")]
     pub keys: Vec<Item>,

@@ -1,0 +1,1 @@
+{"Responses":[{"Item":{"name":{"S":"Ann"},"pk":{"S":"u1"},"sk":{"N":"1"}},"TableName":"T"},{"Item":{"name":{"S":"Cy"},"pk":{"S":"u2"},"sk":{"N":"1"}},"TableName":"T"}]}

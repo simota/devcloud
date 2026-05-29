@@ -28,15 +28,17 @@ use crate::model::{
 };
 use crate::persistence::{PersistedState, PersistedTable};
 use crate::requests::{
-    BatchGetItemRequest, BatchWriteItemRequest, CreateTableRequest, DeleteItemRequest,
-    GetItemRequest, GlobalSecondaryIndexRequest, GlobalSecondaryIndexUpdate,
-    IndexProjectionRequest, ListTablesRequest, LocalSecondaryIndexRequest, PutItemRequest,
-    QueryRequest, ScanRequest, TransactGetItemsRequest, TransactWriteItem,
-    TransactWriteItemsRequest, UpdateItemRequest, UpdateTableRequest,
+    BatchExecuteStatementRequest, BatchGetItemRequest, BatchWriteItemRequest, CreateTableRequest,
+    DeleteItemRequest, ExecuteStatementRequest, ExecuteTransactionRequest, GetItemRequest,
+    GlobalSecondaryIndexRequest, GlobalSecondaryIndexUpdate, IndexProjectionRequest,
+    ListTablesRequest, LocalSecondaryIndexRequest, PutItemRequest, QueryRequest, ScanRequest,
+    TransactGetItemsRequest, TransactWriteItem, TransactWriteItemsRequest, UpdateItemRequest,
+    UpdateTableRequest,
 };
 use crate::responses::{
-    encode, DescribeEndpointsResponse, DescribeLimitsResponse, DescribeTableResponse,
-    EndpointEntry, ListTablesResponse, TableDescriptionResponse,
+    encode, BatchStatementError, BatchStatementResponse, DescribeEndpointsResponse,
+    DescribeLimitsResponse, DescribeTableResponse, EndpointEntry, ListTablesResponse,
+    TableDescriptionResponse,
 };
 use crate::validation::{
     validate_attribute_definition_updates, validate_create_table_request,
@@ -1252,6 +1254,195 @@ impl Server {
         )
         .map_err(|_| transaction_cancelled())?;
         Ok(())
+    }
+
+    /// `ExecuteStatement` (PartiQL SELECT).
+    pub fn execute_statement(&self, request: &ExecuteStatementRequest) -> OpResult {
+        let statement = crate::partiql::parse_select(&request.statement, &request.parameters)
+            .map_err(ApiError::validation)?;
+        let state = self
+            .tables
+            .get(&statement.table_name)
+            .ok_or_else(|| ApiError::not_found("table not found"))?;
+        let source = crate::query::sorted_items_for_query(&state.items, &state.description, "");
+        let mut items: Vec<Value> = Vec::new();
+        for candidate in &source {
+            if !crate::partiql::conditions_match(&candidate.value, &statement.conditions) {
+                continue;
+            }
+            let projected = crate::partiql::project_item(&candidate.value, &statement.projections);
+            items.push(serde_json::to_value(&projected).unwrap());
+            if request.limit > 0 && items.len() as i64 == request.limit {
+                break;
+            }
+        }
+        let mut response = Map::new();
+        response.insert("Items".to_string(), Value::Array(items));
+        add_consumed_capacity(
+            &mut response,
+            &statement.table_name,
+            &request.return_consumed_capacity,
+        );
+        Ok(crate::go_json::to_vec(&Value::Object(response)))
+    }
+
+    /// `BatchExecuteStatement` (per-statement PartiQL SELECT; errors are reported
+    /// inline rather than failing the whole batch).
+    pub fn batch_execute_statement(&self, request: &BatchExecuteStatementRequest) -> OpResult {
+        if request.statements.is_empty() {
+            return Err(ApiError::validation("statements are required"));
+        }
+        if request.statements.len() > 25 {
+            return Err(ApiError::validation(
+                "statements must contain 25 or fewer entries",
+            ));
+        }
+        let mut responses: Vec<BatchStatementResponse> = Vec::new();
+        let mut consumed: Vec<Value> = Vec::new();
+        for statement_request in &request.statements {
+            let statement = match crate::partiql::parse_select(
+                &statement_request.statement,
+                &statement_request.parameters,
+            ) {
+                Ok(s) => s,
+                Err(msg) => {
+                    responses.push(BatchStatementResponse {
+                        error: Some(BatchStatementError {
+                            code: "ValidationError".to_string(),
+                            message: msg,
+                        }),
+                        ..Default::default()
+                    });
+                    continue;
+                }
+            };
+            let Some(state) = self.tables.get(&statement.table_name) else {
+                responses.push(BatchStatementResponse {
+                    error: Some(BatchStatementError {
+                        code: "ResourceNotFound".to_string(),
+                        message: "table not found".to_string(),
+                    }),
+                    table_name: statement.table_name.clone(),
+                    ..Default::default()
+                });
+                append_batch_consumed_capacity(
+                    &mut consumed,
+                    &statement.table_name,
+                    &request.return_consumed_capacity,
+                );
+                continue;
+            };
+            if !crate::partiql::conditions_cover_key(&state.description, &statement.conditions) {
+                responses.push(BatchStatementResponse {
+                    error: Some(BatchStatementError {
+                        code: "ValidationError".to_string(),
+                        message:
+                            "SELECT statement must include equality conditions for all key attributes"
+                                .to_string(),
+                    }),
+                    table_name: statement.table_name.clone(),
+                    ..Default::default()
+                });
+                append_batch_consumed_capacity(
+                    &mut consumed,
+                    &statement.table_name,
+                    &request.return_consumed_capacity,
+                );
+                continue;
+            }
+            let mut found: Option<Item> = None;
+            for candidate in
+                crate::query::sorted_items_for_query(&state.items, &state.description, "")
+            {
+                if crate::partiql::conditions_match(&candidate.value, &statement.conditions) {
+                    found = Some(crate::partiql::project_item(
+                        &candidate.value,
+                        &statement.projections,
+                    ));
+                    break;
+                }
+            }
+            responses.push(BatchStatementResponse {
+                item: found,
+                table_name: statement.table_name.clone(),
+                ..Default::default()
+            });
+            append_batch_consumed_capacity(
+                &mut consumed,
+                &statement.table_name,
+                &request.return_consumed_capacity,
+            );
+        }
+        let mut response = Map::new();
+        response.insert(
+            "Responses".to_string(),
+            serde_json::to_value(&responses).unwrap(),
+        );
+        if !consumed.is_empty() {
+            response.insert("ConsumedCapacity".to_string(), Value::Array(consumed));
+        }
+        Ok(crate::go_json::to_vec(&Value::Object(response)))
+    }
+
+    /// `ExecuteTransaction` (PartiQL SELECT; any failure fails the whole call).
+    pub fn execute_transaction(&self, request: &ExecuteTransactionRequest) -> OpResult {
+        if request.transact_statements.is_empty() {
+            return Err(ApiError::validation("transaction statements are required"));
+        }
+        if request.transact_statements.len() > 100 {
+            return Err(ApiError::validation(
+                "transaction statements must contain 100 or fewer entries",
+            ));
+        }
+        let mut responses: Vec<BatchStatementResponse> = Vec::new();
+        let mut consumed: Vec<Value> = Vec::new();
+        for statement_request in &request.transact_statements {
+            let statement = crate::partiql::parse_select(
+                &statement_request.statement,
+                &statement_request.parameters,
+            )
+            .map_err(ApiError::validation)?;
+            let state = self
+                .tables
+                .get(&statement.table_name)
+                .ok_or_else(|| ApiError::not_found("table not found"))?;
+            if !crate::partiql::conditions_cover_key(&state.description, &statement.conditions) {
+                return Err(ApiError::validation(
+                    "SELECT statement must include equality conditions for all key attributes",
+                ));
+            }
+            let mut found: Option<Item> = None;
+            for candidate in
+                crate::query::sorted_items_for_query(&state.items, &state.description, "")
+            {
+                if crate::partiql::conditions_match(&candidate.value, &statement.conditions) {
+                    found = Some(crate::partiql::project_item(
+                        &candidate.value,
+                        &statement.projections,
+                    ));
+                    break;
+                }
+            }
+            responses.push(BatchStatementResponse {
+                item: found,
+                table_name: statement.table_name.clone(),
+                ..Default::default()
+            });
+            append_batch_consumed_capacity(
+                &mut consumed,
+                &statement.table_name,
+                &request.return_consumed_capacity,
+            );
+        }
+        let mut response = Map::new();
+        response.insert(
+            "Responses".to_string(),
+            serde_json::to_value(&responses).unwrap(),
+        );
+        if !consumed.is_empty() {
+            response.insert("ConsumedCapacity".to_string(), Value::Array(consumed));
+        }
+        Ok(crate::go_json::to_vec(&Value::Object(response)))
     }
 
     fn enable_stream_description(

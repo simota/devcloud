@@ -11,6 +11,7 @@ pub mod expression;
 pub mod go_json;
 pub mod model;
 pub mod number;
+pub mod partiql;
 pub mod persistence;
 pub mod query;
 pub mod requests;

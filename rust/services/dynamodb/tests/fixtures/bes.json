@@ -1,0 +1,1 @@
+{"Responses":[{"Item":{"name":{"S":"Ann"},"pk":{"S":"u1"},"sk":{"N":"1"}},"TableName":"T"},{"Error":{"Code":"ResourceNotFound","Message":"table not found"},"TableName":"Missing"},{"Error":{"Code":"ValidationError","Message":"SELECT statement must include equality conditions for all key attributes"},"TableName":"T"}]}
