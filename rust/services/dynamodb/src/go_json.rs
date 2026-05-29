@@ -60,6 +60,18 @@ pub fn to_vec<T: Serialize>(value: &T) -> Vec<u8> {
     buf
 }
 
+/// Like [`to_vec`] but **without** the trailing newline — matches Go's
+/// `json.Marshal` (used for the internal item-key string and for sizing items,
+/// where the encoded bytes must match Go's `json.Marshal(...)` exactly).
+pub fn marshal<T: Serialize>(value: &T) -> Vec<u8> {
+    html_escape(serde_json::to_vec(value).expect("serialize json"))
+}
+
+/// Convenience: [`marshal`] as a `String`.
+pub fn marshal_string<T: Serialize>(value: &T) -> String {
+    String::from_utf8(marshal(value)).expect("utf-8 json")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

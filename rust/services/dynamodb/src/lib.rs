@@ -5,7 +5,9 @@
 //! operations, expressions, the SigV4 path, and the HTTP server land in later
 //! parts.
 
+pub mod attribute;
 pub mod errors;
+pub mod expression;
 pub mod go_json;
 pub mod model;
 pub mod persistence;

@@ -14,7 +14,11 @@
 
 use std::collections::BTreeMap;
 
+use serde_json::{Map, Value};
+
+use crate::attribute::{item_key, project_item, validate_item_attribute_values};
 use crate::errors::ApiError;
+use crate::expression::check_condition;
 use crate::model::{
     AttributeDefinition, BillingModeSummary, ContinuousBackupsDescription,
     GlobalSecondaryIndexDescription, IndexProjection, Item, KeySchemaElement,
@@ -22,8 +26,9 @@ use crate::model::{
 };
 use crate::persistence::{PersistedState, PersistedTable};
 use crate::requests::{
-    CreateTableRequest, GlobalSecondaryIndexRequest, GlobalSecondaryIndexUpdate,
-    IndexProjectionRequest, ListTablesRequest, LocalSecondaryIndexRequest, UpdateTableRequest,
+    CreateTableRequest, DeleteItemRequest, GetItemRequest, GlobalSecondaryIndexRequest,
+    GlobalSecondaryIndexUpdate, IndexProjectionRequest, ListTablesRequest,
+    LocalSecondaryIndexRequest, PutItemRequest, UpdateTableRequest,
 };
 use crate::responses::{
     encode, DescribeEndpointsResponse, DescribeLimitsResponse, DescribeTableResponse,
@@ -438,6 +443,216 @@ impl Server {
         })
     }
 
+    fn max_item_bytes(&self) -> i64 {
+        if self.config.max_item_bytes > 0 {
+            self.config.max_item_bytes
+        } else {
+            400_000
+        }
+    }
+
+    /// Validates attribute values and the encoded item size. Mirrors
+    /// `validateItemSize`.
+    fn validate_item_size(&self, value: &Item) -> Result<(), String> {
+        validate_item_attribute_values(value)?;
+        let encoded = crate::go_json::marshal(value);
+        if encoded.len() as i64 > self.max_item_bytes() {
+            return Err(format!(
+                "item size exceeds maximum of {} bytes",
+                self.max_item_bytes()
+            ));
+        }
+        Ok(())
+    }
+
+    // --- item operations --------------------------------------------------
+
+    /// `PutItem`.
+    pub fn put_item(&mut self, request: &PutItemRequest) -> OpResult {
+        if request.table_name.is_empty() {
+            return Err(ApiError::validation("table name is required"));
+        }
+        if request.item.is_empty() {
+            return Err(ApiError::validation("item is required"));
+        }
+        self.validate_item_size(&request.item)
+            .map_err(ApiError::validation)?;
+        let return_values = upper_or_none(&request.return_values);
+        if !matches!(return_values.as_str(), "NONE" | "ALL_OLD") {
+            return Err(ApiError::validation(
+                "return values must be NONE or ALL_OLD",
+            ));
+        }
+        let condition_failure_return =
+            upper_or_none(&request.return_values_on_condition_check_failure);
+        if !matches!(condition_failure_return.as_str(), "NONE" | "ALL_OLD") {
+            return Err(ApiError::validation(
+                "return values on condition check failure must be NONE or ALL_OLD",
+            ));
+        }
+        if !valid_return_consumed_capacity(&request.return_consumed_capacity) {
+            return Err(ApiError::validation(
+                "return consumed capacity must be NONE, TOTAL, or INDEXES",
+            ));
+        }
+
+        let state = self
+            .tables
+            .get(&request.table_name)
+            .ok_or_else(|| ApiError::not_found("table not found"))?;
+        let key = item_key(&state.description, &request.item).map_err(ApiError::validation)?;
+        let old_item = state.items.get(&key).cloned();
+        check_condition(
+            &request.condition_expression,
+            &request.expression_attribute_names,
+            &request.expression_attribute_values,
+            old_item.as_ref(),
+        )
+        .map_err(|msg| {
+            ApiError::condition_check_failed(msg, &condition_failure_return, old_item.as_ref())
+        })?;
+
+        let state = self.tables.get_mut(&request.table_name).unwrap();
+        state.items.insert(key.clone(), request.item.clone());
+        state.description.item_count = state.items.len() as i64;
+        update_index_item_counts(state);
+        if let Err(err) = self.persist() {
+            let state = self.tables.get_mut(&request.table_name).unwrap();
+            match &old_item {
+                Some(prev) => {
+                    state.items.insert(key, prev.clone());
+                }
+                None => {
+                    state.items.remove(&key);
+                }
+            }
+            state.description.item_count = state.items.len() as i64;
+            update_index_item_counts(state);
+            return Err(err);
+        }
+
+        let mut response = Map::new();
+        if return_values == "ALL_OLD" {
+            if let Some(prev) = &old_item {
+                response.insert(
+                    "Attributes".to_string(),
+                    serde_json::to_value(prev).unwrap(),
+                );
+            }
+        }
+        add_consumed_capacity(
+            &mut response,
+            &request.table_name,
+            &request.return_consumed_capacity,
+        );
+        Ok(crate::go_json::to_vec(&Value::Object(response)))
+    }
+
+    /// `GetItem`.
+    pub fn get_item(&self, request: &GetItemRequest) -> OpResult {
+        if request.table_name.is_empty() {
+            return Err(ApiError::validation("table name is required"));
+        }
+        if !valid_return_consumed_capacity(&request.return_consumed_capacity) {
+            return Err(ApiError::validation(
+                "return consumed capacity must be NONE, TOTAL, or INDEXES",
+            ));
+        }
+        let state = self
+            .tables
+            .get(&request.table_name)
+            .ok_or_else(|| ApiError::not_found("table not found"))?;
+        let key = item_key(&state.description, &request.key).map_err(ApiError::validation)?;
+        let mut response = Map::new();
+        if let Some(found) = state.items.get(&key) {
+            let projected = project_item(
+                found,
+                &request.projection_expression,
+                &request.expression_attribute_names,
+            );
+            response.insert(
+                "Item".to_string(),
+                serde_json::to_value(&projected).unwrap(),
+            );
+        }
+        add_consumed_capacity(
+            &mut response,
+            &request.table_name,
+            &request.return_consumed_capacity,
+        );
+        Ok(crate::go_json::to_vec(&Value::Object(response)))
+    }
+
+    /// `DeleteItem`.
+    pub fn delete_item(&mut self, request: &DeleteItemRequest) -> OpResult {
+        if request.table_name.is_empty() {
+            return Err(ApiError::validation("table name is required"));
+        }
+        let state = self
+            .tables
+            .get(&request.table_name)
+            .ok_or_else(|| ApiError::not_found("table not found"))?;
+        let key = item_key(&state.description, &request.key).map_err(ApiError::validation)?;
+        let return_values = upper_or_none(&request.return_values);
+        if !matches!(return_values.as_str(), "NONE" | "ALL_OLD") {
+            return Err(ApiError::validation(
+                "return values must be NONE or ALL_OLD",
+            ));
+        }
+        let condition_failure_return =
+            upper_or_none(&request.return_values_on_condition_check_failure);
+        if !matches!(condition_failure_return.as_str(), "NONE" | "ALL_OLD") {
+            return Err(ApiError::validation(
+                "return values on condition check failure must be NONE or ALL_OLD",
+            ));
+        }
+        if !valid_return_consumed_capacity(&request.return_consumed_capacity) {
+            return Err(ApiError::validation(
+                "return consumed capacity must be NONE, TOTAL, or INDEXES",
+            ));
+        }
+        let old_item = state.items.get(&key).cloned();
+        check_condition(
+            &request.condition_expression,
+            &request.expression_attribute_names,
+            &request.expression_attribute_values,
+            old_item.as_ref(),
+        )
+        .map_err(|msg| {
+            ApiError::condition_check_failed(msg, &condition_failure_return, old_item.as_ref())
+        })?;
+
+        let state = self.tables.get_mut(&request.table_name).unwrap();
+        state.items.remove(&key);
+        state.description.item_count = state.items.len() as i64;
+        update_index_item_counts(state);
+        if let Err(err) = self.persist() {
+            let state = self.tables.get_mut(&request.table_name).unwrap();
+            if let Some(prev) = &old_item {
+                state.items.insert(key, prev.clone());
+            }
+            state.description.item_count = state.items.len() as i64;
+            update_index_item_counts(state);
+            return Err(err);
+        }
+
+        let mut response = Map::new();
+        if return_values == "ALL_OLD" {
+            if let Some(prev) = &old_item {
+                response.insert(
+                    "Attributes".to_string(),
+                    serde_json::to_value(prev).unwrap(),
+                );
+            }
+        }
+        add_consumed_capacity(
+            &mut response,
+            &request.table_name,
+            &request.return_consumed_capacity,
+        );
+        Ok(crate::go_json::to_vec(&Value::Object(response)))
+    }
+
     fn enable_stream_description(
         &self,
         description: &mut TableDescription,
@@ -473,6 +688,36 @@ fn billing_mode(value: &str) -> String {
     } else {
         value.to_string()
     }
+}
+
+/// `strings.ToUpper(defaultString(value, "NONE"))` — empty becomes "NONE".
+fn upper_or_none(value: &str) -> String {
+    if value.is_empty() {
+        "NONE".to_string()
+    } else {
+        value.to_uppercase()
+    }
+}
+
+/// Mirrors `validReturnConsumedCapacity` (empty allowed; case-insensitive).
+fn valid_return_consumed_capacity(value: &str) -> bool {
+    matches!(upper_or_none(value).as_str(), "NONE" | "TOTAL" | "INDEXES")
+}
+
+/// Adds the `ConsumedCapacity` field unless the mode is empty/NONE. Mirrors
+/// `addConsumedCapacity`: `CapacityUnits` is the JSON integer `1` (Go writes
+/// `float64(1)`, which marshals as `1`).
+fn add_consumed_capacity(response: &mut Map<String, Value>, table_name: &str, mode: &str) {
+    if mode.is_empty() || mode.eq_ignore_ascii_case("NONE") {
+        return;
+    }
+    let mut cap = Map::new();
+    cap.insert(
+        "TableName".to_string(),
+        Value::String(table_name.to_string()),
+    );
+    cap.insert("CapacityUnits".to_string(), Value::from(1));
+    response.insert("ConsumedCapacity".to_string(), Value::Object(cap));
 }
 
 fn projection_from_request(req: &IndexProjectionRequest) -> IndexProjection {
