@@ -15,6 +15,7 @@ pub mod move_tasks;
 pub mod persistence;
 pub mod policy;
 pub mod server;
+pub mod sigv4;
 pub mod time_fmt;
 pub mod validation;
 

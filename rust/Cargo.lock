@@ -76,6 +76,7 @@ name = "devcloud-sqs"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "hmac",
  "md-5",
  "serde",
  "serde_json",
