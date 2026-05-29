@@ -16,7 +16,9 @@ use std::collections::BTreeMap;
 
 use serde_json::{Map, Value};
 
-use crate::attribute::{item_key, project_item, validate_item_attribute_values};
+use crate::attribute::{
+    attribute_values_equal, item_key, project_item, validate_item_attribute_values,
+};
 use crate::errors::ApiError;
 use crate::expression::check_condition;
 use crate::model::{
@@ -28,7 +30,7 @@ use crate::persistence::{PersistedState, PersistedTable};
 use crate::requests::{
     CreateTableRequest, DeleteItemRequest, GetItemRequest, GlobalSecondaryIndexRequest,
     GlobalSecondaryIndexUpdate, IndexProjectionRequest, ListTablesRequest,
-    LocalSecondaryIndexRequest, PutItemRequest, UpdateTableRequest,
+    LocalSecondaryIndexRequest, PutItemRequest, UpdateItemRequest, UpdateTableRequest,
 };
 use crate::responses::{
     encode, DescribeEndpointsResponse, DescribeLimitsResponse, DescribeTableResponse,
@@ -653,6 +655,130 @@ impl Server {
         Ok(crate::go_json::to_vec(&Value::Object(response)))
     }
 
+    /// `UpdateItem`.
+    pub fn update_item(&mut self, request: &UpdateItemRequest) -> OpResult {
+        if request.table_name.is_empty() {
+            return Err(ApiError::validation("table name is required"));
+        }
+        let state = self
+            .tables
+            .get(&request.table_name)
+            .ok_or_else(|| ApiError::not_found("table not found"))?;
+        let key = item_key(&state.description, &request.key).map_err(ApiError::validation)?;
+        let return_values = upper_or_none(&request.return_values);
+        if !matches!(
+            return_values.as_str(),
+            "NONE" | "ALL_OLD" | "UPDATED_OLD" | "ALL_NEW" | "UPDATED_NEW"
+        ) {
+            return Err(ApiError::validation(
+                "return values must be NONE, ALL_OLD, UPDATED_OLD, ALL_NEW, or UPDATED_NEW",
+            ));
+        }
+        let condition_failure_return =
+            upper_or_none(&request.return_values_on_condition_check_failure);
+        if !matches!(condition_failure_return.as_str(), "NONE" | "ALL_OLD") {
+            return Err(ApiError::validation(
+                "return values on condition check failure must be NONE or ALL_OLD",
+            ));
+        }
+        if !valid_return_consumed_capacity(&request.return_consumed_capacity) {
+            return Err(ApiError::validation(
+                "return consumed capacity must be NONE, TOTAL, or INDEXES",
+            ));
+        }
+
+        let old_item = state.items.get(&key).cloned();
+        // Working item starts as the existing item, or the key when absent.
+        let mut updated = old_item.clone().unwrap_or_else(|| request.key.clone());
+
+        check_condition(
+            &request.condition_expression,
+            &request.expression_attribute_names,
+            &request.expression_attribute_values,
+            old_item.as_ref(),
+        )
+        .map_err(|msg| {
+            ApiError::condition_check_failed(msg, &condition_failure_return, old_item.as_ref())
+        })?;
+
+        crate::update_expression::apply_update_expression(
+            &mut updated,
+            &request.update_expression,
+            &request.expression_attribute_names,
+            &request.expression_attribute_values,
+        )
+        .map_err(ApiError::validation)?;
+
+        self.validate_item_size(&updated)
+            .map_err(ApiError::validation)?;
+
+        let state = self.tables.get_mut(&request.table_name).unwrap();
+        let existed = old_item.is_some();
+        state.items.insert(key.clone(), updated.clone());
+        state.description.item_count = state.items.len() as i64;
+        update_index_item_counts(state);
+        if let Err(err) = self.persist() {
+            let state = self.tables.get_mut(&request.table_name).unwrap();
+            match &old_item {
+                Some(prev) => {
+                    state.items.insert(key, prev.clone());
+                }
+                None => {
+                    state.items.remove(&key);
+                }
+            }
+            state.description.item_count = state.items.len() as i64;
+            update_index_item_counts(state);
+            return Err(err);
+        }
+
+        let empty = Item::new();
+        let old_ref = old_item.as_ref().unwrap_or(&empty);
+        let mut response = Map::new();
+        match return_values.as_str() {
+            "NONE" => {}
+            "ALL_NEW" => {
+                response.insert(
+                    "Attributes".to_string(),
+                    serde_json::to_value(&updated).unwrap(),
+                );
+            }
+            "ALL_OLD" => {
+                if existed {
+                    response.insert(
+                        "Attributes".to_string(),
+                        serde_json::to_value(old_ref).unwrap(),
+                    );
+                }
+            }
+            "UPDATED_NEW" => {
+                let attrs = updated_attributes(old_ref, &updated);
+                if !attrs.is_empty() {
+                    response.insert(
+                        "Attributes".to_string(),
+                        serde_json::to_value(&attrs).unwrap(),
+                    );
+                }
+            }
+            "UPDATED_OLD" => {
+                let attrs = updated_old_attributes(old_ref, &updated);
+                if !attrs.is_empty() {
+                    response.insert(
+                        "Attributes".to_string(),
+                        serde_json::to_value(&attrs).unwrap(),
+                    );
+                }
+            }
+            _ => unreachable!(),
+        }
+        add_consumed_capacity(
+            &mut response,
+            &request.table_name,
+            &request.return_consumed_capacity,
+        );
+        Ok(crate::go_json::to_vec(&Value::Object(response)))
+    }
+
     fn enable_stream_description(
         &self,
         description: &mut TableDescription,
@@ -702,6 +828,36 @@ fn upper_or_none(value: &str) -> String {
 /// Mirrors `validReturnConsumedCapacity` (empty allowed; case-insensitive).
 fn valid_return_consumed_capacity(value: &str) -> bool {
     matches!(upper_or_none(value).as_str(), "NONE" | "TOTAL" | "INDEXES")
+}
+
+/// Attributes that are new or changed from old to new, mirroring
+/// `updatedAttributes` (used by `ReturnValues=UPDATED_NEW`).
+fn updated_attributes(old: &Item, new: &Item) -> Item {
+    let mut result = Item::new();
+    for (name, new_attr) in new {
+        match old.get(name) {
+            Some(old_attr) if attribute_values_equal(old_attr, new_attr) => {}
+            _ => {
+                result.insert(name.clone(), new_attr.clone());
+            }
+        }
+    }
+    result
+}
+
+/// Old values of attributes that were changed or removed, mirroring
+/// `updatedOldAttributes` (used by `ReturnValues=UPDATED_OLD`).
+fn updated_old_attributes(old: &Item, new: &Item) -> Item {
+    let mut result = Item::new();
+    for (name, old_attr) in old {
+        match new.get(name) {
+            Some(new_attr) if attribute_values_equal(old_attr, new_attr) => {}
+            _ => {
+                result.insert(name.clone(), old_attr.clone());
+            }
+        }
+    }
+    result
 }
 
 /// Adds the `ConsumedCapacity` field unless the mode is empty/NONE. Mirrors

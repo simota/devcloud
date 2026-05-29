@@ -41,7 +41,7 @@ pub fn validate_attribute_value(value: &Value, path: &str) -> Result<(), String>
             let number = raw
                 .as_str()
                 .ok_or_else(|| format!("attribute {path} N value must be a string"))?;
-            if parse_rational(number).is_none() {
+            if !crate::number::is_valid_number(number) {
                 return Err(format!("attribute {path} N value must be a valid number"));
             }
         }
@@ -114,7 +114,7 @@ pub fn validate_attribute_value(value: &Value, path: &str) -> Result<(), String>
                 ));
             }
             for number in &values {
-                if parse_rational(number).is_none() {
+                if !crate::number::is_valid_number(number) {
                     return Err(format!(
                         "attribute {path} NS value must contain valid numbers"
                     ));
@@ -230,10 +230,7 @@ pub fn compare_attribute_values(left: &Value, right: &Value) -> std::cmp::Orderi
     if let (Some(lo), Some(ro)) = (lo, ro) {
         if let Some(ln) = lo.get("N").and_then(Value::as_str) {
             return match ro.get("N").and_then(Value::as_str) {
-                Some(rn) => match (parse_rational(ln), parse_rational(rn)) {
-                    (Some(a), Some(b)) => a.cmp(&b),
-                    _ => ln.cmp(rn),
-                },
+                Some(rn) => crate::number::compare_number_strings(ln, rn),
                 None => attribute_type_name(left).cmp(attribute_type_name(right)),
             };
         }
@@ -328,233 +325,6 @@ fn base64_value(c: u8) -> Option<u8> {
     }
 }
 
-/// An arbitrary-precision rational, matching Go's `big.Rat.SetString` semantics
-/// for the number formats DynamoDB accepts (decimal, optional sign, optional
-/// fraction, optional exponent). Returns `None` when Go would reject the string.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Rational {
-    negative: bool,
-    /// numerator / denominator in lowest terms is not required for comparison;
-    /// we compare via cross-multiplication on `i128`-free big integers.
-    num: BigUint,
-    den: BigUint,
-}
-
-impl Rational {
-    fn cmp(&self, other: &Rational) -> std::cmp::Ordering {
-        use std::cmp::Ordering;
-        let lz = self.num.is_zero();
-        let rz = other.num.is_zero();
-        if lz && rz {
-            return Ordering::Equal;
-        }
-        match (self.negative, other.negative) {
-            (false, true) => return Ordering::Greater,
-            (true, false) => return Ordering::Less,
-            _ => {}
-        }
-        // Same sign (treat zero as positive): compare magnitudes a/b vs c/d via
-        // a*d vs c*b.
-        let left = self.num.mul(&other.den);
-        let right = other.num.mul(&self.den);
-        let mag = left.cmp(&right);
-        if self.negative {
-            mag.reverse()
-        } else {
-            mag
-        }
-    }
-}
-
-/// Parses a number string the way Go's `big.Rat.SetString` does (the subset
-/// DynamoDB uses): optional sign, integer/decimal digits, optional `.fraction`,
-/// optional `e`/`E` exponent. Pure base-10. Returns `None` on anything Go would
-/// reject.
-pub fn parse_rational(s: &str) -> Option<Rational> {
-    let s = s.trim();
-    if s.is_empty() {
-        return None;
-    }
-    let bytes = s.as_bytes();
-    let mut idx = 0;
-    let mut negative = false;
-    if bytes[idx] == b'+' || bytes[idx] == b'-' {
-        negative = bytes[idx] == b'-';
-        idx += 1;
-    }
-    let mut int_digits = String::new();
-    while idx < bytes.len() && bytes[idx].is_ascii_digit() {
-        int_digits.push(bytes[idx] as char);
-        idx += 1;
-    }
-    let mut frac_digits = String::new();
-    if idx < bytes.len() && bytes[idx] == b'.' {
-        idx += 1;
-        while idx < bytes.len() && bytes[idx].is_ascii_digit() {
-            frac_digits.push(bytes[idx] as char);
-            idx += 1;
-        }
-    }
-    if int_digits.is_empty() && frac_digits.is_empty() {
-        return None;
-    }
-    let mut exp: i64 = 0;
-    if idx < bytes.len() && (bytes[idx] == b'e' || bytes[idx] == b'E') {
-        idx += 1;
-        let mut exp_neg = false;
-        if idx < bytes.len() && (bytes[idx] == b'+' || bytes[idx] == b'-') {
-            exp_neg = bytes[idx] == b'-';
-            idx += 1;
-        }
-        let mut exp_digits = String::new();
-        while idx < bytes.len() && bytes[idx].is_ascii_digit() {
-            exp_digits.push(bytes[idx] as char);
-            idx += 1;
-        }
-        if exp_digits.is_empty() {
-            return None;
-        }
-        exp = exp_digits.parse::<i64>().ok()?;
-        if exp_neg {
-            exp = -exp;
-        }
-    }
-    if idx != bytes.len() {
-        return None; // trailing garbage — Go rejects
-    }
-
-    // Value = (int_digits frac_digits) * 10^(exp - frac_len).
-    let mut mantissa = int_digits;
-    let frac_len = frac_digits.len() as i64;
-    mantissa.push_str(&frac_digits);
-    let mantissa = mantissa.trim_start_matches('0');
-    let num_digits = if mantissa.is_empty() { "0" } else { mantissa };
-    let total_exp = exp - frac_len;
-
-    let mut num = BigUint::from_decimal(num_digits)?;
-    let mut den = BigUint::one();
-    if total_exp >= 0 {
-        num = num.mul(&BigUint::pow10(total_exp as u64));
-    } else {
-        den = BigUint::pow10((-total_exp) as u64);
-    }
-    Some(Rational {
-        negative: negative && !num.is_zero(),
-        num,
-        den,
-    })
-}
-
-// --- minimal big unsigned integer (base 1e9 limbs) -------------------------
-
-/// A tiny arbitrary-precision unsigned integer, just enough for `N` comparison.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BigUint {
-    /// Little-endian base-1_000_000_000 limbs; empty == zero.
-    limbs: Vec<u32>,
-}
-
-const LIMB_BASE: u64 = 1_000_000_000;
-
-impl BigUint {
-    fn zero() -> Self {
-        BigUint { limbs: Vec::new() }
-    }
-    fn one() -> Self {
-        BigUint { limbs: vec![1] }
-    }
-    fn is_zero(&self) -> bool {
-        self.limbs.iter().all(|&l| l == 0)
-    }
-    fn normalize(mut self) -> Self {
-        while self.limbs.last() == Some(&0) {
-            self.limbs.pop();
-        }
-        self
-    }
-
-    fn from_decimal(s: &str) -> Option<Self> {
-        if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
-            return None;
-        }
-        let mut n = BigUint::zero();
-        let ten = BigUint { limbs: vec![10] };
-        for b in s.bytes() {
-            n = n.mul(&ten).add_small(u32::from(b - b'0'));
-        }
-        Some(n.normalize())
-    }
-
-    fn pow10(mut e: u64) -> Self {
-        let mut result = BigUint::one();
-        let ten = BigUint { limbs: vec![10] };
-        let mut base = ten;
-        while e > 0 {
-            if e & 1 == 1 {
-                result = result.mul(&base);
-            }
-            e >>= 1;
-            if e > 0 {
-                base = base.mul(&base);
-            }
-        }
-        result.normalize()
-    }
-
-    fn add_small(&self, add: u32) -> Self {
-        let mut limbs = self.limbs.clone();
-        let mut carry = add as u64;
-        let mut i = 0;
-        while carry > 0 {
-            if i == limbs.len() {
-                limbs.push(0);
-            }
-            let cur = limbs[i] as u64 + carry;
-            limbs[i] = (cur % LIMB_BASE) as u32;
-            carry = cur / LIMB_BASE;
-            i += 1;
-        }
-        BigUint { limbs }.normalize()
-    }
-
-    fn mul(&self, other: &BigUint) -> Self {
-        if self.is_zero() || other.is_zero() {
-            return BigUint::zero();
-        }
-        let mut out = vec![0u64; self.limbs.len() + other.limbs.len()];
-        for (i, &a) in self.limbs.iter().enumerate() {
-            let mut carry = 0u64;
-            for (j, &b) in other.limbs.iter().enumerate() {
-                let cur = out[i + j] + a as u64 * b as u64 + carry;
-                out[i + j] = cur % LIMB_BASE;
-                carry = cur / LIMB_BASE;
-            }
-            out[i + other.limbs.len()] += carry;
-        }
-        BigUint {
-            limbs: out.into_iter().map(|l| l as u32).collect(),
-        }
-        .normalize()
-    }
-
-    fn cmp(&self, other: &BigUint) -> std::cmp::Ordering {
-        use std::cmp::Ordering;
-        let a = self.clone().normalize();
-        let b = other.clone().normalize();
-        match a.limbs.len().cmp(&b.limbs.len()) {
-            Ordering::Equal => {}
-            ord => return ord,
-        }
-        for i in (0..a.limbs.len()).rev() {
-            match a.limbs[i].cmp(&b.limbs[i]) {
-                Ordering::Equal => {}
-                ord => return ord,
-            }
-        }
-        Ordering::Equal
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -563,49 +333,6 @@ mod tests {
 
     fn names() -> std::collections::BTreeMap<String, String> {
         std::collections::BTreeMap::new()
-    }
-
-    #[test]
-    fn rational_compares_like_big_rat() {
-        use std::cmp::Ordering;
-        assert_eq!(
-            parse_rational("3.5")
-                .unwrap()
-                .cmp(&parse_rational("3.50").unwrap()),
-            Ordering::Equal
-        );
-        assert_eq!(
-            parse_rational("10")
-                .unwrap()
-                .cmp(&parse_rational("9").unwrap()),
-            Ordering::Greater
-        );
-        assert_eq!(
-            parse_rational("-1")
-                .unwrap()
-                .cmp(&parse_rational("0").unwrap()),
-            Ordering::Less
-        );
-        assert_eq!(
-            parse_rational("1e2")
-                .unwrap()
-                .cmp(&parse_rational("100").unwrap()),
-            Ordering::Equal
-        );
-        assert_eq!(
-            parse_rational("0.1")
-                .unwrap()
-                .cmp(&parse_rational("0.2").unwrap()),
-            Ordering::Less
-        );
-    }
-
-    #[test]
-    fn rational_rejects_garbage() {
-        assert!(parse_rational("abc").is_none());
-        assert!(parse_rational("1.2.3").is_none());
-        assert!(parse_rational("").is_none());
-        assert!(parse_rational("1e").is_none());
     }
 
     #[test]

@@ -159,6 +159,29 @@ pub struct GetItemRequest {
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
+pub struct UpdateItemRequest {
+    #[serde(rename = "TableName")]
+    pub table_name: String,
+    #[serde(rename = "Key")]
+    pub key: Item,
+    #[serde(rename = "ConditionExpression")]
+    pub condition_expression: String,
+    #[serde(rename = "UpdateExpression")]
+    pub update_expression: String,
+    #[serde(rename = "ExpressionAttributeNames")]
+    pub expression_attribute_names: BTreeMap<String, String>,
+    #[serde(rename = "ExpressionAttributeValues")]
+    pub expression_attribute_values: BTreeMap<String, AttributeValue>,
+    #[serde(rename = "ReturnValues")]
+    pub return_values: String,
+    #[serde(rename = "ReturnValuesOnConditionCheckFailure")]
+    pub return_values_on_condition_check_failure: String,
+    #[serde(rename = "ReturnConsumedCapacity")]
+    pub return_consumed_capacity: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
 pub struct DeleteItemRequest {
     #[serde(rename = "TableName")]
     pub table_name: String,
