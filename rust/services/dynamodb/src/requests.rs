@@ -159,6 +159,50 @@ pub struct GetItemRequest {
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
+pub struct ListStreamsRequest {
+    #[serde(rename = "TableName")]
+    pub table_name: String,
+    #[serde(rename = "ExclusiveStartStreamArn")]
+    pub exclusive_start_stream_arn: String,
+    #[serde(rename = "Limit")]
+    pub limit: i64,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct DescribeStreamRequest {
+    #[serde(rename = "StreamArn")]
+    pub stream_arn: String,
+    #[serde(rename = "ExclusiveStartShardId")]
+    pub exclusive_start_shard_id: String,
+    #[serde(rename = "Limit")]
+    pub limit: i64,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct GetShardIteratorRequest {
+    #[serde(rename = "StreamArn")]
+    pub stream_arn: String,
+    #[serde(rename = "ShardId")]
+    pub shard_id: String,
+    #[serde(rename = "ShardIteratorType")]
+    pub shard_iterator_type: String,
+    #[serde(rename = "SequenceNumber")]
+    pub sequence_number: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct GetRecordsRequest {
+    #[serde(rename = "ShardIterator")]
+    pub shard_iterator: String,
+    #[serde(rename = "Limit")]
+    pub limit: i64,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
 pub struct ExecuteStatementRequest {
     #[serde(rename = "Statement")]
     pub statement: String,

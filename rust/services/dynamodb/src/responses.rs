@@ -90,6 +90,74 @@ pub struct BatchStatementResponse {
     pub table_name: String,
 }
 
+/// A stream summary in `ListStreams`, mirroring Go `streamSummary`
+/// (`StreamArn`, `StreamLabel`, `TableName`).
+#[derive(Debug, Clone, Serialize)]
+pub struct StreamSummary {
+    #[serde(rename = "StreamArn")]
+    pub stream_arn: String,
+    #[serde(rename = "StreamLabel")]
+    pub stream_label: String,
+    #[serde(rename = "TableName")]
+    pub table_name: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SequenceNumberRange {
+    #[serde(
+        rename = "EndingSequenceNumber",
+        skip_serializing_if = "String::is_empty"
+    )]
+    pub ending_sequence_number: String,
+    #[serde(rename = "StartingSequenceNumber")]
+    pub starting_sequence_number: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ShardDescription {
+    #[serde(rename = "SequenceNumberRange")]
+    pub sequence_number_range: SequenceNumberRange,
+    #[serde(rename = "ShardId")]
+    pub shard_id: String,
+}
+
+/// The `StreamDescription` body of `DescribeStream`, mirroring Go
+/// `streamDescription` field order. `LastEvaluatedShardId` is omitempty.
+#[derive(Debug, Clone, Serialize)]
+pub struct StreamDescription {
+    #[serde(rename = "CreationRequestDateTime")]
+    pub creation_request_date_time: i64,
+    #[serde(rename = "KeySchema", skip_serializing_if = "Vec::is_empty")]
+    pub key_schema: Vec<crate::model::KeySchemaElement>,
+    #[serde(
+        rename = "LastEvaluatedShardId",
+        skip_serializing_if = "String::is_empty"
+    )]
+    pub last_evaluated_shard_id: String,
+    #[serde(rename = "Shards")]
+    pub shards: Vec<ShardDescription>,
+    #[serde(rename = "StreamArn")]
+    pub stream_arn: String,
+    #[serde(rename = "StreamLabel")]
+    pub stream_label: String,
+    #[serde(rename = "StreamStatus")]
+    pub stream_status: String,
+    #[serde(rename = "StreamViewType")]
+    pub stream_view_type: String,
+    #[serde(rename = "TableName")]
+    pub table_name: String,
+}
+
+/// `GetRecords` response. `Records` keeps `StreamRecord` field order (so it must
+/// not be routed through `serde_json::Value`, which would re-sort keys).
+#[derive(Debug, Clone, Serialize)]
+pub struct GetRecordsResponse {
+    #[serde(rename = "NextShardIterator")]
+    pub next_shard_iterator: String,
+    #[serde(rename = "Records")]
+    pub records: Vec<crate::model::StreamRecord>,
+}
+
 /// Serializes any response envelope to the Go wire bytes.
 pub fn encode<T: Serialize>(value: &T) -> Vec<u8> {
     crate::go_json::to_vec(value)

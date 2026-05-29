@@ -12,7 +12,9 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::model::{BackupDescription, ContinuousBackupsDescription, Item, TableDescription};
+use crate::model::{
+    BackupDescription, ContinuousBackupsDescription, Item, StreamRecord, TableDescription,
+};
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct PersistedState {
@@ -44,7 +46,7 @@ pub struct PersistedTable {
         default,
         skip_serializing_if = "Vec::is_empty"
     )]
-    pub stream_records: Vec<serde_json::Value>,
+    pub stream_records: Vec<StreamRecord>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub tags: BTreeMap<String, String>,
     #[serde(

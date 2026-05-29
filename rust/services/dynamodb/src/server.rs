@@ -29,17 +29,19 @@ use crate::model::{
 use crate::persistence::{PersistedState, PersistedTable};
 use crate::requests::{
     BatchExecuteStatementRequest, BatchGetItemRequest, BatchWriteItemRequest, CreateTableRequest,
-    DeleteItemRequest, ExecuteStatementRequest, ExecuteTransactionRequest, GetItemRequest,
-    GlobalSecondaryIndexRequest, GlobalSecondaryIndexUpdate, IndexProjectionRequest,
-    ListTablesRequest, LocalSecondaryIndexRequest, PutItemRequest, QueryRequest, ScanRequest,
-    TransactGetItemsRequest, TransactWriteItem, TransactWriteItemsRequest, UpdateItemRequest,
-    UpdateTableRequest,
+    DeleteItemRequest, DescribeStreamRequest, ExecuteStatementRequest, ExecuteTransactionRequest,
+    GetItemRequest, GetRecordsRequest, GetShardIteratorRequest, GlobalSecondaryIndexRequest,
+    GlobalSecondaryIndexUpdate, IndexProjectionRequest, ListStreamsRequest, ListTablesRequest,
+    LocalSecondaryIndexRequest, PutItemRequest, QueryRequest, ScanRequest, TransactGetItemsRequest,
+    TransactWriteItem, TransactWriteItemsRequest, UpdateItemRequest, UpdateTableRequest,
 };
 use crate::responses::{
     encode, BatchStatementError, BatchStatementResponse, DescribeEndpointsResponse,
     DescribeLimitsResponse, DescribeTableResponse, EndpointEntry, ListTablesResponse,
+    SequenceNumberRange, ShardDescription, StreamDescription, StreamSummary,
     TableDescriptionResponse,
 };
+use crate::streams::{decode_iterator, encode_iterator, StreamIterator};
 use crate::validation::{
     validate_attribute_definition_updates, validate_create_table_request,
     validate_stream_specification,
@@ -89,6 +91,7 @@ impl Config {
 pub struct TableState {
     pub description: TableDescription,
     pub items: BTreeMap<String, Item>,
+    pub stream_records: Vec<crate::model::StreamRecord>,
     pub tags: BTreeMap<String, String>,
     pub continuous_backups: Option<ContinuousBackupsDescription>,
     pub resource_policy: String,
@@ -100,6 +103,7 @@ impl TableState {
         TableState {
             description,
             items: BTreeMap::new(),
+            stream_records: Vec::new(),
             tags: BTreeMap::new(),
             continuous_backups: None,
             resource_policy: String::new(),
@@ -142,6 +146,12 @@ impl Server {
         self.fixed_now_millis = Some(unix_secs * 1000);
     }
 
+    /// Pins the millisecond clock independently (for reproducing a stream label
+    /// with a non-zero millisecond fraction).
+    pub fn set_fixed_now_millis(&mut self, unix_millis: i64) {
+        self.fixed_now_millis = Some(unix_millis);
+    }
+
     pub fn load_err(&self) -> Option<&str> {
         self.load_err.as_deref()
     }
@@ -152,6 +162,33 @@ impl Server {
 
     fn now_millis(&self) -> i64 {
         self.fixed_now_millis.unwrap_or_else(time_util::now_millis)
+    }
+
+    /// Appends a stream record for a write to the named table, if the table's
+    /// stream is enabled. Mirrors `appendStreamRecordLocked`.
+    fn append_stream_record(
+        &mut self,
+        table: &str,
+        event_name: &str,
+        old_item: Option<&Item>,
+        new_item: Option<&Item>,
+    ) {
+        let region = self.config.region().to_string();
+        let now = self.now_unix();
+        let Some(state) = self.tables.get_mut(table) else {
+            return;
+        };
+        if let Some(record) = crate::streams::build_stream_record(
+            &state.description,
+            &region,
+            state.stream_records.len(),
+            event_name,
+            old_item,
+            new_item,
+            now,
+        ) {
+            state.stream_records.push(record);
+        }
     }
 
     fn state_path(&self) -> std::path::PathBuf {
@@ -170,6 +207,7 @@ impl Server {
             let mut state = TableState {
                 description: table.description,
                 items: table.items,
+                stream_records: table.stream_records,
                 tags: table.tags,
                 continuous_backups: table.continuous_backups,
                 resource_policy: table.resource_policy,
@@ -197,7 +235,7 @@ impl Server {
                 PersistedTable {
                     description: state.description.clone(),
                     items: state.items.clone(),
-                    stream_records: Vec::new(),
+                    stream_records: state.stream_records.clone(),
                     tags: state.tags.clone(),
                     continuous_backups: state.continuous_backups.clone(),
                     resource_policy: state.resource_policy.clone(),
@@ -518,10 +556,18 @@ impl Server {
             ApiError::condition_check_failed(msg, &condition_failure_return, old_item.as_ref())
         })?;
 
+        let existed = old_item.is_some();
+        let stream_len = self.tables[&request.table_name].stream_records.len();
         let state = self.tables.get_mut(&request.table_name).unwrap();
         state.items.insert(key.clone(), request.item.clone());
         state.description.item_count = state.items.len() as i64;
         update_index_item_counts(state);
+        self.append_stream_record(
+            &request.table_name,
+            crate::streams::stream_event_name(existed, false),
+            old_item.as_ref(),
+            Some(&request.item),
+        );
         if let Err(err) = self.persist() {
             let state = self.tables.get_mut(&request.table_name).unwrap();
             match &old_item {
@@ -532,6 +578,7 @@ impl Server {
                     state.items.remove(&key);
                 }
             }
+            state.stream_records.truncate(stream_len);
             state.description.item_count = state.items.len() as i64;
             update_index_item_counts(state);
             return Err(err);
@@ -628,15 +675,20 @@ impl Server {
             ApiError::condition_check_failed(msg, &condition_failure_return, old_item.as_ref())
         })?;
 
+        let stream_len = self.tables[&request.table_name].stream_records.len();
         let state = self.tables.get_mut(&request.table_name).unwrap();
         state.items.remove(&key);
         state.description.item_count = state.items.len() as i64;
         update_index_item_counts(state);
+        // Append the REMOVE record (no-op if the stream is disabled or the item
+        // did not exist).
+        self.append_stream_record(&request.table_name, "REMOVE", old_item.as_ref(), None);
         if let Err(err) = self.persist() {
             let state = self.tables.get_mut(&request.table_name).unwrap();
             if let Some(prev) = &old_item {
                 state.items.insert(key, prev.clone());
             }
+            state.stream_records.truncate(stream_len);
             state.description.item_count = state.items.len() as i64;
             update_index_item_counts(state);
             return Err(err);
@@ -716,11 +768,18 @@ impl Server {
         self.validate_item_size(&updated)
             .map_err(ApiError::validation)?;
 
+        let stream_len = self.tables[&request.table_name].stream_records.len();
         let state = self.tables.get_mut(&request.table_name).unwrap();
         let existed = old_item.is_some();
         state.items.insert(key.clone(), updated.clone());
         state.description.item_count = state.items.len() as i64;
         update_index_item_counts(state);
+        self.append_stream_record(
+            &request.table_name,
+            crate::streams::stream_event_name(existed, false),
+            old_item.as_ref(),
+            Some(&updated),
+        );
         if let Err(err) = self.persist() {
             let state = self.tables.get_mut(&request.table_name).unwrap();
             match &old_item {
@@ -731,6 +790,7 @@ impl Server {
                     state.items.remove(&key);
                 }
             }
+            state.stream_records.truncate(stream_len);
             state.description.item_count = state.items.len() as i64;
             update_index_item_counts(state);
             return Err(err);
@@ -1445,6 +1505,231 @@ impl Server {
         Ok(crate::go_json::to_vec(&Value::Object(response)))
     }
 
+    /// `ListStreams`.
+    pub fn list_streams(&self, request: &ListStreamsRequest) -> OpResult {
+        if request.limit < 0 || request.limit > 100 {
+            return Err(ApiError::validation("limit must be between 1 and 100"));
+        }
+        if !request.table_name.is_empty() && !self.tables.contains_key(&request.table_name) {
+            return Err(ApiError::not_found("table not found"));
+        }
+        let mut streams: Vec<StreamSummary> = Vec::new();
+        for state in self.tables.values() {
+            let d = &state.description;
+            if !request.table_name.is_empty() && d.table_name != request.table_name {
+                continue;
+            }
+            if d.latest_stream_arn.is_empty() || !stream_enabled(d) {
+                continue;
+            }
+            streams.push(StreamSummary {
+                stream_arn: d.latest_stream_arn.clone(),
+                stream_label: d.latest_stream_label.clone(),
+                table_name: d.table_name.clone(),
+            });
+        }
+        streams.sort_by(|a, b| {
+            if a.table_name == b.table_name {
+                a.stream_arn.cmp(&b.stream_arn)
+            } else {
+                a.table_name.cmp(&b.table_name)
+            }
+        });
+        let mut start = 0usize;
+        if !request.exclusive_start_stream_arn.is_empty() {
+            match streams
+                .iter()
+                .position(|s| s.stream_arn == request.exclusive_start_stream_arn)
+            {
+                Some(i) => start = i + 1,
+                None => {
+                    return Err(ApiError::validation(
+                        "exclusive start stream arn does not exist",
+                    ))
+                }
+            }
+        }
+        let mut end = streams.len();
+        if request.limit > 0 && start + (request.limit as usize) < end {
+            end = start + request.limit as usize;
+        }
+        let mut response = Map::new();
+        response.insert(
+            "Streams".to_string(),
+            serde_json::to_value(&streams[start..end]).unwrap(),
+        );
+        if end < streams.len() {
+            response.insert(
+                "LastEvaluatedStreamArn".to_string(),
+                Value::String(streams[end - 1].stream_arn.clone()),
+            );
+        }
+        Ok(crate::go_json::to_vec(&Value::Object(response)))
+    }
+
+    /// `DescribeStream`.
+    pub fn describe_stream(&self, request: &DescribeStreamRequest) -> OpResult {
+        if request.stream_arn.is_empty() {
+            return Err(ApiError::validation("stream arn is required"));
+        }
+        if request.limit < 0 || request.limit > 100 {
+            return Err(ApiError::validation("limit must be between 1 and 100"));
+        }
+        if !request.exclusive_start_shard_id.is_empty() {
+            return Err(ApiError::validation(
+                "exclusive start shard id does not exist",
+            ));
+        }
+        let description = self
+            .table_for_stream(&request.stream_arn)
+            .map(|s| s.description.clone())
+            .ok_or_else(|| ApiError::not_found("stream not found"))?;
+        let body = stream_description_for_table(&description);
+        let mut response = Map::new();
+        response.insert(
+            "StreamDescription".to_string(),
+            serde_json::to_value(&body).unwrap(),
+        );
+        Ok(crate::go_json::to_vec(&Value::Object(response)))
+    }
+
+    /// `GetShardIterator`.
+    pub fn get_shard_iterator(&self, request: &GetShardIteratorRequest) -> OpResult {
+        if request.stream_arn.is_empty() {
+            return Err(ApiError::validation("stream arn is required"));
+        }
+        if request.shard_id.is_empty() {
+            return Err(ApiError::validation("shard id is required"));
+        }
+        match request.shard_iterator_type.as_str() {
+            "TRIM_HORIZON" | "LATEST" | "AT_SEQUENCE_NUMBER" | "AFTER_SEQUENCE_NUMBER" => {}
+            "" => return Err(ApiError::validation("shard iterator type is required")),
+            _ => return Err(ApiError::validation("unsupported shard iterator type")),
+        }
+        let needs_seq = matches!(
+            request.shard_iterator_type.as_str(),
+            "AT_SEQUENCE_NUMBER" | "AFTER_SEQUENCE_NUMBER"
+        );
+        if needs_seq && request.sequence_number.is_empty() {
+            return Err(ApiError::validation("sequence number is required"));
+        }
+        if !self.stream_shard_exists(&request.stream_arn, &request.shard_id) {
+            return Err(ApiError::not_found("stream shard not found"));
+        }
+        let mut position = 0i64;
+        if request.shard_iterator_type == "LATEST" {
+            position = self
+                .table_for_stream(&request.stream_arn)
+                .map(|s| s.stream_records.len() as i64)
+                .unwrap_or(0);
+        }
+        if needs_seq {
+            match self.stream_position_for_sequence(
+                &request.stream_arn,
+                &request.sequence_number,
+                request.shard_iterator_type == "AFTER_SEQUENCE_NUMBER",
+            ) {
+                Some(p) => position = p,
+                None => {
+                    return Err(ApiError::new(
+                        400,
+                        "TrimmedDataAccessException",
+                        "sequence number is invalid",
+                    ))
+                }
+            }
+        }
+        let iterator = encode_iterator(&StreamIterator {
+            stream_arn: request.stream_arn.clone(),
+            shard_id: request.shard_id.clone(),
+            position,
+        });
+        let mut response = Map::new();
+        response.insert("ShardIterator".to_string(), Value::String(iterator));
+        Ok(crate::go_json::to_vec(&Value::Object(response)))
+    }
+
+    /// `GetRecords`.
+    pub fn get_records(&self, request: &GetRecordsRequest) -> OpResult {
+        if request.shard_iterator.is_empty() {
+            return Err(ApiError::validation("shard iterator is required"));
+        }
+        if request.limit < 0 || request.limit > 1000 {
+            return Err(ApiError::validation("limit must be between 1 and 1000"));
+        }
+        let iterator = decode_iterator(&request.shard_iterator).map_err(|_| {
+            ApiError::new(
+                400,
+                "TrimmedDataAccessException",
+                "shard iterator is invalid",
+            )
+        })?;
+        if !self.stream_shard_exists(&iterator.stream_arn, &iterator.shard_id) {
+            return Err(ApiError::not_found("stream shard not found"));
+        }
+        let records = self.stream_records(&iterator.stream_arn, iterator.position, request.limit);
+        let next = encode_iterator(&StreamIterator {
+            stream_arn: iterator.stream_arn.clone(),
+            shard_id: iterator.shard_id.clone(),
+            position: iterator.position + records.len() as i64,
+        });
+        Ok(encode(&crate::responses::GetRecordsResponse {
+            next_shard_iterator: next,
+            records,
+        }))
+    }
+
+    // --- stream helpers ---------------------------------------------------
+
+    fn table_for_stream(&self, stream_arn: &str) -> Option<&TableState> {
+        self.tables.values().find(|state| {
+            state.description.latest_stream_arn == stream_arn && stream_enabled(&state.description)
+        })
+    }
+
+    fn stream_shard_exists(&self, stream_arn: &str, shard_id: &str) -> bool {
+        // The single shard is always `shardId-000000000000`.
+        self.table_for_stream(stream_arn).is_some() && shard_id == "shardId-000000000000"
+    }
+
+    fn stream_records(
+        &self,
+        stream_arn: &str,
+        position: i64,
+        limit: i64,
+    ) -> Vec<crate::model::StreamRecord> {
+        let Some(state) = self.table_for_stream(stream_arn) else {
+            return Vec::new();
+        };
+        let len = state.stream_records.len() as i64;
+        if position >= len {
+            return Vec::new();
+        }
+        let start = position.max(0) as usize;
+        let effective_limit = if limit <= 0 || limit > 1000 {
+            1000
+        } else {
+            limit
+        };
+        let end = ((start as i64 + effective_limit).min(len)) as usize;
+        state.stream_records[start..end].to_vec()
+    }
+
+    fn stream_position_for_sequence(
+        &self,
+        stream_arn: &str,
+        sequence_number: &str,
+        after: bool,
+    ) -> Option<i64> {
+        let state = self.table_for_stream(stream_arn)?;
+        for (i, record) in state.stream_records.iter().enumerate() {
+            if record.dynamodb.sequence_number == sequence_number {
+                return Some(if after { i as i64 + 1 } else { i as i64 });
+            }
+        }
+        None
+    }
+
     fn enable_stream_description(
         &self,
         description: &mut TableDescription,
@@ -1578,6 +1863,42 @@ fn count_transact_write_operations(item: &TransactWriteItem) -> usize {
 /// transact-write (`TransactionCanceledException` / "transaction cancelled").
 fn transaction_cancelled() -> ApiError {
     ApiError::new(400, "TransactionCanceledException", "transaction cancelled")
+}
+
+/// True when a table has an enabled stream.
+fn stream_enabled(description: &TableDescription) -> bool {
+    description
+        .stream_specification
+        .as_ref()
+        .map(|s| s.stream_enabled)
+        .unwrap_or(false)
+}
+
+/// Builds the `StreamDescription` for a table, mirroring
+/// `streamDescriptionForTable` (one fixed shard `shardId-000000000000`).
+fn stream_description_for_table(description: &TableDescription) -> StreamDescription {
+    let stream_view_type = description
+        .stream_specification
+        .as_ref()
+        .map(|s| s.stream_view_type.clone())
+        .unwrap_or_default();
+    StreamDescription {
+        creation_request_date_time: description.creation_date_time,
+        key_schema: description.key_schema.clone(),
+        last_evaluated_shard_id: String::new(),
+        shards: vec![ShardDescription {
+            sequence_number_range: SequenceNumberRange {
+                ending_sequence_number: String::new(),
+                starting_sequence_number: "0".to_string(),
+            },
+            shard_id: "shardId-000000000000".to_string(),
+        }],
+        stream_arn: description.latest_stream_arn.clone(),
+        stream_label: description.latest_stream_label.clone(),
+        stream_status: "ENABLED".to_string(),
+        stream_view_type,
+        table_name: description.table_name.clone(),
+    }
 }
 
 fn projection_from_request(req: &IndexProjectionRequest) -> IndexProjection {

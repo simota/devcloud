@@ -251,3 +251,42 @@ pub struct BackupDescription {
     #[serde(rename = "SourceTableDetails")]
     pub source_table_details: SourceTableDetails,
 }
+
+/// The `dynamodb` image of a stream record. Field declaration order and
+/// `omitempty` mirror Go `streamRecordImage`. `New`/`OldImage` are dropped when
+/// empty; the other fields always serialize.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct StreamRecordImage {
+    #[serde(rename = "ApproximateCreationDateTime")]
+    pub approximate_creation_date_time: i64,
+    #[serde(rename = "Keys")]
+    pub keys: Item,
+    #[serde(rename = "NewImage", default, skip_serializing_if = "Item::is_empty")]
+    pub new_image: Item,
+    #[serde(rename = "OldImage", default, skip_serializing_if = "Item::is_empty")]
+    pub old_image: Item,
+    #[serde(rename = "SequenceNumber")]
+    pub sequence_number: String,
+    #[serde(rename = "SizeBytes")]
+    pub size_bytes: i64,
+    #[serde(rename = "StreamViewType")]
+    pub stream_view_type: String,
+}
+
+/// A single stream record. Field declaration order and the lowercase JSON keys
+/// mirror Go `streamRecord`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StreamRecord {
+    #[serde(rename = "eventID")]
+    pub event_id: String,
+    #[serde(rename = "eventName")]
+    pub event_name: String,
+    #[serde(rename = "eventSource")]
+    pub event_source: String,
+    #[serde(rename = "eventVersion")]
+    pub event_version: String,
+    #[serde(rename = "awsRegion")]
+    pub aws_region: String,
+    #[serde(rename = "dynamodb")]
+    pub dynamodb: StreamRecordImage,
+}

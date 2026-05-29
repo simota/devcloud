@@ -17,6 +17,7 @@ pub mod query;
 pub mod requests;
 pub mod responses;
 pub mod server;
+pub mod streams;
 pub mod time_util;
 pub mod update_expression;
 pub mod validation;
