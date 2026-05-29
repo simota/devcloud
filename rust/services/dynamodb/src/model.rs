@@ -42,7 +42,7 @@ pub struct BillingModeSummary {
     pub billing_mode: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct StreamSpecification {
     #[serde(rename = "StreamEnabled")]
     pub stream_enabled: bool,
