@@ -1,0 +1,1 @@
+{"Count":2,"Items":[{"extra":{"S":"e1"},"gsiPk":{"S":"g1"},"name":{"S":"Ann"},"pk":{"S":"u1"},"sk":{"N":"1"}},{"extra":{"S":"e2"},"gsiPk":{"S":"g1"},"name":{"S":"Bob"},"pk":{"S":"u1"},"sk":{"N":"2"}}],"LastEvaluatedKey":{"pk":{"S":"u1"},"sk":{"N":"2"}},"ScannedCount":2}

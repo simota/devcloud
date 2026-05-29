@@ -12,6 +12,7 @@ pub mod go_json;
 pub mod model;
 pub mod number;
 pub mod persistence;
+pub mod query;
 pub mod requests;
 pub mod responses;
 pub mod server;

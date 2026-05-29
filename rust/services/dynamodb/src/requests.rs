@@ -159,6 +159,59 @@ pub struct GetItemRequest {
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
+pub struct QueryRequest {
+    #[serde(rename = "TableName")]
+    pub table_name: String,
+    #[serde(rename = "IndexName")]
+    pub index_name: String,
+    #[serde(rename = "KeyConditionExpression")]
+    pub key_condition_expression: String,
+    #[serde(rename = "ExpressionAttributeNames")]
+    pub expression_attribute_names: BTreeMap<String, String>,
+    #[serde(rename = "ExpressionAttributeValues")]
+    pub expression_attribute_values: BTreeMap<String, AttributeValue>,
+    #[serde(rename = "ProjectionExpression")]
+    pub projection_expression: String,
+    #[serde(rename = "Select")]
+    pub select: String,
+    #[serde(rename = "ExclusiveStartKey")]
+    pub exclusive_start_key: Item,
+    #[serde(rename = "Limit")]
+    pub limit: i64,
+    // Go uses `*bool` (absent => default ascending); model it as Option.
+    #[serde(rename = "ScanIndexForward")]
+    pub scan_index_forward: Option<bool>,
+    #[serde(rename = "ReturnConsumedCapacity")]
+    pub return_consumed_capacity: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct ScanRequest {
+    #[serde(rename = "TableName")]
+    pub table_name: String,
+    #[serde(rename = "IndexName")]
+    pub index_name: String,
+    #[serde(rename = "FilterExpression")]
+    pub filter_expression: String,
+    #[serde(rename = "ExpressionAttributeNames")]
+    pub expression_attribute_names: BTreeMap<String, String>,
+    #[serde(rename = "ExpressionAttributeValues")]
+    pub expression_attribute_values: BTreeMap<String, AttributeValue>,
+    #[serde(rename = "ProjectionExpression")]
+    pub projection_expression: String,
+    #[serde(rename = "Select")]
+    pub select: String,
+    #[serde(rename = "ExclusiveStartKey")]
+    pub exclusive_start_key: Item,
+    #[serde(rename = "Limit")]
+    pub limit: i64,
+    #[serde(rename = "ReturnConsumedCapacity")]
+    pub return_consumed_capacity: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
 pub struct UpdateItemRequest {
     #[serde(rename = "TableName")]
     pub table_name: String,

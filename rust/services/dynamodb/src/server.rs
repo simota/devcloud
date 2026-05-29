@@ -20,7 +20,7 @@ use crate::attribute::{
     attribute_values_equal, item_key, project_item, validate_item_attribute_values,
 };
 use crate::errors::ApiError;
-use crate::expression::check_condition;
+use crate::expression::{check_condition, match_filter, match_key_condition};
 use crate::model::{
     AttributeDefinition, BillingModeSummary, ContinuousBackupsDescription,
     GlobalSecondaryIndexDescription, IndexProjection, Item, KeySchemaElement,
@@ -30,7 +30,8 @@ use crate::persistence::{PersistedState, PersistedTable};
 use crate::requests::{
     CreateTableRequest, DeleteItemRequest, GetItemRequest, GlobalSecondaryIndexRequest,
     GlobalSecondaryIndexUpdate, IndexProjectionRequest, ListTablesRequest,
-    LocalSecondaryIndexRequest, PutItemRequest, UpdateItemRequest, UpdateTableRequest,
+    LocalSecondaryIndexRequest, PutItemRequest, QueryRequest, ScanRequest, UpdateItemRequest,
+    UpdateTableRequest,
 };
 use crate::responses::{
     encode, DescribeEndpointsResponse, DescribeLimitsResponse, DescribeTableResponse,
@@ -771,6 +772,118 @@ impl Server {
             }
             _ => unreachable!(),
         }
+        add_consumed_capacity(
+            &mut response,
+            &request.table_name,
+            &request.return_consumed_capacity,
+        );
+        Ok(crate::go_json::to_vec(&Value::Object(response)))
+    }
+
+    /// `Query`.
+    pub fn query(&self, request: &QueryRequest) -> OpResult {
+        if request.table_name.is_empty() {
+            return Err(ApiError::validation("table name is required"));
+        }
+        if request.key_condition_expression.trim().is_empty() {
+            return Err(ApiError::validation("key condition expression is required"));
+        }
+        crate::query::validate_select(&request.select, &request.projection_expression)
+            .map_err(ApiError::validation)?;
+        if !valid_return_consumed_capacity(&request.return_consumed_capacity) {
+            return Err(ApiError::validation(
+                "return consumed capacity must be NONE, TOTAL, or INDEXES",
+            ));
+        }
+        let state = self
+            .tables
+            .get(&request.table_name)
+            .ok_or_else(|| ApiError::not_found("table not found"))?;
+        if !request.index_name.is_empty()
+            && !table_has_index(&state.description, &request.index_name)
+        {
+            return Err(ApiError::validation("index not found"));
+        }
+        let mut items = crate::query::sorted_items_for_query(
+            &state.items,
+            &state.description,
+            &request.index_name,
+        );
+        if request.scan_index_forward == Some(false) {
+            crate::query::reverse_items(&mut items);
+        }
+        let start_key =
+            crate::query::start_key_string(&state.description, &request.exclusive_start_key)
+                .map_err(ApiError::validation)?;
+        let names = &request.expression_attribute_names;
+        let values = &request.expression_attribute_values;
+        let key_expr = &request.key_condition_expression;
+        let mut response = crate::query::collect_items(
+            &state.description,
+            &request.index_name,
+            &items,
+            request.limit,
+            &start_key,
+            &request.projection_expression,
+            names,
+            false,
+            |candidate| match_key_condition(key_expr, names, values, candidate),
+        )
+        .map_err(ApiError::validation)?;
+        crate::query::apply_select(&mut response, &request.select);
+        add_consumed_capacity(
+            &mut response,
+            &request.table_name,
+            &request.return_consumed_capacity,
+        );
+        Ok(crate::go_json::to_vec(&Value::Object(response)))
+    }
+
+    /// `Scan`.
+    pub fn scan(&self, request: &ScanRequest) -> OpResult {
+        if request.table_name.is_empty() {
+            return Err(ApiError::validation("table name is required"));
+        }
+        crate::query::validate_select(&request.select, &request.projection_expression)
+            .map_err(ApiError::validation)?;
+        if !valid_return_consumed_capacity(&request.return_consumed_capacity) {
+            return Err(ApiError::validation(
+                "return consumed capacity must be NONE, TOTAL, or INDEXES",
+            ));
+        }
+        let state = self
+            .tables
+            .get(&request.table_name)
+            .ok_or_else(|| ApiError::not_found("table not found"))?;
+        if !request.index_name.is_empty()
+            && !table_has_index(&state.description, &request.index_name)
+        {
+            return Err(ApiError::validation("index not found"));
+        }
+        let start_key =
+            crate::query::start_key_string(&state.description, &request.exclusive_start_key)
+                .map_err(ApiError::validation)?;
+        let items = crate::query::sorted_items_for_scan(
+            &state.items,
+            &state.description,
+            &request.index_name,
+        );
+        let names = &request.expression_attribute_names;
+        let values = &request.expression_attribute_values;
+        let filter = &request.filter_expression;
+        let mut response = crate::query::collect_items(
+            &state.description,
+            &request.index_name,
+            &items,
+            request.limit,
+            &start_key,
+            &request.projection_expression,
+            names,
+            true,
+            |candidate| match_filter(filter, names, values, candidate),
+        )
+        .map_err(ApiError::validation)?;
+        crate::query::apply_select(&mut response, &request.select);
         add_consumed_capacity(
             &mut response,
             &request.table_name,

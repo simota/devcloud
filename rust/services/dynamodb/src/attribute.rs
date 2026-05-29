@@ -201,6 +201,75 @@ pub fn project_item(
     projected
 }
 
+/// Applies an index projection then a `ProjectionExpression`, mirroring
+/// `projectResultItem`.
+pub fn project_result_item(
+    description: &TableDescription,
+    index_name: &str,
+    value: &Item,
+    expression: &str,
+    names: &std::collections::BTreeMap<String, String>,
+) -> Item {
+    let projected = project_index_item(description, index_name, value);
+    project_item(&projected, expression, names)
+}
+
+/// Restricts an item to the attributes an index projects, mirroring
+/// `projectIndexItem`. A missing index, or an `ALL`/empty projection type,
+/// returns the item unchanged.
+pub fn project_index_item(description: &TableDescription, index_name: &str, value: &Item) -> Item {
+    let Some((projection, schema)) = index_projection_for_name(description, index_name) else {
+        return value.clone();
+    };
+    if projection.projection_type.is_empty() || projection.projection_type == "ALL" {
+        return value.clone();
+    }
+    let mut allowed: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for element in &description.key_schema {
+        allowed.insert(element.attribute_name.clone());
+    }
+    for element in &schema {
+        allowed.insert(element.attribute_name.clone());
+    }
+    if projection.projection_type == "INCLUDE" {
+        for name in &projection.non_key_attributes {
+            allowed.insert(name.clone());
+        }
+    }
+    let mut projected = Item::new();
+    for name in &allowed {
+        if let Some(attr) = value.get(name) {
+            projected.insert(name.clone(), attr.clone());
+        }
+    }
+    projected
+}
+
+/// Returns the projection + key schema for a named index, mirroring
+/// `indexProjectionForName`.
+fn index_projection_for_name(
+    description: &TableDescription,
+    index_name: &str,
+) -> Option<(
+    crate::model::IndexProjection,
+    Vec<crate::model::KeySchemaElement>,
+)> {
+    if index_name.is_empty() {
+        return None;
+    }
+    for index in &description.global_secondary_indexes {
+        if index.index_name == index_name {
+            return Some((index.projection.clone(), index.key_schema.clone()));
+        }
+    }
+    for index in &description.local_secondary_indexes {
+        if index.index_name == index_name {
+            return Some((index.projection.clone(), index.key_schema.clone()));
+        }
+    }
+    None
+}
+
 /// Resolves a `#name` placeholder against the expression-attribute-names map,
 /// mirroring `resolveAttributeName`.
 pub fn resolve_attribute_name(
