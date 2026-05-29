@@ -1,0 +1,19 @@
+[package]
+name = "devcloud-dynamodb"
+version = "0.1.0"
+edition = "2021"
+description = "Rust reimplementation of the devcloud DynamoDB service — strangler-fig increment #4 of the Go→Rust transmute (foundation: Go-compatible JSON + attribute-value model + persistence)."
+
+[lib]
+name = "devcloud_dynamodb"
+path = "src/lib.rs"
+
+[[bin]]
+name = "devcloud-dynamodb"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+# serde_json's default Map is a BTreeMap (sorted keys), matching Go's sorted-key
+# map marshaling. Do NOT enable preserve_order.
+serde_json = "1"
