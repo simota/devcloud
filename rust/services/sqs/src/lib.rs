@@ -11,6 +11,7 @@ pub mod errors;
 pub mod hashing;
 pub mod messages;
 pub mod model;
+pub mod move_tasks;
 pub mod persistence;
 pub mod policy;
 pub mod server;
@@ -25,6 +26,7 @@ pub use messages::{
 pub use model::{
     DeduplicationState, MessageAttributeValue, MessageState, MoveTaskState, ZERO_TIME,
 };
+pub use move_tasks::MessageMoveTaskResult;
 pub use persistence::{PersistedQueue, PersistedState};
 pub use policy::{
     normalized_permission_actions, parse_redrive_allow_policy, parse_redrive_policy, QueuePolicy,
