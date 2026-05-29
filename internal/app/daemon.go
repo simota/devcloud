@@ -291,7 +291,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 		go func() { errCh <- pubSubServer.Run(ctx) }()
 	}
 	if d.config.Services.AppAutoScaling.Enabled {
-		go func() { errCh <- appAutoScalingServer.Run(ctx) }()
+		if binPath, ok := aasRustEngine(); ok {
+			go func() { errCh <- runAASRust(ctx, d.config, binPath) }()
+		} else {
+			go func() { errCh <- appAutoScalingServer.Run(ctx) }()
+		}
 	}
 	if d.config.Services.Redshift.Enabled {
 		go func() { errCh <- redshiftServer.Run(ctx) }()
