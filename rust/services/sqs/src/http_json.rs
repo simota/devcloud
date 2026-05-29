@@ -36,15 +36,21 @@ impl JsonOutcome {
     fn empty() -> Self {
         JsonOutcome::ok(json!({}))
     }
+
+    /// Builds a `{"__type": code, "message": msg}` error at `status`. Public so
+    /// the socket layer can render gate errors (method/protocol) the same way.
+    pub fn error(status: u16, code: &str, message: &str) -> Self {
+        JsonOutcome {
+            status,
+            error_type: Some(code.to_string()),
+            body: json!({ "__type": code, "message": message }),
+        }
+    }
 }
 
 /// Builds a `{"__type": code, "message": msg}` error at `status`.
 fn json_error(status: u16, code: &str, message: &str) -> JsonOutcome {
-    JsonOutcome {
-        status,
-        error_type: Some(code.to_string()),
-        body: json!({ "__type": code, "message": message }),
-    }
+    JsonOutcome::error(status, code, message)
 }
 
 /// Maps a logic error to its AWS code (via the responses.go substring rules) at

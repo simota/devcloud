@@ -8,6 +8,10 @@ description = "Rust reimplementation of the devcloud SQS service — strangler-f
 name = "devcloud_sqs"
 path = "src/lib.rs"
 
+[[bin]]
+name = "devcloud-sqs"
+path = "src/main.rs"
+
 [dependencies]
 md-5 = "0.10"
 sha2 = "0.10"
@@ -17,5 +21,6 @@ serde = { version = "1", features = ["derive"] }
 # Default serde_json Map is a BTreeMap (sorted keys), matching Go's sorted-key
 # map JSON marshaling — do NOT enable preserve_order.
 serde_json = "1"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "io-util", "signal"] }
 
 [dev-dependencies]

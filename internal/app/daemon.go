@@ -285,7 +285,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 		go func() { errCh <- bigQueryServer.Run(ctx) }()
 	}
 	if d.config.Services.SQS.Enabled {
-		go func() { errCh <- sqsServer.Run(ctx) }()
+		if binPath, ok := sqsRustEngine(); ok {
+			go func() { errCh <- runSQSRust(ctx, d.config, binPath) }()
+		} else {
+			go func() { errCh <- sqsServer.Run(ctx) }()
+		}
 	}
 	if d.config.Services.PubSub.Enabled {
 		go func() { errCh <- pubSubServer.Run(ctx) }()

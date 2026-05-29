@@ -9,6 +9,7 @@
 
 pub mod errors;
 pub mod hashing;
+pub mod http;
 pub mod http_json;
 pub mod messages;
 pub mod model;
