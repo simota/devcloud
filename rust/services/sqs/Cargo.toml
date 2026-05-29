@@ -1,0 +1,15 @@
+[package]
+name = "devcloud-sqs"
+version = "0.1.0"
+edition = "2021"
+description = "Rust reimplementation of the devcloud SQS service — strangler-fig increment #3 of the Go→Rust transmute (foundation: hashing + validation + model)."
+
+[lib]
+name = "devcloud_sqs"
+path = "src/lib.rs"
+
+[dependencies]
+md-5 = "0.10"
+base64 = "0.22"
+
+[dev-dependencies]

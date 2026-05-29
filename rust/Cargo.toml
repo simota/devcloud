@@ -4,4 +4,4 @@
 # shares this root's `target/` directory. Increment #1 is `mail`.
 [workspace]
 resolver = "2"
-members = ["services/mail", "services/applicationautoscaling"]
+members = ["services/mail", "services/applicationautoscaling", "services/sqs"]
