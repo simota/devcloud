@@ -9,6 +9,7 @@
 
 pub mod errors;
 pub mod hashing;
+pub mod http_json;
 pub mod messages;
 pub mod model;
 pub mod move_tasks;
