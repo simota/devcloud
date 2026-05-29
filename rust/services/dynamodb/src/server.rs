@@ -28,10 +28,11 @@ use crate::model::{
 };
 use crate::persistence::{PersistedState, PersistedTable};
 use crate::requests::{
-    CreateTableRequest, DeleteItemRequest, GetItemRequest, GlobalSecondaryIndexRequest,
-    GlobalSecondaryIndexUpdate, IndexProjectionRequest, ListTablesRequest,
-    LocalSecondaryIndexRequest, PutItemRequest, QueryRequest, ScanRequest, UpdateItemRequest,
-    UpdateTableRequest,
+    BatchGetItemRequest, BatchWriteItemRequest, CreateTableRequest, DeleteItemRequest,
+    GetItemRequest, GlobalSecondaryIndexRequest, GlobalSecondaryIndexUpdate,
+    IndexProjectionRequest, ListTablesRequest, LocalSecondaryIndexRequest, PutItemRequest,
+    QueryRequest, ScanRequest, TransactGetItemsRequest, TransactWriteItem,
+    TransactWriteItemsRequest, UpdateItemRequest, UpdateTableRequest,
 };
 use crate::responses::{
     encode, DescribeEndpointsResponse, DescribeLimitsResponse, DescribeTableResponse,
@@ -892,6 +893,367 @@ impl Server {
         Ok(crate::go_json::to_vec(&Value::Object(response)))
     }
 
+    /// `BatchGetItem`.
+    pub fn batch_get_item(&self, request: &BatchGetItemRequest) -> OpResult {
+        if request.request_items.is_empty() {
+            return Err(ApiError::validation("request items are required"));
+        }
+        if !valid_return_consumed_capacity(&request.return_consumed_capacity) {
+            return Err(ApiError::validation(
+                "return consumed capacity must be NONE, TOTAL, or INDEXES",
+            ));
+        }
+        let mut responses = Map::new();
+        let mut consumed: Vec<Value> = Vec::new();
+        for (table_name, table_request) in &request.request_items {
+            let state = self
+                .tables
+                .get(table_name)
+                .ok_or_else(|| ApiError::not_found("table not found"))?;
+            if table_request.keys.is_empty() {
+                return Err(ApiError::validation("keys are required"));
+            }
+            let mut found_items: Vec<Value> = Vec::new();
+            for key_value in &table_request.keys {
+                let key = item_key(&state.description, key_value).map_err(ApiError::validation)?;
+                if let Some(found) = state.items.get(&key) {
+                    let projected = project_item(
+                        found,
+                        &table_request.projection_expression,
+                        &table_request.expression_attribute_names,
+                    );
+                    found_items.push(serde_json::to_value(&projected).unwrap());
+                }
+            }
+            responses.insert(table_name.clone(), Value::Array(found_items));
+            append_batch_consumed_capacity(
+                &mut consumed,
+                table_name,
+                &request.return_consumed_capacity,
+            );
+        }
+        let mut response = Map::new();
+        response.insert("Responses".to_string(), Value::Object(responses));
+        response.insert("UnprocessedKeys".to_string(), Value::Object(Map::new()));
+        if !consumed.is_empty() {
+            response.insert("ConsumedCapacity".to_string(), Value::Array(consumed));
+        }
+        Ok(crate::go_json::to_vec(&Value::Object(response)))
+    }
+
+    /// `BatchWriteItem`.
+    pub fn batch_write_item(&mut self, request: &BatchWriteItemRequest) -> OpResult {
+        if request.request_items.is_empty() {
+            return Err(ApiError::validation("request items are required"));
+        }
+        if !valid_return_consumed_capacity(&request.return_consumed_capacity) {
+            return Err(ApiError::validation(
+                "return consumed capacity must be NONE, TOTAL, or INDEXES",
+            ));
+        }
+        // Validate everything first, planning (table, key, put-or-delete) writes.
+        let mut plan: Vec<PlannedWrite> = Vec::new();
+        let mut consumed: Vec<Value> = Vec::new();
+        for (table_name, writes) in &request.request_items {
+            let state = self
+                .tables
+                .get(table_name)
+                .ok_or_else(|| ApiError::not_found("table not found"))?;
+            if writes.is_empty() {
+                return Err(ApiError::validation("write requests are required"));
+            }
+            for write in writes {
+                if write.put_request.is_some() == write.delete_request.is_some() {
+                    return Err(ApiError::validation(
+                        "each write request must contain exactly one operation",
+                    ));
+                }
+                if let Some(put) = &write.put_request {
+                    if put.item.is_empty() {
+                        return Err(ApiError::validation("put item is required"));
+                    }
+                    self.validate_item_size(&put.item)
+                        .map_err(ApiError::validation)?;
+                    let key =
+                        item_key(&state.description, &put.item).map_err(ApiError::validation)?;
+                    plan.push(PlannedWrite {
+                        table: table_name.clone(),
+                        key,
+                        put: Some(put.item.clone()),
+                    });
+                }
+                if let Some(del) = &write.delete_request {
+                    let key =
+                        item_key(&state.description, &del.key).map_err(ApiError::validation)?;
+                    plan.push(PlannedWrite {
+                        table: table_name.clone(),
+                        key,
+                        put: None,
+                    });
+                }
+            }
+            append_batch_consumed_capacity(
+                &mut consumed,
+                table_name,
+                &request.return_consumed_capacity,
+            );
+        }
+
+        self.apply_planned_writes(&plan)?;
+
+        let mut response = Map::new();
+        response.insert("UnprocessedItems".to_string(), Value::Object(Map::new()));
+        if !consumed.is_empty() {
+            response.insert("ConsumedCapacity".to_string(), Value::Array(consumed));
+        }
+        Ok(crate::go_json::to_vec(&Value::Object(response)))
+    }
+
+    /// `TransactGetItems`.
+    pub fn transact_get_items(&self, request: &TransactGetItemsRequest) -> OpResult {
+        if request.transact_items.is_empty() {
+            return Err(ApiError::validation("transaction items are required"));
+        }
+        let mut responses: Vec<Value> = Vec::new();
+        for transaction_item in &request.transact_items {
+            let get = transaction_item.get.as_ref().ok_or_else(|| {
+                ApiError::validation("each transaction item must contain a Get operation")
+            })?;
+            if get.table_name.is_empty() {
+                return Err(ApiError::validation("table name is required"));
+            }
+            let state = self
+                .tables
+                .get(&get.table_name)
+                .ok_or_else(|| ApiError::not_found("table not found"))?;
+            let key = item_key(&state.description, &get.key).map_err(ApiError::validation)?;
+            match state.items.get(&key) {
+                None => responses.push(Value::Object(Map::new())),
+                Some(found) => {
+                    let projected = project_item(
+                        found,
+                        &get.projection_expression,
+                        &get.expression_attribute_names,
+                    );
+                    let mut entry = Map::new();
+                    entry.insert(
+                        "Item".to_string(),
+                        serde_json::to_value(&projected).unwrap(),
+                    );
+                    responses.push(Value::Object(entry));
+                }
+            }
+        }
+        let mut response = Map::new();
+        response.insert("Responses".to_string(), Value::Array(responses));
+        Ok(crate::go_json::to_vec(&Value::Object(response)))
+    }
+
+    /// `TransactWriteItems`.
+    pub fn transact_write_items(&mut self, request: &TransactWriteItemsRequest) -> OpResult {
+        if request.transact_items.is_empty() {
+            return Err(ApiError::validation("transaction items are required"));
+        }
+        let mut plan: Vec<PlannedWrite> = Vec::new();
+        for transaction_item in &request.transact_items {
+            if count_transact_write_operations(transaction_item) != 1 {
+                return Err(ApiError::validation(
+                    "each transaction item must contain exactly one operation",
+                ));
+            }
+            if let Some(put) = &transaction_item.put {
+                plan.push(self.validate_transact_put(put)?);
+            } else if let Some(update) = &transaction_item.update {
+                plan.push(self.validate_transact_update(update)?);
+            } else if let Some(delete) = &transaction_item.delete {
+                plan.push(self.validate_transact_delete(delete)?);
+            } else if let Some(check) = &transaction_item.condition_check {
+                self.validate_transact_condition_check(check)?;
+            }
+        }
+        self.apply_planned_writes(&plan)?;
+        Ok(crate::go_json::to_vec(&Value::Object(Map::new())))
+    }
+
+    /// Applies validated writes and persists, rolling back item state on a
+    /// persistence failure. Mirrors the apply/persist/restore tail shared by
+    /// BatchWriteItem and TransactWriteItems.
+    fn apply_planned_writes(&mut self, plan: &[PlannedWrite]) -> Result<(), ApiError> {
+        // Back up affected items for rollback.
+        let mut backups: Vec<(String, String, Option<Item>)> = Vec::new();
+        let mut touched: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for write in plan {
+            if let Some(state) = self.tables.get(&write.table) {
+                backups.push((
+                    write.table.clone(),
+                    write.key.clone(),
+                    state.items.get(&write.key).cloned(),
+                ));
+            }
+        }
+        for write in plan {
+            let state = self.tables.get_mut(&write.table).unwrap();
+            match &write.put {
+                Some(item) => {
+                    state.items.insert(write.key.clone(), item.clone());
+                }
+                None => {
+                    state.items.remove(&write.key);
+                }
+            }
+            touched.insert(write.table.clone());
+        }
+        for table in &touched {
+            let state = self.tables.get_mut(table).unwrap();
+            state.description.item_count = state.items.len() as i64;
+            update_index_item_counts(state);
+        }
+        if let Err(err) = self.persist() {
+            for (table, key, prev) in backups.into_iter().rev() {
+                if let Some(state) = self.tables.get_mut(&table) {
+                    match prev {
+                        Some(item) => {
+                            state.items.insert(key, item);
+                        }
+                        None => {
+                            state.items.remove(&key);
+                        }
+                    }
+                }
+            }
+            for table in &touched {
+                if let Some(state) = self.tables.get_mut(table) {
+                    state.description.item_count = state.items.len() as i64;
+                    update_index_item_counts(state);
+                }
+            }
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    fn validate_transact_put(
+        &self,
+        request: &crate::requests::TransactPut,
+    ) -> Result<PlannedWrite, ApiError> {
+        if request.table_name.is_empty() {
+            return Err(ApiError::validation("table name is required"));
+        }
+        if request.item.is_empty() {
+            return Err(ApiError::validation("item is required"));
+        }
+        let state = self
+            .tables
+            .get(&request.table_name)
+            .ok_or_else(|| ApiError::not_found("table not found"))?;
+        let key = item_key(&state.description, &request.item).map_err(ApiError::validation)?;
+        let old_item = state.items.get(&key);
+        check_condition(
+            &request.condition_expression,
+            &request.expression_attribute_names,
+            &request.expression_attribute_values,
+            old_item,
+        )
+        .map_err(|_| transaction_cancelled())?;
+        self.validate_item_size(&request.item)
+            .map_err(ApiError::validation)?;
+        Ok(PlannedWrite {
+            table: request.table_name.clone(),
+            key,
+            put: Some(request.item.clone()),
+        })
+    }
+
+    fn validate_transact_update(
+        &self,
+        request: &crate::requests::TransactUpdate,
+    ) -> Result<PlannedWrite, ApiError> {
+        if request.table_name.is_empty() {
+            return Err(ApiError::validation("table name is required"));
+        }
+        let state = self
+            .tables
+            .get(&request.table_name)
+            .ok_or_else(|| ApiError::not_found("table not found"))?;
+        let key = item_key(&state.description, &request.key).map_err(ApiError::validation)?;
+        let old_item = state.items.get(&key).cloned();
+        let mut updated = old_item.clone().unwrap_or_else(|| request.key.clone());
+        check_condition(
+            &request.condition_expression,
+            &request.expression_attribute_names,
+            &request.expression_attribute_values,
+            old_item.as_ref(),
+        )
+        .map_err(|_| transaction_cancelled())?;
+        crate::update_expression::apply_update_expression(
+            &mut updated,
+            &request.update_expression,
+            &request.expression_attribute_names,
+            &request.expression_attribute_values,
+        )
+        .map_err(ApiError::validation)?;
+        self.validate_item_size(&updated)
+            .map_err(ApiError::validation)?;
+        Ok(PlannedWrite {
+            table: request.table_name.clone(),
+            key,
+            put: Some(updated),
+        })
+    }
+
+    fn validate_transact_delete(
+        &self,
+        request: &crate::requests::TransactDelete,
+    ) -> Result<PlannedWrite, ApiError> {
+        if request.table_name.is_empty() {
+            return Err(ApiError::validation("table name is required"));
+        }
+        let state = self
+            .tables
+            .get(&request.table_name)
+            .ok_or_else(|| ApiError::not_found("table not found"))?;
+        let key = item_key(&state.description, &request.key).map_err(ApiError::validation)?;
+        let old_item = state.items.get(&key);
+        check_condition(
+            &request.condition_expression,
+            &request.expression_attribute_names,
+            &request.expression_attribute_values,
+            old_item,
+        )
+        .map_err(|_| transaction_cancelled())?;
+        Ok(PlannedWrite {
+            table: request.table_name.clone(),
+            key,
+            put: None,
+        })
+    }
+
+    fn validate_transact_condition_check(
+        &self,
+        request: &crate::requests::TransactConditionCheck,
+    ) -> Result<(), ApiError> {
+        if request.table_name.is_empty() {
+            return Err(ApiError::validation("table name is required"));
+        }
+        if request.condition_expression.trim().is_empty() {
+            return Err(ApiError::validation("condition expression is required"));
+        }
+        let state = self
+            .tables
+            .get(&request.table_name)
+            .ok_or_else(|| ApiError::not_found("table not found"))?;
+        let key = item_key(&state.description, &request.key).map_err(ApiError::validation)?;
+        let old_item = state.items.get(&key);
+        check_condition(
+            &request.condition_expression,
+            &request.expression_attribute_names,
+            &request.expression_attribute_values,
+            old_item,
+        )
+        .map_err(|_| transaction_cancelled())?;
+        Ok(())
+    }
+
     fn enable_stream_description(
         &self,
         description: &mut TableDescription,
@@ -987,6 +1349,44 @@ fn add_consumed_capacity(response: &mut Map<String, Value>, table_name: &str, mo
     );
     cap.insert("CapacityUnits".to_string(), Value::from(1));
     response.insert("ConsumedCapacity".to_string(), Value::Object(cap));
+}
+
+/// Appends a per-table `ConsumedCapacity` entry unless mode is empty/NONE.
+/// Mirrors `appendBatchConsumedCapacity`.
+fn append_batch_consumed_capacity(values: &mut Vec<Value>, table_name: &str, mode: &str) {
+    if mode.is_empty() || mode.eq_ignore_ascii_case("NONE") {
+        return;
+    }
+    let mut cap = Map::new();
+    cap.insert(
+        "TableName".to_string(),
+        Value::String(table_name.to_string()),
+    );
+    cap.insert("CapacityUnits".to_string(), Value::from(1));
+    values.push(Value::Object(cap));
+}
+
+/// A planned write for batch/transact apply: a target table, internal key, and
+/// either the item to put (`Some`) or a delete (`None`).
+struct PlannedWrite {
+    table: String,
+    key: String,
+    put: Option<Item>,
+}
+
+/// Counts the set operations on a transact-write item, mirroring
+/// `countTransactWriteOperations`.
+fn count_transact_write_operations(item: &TransactWriteItem) -> usize {
+    item.put.is_some() as usize
+        + item.update.is_some() as usize
+        + item.delete.is_some() as usize
+        + item.condition_check.is_some() as usize
+}
+
+/// The cancelled-transaction error Go returns for any failed condition inside a
+/// transact-write (`TransactionCanceledException` / "transaction cancelled").
+fn transaction_cancelled() -> ApiError {
+    ApiError::new(400, "TransactionCanceledException", "transaction cancelled")
 }
 
 fn projection_from_request(req: &IndexProjectionRequest) -> IndexProjection {

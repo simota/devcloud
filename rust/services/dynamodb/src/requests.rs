@@ -159,6 +159,169 @@ pub struct GetItemRequest {
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
+pub struct BatchGetTableRequest {
+    #[serde(rename = "Keys")]
+    pub keys: Vec<Item>,
+    #[serde(rename = "ProjectionExpression")]
+    pub projection_expression: String,
+    #[serde(rename = "ExpressionAttributeNames")]
+    pub expression_attribute_names: BTreeMap<String, String>,
+    #[serde(rename = "ConsistentRead")]
+    pub consistent_read: bool,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct BatchGetItemRequest {
+    #[serde(rename = "RequestItems")]
+    pub request_items: BTreeMap<String, BatchGetTableRequest>,
+    #[serde(rename = "ReturnConsumedCapacity")]
+    pub return_consumed_capacity: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct PutRequest {
+    #[serde(rename = "Item")]
+    pub item: Item,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct DeleteRequest {
+    #[serde(rename = "Key")]
+    pub key: Item,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct WriteRequest {
+    #[serde(rename = "PutRequest")]
+    pub put_request: Option<PutRequest>,
+    #[serde(rename = "DeleteRequest")]
+    pub delete_request: Option<DeleteRequest>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct BatchWriteItemRequest {
+    #[serde(rename = "RequestItems")]
+    pub request_items: BTreeMap<String, Vec<WriteRequest>>,
+    #[serde(rename = "ReturnConsumedCapacity")]
+    pub return_consumed_capacity: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct TransactGet {
+    #[serde(rename = "TableName")]
+    pub table_name: String,
+    #[serde(rename = "Key")]
+    pub key: Item,
+    #[serde(rename = "ProjectionExpression")]
+    pub projection_expression: String,
+    #[serde(rename = "ExpressionAttributeNames")]
+    pub expression_attribute_names: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct TransactGetItem {
+    #[serde(rename = "Get")]
+    pub get: Option<TransactGet>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct TransactGetItemsRequest {
+    #[serde(rename = "TransactItems")]
+    pub transact_items: Vec<TransactGetItem>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct TransactPut {
+    #[serde(rename = "TableName")]
+    pub table_name: String,
+    #[serde(rename = "Item")]
+    pub item: Item,
+    #[serde(rename = "ConditionExpression")]
+    pub condition_expression: String,
+    #[serde(rename = "ExpressionAttributeNames")]
+    pub expression_attribute_names: BTreeMap<String, String>,
+    #[serde(rename = "ExpressionAttributeValues")]
+    pub expression_attribute_values: BTreeMap<String, AttributeValue>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct TransactUpdate {
+    #[serde(rename = "TableName")]
+    pub table_name: String,
+    #[serde(rename = "Key")]
+    pub key: Item,
+    #[serde(rename = "UpdateExpression")]
+    pub update_expression: String,
+    #[serde(rename = "ConditionExpression")]
+    pub condition_expression: String,
+    #[serde(rename = "ExpressionAttributeNames")]
+    pub expression_attribute_names: BTreeMap<String, String>,
+    #[serde(rename = "ExpressionAttributeValues")]
+    pub expression_attribute_values: BTreeMap<String, AttributeValue>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct TransactDelete {
+    #[serde(rename = "TableName")]
+    pub table_name: String,
+    #[serde(rename = "Key")]
+    pub key: Item,
+    #[serde(rename = "ConditionExpression")]
+    pub condition_expression: String,
+    #[serde(rename = "ExpressionAttributeNames")]
+    pub expression_attribute_names: BTreeMap<String, String>,
+    #[serde(rename = "ExpressionAttributeValues")]
+    pub expression_attribute_values: BTreeMap<String, AttributeValue>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct TransactConditionCheck {
+    #[serde(rename = "TableName")]
+    pub table_name: String,
+    #[serde(rename = "Key")]
+    pub key: Item,
+    #[serde(rename = "ConditionExpression")]
+    pub condition_expression: String,
+    #[serde(rename = "ExpressionAttributeNames")]
+    pub expression_attribute_names: BTreeMap<String, String>,
+    #[serde(rename = "ExpressionAttributeValues")]
+    pub expression_attribute_values: BTreeMap<String, AttributeValue>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct TransactWriteItem {
+    #[serde(rename = "Put")]
+    pub put: Option<TransactPut>,
+    #[serde(rename = "Update")]
+    pub update: Option<TransactUpdate>,
+    #[serde(rename = "Delete")]
+    pub delete: Option<TransactDelete>,
+    #[serde(rename = "ConditionCheck")]
+    pub condition_check: Option<TransactConditionCheck>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct TransactWriteItemsRequest {
+    #[serde(rename = "TransactItems")]
+    pub transact_items: Vec<TransactWriteItem>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
 pub struct QueryRequest {
     #[serde(rename = "TableName")]
     pub table_name: String,
