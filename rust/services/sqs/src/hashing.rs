@@ -12,6 +12,8 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use md5::{Digest, Md5};
 
+pub use crate::model::MessageAttributeValue;
+
 /// Lowercase hex MD5 of a UTF-8 string. Mirrors `md5Hex`.
 pub fn md5_hex(value: &str) -> String {
     let mut hasher = Md5::new();
@@ -41,15 +43,6 @@ pub fn md5_of_message_attributes(attrs: &BTreeMap<String, MessageAttributeValue>
     let mut hasher = Md5::new();
     hasher.update(&payload);
     hex_lower(&hasher.finalize())
-}
-
-/// The fields of `md5_of_message_attributes` actually reads — a minimal view so
-/// the hashing module stays independent of the full request/model types.
-#[derive(Clone, Debug, Default)]
-pub struct MessageAttributeValue {
-    pub data_type: String,
-    pub string_value: String,
-    pub binary_value: String,
 }
 
 fn write_attr_string(buf: &mut Vec<u8>, value: &str) {

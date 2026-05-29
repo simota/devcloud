@@ -12,6 +12,7 @@ fn attr(data_type: &str, string_value: &str, binary_value: &str) -> MessageAttri
         data_type: data_type.to_string(),
         string_value: string_value.to_string(),
         binary_value: binary_value.to_string(),
+        ..Default::default()
     }
 }
 

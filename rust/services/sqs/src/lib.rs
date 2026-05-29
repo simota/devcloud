@@ -9,9 +9,15 @@
 //! subsequent increments.
 
 pub mod hashing;
+pub mod model;
+pub mod persistence;
 pub mod validation;
 
-pub use hashing::{md5_hex, md5_of_message_attributes, MessageAttributeValue};
+pub use hashing::{md5_hex, md5_of_message_attributes};
+pub use model::{
+    DeduplicationState, MessageAttributeValue, MessageState, MoveTaskState, ZERO_TIME,
+};
+pub use persistence::{PersistedQueue, PersistedState};
 pub use validation::{
     valid_batch_entry_id, valid_message_body, valid_queue_name, validate_message_attribute_name,
     validate_message_attribute_value, validate_message_system_attribute,
