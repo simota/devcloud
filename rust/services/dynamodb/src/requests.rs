@@ -159,6 +159,76 @@ pub struct GetItemRequest {
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
+pub struct PointInTimeRecoverySpecification {
+    #[serde(rename = "PointInTimeRecoveryEnabled")]
+    pub point_in_time_recovery_enabled: bool,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct UpdateContinuousBackupsRequest {
+    #[serde(rename = "TableName")]
+    pub table_name: String,
+    #[serde(rename = "PointInTimeRecoverySpecification")]
+    pub point_in_time_recovery_specification: PointInTimeRecoverySpecification,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct CreateBackupRequest {
+    #[serde(rename = "TableName")]
+    pub table_name: String,
+    #[serde(rename = "BackupName")]
+    pub backup_name: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct BackupArnRequest {
+    #[serde(rename = "BackupArn")]
+    pub backup_arn: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct ListBackupsRequest {
+    #[serde(rename = "TableName")]
+    pub table_name: String,
+    #[serde(rename = "ExclusiveStartBackupArn")]
+    pub exclusive_start_backup_arn: String,
+    #[serde(rename = "Limit")]
+    pub limit: i64,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct RestoreTableFromBackupRequest {
+    #[serde(rename = "BackupArn")]
+    pub backup_arn: String,
+    #[serde(rename = "TargetTableName")]
+    pub target_table_name: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, serde::Serialize)]
+#[serde(default)]
+pub struct TimeToLiveSpecification {
+    #[serde(rename = "AttributeName", skip_serializing_if = "String::is_empty")]
+    pub attribute_name: String,
+    #[serde(rename = "Enabled")]
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct UpdateTimeToLiveRequest {
+    #[serde(rename = "TableName")]
+    pub table_name: String,
+    #[serde(rename = "TimeToLiveSpecification")]
+    pub time_to_live_specification: TimeToLiveSpecification,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
 pub struct ListStreamsRequest {
     #[serde(rename = "TableName")]
     pub table_name: String,

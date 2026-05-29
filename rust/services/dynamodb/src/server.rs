@@ -22,18 +22,21 @@ use crate::attribute::{
 use crate::errors::ApiError;
 use crate::expression::{check_condition, match_filter, match_key_condition};
 use crate::model::{
-    AttributeDefinition, BillingModeSummary, ContinuousBackupsDescription,
-    GlobalSecondaryIndexDescription, IndexProjection, Item, KeySchemaElement,
-    LocalSecondaryIndexDescription, StreamSpecification, TableDescription,
+    AttributeDefinition, BackupDescription, BackupDetails, BackupSummary, BillingModeSummary,
+    ContinuousBackupsDescription, GlobalSecondaryIndexDescription, IndexProjection, Item,
+    KeySchemaElement, LocalSecondaryIndexDescription, PointInTimeRecoveryDescription,
+    SourceTableDetails, StreamSpecification, TableDescription, TimeToLiveDescription,
 };
 use crate::persistence::{PersistedState, PersistedTable};
 use crate::requests::{
-    BatchExecuteStatementRequest, BatchGetItemRequest, BatchWriteItemRequest, CreateTableRequest,
-    DeleteItemRequest, DescribeStreamRequest, ExecuteStatementRequest, ExecuteTransactionRequest,
-    GetItemRequest, GetRecordsRequest, GetShardIteratorRequest, GlobalSecondaryIndexRequest,
-    GlobalSecondaryIndexUpdate, IndexProjectionRequest, ListStreamsRequest, ListTablesRequest,
-    LocalSecondaryIndexRequest, PutItemRequest, QueryRequest, ScanRequest, TransactGetItemsRequest,
-    TransactWriteItem, TransactWriteItemsRequest, UpdateItemRequest, UpdateTableRequest,
+    BackupArnRequest, BatchExecuteStatementRequest, BatchGetItemRequest, BatchWriteItemRequest,
+    CreateBackupRequest, CreateTableRequest, DeleteItemRequest, DescribeStreamRequest,
+    ExecuteStatementRequest, ExecuteTransactionRequest, GetItemRequest, GetRecordsRequest,
+    GetShardIteratorRequest, GlobalSecondaryIndexRequest, GlobalSecondaryIndexUpdate,
+    IndexProjectionRequest, ListBackupsRequest, ListStreamsRequest, ListTablesRequest,
+    LocalSecondaryIndexRequest, PutItemRequest, QueryRequest, RestoreTableFromBackupRequest,
+    ScanRequest, TransactGetItemsRequest, TransactWriteItem, TransactWriteItemsRequest,
+    UpdateContinuousBackupsRequest, UpdateItemRequest, UpdateTableRequest, UpdateTimeToLiveRequest,
 };
 use crate::responses::{
     encode, BatchStatementError, BatchStatementResponse, DescribeEndpointsResponse,
@@ -115,6 +118,9 @@ impl TableState {
 pub struct Server {
     config: Config,
     pub(crate) tables: BTreeMap<String, TableState>,
+    backups: BTreeMap<String, crate::model::BackupDescription>,
+    backup_tables: BTreeMap<String, TableDescription>,
+    backup_items: BTreeMap<String, BTreeMap<String, Item>>,
     load_err: Option<String>,
     /// Test hook: when set, used in place of the wall clock for `now_unix` /
     /// stream labels so success bodies are byte-reproducible.
@@ -128,6 +134,9 @@ impl Server {
         let mut server = Server {
             config,
             tables: BTreeMap::new(),
+            backups: BTreeMap::new(),
+            backup_tables: BTreeMap::new(),
+            backup_items: BTreeMap::new(),
             load_err: None,
             fixed_now_unix: None,
             fixed_now_millis: None,
@@ -217,6 +226,9 @@ impl Server {
             update_index_item_counts(&mut state);
             self.tables.insert(name, state);
         }
+        self.backups = persisted.backups;
+        self.backup_tables = persisted.backup_tables;
+        self.backup_items = persisted.backup_items;
         Ok(())
     }
 
@@ -243,6 +255,9 @@ impl Server {
                 },
             );
         }
+        persisted.backups = self.backups.clone();
+        persisted.backup_tables = self.backup_tables.clone();
+        persisted.backup_items = self.backup_items.clone();
         let bytes = go_json::to_vec(&persisted);
         let tmp = self.state_path().with_extension("json.tmp");
         std::fs::write(&tmp, &bytes)
@@ -1730,6 +1745,432 @@ impl Server {
         None
     }
 
+    // --- TTL --------------------------------------------------------------
+
+    /// `DescribeTimeToLive`.
+    pub fn describe_time_to_live(&self, table_name: &str) -> OpResult {
+        if table_name.is_empty() {
+            return Err(ApiError::validation("table name is required"));
+        }
+        let state = self
+            .tables
+            .get(table_name)
+            .ok_or_else(|| ApiError::not_found("table not found"))?;
+        let description = ttl_description(&state.description);
+        let mut response = Map::new();
+        response.insert(
+            "TimeToLiveDescription".to_string(),
+            serde_json::to_value(&description).unwrap(),
+        );
+        Ok(crate::go_json::to_vec(&Value::Object(response)))
+    }
+
+    /// `UpdateTimeToLive`.
+    pub fn update_time_to_live(&mut self, request: &UpdateTimeToLiveRequest) -> OpResult {
+        if request.table_name.is_empty() {
+            return Err(ApiError::validation("table name is required"));
+        }
+        let spec = &request.time_to_live_specification;
+        if spec.enabled && spec.attribute_name.is_empty() {
+            return Err(ApiError::validation(
+                "ttl attribute name is required when ttl is enabled",
+            ));
+        }
+        let state = self
+            .tables
+            .get_mut(&request.table_name)
+            .ok_or_else(|| ApiError::not_found("table not found"))?;
+        let previous = state.description.time_to_live_description.clone();
+        state.description.time_to_live_description = Some(TimeToLiveDescription {
+            attribute_name: spec.attribute_name.clone(),
+            time_to_live_status: if spec.enabled { "ENABLED" } else { "DISABLED" }.to_string(),
+        });
+        if let Err(err) = self.persist() {
+            self.tables
+                .get_mut(&request.table_name)
+                .unwrap()
+                .description
+                .time_to_live_description = previous;
+            return Err(err);
+        }
+        let mut response = Map::new();
+        response.insert(
+            "TimeToLiveSpecification".to_string(),
+            serde_json::to_value(spec).unwrap(),
+        );
+        Ok(crate::go_json::to_vec(&Value::Object(response)))
+    }
+
+    /// Removes expired TTL items across all tables and persists if anything
+    /// changed. Mirrors `expireTTLItems` (called before each operation by the
+    /// HTTP layer). `now_unix` is the comparison time.
+    pub fn expire_ttl_items(&mut self, now_unix: i64) -> Result<(), ApiError> {
+        let mut changed_tables: Vec<(String, Vec<String>)> = Vec::new();
+        for (name, state) in &self.tables {
+            let ttl = ttl_description(&state.description);
+            if ttl.time_to_live_status != "ENABLED" || ttl.attribute_name.is_empty() {
+                continue;
+            }
+            let expired: Vec<String> = state
+                .items
+                .iter()
+                .filter(|(_, item)| ttl_item_expired(item, &ttl.attribute_name, now_unix))
+                .map(|(k, _)| k.clone())
+                .collect();
+            if !expired.is_empty() {
+                changed_tables.push((name.clone(), expired));
+            }
+        }
+        if changed_tables.is_empty() {
+            return Ok(());
+        }
+        // Back up for rollback.
+        let mut backups: Vec<(String, String, Item)> = Vec::new();
+        for (table, keys) in &changed_tables {
+            let state = self.tables.get_mut(table).unwrap();
+            for key in keys {
+                if let Some(item) = state.items.remove(key) {
+                    backups.push((table.clone(), key.clone(), item));
+                }
+            }
+            state.description.item_count = state.items.len() as i64;
+            update_index_item_counts(state);
+        }
+        if let Err(err) = self.persist() {
+            for (table, key, item) in backups {
+                if let Some(state) = self.tables.get_mut(&table) {
+                    state.items.insert(key, item);
+                }
+            }
+            for (table, _) in &changed_tables {
+                if let Some(state) = self.tables.get_mut(table) {
+                    state.description.item_count = state.items.len() as i64;
+                    update_index_item_counts(state);
+                }
+            }
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    // --- continuous backups ----------------------------------------------
+
+    /// `DescribeContinuousBackups`.
+    pub fn describe_continuous_backups(&self, table_name: &str) -> OpResult {
+        if table_name.is_empty() {
+            return Err(ApiError::validation("table name is required"));
+        }
+        let state = self
+            .tables
+            .get(table_name)
+            .ok_or_else(|| ApiError::not_found("table not found"))?;
+        let description = continuous_backups_for_state(state.continuous_backups.as_ref());
+        let mut response = Map::new();
+        response.insert(
+            "ContinuousBackupsDescription".to_string(),
+            serde_json::to_value(&description).unwrap(),
+        );
+        Ok(crate::go_json::to_vec(&Value::Object(response)))
+    }
+
+    /// `UpdateContinuousBackups`.
+    pub fn update_continuous_backups(
+        &mut self,
+        request: &UpdateContinuousBackupsRequest,
+    ) -> OpResult {
+        if request.table_name.is_empty() {
+            return Err(ApiError::validation("table name is required"));
+        }
+        let status = if request
+            .point_in_time_recovery_specification
+            .point_in_time_recovery_enabled
+        {
+            "ENABLED"
+        } else {
+            "DISABLED"
+        };
+        let description = ContinuousBackupsDescription {
+            continuous_backups_status: "ENABLED".to_string(),
+            point_in_time_recovery_description: PointInTimeRecoveryDescription {
+                point_in_time_recovery_status: status.to_string(),
+            },
+        };
+        let state = self
+            .tables
+            .get_mut(&request.table_name)
+            .ok_or_else(|| ApiError::not_found("table not found"))?;
+        let previous = state.continuous_backups.clone();
+        state.continuous_backups = Some(description.clone());
+        if let Err(err) = self.persist() {
+            self.tables
+                .get_mut(&request.table_name)
+                .unwrap()
+                .continuous_backups = previous;
+            return Err(err);
+        }
+        let mut response = Map::new();
+        response.insert(
+            "ContinuousBackupsDescription".to_string(),
+            serde_json::to_value(&description).unwrap(),
+        );
+        Ok(crate::go_json::to_vec(&Value::Object(response)))
+    }
+
+    // --- backups ----------------------------------------------------------
+
+    /// `CreateBackup`.
+    pub fn create_backup(&mut self, request: &CreateBackupRequest) -> OpResult {
+        if request.table_name.is_empty() {
+            return Err(ApiError::validation("table name is required"));
+        }
+        if request.backup_name.is_empty() {
+            return Err(ApiError::validation("backup name is required"));
+        }
+        let state = self
+            .tables
+            .get(&request.table_name)
+            .ok_or_else(|| ApiError::not_found("table not found"))?;
+        let created_at = self.now_unix();
+        let description =
+            backup_description_for_table(&state.description, &request.backup_name, created_at);
+        let arn = description.backup_details.backup_arn.clone();
+        if self.backups.contains_key(&arn) {
+            return Err(ApiError::new(
+                400,
+                "BackupInUseException",
+                "backup already exists",
+            ));
+        }
+        let table_desc = state.description.clone();
+        let items = state.items.clone();
+        self.backups.insert(arn.clone(), description.clone());
+        self.backup_tables.insert(arn.clone(), table_desc);
+        self.backup_items.insert(arn.clone(), items);
+        if let Err(err) = self.persist() {
+            self.backups.remove(&arn);
+            self.backup_tables.remove(&arn);
+            self.backup_items.remove(&arn);
+            return Err(err);
+        }
+        let mut response = Map::new();
+        response.insert(
+            "BackupDetails".to_string(),
+            serde_json::to_value(&description.backup_details).unwrap(),
+        );
+        Ok(crate::go_json::to_vec(&Value::Object(response)))
+    }
+
+    /// `DescribeBackup`.
+    pub fn describe_backup(&self, request: &BackupArnRequest) -> OpResult {
+        if request.backup_arn.is_empty() {
+            return Err(ApiError::validation("backup arn is required"));
+        }
+        let description = self
+            .backups
+            .get(&request.backup_arn)
+            .ok_or_else(|| ApiError::new(400, "BackupNotFoundException", "backup not found"))?;
+        let mut response = Map::new();
+        response.insert(
+            "BackupDescription".to_string(),
+            serde_json::to_value(description).unwrap(),
+        );
+        Ok(crate::go_json::to_vec(&Value::Object(response)))
+    }
+
+    /// `ListBackups`.
+    pub fn list_backups(&self, request: &ListBackupsRequest) -> OpResult {
+        if request.limit < 0 || request.limit > 100 {
+            return Err(ApiError::validation("limit must be between 1 and 100"));
+        }
+        let mut summaries: Vec<BackupSummary> = self
+            .backups
+            .values()
+            .filter(|d| {
+                request.table_name.is_empty()
+                    || d.source_table_details.table_name == request.table_name
+            })
+            .map(backup_summary_for_description)
+            .collect();
+        summaries.sort_by(|a, b| {
+            if a.table_name == b.table_name {
+                a.backup_arn.cmp(&b.backup_arn)
+            } else {
+                a.table_name.cmp(&b.table_name)
+            }
+        });
+        let mut start = 0usize;
+        if !request.exclusive_start_backup_arn.is_empty() {
+            match summaries
+                .iter()
+                .position(|s| s.backup_arn == request.exclusive_start_backup_arn)
+            {
+                Some(i) => start = i + 1,
+                None => {
+                    return Err(ApiError::validation(
+                        "exclusive start backup arn does not exist",
+                    ))
+                }
+            }
+        }
+        let mut end = summaries.len();
+        if request.limit > 0 && start + (request.limit as usize) < end {
+            end = start + request.limit as usize;
+        }
+        let mut response = Map::new();
+        response.insert(
+            "BackupSummaries".to_string(),
+            serde_json::to_value(&summaries[start..end]).unwrap(),
+        );
+        if end < summaries.len() {
+            response.insert(
+                "LastEvaluatedBackupArn".to_string(),
+                Value::String(summaries[end - 1].backup_arn.clone()),
+            );
+        }
+        Ok(crate::go_json::to_vec(&Value::Object(response)))
+    }
+
+    /// `DeleteBackup`.
+    pub fn delete_backup(&mut self, request: &BackupArnRequest) -> OpResult {
+        if request.backup_arn.is_empty() {
+            return Err(ApiError::validation("backup arn is required"));
+        }
+        let arn = &request.backup_arn;
+        let Some(description) = self.backups.get(arn).cloned() else {
+            return Err(ApiError::new(
+                400,
+                "BackupNotFoundException",
+                "backup not found",
+            ));
+        };
+        let table_backup = self.backup_tables.remove(arn);
+        let items_backup = self.backup_items.remove(arn);
+        self.backups.remove(arn);
+        if let Err(err) = self.persist() {
+            self.backups.insert(arn.clone(), description.clone());
+            if let Some(t) = table_backup {
+                self.backup_tables.insert(arn.clone(), t);
+            }
+            if let Some(it) = items_backup {
+                self.backup_items.insert(arn.clone(), it);
+            }
+            return Err(err);
+        }
+        let mut response = Map::new();
+        response.insert(
+            "BackupDescription".to_string(),
+            serde_json::to_value(&description).unwrap(),
+        );
+        Ok(crate::go_json::to_vec(&Value::Object(response)))
+    }
+
+    /// `RestoreTableFromBackup`.
+    pub fn restore_table_from_backup(
+        &mut self,
+        request: &RestoreTableFromBackupRequest,
+    ) -> OpResult {
+        if request.backup_arn.is_empty() {
+            return Err(ApiError::validation("backup arn is required"));
+        }
+        if request.target_table_name.is_empty() {
+            return Err(ApiError::validation("target table name is required"));
+        }
+        let Some(backup) = self.backups.get(&request.backup_arn).cloned() else {
+            return Err(ApiError::new(
+                400,
+                "BackupNotFoundException",
+                "backup not found",
+            ));
+        };
+        if self.tables.contains_key(&request.target_table_name) {
+            return Err(ApiError::in_use("table already exists"));
+        }
+        if self.tables.len() as i64 >= self.config.max_tables() {
+            return Err(ApiError::new(
+                400,
+                "LimitExceededException",
+                "table limit exceeded",
+            ));
+        }
+        let created_at = self.now_unix();
+        let description =
+            self.restored_table_description(&request.target_table_name, &backup, created_at);
+        let items = self
+            .backup_items
+            .get(&request.backup_arn)
+            .cloned()
+            .unwrap_or_default();
+        let mut state = TableState::new(description);
+        state.items = items;
+        state.description.item_count = state.items.len() as i64;
+        update_index_item_counts(&mut state);
+        let committed = state.description.clone();
+        self.tables.insert(request.target_table_name.clone(), state);
+        if let Err(err) = self.persist() {
+            self.tables.remove(&request.target_table_name);
+            return Err(err);
+        }
+        Ok(encode(&TableDescriptionResponse {
+            table_description: committed,
+        }))
+    }
+
+    fn restored_table_description(
+        &self,
+        target_table_name: &str,
+        backup: &BackupDescription,
+        created_at: i64,
+    ) -> TableDescription {
+        let region = self.config.region().to_string();
+        let mut description = match self.backup_tables.get(&backup.backup_details.backup_arn) {
+            Some(desc) => desc.clone(),
+            None => TableDescription {
+                attribute_definitions: backup.source_table_details.attribute_definitions.clone(),
+                billing_mode_summary: Some(BillingModeSummary {
+                    billing_mode: if backup.source_table_details.billing_mode.is_empty() {
+                        "PAY_PER_REQUEST".to_string()
+                    } else {
+                        backup.source_table_details.billing_mode.clone()
+                    },
+                }),
+                creation_date_time: 0,
+                global_secondary_indexes: Vec::new(),
+                item_count: 0,
+                key_schema: backup.source_table_details.key_schema.clone(),
+                latest_stream_arn: String::new(),
+                latest_stream_label: String::new(),
+                local_secondary_indexes: Vec::new(),
+                stream_specification: None,
+                table_arn: String::new(),
+                table_name: String::new(),
+                table_size_bytes: 0,
+                table_status: String::new(),
+                time_to_live_description: None,
+            },
+        };
+        let new_arn = format!("arn:aws:dynamodb:{region}:{ACCOUNT_ID}:table/{target_table_name}");
+        description.creation_date_time = created_at;
+        description.item_count = self
+            .backup_items
+            .get(&backup.backup_details.backup_arn)
+            .map(|i| i.len() as i64)
+            .unwrap_or(0);
+        description.latest_stream_arn = String::new();
+        description.latest_stream_label = String::new();
+        description.stream_specification = None;
+        description.table_arn = new_arn.clone();
+        description.table_name = target_table_name.to_string();
+        description.table_size_bytes = backup.backup_details.backup_size_bytes;
+        description.table_status = "ACTIVE".to_string();
+        for gsi in &mut description.global_secondary_indexes {
+            gsi.index_arn = format!("{new_arn}/index/{}", gsi.index_name);
+        }
+        for lsi in &mut description.local_secondary_indexes {
+            lsi.index_arn = format!("{new_arn}/index/{}", lsi.index_name);
+        }
+        description
+    }
+
     fn enable_stream_description(
         &self,
         description: &mut TableDescription,
@@ -1863,6 +2304,105 @@ fn count_transact_write_operations(item: &TransactWriteItem) -> usize {
 /// transact-write (`TransactionCanceledException` / "transaction cancelled").
 fn transaction_cancelled() -> ApiError {
     ApiError::new(400, "TransactionCanceledException", "transaction cancelled")
+}
+
+/// The TTL description for a table (DISABLED when unset). Mirrors `ttlDescription`.
+fn ttl_description(description: &TableDescription) -> TimeToLiveDescription {
+    match &description.time_to_live_description {
+        Some(d) => d.clone(),
+        None => TimeToLiveDescription {
+            attribute_name: String::new(),
+            time_to_live_status: "DISABLED".to_string(),
+        },
+    }
+}
+
+/// True when an item's TTL attribute (a UNIX-seconds number) is at or before
+/// `now_unix`. Mirrors `ttlItemExpired`.
+fn ttl_item_expired(value: &Item, attribute_name: &str, now_unix: i64) -> bool {
+    let Some(seconds) = value
+        .get(attribute_name)
+        .and_then(|a| a.as_object())
+        .and_then(|o| o.get("N"))
+        .and_then(Value::as_str)
+    else {
+        return false;
+    };
+    if !crate::number::is_valid_number(seconds) {
+        return false;
+    }
+    // Expired when the stored expiry is <= now.
+    crate::number::compare_number_strings(seconds, &now_unix.to_string())
+        != std::cmp::Ordering::Greater
+}
+
+/// The default/active continuous-backups description for a table. Mirrors
+/// `continuousBackupsDescriptionForState`.
+fn continuous_backups_for_state(
+    value: Option<&ContinuousBackupsDescription>,
+) -> ContinuousBackupsDescription {
+    match value {
+        Some(d) => d.clone(),
+        None => ContinuousBackupsDescription {
+            continuous_backups_status: "ENABLED".to_string(),
+            point_in_time_recovery_description: PointInTimeRecoveryDescription {
+                point_in_time_recovery_status: "DISABLED".to_string(),
+            },
+        },
+    }
+}
+
+/// Builds a backup description for a table snapshot. Mirrors
+/// `backupDescriptionForTable`.
+fn backup_description_for_table(
+    description: &TableDescription,
+    backup_name: &str,
+    created_at: i64,
+) -> BackupDescription {
+    let backup_arn = format!(
+        "{}/backup/{created_at}-{backup_name}",
+        description.table_arn
+    );
+    let billing_mode = description
+        .billing_mode_summary
+        .as_ref()
+        .map(|b| b.billing_mode.clone())
+        .unwrap_or_else(|| "PAY_PER_REQUEST".to_string());
+    BackupDescription {
+        backup_details: BackupDetails {
+            backup_arn,
+            backup_creation_date_time: created_at,
+            backup_name: backup_name.to_string(),
+            backup_size_bytes: description.table_size_bytes,
+            backup_status: "AVAILABLE".to_string(),
+            backup_type: "USER".to_string(),
+        },
+        source_table_details: SourceTableDetails {
+            attribute_definitions: description.attribute_definitions.clone(),
+            billing_mode,
+            item_count: description.item_count,
+            key_schema: description.key_schema.clone(),
+            table_arn: description.table_arn.clone(),
+            table_creation_date_time: description.creation_date_time,
+            table_id: description.table_arn.clone(),
+            table_name: description.table_name.clone(),
+            table_size_bytes: description.table_size_bytes,
+        },
+    }
+}
+
+/// Builds a `ListBackups` summary, mirroring `backupSummaryForDescription`.
+fn backup_summary_for_description(description: &BackupDescription) -> BackupSummary {
+    BackupSummary {
+        backup_arn: description.backup_details.backup_arn.clone(),
+        backup_creation_date_time: description.backup_details.backup_creation_date_time,
+        backup_name: description.backup_details.backup_name.clone(),
+        backup_size_bytes: description.backup_details.backup_size_bytes,
+        backup_status: description.backup_details.backup_status.clone(),
+        backup_type: description.backup_details.backup_type.clone(),
+        table_arn: description.source_table_details.table_arn.clone(),
+        table_name: description.source_table_details.table_name.clone(),
+    }
 }
 
 /// True when a table has an enabled stream.

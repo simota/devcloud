@@ -252,6 +252,27 @@ pub struct BackupDescription {
     pub source_table_details: SourceTableDetails,
 }
 
+/// A `ListBackups` summary entry, mirroring Go `backupSummary` field order.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct BackupSummary {
+    #[serde(rename = "BackupArn")]
+    pub backup_arn: String,
+    #[serde(rename = "BackupCreationDateTime")]
+    pub backup_creation_date_time: i64,
+    #[serde(rename = "BackupName")]
+    pub backup_name: String,
+    #[serde(rename = "BackupSizeBytes")]
+    pub backup_size_bytes: i64,
+    #[serde(rename = "BackupStatus")]
+    pub backup_status: String,
+    #[serde(rename = "BackupType")]
+    pub backup_type: String,
+    #[serde(rename = "TableArn")]
+    pub table_arn: String,
+    #[serde(rename = "TableName")]
+    pub table_name: String,
+}
+
 /// The `dynamodb` image of a stream record. Field declaration order and
 /// `omitempty` mirror Go `streamRecordImage`. `New`/`OldImage` are dropped when
 /// empty; the other fields always serialize.
