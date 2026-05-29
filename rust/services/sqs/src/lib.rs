@@ -1,14 +1,15 @@
 //! Rust reimplementation of the devcloud SQS service (strangler-fig increment
 //! #3 of the Go→Rust transmute).
 //!
-//! This increment lands the **pure-logic foundation** — the AWS MD5
-//! attribute-digest hashing and the message/attribute/queue validators — both
-//! verified by golden-oracle parity tests against the Go implementation. The
-//! dual-protocol (JSON + Query/XML) HTTP layer, the 24 operation handlers, the
-//! visibility/delay/retention scheduler, and the daemon seam follow in
-//! subsequent increments.
+//! Lands incrementally: hashing + validation (part 1), model + persistence
+//! (part 2), queue lifecycle/attributes/tags/policy (part 3), and the message
+//! lifecycle — send/receive/delete/visibility + batches + FIFO dedup + DLQ
+//! redrive + retention cleanup (part 4). The dual-protocol HTTP layer, SigV4,
+//! and the daemon seam follow.
 
+pub mod errors;
 pub mod hashing;
+pub mod messages;
 pub mod model;
 pub mod persistence;
 pub mod policy;
@@ -17,6 +18,10 @@ pub mod time_fmt;
 pub mod validation;
 
 pub use hashing::{md5_hex, md5_of_message_attributes};
+pub use messages::{
+    ChangeMessageVisibilityBatchEntry, DeleteMessageBatchEntry, ReceiveMessageRequest,
+    ReceivedMessage, SendMessageBatchEntry, SendMessageRequest,
+};
 pub use model::{
     DeduplicationState, MessageAttributeValue, MessageState, MoveTaskState, ZERO_TIME,
 };

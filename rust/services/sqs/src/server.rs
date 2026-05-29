@@ -114,7 +114,15 @@ impl Server {
             self.config.max_message_bytes
         }
     }
-    fn default_visibility_timeout_seconds(&self) -> i64 {
+    pub(crate) fn max_receive_batch_size(&self) -> i64 {
+        let v = self.config.max_receive_batch_size;
+        if v <= 0 || v > 10 {
+            10
+        } else {
+            v
+        }
+    }
+    pub(crate) fn default_visibility_timeout_seconds(&self) -> i64 {
         if self.config.default_visibility_timeout_seconds <= 0 {
             30
         } else {
@@ -135,7 +143,7 @@ impl Server {
             self.config.default_message_retention_seconds
         }
     }
-    fn default_receive_wait_time_seconds(&self) -> i64 {
+    pub(crate) fn default_receive_wait_time_seconds(&self) -> i64 {
         // Mirrors Go's clamp: < 0 → 0, > 20 → 20, else as-is.
         self.config.default_receive_wait_time_seconds.clamp(0, 20)
     }

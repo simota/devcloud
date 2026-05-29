@@ -79,6 +79,7 @@ dependencies = [
  "md-5",
  "serde",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]

@@ -48,6 +48,76 @@ pub fn unix_from_rfc3339(s: &str) -> i64 {
     parse_rfc3339_secs(s).unwrap_or(GO_ZERO_UNIX)
 }
 
+/// Total nanoseconds since the UNIX epoch for an RFC 3339 UTC timestamp, for
+/// chronological comparison and arithmetic at full precision. The Go zero time
+/// and unparseable input sort oldest (`i128::MIN`).
+pub fn unix_nanos_from_rfc3339(s: &str) -> i128 {
+    if s.is_empty() || s == ZERO_TIME {
+        return i128::MIN;
+    }
+    parse_rfc3339_nanos(s).unwrap_or(i128::MIN)
+}
+
+/// Mirrors Go's `time.Time.UnixMilli()` for an RFC 3339 timestamp.
+pub fn unix_millis_from_rfc3339(s: &str) -> i64 {
+    (unix_nanos_from_rfc3339(s) / 1_000_000) as i64
+}
+
+/// Returns the RFC 3339 timestamp `seconds` after `base` (RFC3339Nano form,
+/// trailing-zero-trimmed fraction), mirroring `t.Add(d).UTC()`.
+pub fn add_seconds(base: &str, seconds: i64) -> String {
+    let nanos = unix_nanos_from_rfc3339(base) + (seconds as i128) * 1_000_000_000;
+    let total_secs = (nanos.div_euclid(1_000_000_000)) as i64;
+    let frac = (nanos.rem_euclid(1_000_000_000)) as u32;
+    rfc3339_from_unix(total_secs, frac)
+}
+
+/// `true` when `a` is strictly before `b` (mirrors `a.Before(b)`).
+pub fn before(a: &str, b: &str) -> bool {
+    unix_nanos_from_rfc3339(a) < unix_nanos_from_rfc3339(b)
+}
+
+/// `true` when the RFC 3339 timestamp is the Go zero time (or empty).
+pub fn is_zero(s: &str) -> bool {
+    s.is_empty() || s == ZERO_TIME
+}
+
+fn parse_rfc3339_nanos(s: &str) -> Option<i128> {
+    let (date, rest) = s.split_once('T')?;
+    let time = rest.strip_suffix('Z').or_else(|| rest.strip_suffix('z'))?;
+    let mut dp = date.split('-');
+    let year: i64 = dp.next()?.parse().ok()?;
+    let month: i64 = dp.next()?.parse().ok()?;
+    let day: i64 = dp.next()?.parse().ok()?;
+    if dp.next().is_some() {
+        return None;
+    }
+    let (hms, frac) = match time.split_once('.') {
+        Some((h, f)) => (h, Some(f)),
+        None => (time, None),
+    };
+    let mut tp = hms.split(':');
+    let hour: i64 = tp.next()?.parse().ok()?;
+    let minute: i64 = tp.next()?.parse().ok()?;
+    let second: i64 = tp.next()?.parse().ok()?;
+    let secs = days_from_civil(year, month, day) * 86_400 + hour * 3600 + minute * 60 + second;
+    let nanos = match frac {
+        None => 0i128,
+        Some(f) => {
+            if f.is_empty() || !f.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            let mut digits = f.to_string();
+            digits.truncate(9);
+            while digits.len() < 9 {
+                digits.push('0');
+            }
+            digits.parse::<i128>().ok()?
+        }
+    };
+    Some((secs as i128) * 1_000_000_000 + nanos)
+}
+
 fn parse_rfc3339_secs(s: &str) -> Option<i64> {
     let (date, rest) = s.split_once('T')?;
     let time = rest.strip_suffix('Z').or_else(|| rest.strip_suffix('z'))?;

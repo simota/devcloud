@@ -10,6 +10,7 @@ path = "src/lib.rs"
 
 [dependencies]
 md-5 = "0.10"
+sha2 = "0.10"
 base64 = "0.22"
 serde = { version = "1", features = ["derive"] }
 # Default serde_json Map is a BTreeMap (sorted keys), matching Go's sorted-key
