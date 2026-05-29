@@ -1,0 +1,29 @@
+[package]
+name = "devcloud-applicationautoscaling"
+version = "0.1.0"
+edition = "2021"
+description = "Rust reimplementation of the devcloud Application Auto Scaling service — strangler-fig increment #2 of the Go→Rust transmute."
+
+[lib]
+name = "devcloud_applicationautoscaling"
+path = "src/lib.rs"
+
+[[bin]]
+name = "devcloud-applicationautoscaling"
+path = "src/main.rs"
+
+[dependencies]
+# A hand-rolled HTTP/1.1 layer on plain tokio keeps the dependency surface tiny
+# (matching the Go service's stdlib-only ethos) and avoids the axum→url→icu
+# transitive chain that fails to resolve on this toolchain.
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "io-util", "signal"] }
+serde = { version = "1", features = ["derive"] }
+# Default serde_json Map is a BTreeMap (sorted keys), matching Go's map JSON
+# marshaling — do NOT enable preserve_order, which would switch to insertion order.
+serde_json = "1"
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "signal"] }

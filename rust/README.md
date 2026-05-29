@@ -13,15 +13,18 @@ last).
 rust/
   Cargo.toml          # workspace root (shared target/)
   services/
-    mail/             # increment #1 — SMTP service (parity of internal/services/mail)
+    mail/                    # increment #1 — SMTP (parity of internal/services/mail)
+    applicationautoscaling/  # increment #2 — AWS JSON 1.1 + SigV4 (parity of
+                             #   internal/services/applicationautoscaling)
 ```
 
 ## Migration order
 
 Leaf → hub, per the Phase 1 dependency analysis:
 
-1. **mail** ✅ (this increment) — SMTP, no shared-store coupling
-2. applicationautoscaling, sqs, dynamodb — leaf HTTP services
+1. **mail** ✅ — SMTP, no shared-store coupling
+2. **applicationautoscaling** ✅ — AWS JSON 1.1 (13 ops), SigV4, state.json
+3. sqs, dynamodb — leaf HTTP services
 3. pubsub — leaf, but gRPC + REST (tonic/prost)
 4. redis — passthrough proxy
 5. s3 — **hub**: owns the `BucketStore` boundary
