@@ -252,6 +252,15 @@ pub struct BackupDescription {
     pub source_table_details: SourceTableDetails,
 }
 
+/// A resource tag (`Key`/`Value`), mirroring Go `tag`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Tag {
+    #[serde(rename = "Key")]
+    pub key: String,
+    #[serde(rename = "Value")]
+    pub value: String,
+}
+
 /// A `ListBackups` summary entry, mirroring Go `backupSummary` field order.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct BackupSummary {

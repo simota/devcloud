@@ -25,7 +25,7 @@ use crate::model::{
     AttributeDefinition, BackupDescription, BackupDetails, BackupSummary, BillingModeSummary,
     ContinuousBackupsDescription, GlobalSecondaryIndexDescription, IndexProjection, Item,
     KeySchemaElement, LocalSecondaryIndexDescription, PointInTimeRecoveryDescription,
-    SourceTableDetails, StreamSpecification, TableDescription, TimeToLiveDescription,
+    SourceTableDetails, StreamSpecification, TableDescription, Tag, TimeToLiveDescription,
 };
 use crate::persistence::{PersistedState, PersistedTable};
 use crate::requests::{
@@ -34,9 +34,11 @@ use crate::requests::{
     ExecuteStatementRequest, ExecuteTransactionRequest, GetItemRequest, GetRecordsRequest,
     GetShardIteratorRequest, GlobalSecondaryIndexRequest, GlobalSecondaryIndexUpdate,
     IndexProjectionRequest, ListBackupsRequest, ListStreamsRequest, ListTablesRequest,
-    LocalSecondaryIndexRequest, PutItemRequest, QueryRequest, RestoreTableFromBackupRequest,
-    ScanRequest, TransactGetItemsRequest, TransactWriteItem, TransactWriteItemsRequest,
-    UpdateContinuousBackupsRequest, UpdateItemRequest, UpdateTableRequest, UpdateTimeToLiveRequest,
+    ListTagsOfResourceRequest, LocalSecondaryIndexRequest, PutItemRequest,
+    PutResourcePolicyRequest, QueryRequest, ResourceArnRequest, RestoreTableFromBackupRequest,
+    ScanRequest, TagResourceRequest, TransactGetItemsRequest, TransactWriteItem,
+    TransactWriteItemsRequest, UntagResourceRequest, UpdateContinuousBackupsRequest,
+    UpdateItemRequest, UpdateTableRequest, UpdateTimeToLiveRequest,
 };
 use crate::responses::{
     encode, BatchStatementError, BatchStatementResponse, DescribeEndpointsResponse,
@@ -163,6 +165,21 @@ impl Server {
 
     pub fn load_err(&self) -> Option<&str> {
         self.load_err.as_deref()
+    }
+
+    /// The configured region (defaulted), for the SigV4 verifier.
+    pub fn sigv4_region(&self) -> &str {
+        self.config.region()
+    }
+
+    /// The configured access key id (raw; the verifier defaults it).
+    pub fn sigv4_access_key(&self) -> &str {
+        &self.config.access_key_id
+    }
+
+    /// The configured secret access key (raw; the verifier defaults it).
+    pub fn sigv4_secret(&self) -> &str {
+        &self.config.secret_access_key
     }
 
     fn now_unix(&self) -> i64 {
@@ -2171,6 +2188,192 @@ impl Server {
         description
     }
 
+    // --- tags & resource policy -------------------------------------------
+
+    fn table_for_arn(&self, arn: &str) -> Option<&str> {
+        self.tables
+            .iter()
+            .find(|(_, s)| s.description.table_arn == arn)
+            .map(|(name, _)| name.as_str())
+    }
+
+    /// `TagResource`.
+    pub fn tag_resource(&mut self, request: &TagResourceRequest) -> OpResult {
+        if request.resource_arn.is_empty() {
+            return Err(ApiError::validation("resource arn is required"));
+        }
+        if request.tags.is_empty() {
+            return Err(ApiError::validation("tags are required"));
+        }
+        let Some(name) = self
+            .table_for_arn(&request.resource_arn)
+            .map(str::to_string)
+        else {
+            return Err(ApiError::not_found("resource not found"));
+        };
+        let state = self.tables.get(&name).unwrap();
+        let mut projected = state.tags.clone();
+        for tag in &request.tags {
+            if tag.key.is_empty() {
+                return Err(ApiError::validation("tag key is required"));
+            }
+            projected.insert(tag.key.clone(), tag.value.clone());
+        }
+        if projected.len() > 50 {
+            return Err(ApiError::new(
+                400,
+                "LimitExceededException",
+                "tag limit exceeded",
+            ));
+        }
+        let previous = state.tags.clone();
+        self.tables.get_mut(&name).unwrap().tags = projected;
+        if let Err(err) = self.persist() {
+            self.tables.get_mut(&name).unwrap().tags = previous;
+            return Err(err);
+        }
+        Ok(crate::go_json::to_vec(&Value::Object(Map::new())))
+    }
+
+    /// `ListTagsOfResource`.
+    pub fn list_tags_of_resource(&self, request: &ListTagsOfResourceRequest) -> OpResult {
+        if request.resource_arn.is_empty() {
+            return Err(ApiError::validation("resource arn is required"));
+        }
+        if !request.next_token.is_empty() {
+            return Err(ApiError::validation("next token is invalid"));
+        }
+        let Some(name) = self.table_for_arn(&request.resource_arn) else {
+            return Err(ApiError::not_found("resource not found"));
+        };
+        let state = &self.tables[name];
+        // BTreeMap iteration is already key-sorted, matching Go's explicit sort.
+        let tags: Vec<Tag> = state
+            .tags
+            .iter()
+            .map(|(k, v)| Tag {
+                key: k.clone(),
+                value: v.clone(),
+            })
+            .collect();
+        let mut response = Map::new();
+        response.insert("Tags".to_string(), serde_json::to_value(&tags).unwrap());
+        Ok(crate::go_json::to_vec(&Value::Object(response)))
+    }
+
+    /// `UntagResource`.
+    pub fn untag_resource(&mut self, request: &UntagResourceRequest) -> OpResult {
+        if request.resource_arn.is_empty() {
+            return Err(ApiError::validation("resource arn is required"));
+        }
+        if request.tag_keys.is_empty() {
+            return Err(ApiError::validation("tag keys are required"));
+        }
+        let Some(name) = self
+            .table_for_arn(&request.resource_arn)
+            .map(str::to_string)
+        else {
+            return Err(ApiError::not_found("resource not found"));
+        };
+        let previous = self.tables[&name].tags.clone();
+        let state = self.tables.get_mut(&name).unwrap();
+        for key in &request.tag_keys {
+            state.tags.remove(key);
+        }
+        if let Err(err) = self.persist() {
+            self.tables.get_mut(&name).unwrap().tags = previous;
+            return Err(err);
+        }
+        Ok(crate::go_json::to_vec(&Value::Object(Map::new())))
+    }
+
+    /// `PutResourcePolicy`.
+    pub fn put_resource_policy(&mut self, request: &PutResourcePolicyRequest) -> OpResult {
+        if request.resource_arn.is_empty() {
+            return Err(ApiError::validation("resource arn is required"));
+        }
+        if request.policy.trim().is_empty() {
+            return Err(ApiError::validation("policy is required"));
+        }
+        if serde_json::from_str::<serde_json::Value>(&request.policy).is_err() {
+            return Err(ApiError::validation("policy must be valid JSON"));
+        }
+        let Some(name) = self
+            .table_for_arn(&request.resource_arn)
+            .map(str::to_string)
+        else {
+            return Err(ApiError::not_found("resource not found"));
+        };
+        let prev_policy = self.tables[&name].resource_policy.clone();
+        let prev_rev = self.tables[&name].resource_policy_revision.clone();
+        let revision = resource_policy_revision(&request.policy);
+        let state = self.tables.get_mut(&name).unwrap();
+        state.resource_policy = request.policy.clone();
+        state.resource_policy_revision = revision.clone();
+        if let Err(err) = self.persist() {
+            let state = self.tables.get_mut(&name).unwrap();
+            state.resource_policy = prev_policy;
+            state.resource_policy_revision = prev_rev;
+            return Err(err);
+        }
+        let mut response = Map::new();
+        response.insert("RevisionId".to_string(), Value::String(revision));
+        Ok(crate::go_json::to_vec(&Value::Object(response)))
+    }
+
+    /// `GetResourcePolicy`.
+    pub fn get_resource_policy(&self, request: &ResourceArnRequest) -> OpResult {
+        if request.resource_arn.is_empty() {
+            return Err(ApiError::validation("resource arn is required"));
+        }
+        let Some(name) = self.table_for_arn(&request.resource_arn) else {
+            return Err(ApiError::not_found("resource not found"));
+        };
+        let state = &self.tables[name];
+        if state.resource_policy.is_empty() {
+            return Err(ApiError::new(
+                400,
+                "PolicyNotFoundException",
+                "resource policy not found",
+            ));
+        }
+        let mut response = Map::new();
+        response.insert(
+            "Policy".to_string(),
+            Value::String(state.resource_policy.clone()),
+        );
+        response.insert(
+            "RevisionId".to_string(),
+            Value::String(state.resource_policy_revision.clone()),
+        );
+        Ok(crate::go_json::to_vec(&Value::Object(response)))
+    }
+
+    /// `DeleteResourcePolicy`.
+    pub fn delete_resource_policy(&mut self, request: &ResourceArnRequest) -> OpResult {
+        if request.resource_arn.is_empty() {
+            return Err(ApiError::validation("resource arn is required"));
+        }
+        let Some(name) = self
+            .table_for_arn(&request.resource_arn)
+            .map(str::to_string)
+        else {
+            return Err(ApiError::not_found("resource not found"));
+        };
+        let prev_policy = self.tables[&name].resource_policy.clone();
+        let prev_rev = self.tables[&name].resource_policy_revision.clone();
+        let state = self.tables.get_mut(&name).unwrap();
+        state.resource_policy = String::new();
+        state.resource_policy_revision = String::new();
+        if let Err(err) = self.persist() {
+            let state = self.tables.get_mut(&name).unwrap();
+            state.resource_policy = prev_policy;
+            state.resource_policy_revision = prev_rev;
+            return Err(err);
+        }
+        Ok(crate::go_json::to_vec(&Value::Object(Map::new())))
+    }
+
     fn enable_stream_description(
         &self,
         description: &mut TableDescription,
@@ -2403,6 +2606,14 @@ fn backup_summary_for_description(description: &BackupDescription) -> BackupSumm
         table_arn: description.source_table_details.table_arn.clone(),
         table_name: description.source_table_details.table_name.clone(),
     }
+}
+
+/// SHA-256 hex of the policy string, mirroring `resourcePolicyRevision`.
+fn resource_policy_revision(policy: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(policy.as_bytes());
+    hex::encode(hasher.finalize())
 }
 
 /// True when a table has an enabled stream.

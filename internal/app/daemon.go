@@ -279,7 +279,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 		go func() { errCh <- gcsServer.Run(ctx) }()
 	}
 	if d.config.Services.DynamoDB.Enabled {
-		go func() { errCh <- dynamoDBServer.Run(ctx) }()
+		if binPath, ok := dynamoDBRustEngine(); ok {
+			go func() { errCh <- runDynamoDBRust(ctx, d.config, binPath) }()
+		} else {
+			go func() { errCh <- dynamoDBServer.Run(ctx) }()
+		}
 	}
 	if d.config.Services.BigQuery.Enabled {
 		go func() { errCh <- bigQueryServer.Run(ctx) }()

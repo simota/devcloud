@@ -18,6 +18,8 @@ rust/
                              #   internal/services/applicationautoscaling)
     sqs/                     # increment #3 — AWS JSON 1.0 + SigV4 + FIFO + DLQ
                              #   (parity of internal/services/sqs)
+    dynamodb/                # increment #4 — AWS JSON 1.0 + SigV4, full data &
+                             #   control plane (parity of internal/services/dynamodb)
 ```
 
 ## Migration order
@@ -29,7 +31,10 @@ Leaf → hub, per the Phase 1 dependency analysis:
 3. **sqs** ✅ — AWS JSON 1.0 (23 ops), SigV4, FIFO dedup, DLQ redrive,
    visibility timeouts, move-tasks, state.json. JSON protocol only; the legacy
    Query/XML protocol stays on the Go engine.
-4. dynamodb — leaf HTTP service
+4. **dynamodb** ✅ — AWS JSON 1.0 (39 ops), SigV4, the full data plane (tables,
+   items, condition/update/key/filter expressions, Query/Scan, batch/transact,
+   PartiQL) and control plane (streams, TTL, backups, tags, resource policy),
+   byte-compatible `state.json`.
 5. pubsub — leaf, but gRPC + REST (tonic/prost)
 6. redis — passthrough proxy
 7. s3 — **hub**: owns the `BucketStore` boundary
@@ -47,7 +52,7 @@ cd rust && cargo test          # run all migrated crates
 cd rust && cargo test -p devcloud-mail
 ```
 
-## Daemon seam (mail, applicationautoscaling, sqs)
+## Daemon seam (mail, applicationautoscaling, sqs, dynamodb)
 
 Each migrated service is wired into the Go daemon behind an **opt-in, dev-only**
 environment seam — the default path and the YAML config are unchanged. When the
@@ -58,15 +63,17 @@ The Rust stores write a byte-compatible `state.json` (and, for mail, the same
 JSONL + blob layout), so state survives switching engines.
 
 ```
-DEVCLOUD_MAIL_ENGINE=rust DEVCLOUD_MAIL_RUST_BIN=rust/target/debug/devcloud-mail \
-DEVCLOUD_AAS_ENGINE=rust  DEVCLOUD_AAS_RUST_BIN=rust/target/debug/devcloud-applicationautoscaling \
-DEVCLOUD_SQS_ENGINE=rust  DEVCLOUD_SQS_RUST_BIN=rust/target/debug/devcloud-sqs \
+DEVCLOUD_MAIL_ENGINE=rust     DEVCLOUD_MAIL_RUST_BIN=rust/target/debug/devcloud-mail \
+DEVCLOUD_AAS_ENGINE=rust      DEVCLOUD_AAS_RUST_BIN=rust/target/debug/devcloud-applicationautoscaling \
+DEVCLOUD_SQS_ENGINE=rust      DEVCLOUD_SQS_RUST_BIN=rust/target/debug/devcloud-sqs \
+DEVCLOUD_DYNAMODB_ENGINE=rust DEVCLOUD_DYNAMODB_RUST_BIN=rust/target/debug/devcloud-dynamodb \
   go run ./cmd/devcloud up
 ```
 
 On Ctrl-C the subprocess gets SIGTERM (graceful) then SIGKILL after a grace
 period. Known gaps: the SQS Rust engine serves only the AWS JSON 1.0 protocol
 (modern SDK default) — a request without an `X-Amz-Target` (legacy Query/XML)
-gets a documented `501 NotImplemented`; and the in-process `events.Bus` SSE feed
-is not bridged to subprocesses (live dashboard events absent under a Rust engine;
-lists still update on refresh).
+gets a documented `501 NotImplemented`; the DynamoDB Rust engine likewise serves
+only the JSON 1.0 protocol (which is the only protocol the Go engine speaks); and
+the in-process `events.Bus` SSE feed is not bridged to subprocesses (live
+dashboard events absent under a Rust engine; lists still update on refresh).

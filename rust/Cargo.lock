@@ -64,8 +64,12 @@ dependencies = [
 name = "devcloud-dynamodb"
 version = "0.1.0"
 dependencies = [
+ "hex",
+ "hmac",
  "serde",
  "serde_json",
+ "sha2",
+ "tokio",
 ]
 
 [[package]]

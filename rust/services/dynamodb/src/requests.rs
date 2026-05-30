@@ -159,6 +159,49 @@ pub struct GetItemRequest {
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
+pub struct TagResourceRequest {
+    #[serde(rename = "ResourceArn")]
+    pub resource_arn: String,
+    #[serde(rename = "Tags")]
+    pub tags: Vec<crate::model::Tag>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct ListTagsOfResourceRequest {
+    #[serde(rename = "ResourceArn")]
+    pub resource_arn: String,
+    #[serde(rename = "NextToken")]
+    pub next_token: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct UntagResourceRequest {
+    #[serde(rename = "ResourceArn")]
+    pub resource_arn: String,
+    #[serde(rename = "TagKeys")]
+    pub tag_keys: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct PutResourcePolicyRequest {
+    #[serde(rename = "ResourceArn")]
+    pub resource_arn: String,
+    #[serde(rename = "Policy")]
+    pub policy: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct ResourceArnRequest {
+    #[serde(rename = "ResourceArn")]
+    pub resource_arn: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
 pub struct PointInTimeRecoverySpecification {
     #[serde(rename = "PointInTimeRecoveryEnabled")]
     pub point_in_time_recovery_enabled: bool,
