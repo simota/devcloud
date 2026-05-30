@@ -10,12 +10,14 @@
 //! XML response layer, SigV4, routing, and the daemon seam.
 
 pub mod base64;
+pub mod csv;
 pub mod go_json;
 pub mod hashes;
 pub mod model;
 pub mod objops;
 pub mod store;
 pub mod store_config;
+pub mod store_inventory;
 pub mod store_multipart;
 pub mod store_objectlock;
 pub mod store_objects;

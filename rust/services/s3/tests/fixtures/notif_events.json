@@ -1,0 +1,11 @@
+[
+  {
+    "eventId": "e1",
+    "eventName": "s3:ObjectCreated:Put",
+    "eventTime": "0001-01-01T00:00:00Z",
+    "bucket": "data",
+    "key": "k",
+    "etag": "\"abc\"",
+    "size": 3
+  }
+]

@@ -159,6 +159,38 @@ impl FileBucketStore {
             .join(format!("{part_number:05}"))
     }
 
+    pub fn inventory_path(&self, bucket: &str) -> PathBuf {
+        self.bucket_path(bucket).join("inventory")
+    }
+
+    pub fn inventory_config_path(&self, bucket: &str, id: &str) -> PathBuf {
+        self.inventory_path(bucket)
+            .join(format!("{}.json", base64::raw_url_encode(id.as_bytes())))
+    }
+
+    pub fn inventory_report_path(&self, bucket: &str, id: &str) -> PathBuf {
+        self.inventory_path(bucket)
+            .join("reports")
+            .join(base64::raw_url_encode(id.as_bytes()))
+    }
+
+    pub fn inventory_report_csv_path(&self, bucket: &str, id: &str) -> PathBuf {
+        self.inventory_report_path(bucket, id).join("inventory.csv")
+    }
+
+    pub fn inventory_report_manifest_path(&self, bucket: &str, id: &str) -> PathBuf {
+        self.inventory_report_path(bucket, id).join("manifest.json")
+    }
+
+    pub fn analytics_path(&self, bucket: &str) -> PathBuf {
+        self.bucket_path(bucket).join("analytics")
+    }
+
+    pub fn analytics_config_path(&self, bucket: &str, id: &str) -> PathBuf {
+        self.analytics_path(bucket)
+            .join(format!("{}.json", base64::raw_url_encode(id.as_bytes())))
+    }
+
     // --- bucket CRUD --------------------------------------------------------
 
     /// Creates a bucket. Returns `(bucket, created)`; `created` is false when the
@@ -258,6 +290,17 @@ impl FileBucketStore {
         }
         fs::remove_dir(&path)?;
         Ok(true)
+    }
+}
+
+/// Reads and JSON-decodes a file; `None` if it does not exist.
+pub(crate) fn read_json_file<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Option<T>> {
+    match fs::read(path) {
+        Ok(data) => Ok(Some(
+            serde_json::from_slice(&data).map_err(|e| StoreError::Io(io::Error::other(e)))?,
+        )),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(StoreError::Io(e)),
     }
 }
 

@@ -1,0 +1,16 @@
+{
+  "configurationId": "inv1",
+  "sourceBucket": "data",
+  "format": "CSV",
+  "includedObjectVersions": "Current",
+  "fields": [
+    "Bucket",
+    "Key",
+    "Size",
+    "LastModifiedDate",
+    "ETag",
+    "StorageClass"
+  ],
+  "objectCount": 2,
+  "reportKey": "inventory/reports/aW52MQ/inventory.csv"
+}

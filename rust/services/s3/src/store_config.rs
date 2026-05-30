@@ -2,8 +2,11 @@
 //! lifecycle (including expiration application), ACL, and policy. Notification,
 //! inventory, analytics, and replication land in a later part.
 
-use crate::model::{LifecycleConfiguration, Object, ObjectLockConfiguration};
-use crate::store::{remove_if_exists, FileBucketStore, Result, StoreError};
+use crate::model::{
+    AnalyticsConfiguration, LifecycleConfiguration, NotificationConfiguration,
+    NotificationEventRecord, Object, ObjectLockConfiguration, ReplicationConfiguration,
+};
+use crate::store::{read_json_file, remove_if_exists, FileBucketStore, Result, StoreError};
 use crate::time_fmt::{parse_lifecycle_date, parse_rfc3339};
 use serde::{Deserialize, Serialize};
 use std::io;
@@ -249,6 +252,174 @@ impl FileBucketStore {
             Err(e) => Err(StoreError::Io(e)),
         }
     }
+}
+
+impl FileBucketStore {
+    // --- notification -------------------------------------------------------
+
+    /// Persists the bucket's notification configuration. Errors if absent.
+    pub fn put_bucket_notification(
+        &self,
+        bucket: &str,
+        config: &NotificationConfiguration,
+    ) -> Result<()> {
+        self.get_bucket(bucket)?.ok_or(StoreError::BucketNotExist)?;
+        Self::write_json(&self.bucket_path(bucket).join("notification.json"), config)
+    }
+
+    /// Reads the bucket's notification configuration (default if unset). `None`
+    /// if the bucket does not exist.
+    pub fn get_bucket_notification(
+        &self,
+        bucket: &str,
+    ) -> Result<Option<NotificationConfiguration>> {
+        if self.get_bucket(bucket)?.is_none() {
+            return Ok(None);
+        }
+        Ok(Some(
+            read_json_file(&self.bucket_path(bucket).join("notification.json"))?
+                .unwrap_or_default(),
+        ))
+    }
+
+    /// Appends a notification event record. Returns whether the bucket exists.
+    pub fn append_notification_event(
+        &self,
+        bucket: &str,
+        event: NotificationEventRecord,
+    ) -> Result<bool> {
+        if self.get_bucket(bucket)?.is_none() {
+            return Ok(false);
+        }
+        let path = self.bucket_path(bucket).join("notification-events.json");
+        let mut events: Vec<NotificationEventRecord> = read_json_file(&path)?.unwrap_or_default();
+        events.push(event);
+        Self::write_json(&path, &events)?;
+        Ok(true)
+    }
+
+    /// Lists notification event records. `None` if the bucket does not exist.
+    pub fn list_notification_events(
+        &self,
+        bucket: &str,
+    ) -> Result<Option<Vec<NotificationEventRecord>>> {
+        if self.get_bucket(bucket)?.is_none() {
+            return Ok(None);
+        }
+        Ok(Some(
+            read_json_file(&self.bucket_path(bucket).join("notification-events.json"))?
+                .unwrap_or_default(),
+        ))
+    }
+
+    // --- replication --------------------------------------------------------
+
+    /// Persists the bucket's replication configuration. Errors if absent.
+    pub fn put_bucket_replication(
+        &self,
+        bucket: &str,
+        config: &ReplicationConfiguration,
+    ) -> Result<()> {
+        self.get_bucket(bucket)?.ok_or(StoreError::BucketNotExist)?;
+        Self::write_json(&self.bucket_path(bucket).join("replication.json"), config)
+    }
+
+    /// Reads the bucket's replication configuration. `None` if the bucket is
+    /// absent; the bool indicates whether a configuration is present.
+    pub fn get_bucket_replication(
+        &self,
+        bucket: &str,
+    ) -> Result<Option<(ReplicationConfiguration, bool)>> {
+        if self.get_bucket(bucket)?.is_none() {
+            return Ok(None);
+        }
+        match read_json_file(&self.bucket_path(bucket).join("replication.json"))? {
+            Some(config) => Ok(Some((config, true))),
+            None => Ok(Some((ReplicationConfiguration::default(), false))),
+        }
+    }
+
+    /// Removes the bucket's replication configuration. Errors if absent.
+    pub fn delete_bucket_replication(&self, bucket: &str) -> Result<bool> {
+        self.get_bucket(bucket)?.ok_or(StoreError::BucketNotExist)?;
+        remove_if_exists(&self.bucket_path(bucket).join("replication.json"))?;
+        Ok(true)
+    }
+
+    // --- analytics ----------------------------------------------------------
+
+    /// Persists an analytics configuration under `id`. Errors if absent.
+    pub fn put_bucket_analytics(
+        &self,
+        bucket: &str,
+        id: &str,
+        mut config: AnalyticsConfiguration,
+    ) -> Result<()> {
+        self.get_bucket(bucket)?.ok_or(StoreError::BucketNotExist)?;
+        config.id = id.to_string();
+        std::fs::create_dir_all(self.analytics_path(bucket))?;
+        Self::write_json(&self.analytics_config_path(bucket, id), &config)
+    }
+
+    /// Reads an analytics configuration. `None` if the bucket is absent; the bool
+    /// indicates whether the configuration is present.
+    pub fn get_bucket_analytics(
+        &self,
+        bucket: &str,
+        id: &str,
+    ) -> Result<Option<(AnalyticsConfiguration, bool)>> {
+        if self.get_bucket(bucket)?.is_none() {
+            return Ok(None);
+        }
+        match read_json_file(&self.analytics_config_path(bucket, id))? {
+            Some(config) => Ok(Some((config, true))),
+            None => Ok(Some((AnalyticsConfiguration::default(), false))),
+        }
+    }
+
+    /// Lists analytics configurations, sorted by ID. `None` if the bucket absent.
+    pub fn list_bucket_analytics(
+        &self,
+        bucket: &str,
+    ) -> Result<Option<Vec<AnalyticsConfiguration>>> {
+        if self.get_bucket(bucket)?.is_none() {
+            return Ok(None);
+        }
+        let mut configs = read_config_dir(&self.analytics_path(bucket))?;
+        configs.sort_by(|a: &AnalyticsConfiguration, b| a.id.cmp(&b.id));
+        Ok(Some(configs))
+    }
+
+    /// Removes an analytics configuration. Errors if the bucket is absent.
+    pub fn delete_bucket_analytics(&self, bucket: &str, id: &str) -> Result<bool> {
+        self.get_bucket(bucket)?.ok_or(StoreError::BucketNotExist)?;
+        remove_if_exists(&self.analytics_config_path(bucket, id))?;
+        let _ = std::fs::remove_dir(self.analytics_path(bucket));
+        Ok(true)
+    }
+}
+
+/// Reads every `*.json` file in `dir` (skipping subdirectories) into `T`.
+/// Returns an empty list if the directory does not exist.
+pub(crate) fn read_config_dir<T: serde::de::DeserializeOwned>(
+    dir: &std::path::Path,
+) -> Result<Vec<T>> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(StoreError::Io(e)),
+    };
+    let mut configs = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            continue;
+        }
+        if let Some(config) = read_json_file(&entry.path())? {
+            configs.push(config);
+        }
+    }
+    Ok(configs)
 }
 
 /// Whether any enabled lifecycle rule expires `object` at `now` (RFC3339 UTC).

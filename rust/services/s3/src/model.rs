@@ -202,6 +202,276 @@ pub struct LifecycleExpiration {
     pub date: String,
 }
 
+// --- notification ----------------------------------------------------------
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NotificationConfiguration {
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub xmlns: String,
+    #[serde(rename = "topicConfigurations", skip_serializing_if = "Vec::is_empty")]
+    pub topic_configurations: Vec<NotificationTopicConfig>,
+    #[serde(rename = "queueConfigurations", skip_serializing_if = "Vec::is_empty")]
+    pub queue_configurations: Vec<NotificationQueueConfig>,
+    #[serde(
+        rename = "lambdaFunctionConfigurations",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub lambda_function_configurations: Vec<NotificationLambdaConfig>,
+    #[serde(
+        rename = "eventBridgeConfiguration",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub event_bridge_configuration: Option<EventBridgeConfiguration>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NotificationTopicConfig {
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub id: String,
+    pub topic: String,
+    pub events: Vec<String>,
+    pub filter: NotificationFilter,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NotificationQueueConfig {
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub id: String,
+    pub queue: String,
+    pub events: Vec<String>,
+    pub filter: NotificationFilter,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NotificationLambdaConfig {
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub id: String,
+    #[serde(rename = "lambdaFunction")]
+    pub lambda_function: String,
+    pub events: Vec<String>,
+    pub filter: NotificationFilter,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NotificationFilter {
+    #[serde(rename = "s3Key")]
+    pub s3_key: NotificationS3KeyFilter,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NotificationS3KeyFilter {
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub rules: Vec<NotificationFilterRule>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NotificationFilterRule {
+    pub name: String,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct EventBridgeConfiguration {}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NotificationEventRecord {
+    #[serde(rename = "eventId")]
+    pub event_id: String,
+    #[serde(rename = "eventName")]
+    pub event_name: String,
+    #[serde(rename = "eventTime")]
+    pub event_time: String,
+    pub bucket: String,
+    pub key: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub etag: String,
+    #[serde(skip_serializing_if = "is_zero_i64")]
+    pub size: i64,
+    #[serde(rename = "versionId", skip_serializing_if = "String::is_empty")]
+    pub version_id: String,
+    #[serde(rename = "deleteMarker", skip_serializing_if = "is_false")]
+    pub delete_marker: bool,
+}
+
+// --- replication -----------------------------------------------------------
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ReplicationConfiguration {
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub xmlns: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub role: String,
+    pub rules: Vec<ReplicationRule>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ReplicationRule {
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub id: String,
+    #[serde(skip_serializing_if = "is_zero_i64")]
+    pub priority: i64,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub prefix: String,
+    pub filter: ReplicationFilter,
+    pub status: String,
+    pub destination: ReplicationDestination,
+    #[serde(rename = "deleteMarkerReplication")]
+    pub delete_marker_replication: ReplicationDeleteMarkerSetting,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ReplicationFilter {
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub prefix: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ReplicationDestination {
+    pub bucket: String,
+    #[serde(rename = "storageClass", skip_serializing_if = "String::is_empty")]
+    pub storage_class: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ReplicationDeleteMarkerSetting {
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub status: String,
+}
+
+// --- analytics -------------------------------------------------------------
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AnalyticsConfiguration {
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub xmlns: String,
+    pub id: String,
+    pub filter: AnalyticsFilter,
+    #[serde(rename = "storageClassAnalysis")]
+    pub storage_class_analysis: StorageClassAnalysis,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AnalyticsFilter {
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub prefix: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StorageClassAnalysis {
+    #[serde(rename = "dataExport")]
+    pub data_export: AnalyticsDataExport,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AnalyticsDataExport {
+    #[serde(
+        rename = "outputSchemaVersion",
+        skip_serializing_if = "String::is_empty"
+    )]
+    pub output_schema_version: String,
+    pub destination: AnalyticsDestination,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AnalyticsDestination {
+    #[serde(rename = "s3BucketDestination")]
+    pub s3_bucket_destination: AnalyticsS3BucketDestination,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AnalyticsS3BucketDestination {
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub format: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub bucket: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub prefix: String,
+}
+
+// --- inventory -------------------------------------------------------------
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct InventoryConfiguration {
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub xmlns: String,
+    pub id: String,
+    #[serde(rename = "isEnabled")]
+    pub is_enabled: bool,
+    #[serde(
+        rename = "includedObjectVersions",
+        skip_serializing_if = "String::is_empty"
+    )]
+    pub included_object_versions: String,
+    pub schedule: InventorySchedule,
+    pub destination: InventoryDestination,
+    #[serde(rename = "optionalFields", skip_serializing_if = "Vec::is_empty")]
+    pub optional_fields: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct InventorySchedule {
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub frequency: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct InventoryDestination {
+    #[serde(rename = "s3BucketDestination")]
+    pub s3_bucket_destination: InventoryS3BucketDestination,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct InventoryS3BucketDestination {
+    #[serde(rename = "accountId", skip_serializing_if = "String::is_empty")]
+    pub account_id: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub bucket: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub format: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub prefix: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct InventoryReportManifest {
+    #[serde(rename = "configurationId")]
+    pub configuration_id: String,
+    #[serde(rename = "sourceBucket")]
+    pub source_bucket: String,
+    pub format: String,
+    #[serde(rename = "includedObjectVersions")]
+    pub included_versions: String,
+    pub fields: Vec<String>,
+    #[serde(rename = "objectCount")]
+    pub object_count: i64,
+    #[serde(rename = "reportKey")]
+    pub report_key: String,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct MultipartPart {
