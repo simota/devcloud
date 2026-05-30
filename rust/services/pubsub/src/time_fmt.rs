@@ -35,6 +35,51 @@ pub fn rfc3339nano_from_unix(secs: i64, nanos: u32) -> String {
     out
 }
 
+/// Parses an RFC3339(/Nano) UTC timestamp to `(unix_secs, nanos)`. Accepts an
+/// optional fractional part and a trailing `Z`. Returns `None` on malformed
+/// input (the limited subset the service produces/consumes).
+pub fn parse_rfc3339(value: &str) -> Option<(i64, u32)> {
+    let s = value.strip_suffix('Z')?;
+    let (date, time) = s.split_once('T')?;
+    let mut date_parts = date.split('-');
+    let year: i64 = date_parts.next()?.parse().ok()?;
+    let month: u32 = date_parts.next()?.parse().ok()?;
+    let day: u32 = date_parts.next()?.parse().ok()?;
+    if date_parts.next().is_some() {
+        return None;
+    }
+    let (hms, frac) = match time.split_once('.') {
+        Some((hms, frac)) => (hms, frac),
+        None => (time, ""),
+    };
+    let mut t = hms.split(':');
+    let hour: i64 = t.next()?.parse().ok()?;
+    let minute: i64 = t.next()?.parse().ok()?;
+    let second: i64 = t.next()?.parse().ok()?;
+    if t.next().is_some() {
+        return None;
+    }
+    let days = days_from_civil(year, month, day);
+    let secs = days * 86_400 + hour * 3600 + minute * 60 + second;
+    let nanos = if frac.is_empty() {
+        0
+    } else {
+        let padded = format!("{frac:0<9}");
+        padded[..9].parse().ok()?
+    };
+    Some((secs, nanos))
+}
+
+/// Hinnant days-from-civil: (year, month, day) -> days since the UNIX epoch.
+fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) as i64 + 2) / 5 + d as i64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
 /// Hinnant civil-from-days: days since the UNIX epoch -> (year, month, day).
 fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let z = z + 719_468;

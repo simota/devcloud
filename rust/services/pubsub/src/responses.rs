@@ -10,7 +10,7 @@
 
 use serde::Serialize;
 
-use crate::model::{Subscription, Topic};
+use crate::model::{Schema, Snapshot, Subscription, Topic};
 
 /// `{"nextPageToken": ..., "topics": [...]}`.
 #[derive(Debug, Serialize)]
@@ -42,4 +42,20 @@ pub struct ListSnapshotNamesResponse {
     #[serde(rename = "nextPageToken")]
     pub next_page_token: String,
     pub snapshots: Vec<String>,
+}
+
+/// `{"nextPageToken": ..., "snapshots": [...]}` of full snapshots.
+#[derive(Debug, Serialize)]
+pub struct ListSnapshotsResponse {
+    #[serde(rename = "nextPageToken")]
+    pub next_page_token: String,
+    pub snapshots: Vec<Snapshot>,
+}
+
+/// `{"nextPageToken": ..., "schemas": [...]}` of full schemas.
+#[derive(Debug, Serialize)]
+pub struct ListSchemasResponse {
+    #[serde(rename = "nextPageToken")]
+    pub next_page_token: String,
+    pub schemas: Vec<Schema>,
 }

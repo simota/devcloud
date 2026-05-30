@@ -218,6 +218,81 @@ pub fn subscription_action_parts(path: &str) -> Option<(String, String, String)>
     Some((parts[2].clone(), sub_id.to_string(), action.to_string()))
 }
 
+/// `/v1/projects/<p>/snapshots` collection path.
+pub fn snapshots_collection(path: &str) -> Option<String> {
+    simple_collection(path, "snapshots")
+}
+
+/// `/v1/projects/<p>/snapshots/<id>` — returns `(project, snapshot_id)`.
+pub fn snapshot_name_parts(path: &str) -> Option<(String, String)> {
+    leaf_name_parts(path, "snapshots")
+}
+
+/// `projects/<project>/snapshots/<id>`.
+pub fn snapshot_name(project: &str, snapshot_id: &str) -> String {
+    format!("projects/{project}/snapshots/{snapshot_id}")
+}
+
+/// `/v1/projects/<p>/schemas` collection path.
+pub fn schemas_collection(path: &str) -> Option<String> {
+    simple_collection(path, "schemas")
+}
+
+/// `/v1/projects/<p>/schemas/<id>` — returns `(project, schema_id)`.
+pub fn schema_name_parts(path: &str) -> Option<(String, String)> {
+    leaf_name_parts(path, "schemas")
+}
+
+/// `projects/<project>/schemas/<id>`.
+pub fn schema_name(project: &str, schema_id: &str) -> String {
+    format!("projects/{project}/schemas/{schema_id}")
+}
+
+/// `/v1/projects/<p>/schemas:validateMessage` — returns the project.
+pub fn schemas_validate_message(path: &str) -> Option<String> {
+    let parts = path_parts(path);
+    if parts.len() == 4
+        && parts[0] == "v1"
+        && parts[1] == "projects"
+        && !parts[2].is_empty()
+        && parts[3] == "schemas:validateMessage"
+    {
+        Some(parts[2].clone())
+    } else {
+        None
+    }
+}
+
+fn simple_collection(path: &str, collection: &str) -> Option<String> {
+    let parts = path_parts(path);
+    if parts.len() == 4
+        && parts[0] == "v1"
+        && parts[1] == "projects"
+        && parts[3] == collection
+        && !parts[2].is_empty()
+    {
+        Some(parts[2].clone())
+    } else {
+        None
+    }
+}
+
+fn leaf_name_parts(path: &str, collection: &str) -> Option<(String, String)> {
+    let parts = path_parts(path);
+    if parts.len() == 5
+        && parts[0] == "v1"
+        && parts[1] == "projects"
+        && parts[3] == collection
+        && !parts[2].is_empty()
+        && !parts[4].is_empty()
+        && !parts[4].contains(':')
+    {
+        Some((parts[2].clone(), parts[4].clone()))
+    } else {
+        None
+    }
+}
+
 /// `/v1/projects/<p>/topics/<id>:<action>` — returns `(project, topic_id, action)`.
 pub fn topic_action_parts(path: &str) -> Option<(String, String, String)> {
     let parts = path_parts(path);

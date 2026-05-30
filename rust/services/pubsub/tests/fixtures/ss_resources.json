@@ -1,0 +1,26 @@
+{
+  "topics": [
+    {
+      "name": "projects/devcloud/topics/orders",
+      "createdAt": "2026-05-30T12:00:00Z",
+      "updatedAt": "2026-05-30T12:00:00Z"
+    }
+  ],
+  "subscriptions": [
+    {
+      "name": "projects/devcloud/subscriptions/sub1",
+      "topic": "projects/devcloud/topics/orders",
+      "createdAt": "2026-05-30T12:00:00Z",
+      "updatedAt": "2026-05-30T12:00:00Z",
+      "ackDeadlineSeconds": 10
+    }
+  ],
+  "schemas": [
+    {
+      "name": "projects/devcloud/schemas/sch1",
+      "type": "AVRO",
+      "definition": "{\"type\":\"record\",\"name\":\"R\",\"fields\":[]}",
+      "revisionId": "1"
+    }
+  ]
+}

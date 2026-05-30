@@ -12,6 +12,136 @@ use crate::duration::valid_google_duration;
 use crate::errors::ApiError;
 use crate::paths::valid_full_topic_name;
 
+/// True for `""`/`TYPE_UNSPECIFIED`/`PROTOCOL_BUFFER`/`AVRO`, mirroring
+/// `validSchemaType`.
+pub fn valid_schema_type(schema_type: &str) -> bool {
+    matches!(
+        schema_type,
+        "" | "TYPE_UNSPECIFIED" | "PROTOCOL_BUFFER" | "AVRO"
+    )
+}
+
+/// True for `""`/`ENCODING_UNSPECIFIED`/`JSON`/`BINARY`, mirroring
+/// `validSchemaEncoding`.
+pub fn valid_schema_encoding(encoding: &str) -> bool {
+    matches!(encoding, "" | "ENCODING_UNSPECIFIED" | "JSON" | "BINARY")
+}
+
+/// Validates a schema definition, mirroring `validateSchemaDefinition` (AVRO
+/// must be a JSON object; others are unchecked). An empty/whitespace definition
+/// is always allowed.
+pub fn validate_schema_definition(schema_type: &str, definition: &str) -> Result<(), ApiError> {
+    if definition.trim().is_empty() {
+        return Ok(());
+    }
+    if schema_type == "AVRO" {
+        match serde_json::from_str::<Value>(definition) {
+            Ok(Value::Object(_)) => {}
+            Ok(_) => {
+                return Err(ApiError::invalid_argument(
+                    "avro schema definition must be a json object",
+                ))
+            }
+            Err(_) => {
+                return Err(ApiError::invalid_argument(
+                    "avro schema definition must be valid json",
+                ))
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Validates message bytes for a schema encoding, mirroring
+/// `validSchemaMessageData` (only `JSON` is checked: it must be valid JSON).
+pub fn valid_schema_message_data(message: &[u8], encoding: &str) -> bool {
+    if message.is_empty() {
+        return true;
+    }
+    if encoding == "JSON" {
+        return serde_json::from_slice::<Value>(message).is_ok();
+    }
+    true
+}
+
+/// Decodes base64 trying StdEncoding then RawStdEncoding, mirroring
+/// `decodeBase64Bytes`.
+pub fn decode_base64_bytes(value: &str) -> Option<Vec<u8>> {
+    base64_decode(value, true).or_else(|| base64_decode(value, false))
+}
+
+/// Minimal base64 decoder. `padded` selects StdEncoding (requires `=` padding to
+/// a multiple of 4) vs RawStdEncoding (no padding).
+fn base64_decode(input: &str, padded: bool) -> Option<Vec<u8>> {
+    fn val(c: u8) -> Option<u32> {
+        match c {
+            b'A'..=b'Z' => Some((c - b'A') as u32),
+            b'a'..=b'z' => Some((c - b'a' + 26) as u32),
+            b'0'..=b'9' => Some((c - b'0' + 52) as u32),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+    let bytes = input.as_bytes();
+    if padded {
+        if !bytes.len().is_multiple_of(4) {
+            return None;
+        }
+        let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
+        for chunk in bytes.chunks(4) {
+            let pads = chunk.iter().rev().take_while(|&&b| b == b'=').count();
+            if pads > 2 {
+                return None;
+            }
+            let mut acc = 0u32;
+            for (j, &c) in chunk.iter().enumerate() {
+                let v = if c == b'=' {
+                    if j < 4 - pads {
+                        return None;
+                    }
+                    0
+                } else {
+                    val(c)?
+                };
+                acc = (acc << 6) | v;
+            }
+            out.push((acc >> 16) as u8);
+            if pads < 2 {
+                out.push((acc >> 8) as u8);
+            }
+            if pads < 1 {
+                out.push(acc as u8);
+            }
+        }
+        Some(out)
+    } else {
+        // RawStdEncoding: no padding allowed.
+        if bytes.contains(&b'=') {
+            return None;
+        }
+        let mut out = Vec::with_capacity(bytes.len() * 3 / 4);
+        for chunk in bytes.chunks(4) {
+            if chunk.len() == 1 {
+                return None;
+            }
+            let mut acc = 0u32;
+            for &c in chunk {
+                acc = (acc << 6) | val(c)?;
+            }
+            acc <<= 6 * (4 - chunk.len());
+            out.push((acc >> 16) as u8);
+            if chunk.len() > 2 {
+                out.push((acc >> 8) as u8);
+            }
+            if chunk.len() > 3 {
+                out.push(acc as u8);
+            }
+        }
+        Some(out)
+    }
+}
+
 /// Validates a subscription filter, mirroring `validateSubscriptionFilter`.
 pub fn validate_subscription_filter(filter: &str) -> Result<(), ApiError> {
     let filter = filter.trim();

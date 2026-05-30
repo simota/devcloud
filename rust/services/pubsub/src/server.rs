@@ -784,10 +784,371 @@ impl Server {
         self.topics.contains_key(&topic)
     }
 
+    // --- snapshot operations ----------------------------------------------
+
+    /// `PUT /v1/projects/<p>/snapshots/<id>` — create a snapshot of a
+    /// subscription. `subscription` is the full subscription name.
+    pub fn create_snapshot(
+        &mut self,
+        project: &str,
+        snapshot_id: &str,
+        subscription: &str,
+    ) -> Result<RestResponse, ApiError> {
+        let name = paths::snapshot_name(project, snapshot_id);
+        if !paths::valid_project_id(project) {
+            return Err(ApiError::invalid_argument("invalid project name"));
+        }
+        if !paths::valid_resource_id(snapshot_id) {
+            return Err(ApiError::invalid_argument("invalid snapshot name"));
+        }
+        if !paths::valid_full_subscription_name(subscription) {
+            return Err(ApiError::invalid_argument("invalid subscription name"));
+        }
+        if self.snapshots.contains_key(&name) {
+            return Err(ApiError::already_exists("snapshot already exists"));
+        }
+        let Some(sub) = self.subscriptions.get(subscription).cloned() else {
+            return Err(ApiError::not_found("subscription not found"));
+        };
+        let snapshot = Snapshot {
+            name: name.clone(),
+            topic: sub.topic.clone(),
+            subscription: sub.name.clone(),
+            expire_time: self.snapshot_expire_time(),
+            // Deliveries are captured from the subscription's pending records;
+            // empty here (no messages yet) — the messages part fills them in.
+            deliveries: Vec::new(),
+            ..Default::default()
+        };
+        self.snapshots.insert(name.clone(), snapshot.clone());
+        if let Err(err) = self.persist() {
+            self.snapshots.remove(&name);
+            return Err(err);
+        }
+        Ok(RestResponse::ok_struct(&snapshot_public(&snapshot)))
+    }
+
+    /// `GET /v1/projects/<p>/snapshots/<id>`.
+    pub fn get_snapshot(&self, project: &str, snapshot_id: &str) -> Result<RestResponse, ApiError> {
+        let name = paths::snapshot_name(project, snapshot_id);
+        if !paths::valid_project_id(project) {
+            return Err(ApiError::invalid_argument("invalid project name"));
+        }
+        if !paths::valid_resource_id(snapshot_id) {
+            return Err(ApiError::invalid_argument("invalid snapshot name"));
+        }
+        match self.snapshots.get(&name) {
+            Some(snap) if !self.snapshot_expired(snap) => {
+                Ok(RestResponse::ok_struct(&snapshot_public(snap)))
+            }
+            _ => Err(ApiError::not_found("snapshot not found")),
+        }
+    }
+
+    /// `DELETE /v1/projects/<p>/snapshots/<id>`.
+    pub fn delete_snapshot(
+        &mut self,
+        project: &str,
+        snapshot_id: &str,
+    ) -> Result<RestResponse, ApiError> {
+        let name = paths::snapshot_name(project, snapshot_id);
+        if !paths::valid_project_id(project) {
+            return Err(ApiError::invalid_argument("invalid project name"));
+        }
+        if !paths::valid_resource_id(snapshot_id) {
+            return Err(ApiError::invalid_argument("invalid snapshot name"));
+        }
+        if !self.snapshots.contains_key(&name) {
+            return Err(ApiError::not_found("snapshot not found"));
+        }
+        let removed = self.snapshots.remove(&name);
+        if let Err(err) = self.persist() {
+            if let Some(s) = removed {
+                self.snapshots.insert(name, s);
+            }
+            return Err(err);
+        }
+        Ok(RestResponse::no_content())
+    }
+
+    /// `GET /v1/projects/<p>/snapshots` — list non-expired snapshots.
+    pub fn list_snapshots(
+        &self,
+        project: &str,
+        page_size: i64,
+        page_token: i64,
+    ) -> Result<RestResponse, ApiError> {
+        if !paths::valid_project_id(project) {
+            return Err(ApiError::invalid_argument("invalid project name"));
+        }
+        let snaps: Vec<Snapshot> = self
+            .snapshots
+            .values()
+            .filter(|s| paths::resource_project(&s.name) == project && !self.snapshot_expired(s))
+            .map(snapshot_public)
+            .collect();
+        let (start, end, next) = page_bounds(snaps.len(), page_token, page_size);
+        Ok(RestResponse::ok_struct(
+            &crate::responses::ListSnapshotsResponse {
+                next_page_token: next,
+                snapshots: snaps[start..end].to_vec(),
+            },
+        ))
+    }
+
+    fn snapshot_expire_time(&self) -> String {
+        match crate::time_fmt::parse_rfc3339(&self.now()) {
+            Some((secs, nanos)) => {
+                crate::time_fmt::rfc3339nano_from_unix(secs + 7 * 24 * 3600, nanos)
+            }
+            None => String::new(),
+        }
+    }
+
+    fn snapshot_expired(&self, snapshot: &Snapshot) -> bool {
+        let expire = snapshot.expire_time.trim();
+        if expire.is_empty() {
+            return false;
+        }
+        let Some((exp_secs, _)) = crate::time_fmt::parse_rfc3339(expire) else {
+            return false;
+        };
+        let Some((now_secs, _)) = crate::time_fmt::parse_rfc3339(&self.now()) else {
+            return false;
+        };
+        // Expired when expireTime is not after now.
+        exp_secs <= now_secs
+    }
+
+    // --- schema operations ------------------------------------------------
+
+    /// `POST /v1/projects/<p>/schemas?schemaId=<id>` and
+    /// `PUT /v1/projects/<p>/schemas/<id>` — create a schema. `schema_id` is the
+    /// path/query id; `request` is the body.
+    pub fn create_schema(
+        &mut self,
+        project: &str,
+        schema_id: &str,
+        request: &Schema,
+    ) -> Result<RestResponse, ApiError> {
+        if !paths::valid_project_id(project) {
+            return Err(ApiError::invalid_argument("invalid project name"));
+        }
+        if schema_id.trim().is_empty() {
+            return Err(ApiError::invalid_argument("schemaId is required"));
+        }
+        if !paths::valid_resource_id(schema_id) {
+            return Err(ApiError::invalid_argument("invalid schema name"));
+        }
+        let name = paths::schema_name(project, schema_id);
+        if !request.name.is_empty() && request.name != name {
+            return Err(ApiError::invalid_argument(
+                "schema name does not match request path",
+            ));
+        }
+        if !request.type_.is_empty() && !crate::validation::valid_schema_type(&request.type_) {
+            return Err(ApiError::invalid_argument("invalid schema type"));
+        }
+        crate::validation::validate_schema_definition(&request.type_, &request.definition)?;
+        if self.schemas.contains_key(&name) {
+            return Err(ApiError::already_exists("schema already exists"));
+        }
+        let schema = Schema {
+            name: name.clone(),
+            revision_id: if request.revision_id.is_empty() {
+                "1".to_string()
+            } else {
+                request.revision_id.clone()
+            },
+            ..request.clone()
+        };
+        self.schemas.insert(name.clone(), schema.clone());
+        if let Err(err) = self.persist() {
+            self.schemas.remove(&name);
+            return Err(err);
+        }
+        Ok(RestResponse::ok_struct(&schema))
+    }
+
+    /// `GET /v1/projects/<p>/schemas/<id>` — `view` is `""`/`FULL`/`BASIC`.
+    pub fn get_schema(
+        &self,
+        project: &str,
+        schema_id: &str,
+        view: &str,
+    ) -> Result<RestResponse, ApiError> {
+        if !paths::valid_project_id(project) {
+            return Err(ApiError::invalid_argument("invalid project name"));
+        }
+        if !paths::valid_resource_id(schema_id) {
+            return Err(ApiError::invalid_argument("invalid schema name"));
+        }
+        let name = paths::schema_name(project, schema_id);
+        match self.schemas.get(&name) {
+            Some(schema) => Ok(RestResponse::ok_struct(&schema_public(schema, view))),
+            None => Err(ApiError::not_found("schema not found")),
+        }
+    }
+
+    /// `DELETE /v1/projects/<p>/schemas/<id>`.
+    pub fn delete_schema(
+        &mut self,
+        project: &str,
+        schema_id: &str,
+    ) -> Result<RestResponse, ApiError> {
+        if !paths::valid_project_id(project) {
+            return Err(ApiError::invalid_argument("invalid project name"));
+        }
+        if !paths::valid_resource_id(schema_id) {
+            return Err(ApiError::invalid_argument("invalid schema name"));
+        }
+        let name = paths::schema_name(project, schema_id);
+        if !self.schemas.contains_key(&name) {
+            return Err(ApiError::not_found("schema not found"));
+        }
+        let removed = self.schemas.remove(&name);
+        if let Err(err) = self.persist() {
+            if let Some(s) = removed {
+                self.schemas.insert(name, s);
+            }
+            return Err(err);
+        }
+        Ok(RestResponse::no_content())
+    }
+
+    /// `GET /v1/projects/<p>/schemas` — list schemas (`view` applied).
+    pub fn list_schemas(
+        &self,
+        project: &str,
+        view: &str,
+        page_size: i64,
+        page_token: i64,
+    ) -> Result<RestResponse, ApiError> {
+        if !paths::valid_project_id(project) {
+            return Err(ApiError::invalid_argument("invalid project name"));
+        }
+        let schemas: Vec<Schema> = self
+            .schemas
+            .values()
+            .filter(|s| paths::resource_project(&s.name) == project)
+            .map(|s| schema_public(s, view))
+            .collect();
+        let (start, end, next) = page_bounds(schemas.len(), page_token, page_size);
+        Ok(RestResponse::ok_struct(
+            &crate::responses::ListSchemasResponse {
+                next_page_token: next,
+                schemas: schemas[start..end].to_vec(),
+            },
+        ))
+    }
+
+    /// `POST /v1/projects/<p>/schemas:validateMessage`.
+    pub fn validate_message(
+        &self,
+        project: &str,
+        request: &Value,
+    ) -> Result<RestResponse, ApiError> {
+        if !paths::valid_project_id(project) {
+            return Err(ApiError::invalid_argument("invalid project name"));
+        }
+        let obj = request.as_object().cloned().unwrap_or_default();
+        let name = obj.get("name").and_then(Value::as_str).unwrap_or("");
+        let schema_val = obj.get("schema");
+        let inline: Schema = schema_val
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default();
+        let has_inline = !schema_is_empty(&inline);
+        let message = obj.get("message").and_then(Value::as_str).unwrap_or("");
+        let encoding = obj.get("encoding").and_then(Value::as_str).unwrap_or("");
+
+        if name.is_empty() && !has_inline {
+            return Err(ApiError::invalid_argument(
+                "schema name or inline schema is required",
+            ));
+        }
+        if !name.is_empty() && has_inline {
+            return Err(ApiError::invalid_argument(
+                "only one of schema name or inline schema may be set",
+            ));
+        }
+        if !encoding.is_empty() && !crate::validation::valid_schema_encoding(encoding) {
+            return Err(ApiError::invalid_argument("invalid schema encoding"));
+        }
+        if !message.is_empty() {
+            let decoded = crate::validation::decode_base64_bytes(message)
+                .ok_or_else(|| ApiError::invalid_argument("message must be base64 encoded"))?;
+            if !crate::validation::valid_schema_message_data(&decoded, encoding) {
+                return Err(ApiError::invalid_argument(
+                    "message is invalid for schema encoding",
+                ));
+            }
+        }
+        if !name.is_empty() {
+            if !paths::valid_full_schema_name(name) {
+                return Err(ApiError::invalid_argument("invalid schema name"));
+            }
+            if paths::resource_project(name) != project {
+                return Err(ApiError::failed_precondition(
+                    "schema belongs to a different project",
+                ));
+            }
+            if !self.schemas.contains_key(name) {
+                return Err(ApiError::not_found("schema not found"));
+            }
+            return Ok(RestResponse::ok_struct(&serde_json::Map::new()));
+        }
+        if !inline.name.is_empty() {
+            if !paths::valid_full_schema_name(&inline.name) {
+                return Err(ApiError::invalid_argument("invalid schema name"));
+            }
+            if paths::resource_project(&inline.name) != project {
+                return Err(ApiError::failed_precondition(
+                    "schema belongs to a different project",
+                ));
+            }
+        }
+        if !crate::validation::valid_schema_type(&inline.type_) {
+            return Err(ApiError::invalid_argument("invalid schema type"));
+        }
+        crate::validation::validate_schema_definition(&inline.type_, &inline.definition)?;
+        Ok(RestResponse::ok_struct(&serde_json::Map::new()))
+    }
+
     /// The configured (defaulted) project, for tests/handlers.
     pub fn default_project(&self) -> &str {
         self.config.project()
     }
+}
+
+/// A snapshot with `deliveries` hidden, mirroring `snapshotResource.public()`.
+fn snapshot_public(snapshot: &Snapshot) -> Snapshot {
+    Snapshot {
+        deliveries: Vec::new(),
+        ..snapshot.clone()
+    }
+}
+
+/// A schema with `definition` hidden for `BASIC` view, mirroring
+/// `schemaResource.public(view)`.
+fn schema_public(schema: &Schema, view: &str) -> Schema {
+    if view == "BASIC" {
+        Schema {
+            definition: String::new(),
+            ..schema.clone()
+        }
+    } else {
+        schema.clone()
+    }
+}
+
+/// True when a schema resource carries no content, mirroring `emptySchemaResource`.
+fn schema_is_empty(schema: &Schema) -> bool {
+    schema.name.is_empty()
+        && schema.type_.is_empty()
+        && schema.definition.is_empty()
+        && schema.revision_id.is_empty()
+        && schema.revision_create_time.is_empty()
+        && schema.revisions.is_empty()
 }
 
 /// Normalizes an optional any-map to `Some(empty-removed)` matching Go's
