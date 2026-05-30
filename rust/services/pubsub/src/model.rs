@@ -19,6 +19,7 @@ fn is_zero(n: &i64) -> bool {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Topic {
     pub name: String,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -56,6 +57,7 @@ pub struct Topic {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Subscription {
     pub name: String,
     pub topic: String,
@@ -134,6 +136,7 @@ pub struct Subscription {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Snapshot {
     pub name: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -153,6 +156,7 @@ pub struct Snapshot {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SchemaRevision {
     #[serde(rename = "type", default, skip_serializing_if = "String::is_empty")]
     pub type_: String,
@@ -173,6 +177,7 @@ pub struct SchemaRevision {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Schema {
     pub name: String,
     #[serde(rename = "type", default, skip_serializing_if = "String::is_empty")]
@@ -196,6 +201,7 @@ pub struct Schema {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct PubsubMessage {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub data: String,

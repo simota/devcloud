@@ -1,0 +1,37 @@
+//! Typed list-response envelopes.
+//!
+//! Go builds list bodies as `map[string]any{"<collection>": [...],
+//! "nextPageToken": ...}`. `json.Encoder` sorts the **map** keys but keeps each
+//! element struct's fields in declaration order. Routing the element structs
+//! through `serde_json::Value` would re-sort their fields, so these envelopes
+//! serialize the typed structs directly. `nextPageToken` sorts before every
+//! collection name (`snapshots`/`subscriptions`/`topics`), so declaring it first
+//! reproduces Go's sorted-key output.
+
+use serde::Serialize;
+
+use crate::model::Topic;
+
+/// `{"nextPageToken": ..., "topics": [...]}`.
+#[derive(Debug, Serialize)]
+pub struct ListTopicsResponse {
+    #[serde(rename = "nextPageToken")]
+    pub next_page_token: String,
+    pub topics: Vec<Topic>,
+}
+
+/// `{"nextPageToken": ..., "subscriptions": [...]}` of subscription names.
+#[derive(Debug, Serialize)]
+pub struct ListSubscriptionNamesResponse {
+    #[serde(rename = "nextPageToken")]
+    pub next_page_token: String,
+    pub subscriptions: Vec<String>,
+}
+
+/// `{"nextPageToken": ..., "snapshots": [...]}` of snapshot names.
+#[derive(Debug, Serialize)]
+pub struct ListSnapshotNamesResponse {
+    #[serde(rename = "nextPageToken")]
+    pub next_page_token: String,
+    pub snapshots: Vec<String>,
+}
