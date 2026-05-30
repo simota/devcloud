@@ -49,7 +49,7 @@ fn read_object_metadata_for_version_list(path: &Path, default_vid: &str) -> Resu
 }
 
 impl FileBucketStore {
-    fn require_bucket_and_key(&self, bucket: &str, key: &str) -> Result<()> {
+    pub(crate) fn require_bucket_and_key(&self, bucket: &str, key: &str) -> Result<()> {
         if !valid_bucket_name(bucket) {
             return Err(StoreError::InvalidBucketName);
         }
@@ -437,7 +437,12 @@ impl FileBucketStore {
         read_object(&self.object_path(bucket, key).join("object.json"))
     }
 
-    fn write_object_version(&self, object_path: &Path, object: &Object, body: &[u8]) -> Result<()> {
+    pub(crate) fn write_object_version(
+        &self,
+        object_path: &Path,
+        object: &Object,
+        body: &[u8],
+    ) -> Result<()> {
         if object.version_id.is_empty() {
             return Ok(());
         }

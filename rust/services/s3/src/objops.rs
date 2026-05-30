@@ -29,6 +29,20 @@ pub struct PutObjectInput {
     pub legal_hold: ObjectLegalHold,
 }
 
+/// Input to `FileBucketStore::create_multipart_upload` (the Go
+/// `CreateMultipartUploadInput`).
+#[derive(Debug, Default, Clone)]
+pub struct CreateMultipartUploadInput {
+    pub bucket: String,
+    pub key: String,
+    pub content_type: String,
+    pub content_encoding: String,
+    pub cache_control: String,
+    pub content_disposition: String,
+    pub metadata: BTreeMap<String, String>,
+    pub encryption: ServerSideEncryption,
+}
+
 /// Input to `FileBucketStore::update_object_metadata` (the Go
 /// `UpdateObjectMetadataInput`).
 #[derive(Debug, Default, Clone)]

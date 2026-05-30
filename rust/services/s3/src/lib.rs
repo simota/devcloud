@@ -16,6 +16,7 @@ pub mod model;
 pub mod objops;
 pub mod store;
 pub mod store_config;
+pub mod store_multipart;
 pub mod store_objects;
 pub mod time_fmt;
 pub mod validation;

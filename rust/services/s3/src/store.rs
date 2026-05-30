@@ -46,6 +46,10 @@ pub enum StoreError {
     ContentMd5Mismatch,
     ObjectLocked,
     VersionIdRequired,
+    InvalidUploadId,
+    InvalidPartNumber,
+    MultipartUploadNotExist,
+    InvalidPart(i64),
     Io(io::Error),
 }
 
