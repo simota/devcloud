@@ -1,0 +1,22 @@
+{
+  "bucket": "my-bucket",
+  "key": "path/to/object.txt",
+  "etag": "\"9a0364b9e99bb480dd25e1f0284c8555\"",
+  "size": 7,
+  "createdAt": "2026-05-30T12:00:00.123456789Z",
+  "lastModified": "2026-05-30T12:00:00.123456789Z",
+  "updatedAt": "2026-05-30T12:00:00.123456789Z",
+  "metageneration": 1,
+  "contentType": "application/octet-stream",
+  "crc32c": "Ya91Mw==",
+  "metadata": {
+    "x-amz-meta-baz": "qux",
+    "x-amz-meta-foo": "bar"
+  },
+  "encryption": {
+    "algorithm": "AES256",
+    "bucketKeyEnabled": true
+  },
+  "retention": {},
+  "legalHold": {}
+}

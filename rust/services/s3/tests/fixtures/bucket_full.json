@@ -1,0 +1,16 @@
+{
+  "name": "my-bucket",
+  "createdAt": "2026-05-30T12:00:00.123456789Z",
+  "versioning": "Enabled",
+  "acl": "public-read",
+  "objectLockConfig": {
+    "xmlns": "http://s3.amazonaws.com/doc/2006-03-01/",
+    "objectLockEnabled": "Enabled",
+    "rule": {
+      "defaultRetention": {
+        "mode": "GOVERNANCE",
+        "days": 30
+      }
+    }
+  }
+}

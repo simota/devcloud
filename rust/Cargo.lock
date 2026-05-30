@@ -95,6 +95,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "devcloud-s3"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "hmac",
+ "md-5",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+]
+
+[[package]]
 name = "devcloud-sqs"
 version = "0.1.0"
 dependencies = [
