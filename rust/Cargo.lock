@@ -84,6 +84,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "devcloud-pubsub"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+]
+
+[[package]]
 name = "devcloud-sqs"
 version = "0.1.0"
 dependencies = [
