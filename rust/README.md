@@ -23,6 +23,11 @@ rust/
     pubsub/                  # increment #5 — Pub/Sub REST protocol (topics,
                              #   subscriptions, snapshots, schemas, messages, IAM,
                              #   seek); gRPC stays on the Go engine
+    s3/                      # increment #7 — S3 full gate parity: bucket/object
+                             #   APIs, versioning, policy/ACL, lifecycle,
+                             #   notification metadata, inventory/analytics,
+                             #   replication, multipart, select, object lock,
+                             #   SigV4, daemon seam, dashboard event bridge
 ```
 
 ## Migration order
@@ -44,7 +49,12 @@ Leaf → hub, per the Phase 1 dependency analysis:
    the Go engine (avoids the tonic/prost + icu transitive-resolution risk); the
    REST seam switches only the REST port.
 6. redis — passthrough proxy
-7. s3 — **hub**: owns the `BucketStore` boundary
+7. **s3** ✅ — **hub**: owns the `BucketStore` boundary. The Rust engine now
+   passes the S3 full acceptance gate: bucket/object CRUD, listing, metadata,
+   range GET, copy, presigned URLs, multipart, versioning, policy/ACL,
+   lifecycle, notification metadata, select, replication, object lock,
+   dashboard API/page smoke, strict SigV4 header auth, daemon seam, inherited
+   auth/region config, and dashboard SSE event bridging.
 8. gcs, bigquery, redshift — depend on s3 / pgwire / managed Postgres
 
 ## Parity discipline
@@ -75,6 +85,7 @@ DEVCLOUD_AAS_ENGINE=rust      DEVCLOUD_AAS_RUST_BIN=rust/target/debug/devcloud-a
 DEVCLOUD_SQS_ENGINE=rust      DEVCLOUD_SQS_RUST_BIN=rust/target/debug/devcloud-sqs \
 DEVCLOUD_DYNAMODB_ENGINE=rust DEVCLOUD_DYNAMODB_RUST_BIN=rust/target/debug/devcloud-dynamodb \
 DEVCLOUD_PUBSUB_ENGINE=rust   DEVCLOUD_PUBSUB_RUST_BIN=rust/target/debug/devcloud-pubsub \
+DEVCLOUD_S3_ENGINE=rust       DEVCLOUD_S3_RUST_BIN=rust/target/debug/devcloud-s3 \
   go run ./cmd/devcloud up
 ```
 
@@ -85,6 +96,6 @@ gets a documented `501 NotImplemented`; the DynamoDB Rust engine likewise serves
 only the JSON 1.0 protocol (which is the only protocol the Go engine speaks); the
 **Pub/Sub Rust engine serves only the REST protocol** — when enabled, the
 in-process Go server keeps serving gRPC while the Rust subprocess takes over the
-REST port (both share `resources.json` / `pubsub.json`); and the in-process
-`events.Bus` SSE feed is not bridged to subprocesses (live dashboard events
-absent under a Rust engine; lists still update on refresh).
+REST port (both share `resources.json` / `pubsub.json`). The S3 Rust subprocess
+emits safe JSONL dashboard events for bucket/object create/delete, and the Go
+daemon forwards those into the in-process `events.Bus` SSE feed.

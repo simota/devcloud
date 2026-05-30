@@ -456,7 +456,7 @@ dashboard_s3_api() {
 }
 
 dashboard_s3_page() {
-  curl -fsS "${DASHBOARD_ENDPOINT}/s3" | grep -qi 'devcloud S3'
+  curl -fsS "${DASHBOARD_ENDPOINT}/dashboard/s3" | grep -qi 'devcloud Dashboard'
 }
 
 run_s3_core_checks() {

@@ -3,7 +3,11 @@
 //! byte-exact XML via [`crate::xml::encode`]; `omitempty` is applied by
 //! conditionally adding child elements.
 
-use crate::model::{Object, NULL_VERSION_ID};
+use crate::model::{
+    AnalyticsConfiguration, InventoryConfiguration, LifecycleConfiguration, MultipartPart,
+    MultipartUpload, NotificationConfiguration, NotificationFilter, Object, ObjectLegalHold,
+    ObjectLockConfiguration, ObjectRetention, ReplicationConfiguration, NULL_VERSION_ID,
+};
 use crate::percent::aws_percent_encode;
 use crate::xml::{encode, Element};
 use serde::{Deserialize, Serialize};
@@ -97,6 +101,311 @@ pub fn versioning_configuration(status: &str) -> Vec<u8> {
     encode(&el)
 }
 
+/// `<LifecycleConfiguration>` for `GET /<bucket>?lifecycle`.
+pub fn lifecycle_configuration(config: &LifecycleConfiguration) -> Vec<u8> {
+    let xmlns = if config.xmlns.is_empty() {
+        XMLNS
+    } else {
+        &config.xmlns
+    };
+    let mut el = Element::new("LifecycleConfiguration").attr("xmlns", xmlns);
+    for rule in &config.rules {
+        let mut rule_el = Element::new("Rule");
+        if !rule.id.is_empty() {
+            rule_el = rule_el.text_child("ID", &rule.id);
+        }
+        if !rule.prefix.is_empty() {
+            rule_el = rule_el.text_child("Prefix", &rule.prefix);
+        }
+        if !rule.filter.prefix.is_empty() {
+            rule_el =
+                rule_el.child(Element::new("Filter").text_child("Prefix", &rule.filter.prefix));
+        }
+        rule_el = rule_el.text_child("Status", &rule.status);
+        let mut expiration = Element::new("Expiration");
+        if let Some(days) = rule.expiration.days {
+            expiration = expiration.text_child("Days", &days.to_string());
+        }
+        if !rule.expiration.date.is_empty() {
+            expiration = expiration.text_child("Date", &rule.expiration.date);
+        }
+        el = el.child(rule_el.child(expiration));
+    }
+    encode(&el)
+}
+
+/// `<ObjectLockConfiguration>` for `GET /<bucket>?object-lock`.
+pub fn object_lock_configuration(config: &ObjectLockConfiguration) -> Vec<u8> {
+    let xmlns = if config.xmlns.is_empty() {
+        XMLNS
+    } else {
+        &config.xmlns
+    };
+    let mut el = Element::new("ObjectLockConfiguration").attr("xmlns", xmlns);
+    if !config.object_lock_enabled.is_empty() {
+        el = el.text_child("ObjectLockEnabled", &config.object_lock_enabled);
+    }
+    let retention = &config.rule.default_retention;
+    if !retention.mode.is_empty() || retention.days != 0 || retention.years != 0 {
+        let mut default_retention = Element::new("DefaultRetention");
+        if !retention.mode.is_empty() {
+            default_retention = default_retention.text_child("Mode", &retention.mode);
+        }
+        if retention.days != 0 {
+            default_retention = default_retention.text_child("Days", &retention.days.to_string());
+        }
+        if retention.years != 0 {
+            default_retention = default_retention.text_child("Years", &retention.years.to_string());
+        }
+        el = el.child(Element::new("Rule").child(default_retention));
+    }
+    encode(&el)
+}
+
+/// `<Retention>` for `GET /<bucket>/<key>?retention`.
+pub fn object_retention(retention: &ObjectRetention) -> Vec<u8> {
+    let mut el = Element::new("Retention");
+    if !retention.mode.is_empty() {
+        el = el.text_child("Mode", &retention.mode);
+    }
+    if !retention.retain_until_date.is_empty() {
+        el = el.text_child("RetainUntilDate", &retention.retain_until_date);
+    }
+    encode(&el)
+}
+
+/// `<LegalHold>` for `GET /<bucket>/<key>?legal-hold`.
+pub fn object_legal_hold(legal_hold: &ObjectLegalHold) -> Vec<u8> {
+    let mut el = Element::new("LegalHold");
+    if !legal_hold.status.is_empty() {
+        el = el.text_child("Status", &legal_hold.status);
+    }
+    encode(&el)
+}
+
+/// `<NotificationConfiguration>` for `GET /<bucket>?notification`.
+pub fn notification_configuration(config: &NotificationConfiguration) -> Vec<u8> {
+    let xmlns = if config.xmlns.is_empty() {
+        XMLNS
+    } else {
+        &config.xmlns
+    };
+    let mut el = Element::new("NotificationConfiguration").attr("xmlns", xmlns);
+    for topic in &config.topic_configurations {
+        let mut child = Element::new("TopicConfiguration");
+        if !topic.id.is_empty() {
+            child = child.text_child("Id", &topic.id);
+        }
+        child = child.text_child("Topic", &topic.topic);
+        for event in &topic.events {
+            child = child.text_child("Event", event);
+        }
+        child = notification_filter_child(child, &topic.filter);
+        el = el.child(child);
+    }
+    for queue in &config.queue_configurations {
+        let mut child = Element::new("QueueConfiguration");
+        if !queue.id.is_empty() {
+            child = child.text_child("Id", &queue.id);
+        }
+        child = child.text_child("Queue", &queue.queue);
+        for event in &queue.events {
+            child = child.text_child("Event", event);
+        }
+        child = notification_filter_child(child, &queue.filter);
+        el = el.child(child);
+    }
+    for lambda in &config.lambda_function_configurations {
+        let mut child = Element::new("CloudFunctionConfiguration");
+        if !lambda.id.is_empty() {
+            child = child.text_child("Id", &lambda.id);
+        }
+        child = child.text_child("CloudFunction", &lambda.lambda_function);
+        for event in &lambda.events {
+            child = child.text_child("Event", event);
+        }
+        child = notification_filter_child(child, &lambda.filter);
+        el = el.child(child);
+    }
+    if config.event_bridge_configuration.is_some() {
+        el = el.child(Element::new("EventBridgeConfiguration"));
+    }
+    encode(&el)
+}
+
+fn notification_filter_child(mut parent: Element, filter: &NotificationFilter) -> Element {
+    if filter.s3_key.rules.is_empty() {
+        return parent;
+    }
+    let mut s3_key = Element::new("S3Key");
+    for rule in &filter.s3_key.rules {
+        s3_key = s3_key.child(
+            Element::new("FilterRule")
+                .text_child("Name", &rule.name)
+                .text_child("Value", &rule.value),
+        );
+    }
+    parent = parent.child(Element::new("Filter").child(s3_key));
+    parent
+}
+
+/// `<InventoryConfiguration>` for `GET /<bucket>?inventory&id=...`.
+pub fn inventory_configuration(config: &InventoryConfiguration) -> Vec<u8> {
+    encode(&inventory_configuration_element(config).attr(
+        "xmlns",
+        if config.xmlns.is_empty() {
+            XMLNS
+        } else {
+            &config.xmlns
+        },
+    ))
+}
+
+/// `<ListInventoryConfigurationsResult>` for `GET /<bucket>?inventory`.
+pub fn list_inventory_configurations_result(configs: &[InventoryConfiguration]) -> Vec<u8> {
+    let mut el = Element::new("ListInventoryConfigurationsResult")
+        .attr("xmlns", XMLNS)
+        .text_child("IsTruncated", "false");
+    for config in configs {
+        el = el.child(inventory_configuration_element(config));
+    }
+    encode(&el)
+}
+
+fn inventory_configuration_element(config: &InventoryConfiguration) -> Element {
+    let mut el = Element::new("InventoryConfiguration");
+    if !config.id.is_empty() {
+        el = el.text_child("Id", &config.id);
+    }
+    el = el.text_child("IsEnabled", &bool_str(config.is_enabled));
+
+    let dest = &config.destination.s3_bucket_destination;
+    let mut s3_dest = Element::new("S3BucketDestination");
+    if !dest.account_id.is_empty() {
+        s3_dest = s3_dest.text_child("AccountId", &dest.account_id);
+    }
+    if !dest.bucket.is_empty() {
+        s3_dest = s3_dest.text_child("Bucket", &dest.bucket);
+    }
+    if !dest.format.is_empty() {
+        s3_dest = s3_dest.text_child("Format", &dest.format);
+    }
+    if !dest.prefix.is_empty() {
+        s3_dest = s3_dest.text_child("Prefix", &dest.prefix);
+    }
+    el = el.child(Element::new("Destination").child(s3_dest));
+
+    if !config.schedule.frequency.is_empty() {
+        el = el.child(Element::new("Schedule").text_child("Frequency", &config.schedule.frequency));
+    }
+    if !config.included_object_versions.is_empty() {
+        el = el.text_child("IncludedObjectVersions", &config.included_object_versions);
+    }
+    if !config.optional_fields.is_empty() {
+        let mut fields = Element::new("OptionalFields");
+        for field in &config.optional_fields {
+            fields = fields.text_child("Field", field);
+        }
+        el = el.child(fields);
+    }
+    el
+}
+
+/// `<AnalyticsConfiguration>` for `GET /<bucket>?analytics&id=...`.
+pub fn analytics_configuration(config: &AnalyticsConfiguration) -> Vec<u8> {
+    encode(&analytics_configuration_element(config).attr(
+        "xmlns",
+        if config.xmlns.is_empty() {
+            XMLNS
+        } else {
+            &config.xmlns
+        },
+    ))
+}
+
+/// `<ListAnalyticsConfigurationsResult>` for `GET /<bucket>?analytics`.
+pub fn list_analytics_configurations_result(configs: &[AnalyticsConfiguration]) -> Vec<u8> {
+    let mut el = Element::new("ListAnalyticsConfigurationsResult")
+        .attr("xmlns", XMLNS)
+        .text_child("IsTruncated", "false");
+    for config in configs {
+        el = el.child(analytics_configuration_element(config));
+    }
+    encode(&el)
+}
+
+fn analytics_configuration_element(config: &AnalyticsConfiguration) -> Element {
+    let mut el = Element::new("AnalyticsConfiguration");
+    if !config.id.is_empty() {
+        el = el.text_child("Id", &config.id);
+    }
+    if !config.filter.prefix.is_empty() {
+        el = el.child(Element::new("Filter").text_child("Prefix", &config.filter.prefix));
+    }
+
+    let export = &config.storage_class_analysis.data_export;
+    let dest = &export.destination.s3_bucket_destination;
+    let mut s3_dest = Element::new("S3BucketDestination");
+    if !dest.format.is_empty() {
+        s3_dest = s3_dest.text_child("Format", &dest.format);
+    }
+    if !dest.bucket.is_empty() {
+        s3_dest = s3_dest.text_child("Bucket", &dest.bucket);
+    }
+    if !dest.prefix.is_empty() {
+        s3_dest = s3_dest.text_child("Prefix", &dest.prefix);
+    }
+    let mut data_export = Element::new("DataExport");
+    if !export.output_schema_version.is_empty() {
+        data_export = data_export.text_child("OutputSchemaVersion", &export.output_schema_version);
+    }
+    data_export = data_export.child(Element::new("Destination").child(s3_dest));
+    el.child(Element::new("StorageClassAnalysis").child(data_export))
+}
+
+/// `<ReplicationConfiguration>` for `GET /<bucket>?replication`.
+pub fn replication_configuration(config: &ReplicationConfiguration) -> Vec<u8> {
+    let xmlns = if config.xmlns.is_empty() {
+        XMLNS
+    } else {
+        &config.xmlns
+    };
+    let mut el = Element::new("ReplicationConfiguration").attr("xmlns", xmlns);
+    if !config.role.is_empty() {
+        el = el.text_child("Role", &config.role);
+    }
+    for rule in &config.rules {
+        let mut child = Element::new("Rule");
+        if !rule.id.is_empty() {
+            child = child.text_child("ID", &rule.id);
+        }
+        if rule.priority != 0 {
+            child = child.text_child("Priority", &rule.priority.to_string());
+        }
+        if !rule.prefix.is_empty() {
+            child = child.text_child("Prefix", &rule.prefix);
+        }
+        if !rule.filter.prefix.is_empty() {
+            child = child.child(Element::new("Filter").text_child("Prefix", &rule.filter.prefix));
+        }
+        child = child.text_child("Status", &rule.status);
+        let mut destination =
+            Element::new("Destination").text_child("Bucket", &rule.destination.bucket);
+        if !rule.destination.storage_class.is_empty() {
+            destination = destination.text_child("StorageClass", &rule.destination.storage_class);
+        }
+        child = child.child(destination);
+        if !rule.delete_marker_replication.status.is_empty() {
+            child = child.child(
+                Element::new("DeleteMarkerReplication")
+                    .text_child("Status", &rule.delete_marker_replication.status),
+            );
+        }
+        el = el.child(child);
+    }
+    encode(&el)
+}
+
 /// `<CopyObjectResult>`.
 pub fn copy_object_result(last_modified: &str, etag: &str) -> Vec<u8> {
     encode(
@@ -104,6 +413,132 @@ pub fn copy_object_result(last_modified: &str, etag: &str) -> Vec<u8> {
             .text_child("LastModified", last_modified)
             .text_child("ETag", etag),
     )
+}
+
+/// `<InitiateMultipartUploadResult>`.
+pub fn initiate_multipart_upload_result(bucket: &str, key: &str, upload_id: &str) -> Vec<u8> {
+    encode(
+        &Element::new("InitiateMultipartUploadResult")
+            .attr("xmlns", XMLNS)
+            .text_child("Bucket", bucket)
+            .text_child("Key", key)
+            .text_child("UploadId", upload_id),
+    )
+}
+
+/// `<CompleteMultipartUploadResult>`.
+pub fn complete_multipart_upload_result(bucket: &str, key: &str, etag: &str) -> Vec<u8> {
+    encode(
+        &Element::new("CompleteMultipartUploadResult")
+            .attr("xmlns", XMLNS)
+            .text_child("Location", &format!("/{bucket}/{key}"))
+            .text_child("Bucket", bucket)
+            .text_child("Key", key)
+            .text_child("ETag", etag),
+    )
+}
+
+/// `<ListMultipartUploadsResult>`.
+pub fn list_multipart_uploads_result(bucket: &str, uploads: &[MultipartUpload]) -> Vec<u8> {
+    let mut el = Element::new("ListMultipartUploadsResult")
+        .attr("xmlns", XMLNS)
+        .text_child("Bucket", bucket)
+        .text_child("IsTruncated", "false");
+    for upload in uploads {
+        el = el.child(
+            Element::new("Upload")
+                .text_child("Key", &upload.key)
+                .text_child("UploadId", &upload.upload_id)
+                .text_child("Initiated", &seconds(&upload.created_at))
+                .text_child("StorageClass", "STANDARD"),
+        );
+    }
+    encode(&el)
+}
+
+/// `<ListPartsResult>`.
+pub fn list_parts_result(
+    upload: &MultipartUpload,
+    parts: &[MultipartPart],
+    part_number_marker: i64,
+    max_parts: i64,
+    is_truncated: bool,
+    next_part_number_marker: i64,
+) -> Vec<u8> {
+    let mut el = Element::new("ListPartsResult")
+        .attr("xmlns", XMLNS)
+        .text_child("Bucket", &upload.bucket)
+        .text_child("Key", &upload.key)
+        .text_child("UploadId", &upload.upload_id)
+        .text_child("PartNumberMarker", &part_number_marker.to_string());
+    if next_part_number_marker != 0 {
+        el = el.text_child("NextPartNumberMarker", &next_part_number_marker.to_string());
+    }
+    el = el
+        .text_child("MaxParts", &max_parts.to_string())
+        .text_child("IsTruncated", &bool_str(is_truncated));
+    for part in parts {
+        el = el.child(
+            Element::new("Part")
+                .text_child("PartNumber", &part.part_number.to_string())
+                .text_child("LastModified", &seconds(&part.last_modified))
+                .text_child("ETag", &part.etag)
+                .text_child("Size", &part.size.to_string()),
+        );
+    }
+    encode(&el)
+}
+
+/// Parses S3's `max-parts` query value: empty -> 1000, clamped to 1000,
+/// negative/malformed is an error. Mirrors the Go `parseMaxParts`.
+pub fn parse_max_parts(value: &str) -> Result<i64, InvalidMaxKeys> {
+    parse_max_keys(value)
+}
+
+/// Parses S3's `part-number-marker` query value.
+pub fn parse_part_number_marker(value: &str) -> Result<i64, InvalidMaxKeys> {
+    if value.is_empty() {
+        return Ok(0);
+    }
+    match value.parse::<i64>() {
+        Ok(n) if n >= 0 => Ok(n),
+        _ => Err(InvalidMaxKeys),
+    }
+}
+
+/// Paginates uploaded parts. Mirrors the Go `paginateParts`.
+pub fn paginate_parts(
+    parts: &[MultipartPart],
+    part_number_marker: i64,
+    max_parts: i64,
+) -> (Vec<MultipartPart>, bool, i64) {
+    if max_parts == 0 {
+        for part in parts {
+            if part.part_number > part_number_marker {
+                return (Vec::new(), true, part_number_marker);
+            }
+        }
+        return (Vec::new(), false, 0);
+    }
+    let mut page = Vec::new();
+    let mut next_part_number_marker = 0;
+    for part in parts {
+        if part.part_number <= part_number_marker {
+            continue;
+        }
+        if page.len() as i64 >= max_parts {
+            return (page, true, next_part_number_marker);
+        }
+        page.push(part.clone());
+        next_part_number_marker = part.part_number;
+    }
+    (page, false, 0)
+}
+
+fn seconds(value: &str) -> String {
+    crate::time_fmt::parse_rfc3339(value)
+        .map(|(secs, _)| crate::time_fmt::rfc3339_seconds_from_unix(secs))
+        .unwrap_or_else(|| value.to_string())
 }
 
 // --- object listing --------------------------------------------------------

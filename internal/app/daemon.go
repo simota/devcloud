@@ -277,7 +277,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 		}
 	}
 	if d.config.Services.S3.Enabled {
-		go func() { errCh <- s3Server.Run(ctx) }()
+		if binPath, ok := s3RustEngine(); ok {
+			go func() { errCh <- runS3Rust(ctx, d.config, binPath, bus) }()
+		} else {
+			go func() { errCh <- s3Server.Run(ctx) }()
+		}
 	}
 	if d.config.Services.GCS.Enabled {
 		go func() { errCh <- gcsServer.Run(ctx) }()

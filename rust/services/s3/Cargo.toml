@@ -2,7 +2,7 @@
 name = "devcloud-s3"
 version = "0.1.0"
 edition = "2021"
-description = "Rust reimplementation of the devcloud S3 service — strangler-fig increment #7 (the hub: owns the BucketStore boundary shared with gcs/bigquery/redshift). Part 1 foundation: Go-compatible JSON persistence + bucket/object model + validation + ETag/CRC32C helpers."
+description = "Rust reimplementation of the devcloud S3 service — strangler-fig increment #7 (the hub: owns the BucketStore boundary shared with gcs/bigquery/redshift). Passes the repo S3 full acceptance gate with HTTP parity, persistence parity, SigV4, daemon seam, and dashboard event bridging."
 
 [lib]
 name = "devcloud_s3"
