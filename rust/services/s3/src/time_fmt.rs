@@ -6,6 +6,10 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// Go's `time.Time` zero value, as rendered by `encoding/json`. Object metadata
+/// fields left unset (e.g. a delete marker's `createdAt`) serialize to this.
+pub const GO_ZERO_TIME: &str = "0001-01-01T00:00:00Z";
+
 /// Current UTC time as RFC3339Nano.
 pub fn now_rfc3339nano() -> String {
     let d = SystemTime::now()
@@ -68,6 +72,39 @@ pub fn parse_rfc3339(value: &str) -> Option<(i64, u32)> {
         padded[..9].parse().ok()?
     };
     Some((secs, nanos))
+}
+
+/// Reports whether RFC3339 time `a` is strictly after `b`, compared numerically
+/// (fractional precision varies, so a lexical compare would be wrong).
+/// Unparseable inputs sort before any valid time.
+pub fn time_after(a: &str, b: &str) -> bool {
+    parse_rfc3339(a).unwrap_or((i64::MIN, 0)) > parse_rfc3339(b).unwrap_or((i64::MIN, 0))
+}
+
+/// Formats UNIX seconds as RFC3339 (second precision, no fraction), matching
+/// Go's `t.Format(time.RFC3339)` for a UTC instant.
+pub fn rfc3339_seconds_from_unix(secs: i64) -> String {
+    let days = secs.div_euclid(86_400);
+    let sod = secs.rem_euclid(86_400);
+    let (y, m, d) = civil_from_days(days);
+    format!(
+        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z",
+        sod / 3600,
+        (sod % 3600) / 60,
+        sod % 60
+    )
+}
+
+/// Adds `years` calendar years to an RFC3339(/Nano) timestamp, normalizing
+/// day overflow like Go's `time.Time.AddDate(years, 0, 0)`, and returns RFC3339
+/// (second precision). `None` if `value` does not parse.
+pub fn add_calendar_years_rfc3339(value: &str, years: i64) -> Option<String> {
+    let (secs, _) = parse_rfc3339(value)?;
+    let days = secs.div_euclid(86_400);
+    let sod = secs.rem_euclid(86_400);
+    let (y, m, d) = civil_from_days(days);
+    let serial = days_from_civil(y + years, m, d);
+    Some(rfc3339_seconds_from_unix(serial * 86_400 + sod))
 }
 
 /// Hinnant days-from-civil: (year, month, day) -> days since the UNIX epoch.

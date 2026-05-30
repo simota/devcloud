@@ -9,9 +9,13 @@ use crate::go_json;
 use crate::model::Bucket;
 use crate::time_fmt::now_rfc3339nano;
 use crate::validation::valid_bucket_name;
+use std::collections::VecDeque;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// The metadata sidecar files (and `inventory`/`analytics` directories) that do
 /// not count toward bucket emptiness — a bucket carrying only these is deletable.
@@ -38,6 +42,10 @@ pub enum StoreError {
     InvalidObjectKey,
     BucketNotEmpty,
     BucketNotExist,
+    InvalidContentMd5,
+    ContentMd5Mismatch,
+    ObjectLocked,
+    VersionIdRequired,
     Io(io::Error),
 }
 
@@ -54,6 +62,11 @@ pub struct FileBucketStore {
     /// Test hook: when set, `created_at` uses this fixed RFC3339Nano timestamp
     /// instead of the wall clock, so on-disk metadata is byte-deterministic.
     fixed_now: Option<String>,
+    /// Test hook: a queue of version IDs to hand out (in order) instead of
+    /// random ones, so versioned on-disk trees are deterministic.
+    fixed_version_ids: Mutex<VecDeque<String>>,
+    /// Monotonic counter mixed into random version-ID generation.
+    id_counter: AtomicU64,
 }
 
 impl FileBucketStore {
@@ -61,6 +74,8 @@ impl FileBucketStore {
         FileBucketStore {
             root: root.into(),
             fixed_now: None,
+            fixed_version_ids: Mutex::new(VecDeque::new()),
+            id_counter: AtomicU64::new(0),
         }
     }
 
@@ -69,8 +84,40 @@ impl FileBucketStore {
         self.fixed_now = Some(ts.to_string());
     }
 
-    fn now(&self) -> String {
+    /// Queues version IDs to be returned (in order) by `new_version_id`, for
+    /// deterministic versioned trees in tests.
+    pub fn push_version_ids(&self, ids: &[&str]) {
+        let mut q = self.fixed_version_ids.lock().unwrap();
+        for id in ids {
+            q.push_back((*id).to_string());
+        }
+    }
+
+    pub(crate) fn now(&self) -> String {
         self.fixed_now.clone().unwrap_or_else(now_rfc3339nano)
+    }
+
+    /// A new 32-hex version/upload ID. Uses the test queue when primed, otherwise
+    /// 16 random bytes (matching the Go `newUploadID`/`newVersionID` format).
+    pub(crate) fn new_version_id(&self) -> String {
+        if let Some(id) = self.fixed_version_ids.lock().unwrap().pop_front() {
+            return id;
+        }
+        let seq = self.id_counter.fetch_add(1, Ordering::Relaxed);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+        let mut state = nanos ^ seq.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let mut bytes = [0u8; 16];
+        bytes[..8].copy_from_slice(&splitmix64(&mut state).to_be_bytes());
+        bytes[8..].copy_from_slice(&splitmix64(&mut state).to_be_bytes());
+        hex::encode(bytes)
+    }
+
+    pub(crate) fn write_json<T: serde::Serialize>(path: &Path, value: &T) -> Result<()> {
+        fs::write(path, go_json::to_vec_indent(value))?;
+        Ok(())
     }
 
     // --- path layout --------------------------------------------------------
@@ -106,13 +153,6 @@ impl FileBucketStore {
         self.multipart_upload_path(bucket, upload_id)
             .join("parts")
             .join(format!("{part_number:05}"))
-    }
-
-    // --- metadata io --------------------------------------------------------
-
-    fn write_json<T: serde::Serialize>(path: &Path, value: &T) -> Result<()> {
-        fs::write(path, go_json::to_vec_indent(value))?;
-        Ok(())
     }
 
     // --- bucket CRUD --------------------------------------------------------
@@ -217,12 +257,16 @@ impl FileBucketStore {
     }
 }
 
-fn remove_if_exists(path: &Path) -> Result<()> {
+pub(crate) fn remove_if_exists(path: &Path) -> Result<()> {
     match fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(StoreError::Io(e)),
     }
+}
+
+pub(crate) fn remove_dir_all_ignoring_missing(path: &Path) -> Result<()> {
+    remove_dir_all_if_exists(path)
 }
 
 fn remove_dir_all_if_exists(path: &Path) -> Result<()> {
@@ -231,4 +275,12 @@ fn remove_dir_all_if_exists(path: &Path) -> Result<()> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(StoreError::Io(e)),
     }
+}
+
+fn splitmix64(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
 }
