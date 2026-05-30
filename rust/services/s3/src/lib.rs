@@ -13,5 +13,6 @@ pub mod base64;
 pub mod go_json;
 pub mod hashes;
 pub mod model;
+pub mod store;
 pub mod time_fmt;
 pub mod validation;
