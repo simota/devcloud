@@ -61,6 +61,12 @@ pub fn to_vec_indent<T: Serialize>(value: &T) -> Vec<u8> {
     buf
 }
 
+/// Compact JSON + Go HTML escaping, no trailing newline — matches `json.Marshal`
+/// (used for the listing continuation token).
+pub fn to_vec_compact<T: Serialize>(value: &T) -> Vec<u8> {
+    html_escape(serde_json::to_vec(value).expect("serialize json"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
