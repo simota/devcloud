@@ -1,0 +1,23 @@
+{
+  "messages": [
+    {
+      "data": "aGVsbG8=",
+      "messageId": "1",
+      "publishTime": "2026-05-30T12:00:00Z"
+    }
+  ],
+  "deliveries": {
+    "projects/devcloud/subscriptions/sub1": [
+      {
+        "MessageID": "1",
+        "AckID": "1-2",
+        "LeaseDeadline": "2026-05-30T12:00:25Z",
+        "NextDeliveryTime": "0001-01-01T00:00:00Z",
+        "DeliveryAttempt": 2,
+        "Acked": false
+      }
+    ]
+  },
+  "nextMessageId": 1,
+  "nextAckId": 2
+}

@@ -16,7 +16,7 @@ use serde_json::Value;
 use crate::errors::ApiError;
 use crate::model::{Schema, Snapshot, Subscription, Topic};
 use crate::paths;
-use crate::persistence::ResourceFile;
+use crate::persistence::{MessageStateFile, ResourceFile};
 
 /// Default project, defaulted like Go's `defaultString(cfg.Project, "devcloud")`.
 const DEFAULT_PROJECT: &str = "devcloud";
@@ -72,6 +72,10 @@ pub struct Server {
     pub(crate) subscriptions: BTreeMap<String, Subscription>,
     pub(crate) snapshots: BTreeMap<String, Snapshot>,
     pub(crate) schemas: BTreeMap<String, Schema>,
+    pub(crate) messages: BTreeMap<String, crate::model::PubsubMessage>,
+    pub(crate) deliveries: BTreeMap<String, Vec<crate::model::DeliveryRecord>>,
+    next_message_id: u64,
+    next_ack_id: u64,
     load_err: Option<String>,
     /// Test hook for `createdAt`/`updatedAt` (RFC3339Nano string).
     fixed_now: Option<String>,
@@ -85,6 +89,10 @@ impl Server {
             subscriptions: BTreeMap::new(),
             snapshots: BTreeMap::new(),
             schemas: BTreeMap::new(),
+            messages: BTreeMap::new(),
+            deliveries: BTreeMap::new(),
+            next_message_id: 0,
+            next_ack_id: 0,
             load_err: None,
             fixed_now: None,
         };
@@ -112,66 +120,187 @@ impl Server {
             .unwrap_or_else(crate::time_fmt::now_rfc3339nano)
     }
 
+    /// Current time as `(unix_secs, nanos)` for delivery arithmetic.
+    fn now_parts(&self) -> (i64, u32) {
+        crate::time_fmt::parse_rfc3339(&self.now()).unwrap_or((0, 0))
+    }
+
     fn resource_file_path(&self) -> std::path::PathBuf {
         std::path::Path::new(&self.config.storage_path).join("resources.json")
     }
 
+    fn message_state_file_path(&self) -> std::path::PathBuf {
+        std::path::Path::new(&self.config.message_storage_path).join("pubsub.json")
+    }
+
     fn load(&mut self) -> Result<(), String> {
-        if self.config.storage_path.is_empty() {
+        if !self.config.storage_path.is_empty() {
+            match std::fs::read(self.resource_file_path()) {
+                Ok(data) => {
+                    let file = ResourceFile::from_slice(&data).map_err(|e| e.to_string())?;
+                    for t in file.topics {
+                        if !t.name.is_empty() {
+                            self.topics.insert(t.name.clone(), t);
+                        }
+                    }
+                    for sub in file.subscriptions {
+                        if !sub.name.is_empty() {
+                            self.subscriptions.insert(sub.name.clone(), sub);
+                        }
+                    }
+                    for snap in file.snapshots {
+                        if !snap.name.is_empty() {
+                            self.snapshots.insert(snap.name.clone(), snap);
+                        }
+                    }
+                    for sch in file.schemas {
+                        if !sch.name.is_empty() {
+                            self.schemas.insert(sch.name.clone(), sch);
+                        }
+                    }
+                    // When message state lives in resources.json (no separate
+                    // message store), load it here.
+                    if self.config.message_storage_path.is_empty() {
+                        self.load_message_state(
+                            file.messages,
+                            file.deliveries,
+                            file.next_message_id,
+                            file.next_ack_id,
+                        );
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.to_string()),
+            }
+        }
+        if self.config.message_storage_path.is_empty() {
             return Ok(());
         }
-        let data = match std::fs::read(self.resource_file_path()) {
-            Ok(d) => d,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        match std::fs::read(self.message_state_file_path()) {
+            Ok(data) => {
+                let file = MessageStateFile::from_slice(&data).map_err(|e| e.to_string())?;
+                self.messages.clear();
+                self.deliveries.clear();
+                self.next_message_id = 0;
+                self.load_message_state(
+                    file.messages,
+                    file.deliveries,
+                    file.next_message_id,
+                    file.next_ack_id,
+                );
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(e.to_string()),
-        };
-        let file = ResourceFile::from_slice(&data).map_err(|e| e.to_string())?;
-        for t in file.topics {
-            if !t.name.is_empty() {
-                self.topics.insert(t.name.clone(), t);
-            }
-        }
-        for sub in file.subscriptions {
-            if !sub.name.is_empty() {
-                self.subscriptions.insert(sub.name.clone(), sub);
-            }
-        }
-        for snap in file.snapshots {
-            if !snap.name.is_empty() {
-                self.snapshots.insert(snap.name.clone(), snap);
-            }
-        }
-        for sch in file.schemas {
-            if !sch.name.is_empty() {
-                self.schemas.insert(sch.name.clone(), sch);
-            }
         }
         Ok(())
     }
 
-    /// Persists `resources.json` byte-compatibly with `saveResourcesLocked`
-    /// (topics/subscriptions/snapshots/schemas, sorted by name). Message state is
-    /// handled by later parts; here we only carry the resource file.
-    pub(crate) fn persist(&self) -> Result<(), ApiError> {
-        if self.config.storage_path.is_empty() {
+    fn load_message_state(
+        &mut self,
+        messages: Vec<crate::model::PubsubMessage>,
+        deliveries: BTreeMap<String, Vec<crate::model::DeliveryRecord>>,
+        next_message_id: u64,
+        next_ack_id: u64,
+    ) {
+        for m in messages {
+            if !m.message_id.is_empty() {
+                if let Ok(id) = m.message_id.parse::<u64>() {
+                    if id > self.next_message_id {
+                        self.next_message_id = id;
+                    }
+                }
+                self.messages.insert(m.message_id.clone(), m);
+            }
+        }
+        for (sub, records) in deliveries {
+            if !sub.is_empty() {
+                self.deliveries.insert(sub, records);
+            }
+        }
+        if next_message_id > self.next_message_id {
+            self.next_message_id = next_message_id;
+        }
+        self.next_ack_id = next_ack_id;
+    }
+
+    /// Persists state byte-compatibly with `saveResourcesLocked`: resources.json
+    /// (topics/subscriptions/snapshots/schemas, plus message state when no
+    /// separate message store) and pubsub.json (message state) when a message
+    /// store is configured. Cleanup of unreferenced messages runs first.
+    pub(crate) fn persist(&mut self) -> Result<(), ApiError> {
+        if self.config.storage_path.is_empty() && self.config.message_storage_path.is_empty() {
+            self.cleanup_unreferenced_messages();
             return Ok(());
         }
-        std::fs::create_dir_all(&self.config.storage_path)
+        self.cleanup_unreferenced_messages();
+
+        let messages: Vec<crate::model::PubsubMessage> = self.messages.values().cloned().collect();
+        let deliveries: BTreeMap<String, Vec<crate::model::DeliveryRecord>> = self
+            .deliveries
+            .iter()
+            .filter(|(_, r)| !r.is_empty())
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        let include_message_state = self.config.message_storage_path.is_empty();
+
+        if !self.config.storage_path.is_empty() {
+            std::fs::create_dir_all(&self.config.storage_path)
+                .map_err(|_| ApiError::internal("pubsub resource store unavailable"))?;
+            let mut file = ResourceFile {
+                topics: self.topics.values().cloned().collect(),
+                subscriptions: self.subscriptions.values().cloned().collect(),
+                snapshots: self.snapshots.values().cloned().collect(),
+                schemas: self.schemas.values().cloned().collect(),
+                ..Default::default()
+            };
+            if include_message_state {
+                file.messages = messages.clone();
+                file.deliveries = deliveries.clone();
+                file.next_message_id = self.next_message_id;
+                file.next_ack_id = self.next_ack_id;
+            }
+            write_atomic(&self.resource_file_path(), &file.to_bytes())?;
+        }
+        if self.config.message_storage_path.is_empty() {
+            return Ok(());
+        }
+        std::fs::create_dir_all(&self.config.message_storage_path)
             .map_err(|_| ApiError::internal("pubsub resource store unavailable"))?;
-        let file = ResourceFile {
-            topics: self.topics.values().cloned().collect(),
-            subscriptions: self.subscriptions.values().cloned().collect(),
-            snapshots: self.snapshots.values().cloned().collect(),
-            schemas: self.schemas.values().cloned().collect(),
-            ..Default::default()
+        let msg_file = MessageStateFile {
+            messages,
+            deliveries,
+            next_message_id: self.next_message_id,
+            next_ack_id: self.next_ack_id,
         };
-        let bytes = file.to_bytes();
-        let tmp = self.resource_file_path().with_extension("json.tmp");
-        std::fs::write(&tmp, &bytes)
-            .map_err(|_| ApiError::internal("pubsub resource store unavailable"))?;
-        std::fs::rename(&tmp, self.resource_file_path())
-            .map_err(|_| ApiError::internal("pubsub resource store unavailable"))?;
-        Ok(())
+        write_atomic(&self.message_state_file_path(), &msg_file.to_bytes())
+    }
+
+    /// Drops messages no subscription/snapshot references, mirroring
+    /// `cleanupUnreferencedMessagesLocked`.
+    fn cleanup_unreferenced_messages(&mut self) {
+        if self.messages.is_empty() {
+            return;
+        }
+        let mut referenced: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for (sub_name, records) in &self.deliveries {
+            let retain_acked = self
+                .subscriptions
+                .get(sub_name)
+                .map(|s| s.retain_acked_messages)
+                .unwrap_or(false);
+            for r in records {
+                if r.acked && !retain_acked {
+                    continue;
+                }
+                referenced.insert(r.message_id.clone());
+            }
+        }
+        for snap in self.snapshots.values() {
+            for r in &snap.deliveries {
+                referenced.insert(r.message_id.clone());
+            }
+        }
+        self.messages.retain(|id, _| referenced.contains(id));
     }
 
     // --- topic operations -------------------------------------------------
@@ -1114,9 +1243,570 @@ impl Server {
         Ok(RestResponse::ok_struct(&serde_json::Map::new()))
     }
 
+    // --- message operations -----------------------------------------------
+
+    fn default_ack_deadline_cfg(&self) -> i64 {
+        if self.config.default_ack_deadline_seconds > 0 {
+            self.config.default_ack_deadline_seconds
+        } else {
+            10
+        }
+    }
+
+    fn max_pull_messages(&self) -> i64 {
+        if self.config.max_pull_messages > 0 {
+            self.config.max_pull_messages
+        } else {
+            1000
+        }
+    }
+
+    /// `POST /v1/projects/<p>/topics/<id>:publish`.
+    pub fn publish(
+        &mut self,
+        project: &str,
+        topic_id: &str,
+        messages: &[Value],
+    ) -> Result<RestResponse, ApiError> {
+        if !paths::valid_resource_id(topic_id) {
+            return Err(ApiError::invalid_argument("invalid topic name"));
+        }
+        if !paths::valid_project_id(project) {
+            return Err(ApiError::invalid_argument("invalid project name"));
+        }
+        let name = paths::topic_name(project, topic_id);
+        if messages.is_empty() {
+            return Err(ApiError::invalid_argument("messages are required"));
+        }
+        for m in messages {
+            let data = m.get("data").and_then(Value::as_str).unwrap_or("");
+            let attrs = m.get("attributes").and_then(Value::as_object);
+            validate_publish_message(data, attrs)?;
+        }
+        let Some(topic) = self.topics.get(&name).cloned() else {
+            return Err(ApiError::not_found("topic not found"));
+        };
+        for m in messages {
+            let data = m.get("data").and_then(Value::as_str).unwrap_or("");
+            validate_message_against_topic_schema(data, topic.schema_settings.as_ref())?;
+        }
+        let now = self.now();
+        let mut message_ids = Vec::with_capacity(messages.len());
+        for incoming in messages {
+            self.next_message_id += 1;
+            let message_id = self.next_message_id.to_string();
+            let attributes: BTreeMap<String, String> = incoming
+                .get("attributes")
+                .and_then(Value::as_object)
+                .map(|o| {
+                    o.iter()
+                        .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let message = crate::model::PubsubMessage {
+                data: incoming
+                    .get("data")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                attributes,
+                message_id: message_id.clone(),
+                publish_time: now.clone(),
+                ordering_key: incoming
+                    .get("orderingKey")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+            };
+            self.messages.insert(message_id.clone(), message.clone());
+            let matched: Vec<String> = self
+                .subscriptions
+                .values()
+                .filter(|sub| {
+                    sub.topic == name
+                        && !sub.detached
+                        && subscription_matches_message(sub, &message)
+                })
+                .map(|sub| sub.name.clone())
+                .collect();
+            for sub_name in matched {
+                self.deliveries
+                    .entry(sub_name)
+                    .or_default()
+                    .push(crate::model::DeliveryRecord {
+                        message_id: message_id.clone(),
+                        ..Default::default()
+                    });
+            }
+            message_ids.push(message_id);
+        }
+        self.persist()?;
+        Ok(RestResponse::ok_struct(&serde_json::json!({
+            "messageIds": message_ids,
+        })))
+    }
+
+    /// `POST /v1/projects/<p>/subscriptions/<id>:pull`.
+    pub fn pull(
+        &mut self,
+        project: &str,
+        subscription_id: &str,
+        max_messages: i64,
+    ) -> Result<RestResponse, ApiError> {
+        if !paths::valid_resource_id(subscription_id) {
+            return Err(ApiError::invalid_argument("invalid subscription name"));
+        }
+        if !paths::valid_project_id(project) {
+            return Err(ApiError::invalid_argument("invalid project name"));
+        }
+        let name = paths::subscription_name(project, subscription_id);
+        let mut max = if max_messages <= 0 { 1 } else { max_messages };
+        if max > self.max_pull_messages() {
+            max = self.max_pull_messages();
+        }
+        let Some(sub) = self.subscriptions.get(&name).cloned() else {
+            return Err(ApiError::not_found("subscription not found"));
+        };
+        if sub.detached {
+            return Err(ApiError::failed_precondition("subscription is detached"));
+        }
+        if subscription_push_endpoint(&sub).is_some() {
+            return Err(ApiError::failed_precondition(
+                "subscription is configured for push delivery",
+            ));
+        }
+        let (now_secs, _) = self.now_parts();
+        self.expire_leases(now_secs);
+        let ack_deadline = if sub.ack_deadline_seconds > 0 {
+            sub.ack_deadline_seconds
+        } else {
+            self.default_ack_deadline_cfg()
+        };
+
+        let mut blocked: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        if sub.enable_message_ordering {
+            for d in self.deliveries.get(&name).into_iter().flatten() {
+                if d.acked || !crate::delivery::after(&d.lease_deadline, now_secs) {
+                    continue;
+                }
+                if let Some(m) = self.messages.get(&d.message_id) {
+                    if !m.ordering_key.is_empty() {
+                        blocked.insert(m.ordering_key.clone());
+                    }
+                }
+            }
+        }
+
+        let mut received: Vec<Value> = Vec::new();
+        let mut deliveries = self.deliveries.get(&name).cloned().unwrap_or_default();
+        let mut dead_lettered: Vec<(String, crate::model::PubsubMessage)> = Vec::new();
+        // Index-based loop: each iteration mutates `deliveries[i]` while reading
+        // `self.messages`, so a by-value iterator does not fit.
+        #[allow(clippy::needless_range_loop)]
+        for i in 0..deliveries.len() {
+            if received.len() as i64 >= max {
+                break;
+            }
+            if deliveries[i].acked
+                || crate::delivery::after(&deliveries[i].lease_deadline, now_secs)
+            {
+                continue;
+            }
+            if crate::delivery::after(&deliveries[i].next_delivery_time, now_secs) {
+                if sub.enable_message_ordering {
+                    if let Some(m) = self.messages.get(&deliveries[i].message_id) {
+                        if !m.ordering_key.is_empty() {
+                            blocked.insert(m.ordering_key.clone());
+                        }
+                    }
+                }
+                continue;
+            }
+            let Some(message) = self.messages.get(&deliveries[i].message_id).cloned() else {
+                continue;
+            };
+            if let Some((dl_topic, max_attempts)) = self.dead_letter_target(&sub) {
+                if deliveries[i].delivery_attempt >= max_attempts {
+                    self.next_message_id += 1;
+                    let dl_id = self.next_message_id.to_string();
+                    let dl_msg = crate::model::PubsubMessage {
+                        message_id: dl_id.clone(),
+                        publish_time: self.now(),
+                        ..message.clone()
+                    };
+                    dead_lettered.push((dl_topic, dl_msg));
+                    deliveries[i].acked = true;
+                    deliveries[i].ack_id = String::new();
+                    deliveries[i].lease_deadline = crate::model::ZERO_TIME.to_string();
+                    deliveries[i].next_delivery_time = crate::model::ZERO_TIME.to_string();
+                    continue;
+                }
+            }
+            if sub.enable_message_ordering && !message.ordering_key.is_empty() {
+                if blocked.contains(&message.ordering_key) {
+                    continue;
+                }
+                blocked.insert(message.ordering_key.clone());
+            }
+            self.next_ack_id += 1;
+            deliveries[i].ack_id = format!("{}-{}", deliveries[i].message_id, self.next_ack_id);
+            deliveries[i].lease_deadline = crate::delivery::plus_seconds(now_secs, ack_deadline);
+            deliveries[i].next_delivery_time = crate::model::ZERO_TIME.to_string();
+            deliveries[i].delivery_attempt += 1;
+            received.push(serde_json::json!({
+                "ackId": deliveries[i].ack_id,
+                "message": pull_message_value(&message),
+                "deliveryAttempt": deliveries[i].delivery_attempt,
+            }));
+        }
+
+        for (dl_topic, dl_msg) in dead_lettered {
+            self.messages
+                .insert(dl_msg.message_id.clone(), dl_msg.clone());
+            let dl_subs: Vec<String> = self
+                .subscriptions
+                .values()
+                .filter(|c| c.topic == dl_topic && !c.detached)
+                .map(|c| c.name.clone())
+                .collect();
+            for cn in dl_subs {
+                self.deliveries
+                    .entry(cn)
+                    .or_default()
+                    .push(crate::model::DeliveryRecord {
+                        message_id: dl_msg.message_id.clone(),
+                        ..Default::default()
+                    });
+            }
+        }
+
+        let compacted = compact_acked(deliveries, sub.retain_acked_messages);
+        self.deliveries.insert(name.clone(), compacted);
+        self.persist()?;
+        if received.is_empty() {
+            return Ok(RestResponse::ok_struct(&serde_json::Map::new()));
+        }
+        Ok(RestResponse::ok_struct(&serde_json::json!({
+            "receivedMessages": received,
+        })))
+    }
+
+    /// `POST /v1/projects/<p>/subscriptions/<id>:acknowledge`.
+    pub fn acknowledge(
+        &mut self,
+        project: &str,
+        subscription_id: &str,
+        ack_ids: &[String],
+    ) -> Result<RestResponse, ApiError> {
+        self.update_ack_deadlines(project, subscription_id, ack_ids, None, true)
+    }
+
+    /// `POST /v1/projects/<p>/subscriptions/<id>:modifyAckDeadline`.
+    pub fn modify_ack_deadline(
+        &mut self,
+        project: &str,
+        subscription_id: &str,
+        ack_ids: &[String],
+        ack_deadline_seconds: i64,
+    ) -> Result<RestResponse, ApiError> {
+        self.update_ack_deadlines(
+            project,
+            subscription_id,
+            ack_ids,
+            Some(ack_deadline_seconds),
+            false,
+        )
+    }
+
+    fn update_ack_deadlines(
+        &mut self,
+        project: &str,
+        subscription_id: &str,
+        ack_ids: &[String],
+        ack_deadline_seconds: Option<i64>,
+        acknowledge: bool,
+    ) -> Result<RestResponse, ApiError> {
+        if !paths::valid_resource_id(subscription_id) {
+            return Err(ApiError::invalid_argument("invalid subscription name"));
+        }
+        if !paths::valid_project_id(project) {
+            return Err(ApiError::invalid_argument("invalid project name"));
+        }
+        if ack_ids.is_empty() {
+            return Ok(RestResponse::ok_struct(&serde_json::Map::new()));
+        }
+        for ack_id in ack_ids {
+            if ack_id.trim().is_empty() {
+                return Err(ApiError::invalid_argument(
+                    "ackIds must not contain empty values",
+                ));
+            }
+        }
+        if let Some(deadline) = ack_deadline_seconds {
+            if deadline < 0 {
+                return Err(ApiError::invalid_argument(
+                    "ackDeadlineSeconds must be non-negative",
+                ));
+            }
+            let max = if self.config.max_ack_deadline_seconds > 0 {
+                self.config.max_ack_deadline_seconds
+            } else {
+                600
+            };
+            if deadline > max {
+                return Err(ApiError::invalid_argument(
+                    "ackDeadlineSeconds exceeds maxAckDeadlineSeconds",
+                ));
+            }
+        }
+        let name = paths::subscription_name(project, subscription_id);
+        let Some(sub) = self.subscriptions.get(&name).cloned() else {
+            return Err(ApiError::not_found("subscription not found"));
+        };
+        let (now_secs, _) = self.now_parts();
+        self.expire_leases(now_secs);
+        let id_set: std::collections::BTreeSet<&String> = ack_ids.iter().collect();
+        let mut deliveries = self.deliveries.get(&name).cloned().unwrap_or_default();
+        for d in &mut deliveries {
+            if !id_set.contains(&d.ack_id) || d.acked {
+                continue;
+            }
+            if acknowledge {
+                d.acked = true;
+                d.ack_id = String::new();
+                d.lease_deadline = crate::model::ZERO_TIME.to_string();
+                d.next_delivery_time = crate::model::ZERO_TIME.to_string();
+                continue;
+            }
+            let deadline = ack_deadline_seconds.unwrap_or(0);
+            if deadline == 0 {
+                d.ack_id = String::new();
+                d.lease_deadline = crate::model::ZERO_TIME.to_string();
+                d.next_delivery_time = crate::model::ZERO_TIME.to_string();
+            } else {
+                d.lease_deadline = crate::delivery::plus_seconds(now_secs, deadline);
+                d.next_delivery_time = crate::model::ZERO_TIME.to_string();
+            }
+        }
+        let compacted = compact_acked(deliveries, sub.retain_acked_messages);
+        self.deliveries.insert(name, compacted);
+        self.persist()?;
+        Ok(RestResponse::ok_struct(&serde_json::Map::new()))
+    }
+
+    /// Expires leases past their deadline, applying retry backoff. Mirrors
+    /// `expireLeasesLocked`.
+    fn expire_leases(&mut self, now_secs: i64) {
+        let names: Vec<String> = self.deliveries.keys().cloned().collect();
+        for sub_name in names {
+            let mut deliveries = self.deliveries.get(&sub_name).cloned().unwrap_or_default();
+            let mut changed = false;
+            for d in &mut deliveries {
+                if d.acked
+                    || crate::delivery::is_zero(&d.lease_deadline)
+                    || crate::delivery::after(&d.lease_deadline, now_secs)
+                {
+                    continue;
+                }
+                d.ack_id = String::new();
+                let lease_secs = crate::delivery::unix_secs(&d.lease_deadline);
+                d.lease_deadline = crate::model::ZERO_TIME.to_string();
+                let backoff = self.retry_backoff(&sub_name, d.delivery_attempt);
+                if backoff > 0 {
+                    d.next_delivery_time = crate::delivery::plus_seconds(lease_secs, backoff);
+                }
+                changed = true;
+            }
+            if changed {
+                self.deliveries.insert(sub_name, deliveries);
+            }
+        }
+    }
+
+    /// Retry backoff in seconds for the next attempt, mirroring
+    /// `subscriptionRetryBackoffLocked`.
+    fn retry_backoff(&self, sub_name: &str, delivery_attempt: i64) -> i64 {
+        let Some(sub) = self.subscriptions.get(sub_name) else {
+            return 0;
+        };
+        let policy = sub.retry_policy.as_ref();
+        let Some(min) = policy_backoff_secs(policy, "minimumBackoff") else {
+            return 0;
+        };
+        let max = policy_backoff_secs(policy, "maximumBackoff");
+        let mut backoff = min;
+        let mut attempt = 1;
+        while attempt < delivery_attempt {
+            if let Some(m) = max {
+                if backoff >= m {
+                    return m;
+                }
+            }
+            backoff = backoff.saturating_mul(2);
+            attempt += 1;
+        }
+        if let Some(m) = max {
+            if backoff > m {
+                return m;
+            }
+        }
+        backoff
+    }
+
+    /// The dead-letter `(topic, maxDeliveryAttempts)` for a subscription.
+    fn dead_letter_target(&self, sub: &Subscription) -> Option<(String, i64)> {
+        let policy = sub.dead_letter_policy.as_ref()?.as_object()?;
+        let max = policy.get("maxDeliveryAttempts").and_then(Value::as_i64)?;
+        let topic = policy.get("deadLetterTopic").and_then(Value::as_str)?;
+        if topic.is_empty() || !self.topics.contains_key(topic) {
+            return None;
+        }
+        Some((topic.to_string(), max))
+    }
+
     /// The configured (defaulted) project, for tests/handlers.
     pub fn default_project(&self) -> &str {
         self.config.project()
+    }
+}
+
+/// Validates publish-message content, mirroring `validatePublishMessage`.
+fn validate_publish_message(
+    data: &str,
+    attributes: Option<&serde_json::Map<String, Value>>,
+) -> Result<(), ApiError> {
+    let attr_count = attributes.map(|a| a.len()).unwrap_or(0);
+    if data.is_empty() && attr_count == 0 {
+        return Err(ApiError::invalid_argument(
+            "message data or attributes are required",
+        ));
+    }
+    if !data.is_empty() && crate::validation::decode_base64_bytes(data).is_none() {
+        return Err(ApiError::invalid_argument(
+            "message data must be base64 encoded",
+        ));
+    }
+    if let Some(attrs) = attributes {
+        for key in attrs.keys() {
+            if key.trim().is_empty() {
+                return Err(ApiError::invalid_argument(
+                    "message attributes must not contain empty keys",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Validates a message against a topic's schema settings, mirroring
+/// `validateMessageAgainstTopicSchemaSettings`.
+fn validate_message_against_topic_schema(
+    data: &str,
+    schema_settings: Option<&Value>,
+) -> Result<(), ApiError> {
+    let Some(settings) = schema_settings.and_then(Value::as_object) else {
+        return Ok(());
+    };
+    if settings.is_empty() {
+        return Ok(());
+    }
+    let encoding = settings
+        .get("encoding")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if encoding.is_empty() {
+        return Ok(());
+    }
+    let decoded = crate::validation::decode_base64_bytes(data)
+        .ok_or_else(|| ApiError::invalid_argument("message data must be base64 encoded"))?;
+    if !crate::validation::valid_schema_message_data(&decoded, encoding) {
+        return Err(ApiError::invalid_argument(
+            "message is invalid for topic schema encoding",
+        ));
+    }
+    Ok(())
+}
+
+/// Whether a subscription's filter matches a message, mirroring
+/// `subscriptionMatchesMessage`.
+fn subscription_matches_message(sub: &Subscription, message: &crate::model::PubsubMessage) -> bool {
+    let filter = sub.filter.trim();
+    if filter.is_empty() {
+        return true;
+    }
+    if let Some((key, op, value)) = crate::validation::parse_comparison_filter(filter) {
+        let actual = message
+            .attributes
+            .get(&key)
+            .map(String::as_str)
+            .unwrap_or("");
+        return if op == "!=" {
+            actual != value
+        } else {
+            actual == value
+        };
+    }
+    if let Some((key, prefix)) = crate::validation::parse_prefix_filter(filter) {
+        let actual = message
+            .attributes
+            .get(&key)
+            .map(String::as_str)
+            .unwrap_or("");
+        return actual.starts_with(&prefix);
+    }
+    false
+}
+
+/// The push endpoint of a subscription, if configured.
+fn subscription_push_endpoint(sub: &Subscription) -> Option<String> {
+    sub.push_config
+        .as_ref()
+        .and_then(Value::as_object)
+        .and_then(|o| o.get("pushEndpoint"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .map(str::to_string)
+}
+
+/// Builds the pull-response `message` object, mirroring the Go map: `attributes`
+/// is `null` when absent, `orderingKey` is always present.
+fn pull_message_value(message: &crate::model::PubsubMessage) -> Value {
+    let attributes = if message.attributes.is_empty() {
+        Value::Null
+    } else {
+        serde_json::to_value(&message.attributes).unwrap()
+    };
+    serde_json::json!({
+        "data": message.data,
+        "attributes": attributes,
+        "messageId": message.message_id,
+        "publishTime": message.publish_time,
+        "orderingKey": message.ordering_key,
+    })
+}
+
+/// Drops acked deliveries unless `retain_acked`, mirroring
+/// `compactAckedDeliveries`.
+fn compact_acked(
+    deliveries: Vec<crate::model::DeliveryRecord>,
+    retain_acked: bool,
+) -> Vec<crate::model::DeliveryRecord> {
+    if retain_acked {
+        return deliveries;
+    }
+    deliveries.into_iter().filter(|d| !d.acked).collect()
+}
+
+/// Retry-policy backoff in seconds (`None` when absent/invalid).
+fn policy_backoff_secs(policy: Option<&Value>, field: &str) -> Option<i64> {
+    let value = policy
+        .and_then(Value::as_object)
+        .and_then(|o| o.get(field))
+        .and_then(Value::as_str)?;
+    match crate::duration::parse_go_duration(value) {
+        Some(nanos) if nanos >= 0 => Some((nanos / 1_000_000_000) as i64),
+        _ => None,
     }
 }
 
@@ -1158,6 +1848,15 @@ fn normalize_any_map(value: Option<&Value>) -> Option<Value> {
         Some(o) if !o.is_empty() => Some(Value::Object(o.clone())),
         _ => None,
     }
+}
+
+/// Writes `data` to `path` atomically via a `.tmp` rename, mirroring
+/// `writeJSONFileAtomically`.
+fn write_atomic(path: &std::path::Path, data: &[u8]) -> Result<(), ApiError> {
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, data)
+        .map_err(|_| ApiError::internal("pubsub resource store unavailable"))?;
+    std::fs::rename(&tmp, path).map_err(|_| ApiError::internal("pubsub resource store unavailable"))
 }
 
 /// Computes `(start, end, next_page_token)`, mirroring `pageBounds` (token is the

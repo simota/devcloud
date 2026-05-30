@@ -5,6 +5,7 @@
 //! encoder, the resource model, and persistence; handlers and the HTTP server
 //! land in later parts.
 
+pub mod delivery;
 pub mod duration;
 pub mod errors;
 pub mod go_json;
