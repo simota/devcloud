@@ -126,6 +126,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 		SecretAccessKey: d.config.Auth.AppAutoScaling.SecretAccessKey,
 		StoragePath:     filepath.Join(d.config.Storage.Path, "applicationautoscaling"),
 	})
+	// Opt-in Rust REST engine for Pub/Sub: when enabled, the in-process Go server
+	// serves only gRPC and the Rust subprocess serves REST (both share state on
+	// disk). The gRPC protocol is not ported.
+	pubSubRustBin, pubSubRESTRust := pubSubRustEngine()
 	pubSubServer := pubsubsvc.NewServer(pubsubsvc.Config{
 		GRPCAddr:                  loopbackAddr(d.config.Server.PubSubGRPCPort),
 		RESTAddr:                  loopbackAddr(d.config.Server.PubSubRESTPort),
@@ -134,7 +138,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 		BearerToken:               d.config.Auth.PubSub.BearerToken,
 		StoragePath:               pubsubDataDir(d.config),
 		MessageStoragePath:        pubsubMessageDataDir(d.config),
-		RESTEnabled:               d.config.Services.PubSub.EnableREST,
+		RESTEnabled:               d.config.Services.PubSub.EnableREST && !pubSubRESTRust,
 		DefaultAckDeadlineSeconds: d.config.Services.PubSub.DefaultAckDeadlineSeconds,
 		MessageRetentionSeconds:   d.config.Services.PubSub.MessageRetentionSeconds,
 		MaxAckDeadlineSeconds:     d.config.Services.PubSub.MaxAckDeadlineSeconds,
@@ -297,6 +301,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	}
 	if d.config.Services.PubSub.Enabled {
 		go func() { errCh <- pubSubServer.Run(ctx) }()
+		if pubSubRESTRust && d.config.Services.PubSub.EnableREST {
+			go func() { errCh <- runPubSubRESTRust(ctx, d.config, pubSubRustBin) }()
+		}
 	}
 	if d.config.Services.AppAutoScaling.Enabled {
 		if binPath, ok := aasRustEngine(); ok {
@@ -368,6 +375,11 @@ func (d *Daemon) enabledServerCount() int {
 	}
 	if d.config.Services.PubSub.Enabled {
 		count++
+		// The opt-in Rust REST engine runs as an extra subprocess goroutine that
+		// also reports to the shared error channel.
+		if _, ok := pubSubRustEngine(); ok && d.config.Services.PubSub.EnableREST {
+			count++
+		}
 	}
 	if d.config.Services.AppAutoScaling.Enabled {
 		count++

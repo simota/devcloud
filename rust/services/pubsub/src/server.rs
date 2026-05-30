@@ -44,11 +44,14 @@ impl Config {
     }
 }
 
-/// A rendered REST response: HTTP status + encoded body (empty for 204).
+/// A rendered REST response: HTTP status + encoded body (empty for 204), plus
+/// optional `Allow` / `WWW-Authenticate` headers set by the router.
 #[derive(Debug)]
 pub struct RestResponse {
     pub status: u16,
     pub body: Vec<u8>,
+    pub allow: Option<String>,
+    pub www_authenticate: bool,
 }
 
 impl RestResponse {
@@ -56,12 +59,16 @@ impl RestResponse {
         RestResponse {
             status: 200,
             body: crate::go_json::to_vec(value),
+            allow: None,
+            www_authenticate: false,
         }
     }
     fn no_content() -> Self {
         RestResponse {
             status: 204,
             body: Vec::new(),
+            allow: None,
+            www_authenticate: false,
         }
     }
 }
@@ -1665,10 +1672,230 @@ impl Server {
         Some((topic.to_string(), max))
     }
 
+    // --- IAM (stub) -------------------------------------------------------
+
+    /// IAM action for a topic, mirroring `handleTopicIAM` + `handleIAMAction`.
+    pub fn topic_iam(
+        &self,
+        project: &str,
+        topic_id: &str,
+        action: &str,
+        body: &Value,
+    ) -> Result<RestResponse, ApiError> {
+        if !paths::valid_project_id(project) {
+            return Err(ApiError::invalid_argument("invalid project name"));
+        }
+        if !paths::valid_resource_id(topic_id) {
+            return Err(ApiError::invalid_argument("invalid topic name"));
+        }
+        let name = paths::topic_name(project, topic_id);
+        if !self.topics.contains_key(&name) {
+            return Err(ApiError::not_found("topic not found"));
+        }
+        iam_action(action, body)
+    }
+
+    /// IAM action for a subscription, mirroring `handleSubscriptionIAM`.
+    pub fn subscription_iam(
+        &self,
+        project: &str,
+        subscription_id: &str,
+        action: &str,
+        body: &Value,
+    ) -> Result<RestResponse, ApiError> {
+        if !paths::valid_resource_id(subscription_id) {
+            return Err(ApiError::invalid_argument("invalid subscription name"));
+        }
+        if !paths::valid_project_id(project) {
+            return Err(ApiError::invalid_argument("invalid project name"));
+        }
+        let name = paths::subscription_name(project, subscription_id);
+        if !self.subscriptions.contains_key(&name) {
+            return Err(ApiError::not_found("subscription not found"));
+        }
+        iam_action(action, body)
+    }
+
+    // --- Seek -------------------------------------------------------------
+
+    /// `POST /v1/projects/<p>/subscriptions/<id>:seek`. Exactly one of
+    /// `snapshot`/`time` must be set.
+    pub fn seek(
+        &mut self,
+        project: &str,
+        subscription_id: &str,
+        snapshot: &str,
+        time: &str,
+    ) -> Result<RestResponse, ApiError> {
+        if !paths::valid_project_id(project) {
+            return Err(ApiError::invalid_argument("invalid project name"));
+        }
+        if !paths::valid_resource_id(subscription_id) {
+            return Err(ApiError::invalid_argument("invalid subscription name"));
+        }
+        if snapshot.is_empty() && time.is_empty() {
+            return Err(ApiError::invalid_argument("snapshot or time is required"));
+        }
+        if !snapshot.is_empty() && !time.is_empty() {
+            return Err(ApiError::invalid_argument(
+                "only one of snapshot or time may be set",
+            ));
+        }
+        let mut seek_secs = 0i64;
+        if !time.is_empty() {
+            match crate::time_fmt::parse_rfc3339(time) {
+                Some((secs, _)) => seek_secs = secs,
+                None => return Err(ApiError::invalid_argument("invalid seek time")),
+            }
+        }
+        if !snapshot.is_empty() && !paths::valid_full_snapshot_name(snapshot) {
+            return Err(ApiError::invalid_argument("invalid snapshot name"));
+        }
+        let name = paths::subscription_name(project, subscription_id);
+        if !self.subscriptions.contains_key(&name) {
+            return Err(ApiError::not_found("subscription not found"));
+        }
+        if !time.is_empty() {
+            let replayed = self.seek_deliveries_by_time(&name, seek_secs);
+            self.deliveries.insert(name, replayed);
+            self.persist()?;
+            return Ok(RestResponse::ok_struct(&serde_json::Map::new()));
+        }
+        let snap = match self.snapshots.get(snapshot) {
+            Some(s) if !self.snapshot_expired(s) => s.clone(),
+            _ => return Err(ApiError::not_found("snapshot not found")),
+        };
+        if snap.subscription != name {
+            return Err(ApiError::failed_precondition(
+                "snapshot belongs to a different subscription",
+            ));
+        }
+        let replayed = snapshot_deliveries(&snap.deliveries);
+        self.deliveries.insert(name, replayed);
+        self.persist()?;
+        Ok(RestResponse::ok_struct(&serde_json::Map::new()))
+    }
+
+    /// Replays deliveries published at or after `seek_secs`, mirroring
+    /// `seekDeliveriesByTimeLocked`.
+    fn seek_deliveries_by_time(
+        &self,
+        sub_name: &str,
+        seek_secs: i64,
+    ) -> Vec<crate::model::DeliveryRecord> {
+        let mut replayed = Vec::new();
+        for delivery in self.deliveries.get(sub_name).into_iter().flatten() {
+            let Some(message) = self.messages.get(&delivery.message_id) else {
+                continue;
+            };
+            let Some((pub_secs, _)) = crate::time_fmt::parse_rfc3339(&message.publish_time) else {
+                continue;
+            };
+            if pub_secs < seek_secs {
+                continue;
+            }
+            replayed.push(crate::model::DeliveryRecord {
+                message_id: delivery.message_id.clone(),
+                ..Default::default()
+            });
+        }
+        replayed
+    }
+
+    // --- health -----------------------------------------------------------
+
+    /// The `{service,status,protocol}` body for healthz/readyz.
+    pub fn health_body(&self) -> Value {
+        serde_json::json!({"service": "pubsub", "status": "running", "protocol": "rest"})
+    }
+
+    /// True when the resource store loaded cleanly (for readyz).
+    pub fn ready(&self) -> bool {
+        self.load_err.is_none()
+    }
+
+    /// Whether a request is authorized under the configured auth mode, mirroring
+    /// `authorize`. `bearer_token` is the token extracted from `Authorization:
+    /// Bearer <token>` (empty if absent).
+    pub fn authorized(&self, bearer_token: &str) -> bool {
+        match self.config.auth_mode.trim().to_lowercase().as_str() {
+            "" | "off" | "relaxed" => true,
+            "oauth-relaxed" => !bearer_token.is_empty(),
+            "bearer-dev" | "strict" => {
+                let expected = self.config.bearer_token.trim();
+                if bearer_token.is_empty() || expected.is_empty() {
+                    return false;
+                }
+                constant_time_eq(bearer_token.as_bytes(), expected.as_bytes())
+            }
+            _ => false,
+        }
+    }
+
     /// The configured (defaulted) project, for tests/handlers.
     pub fn default_project(&self) -> &str {
         self.config.project()
     }
+}
+
+/// Renders an IAM action, mirroring `handleIAMAction`.
+fn iam_action(action: &str, body: &Value) -> Result<RestResponse, ApiError> {
+    match action {
+        "getIamPolicy" => Ok(RestResponse::ok_struct(&serde_json::json!({
+            "version": 1, "bindings": [],
+        }))),
+        "setIamPolicy" => {
+            let policy = body
+                .get("policy")
+                .filter(|p| p.is_object())
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({"version": 1, "bindings": []}));
+            Ok(RestResponse::ok_struct(&policy))
+        }
+        "testIamPermissions" => {
+            let perms = body.get("permissions").cloned().unwrap_or(Value::Null);
+            let perms = if perms.is_array() {
+                perms
+            } else {
+                Value::Array(Vec::new())
+            };
+            Ok(RestResponse::ok_struct(&serde_json::json!({
+                "permissions": perms,
+            })))
+        }
+        _ => Err(ApiError::not_found("not found")),
+    }
+}
+
+/// Constant-time byte comparison.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// Snapshot deliveries: unacked records with lease fields cleared, mirroring
+/// `snapshotDeliveries`.
+fn snapshot_deliveries(
+    deliveries: &[crate::model::DeliveryRecord],
+) -> Vec<crate::model::DeliveryRecord> {
+    deliveries
+        .iter()
+        .filter(|d| !d.acked)
+        .map(|d| crate::model::DeliveryRecord {
+            message_id: d.message_id.clone(),
+            ack_id: String::new(),
+            lease_deadline: crate::model::ZERO_TIME.to_string(),
+            next_delivery_time: crate::model::ZERO_TIME.to_string(),
+            delivery_attempt: d.delivery_attempt,
+            acked: false,
+        })
+        .collect()
 }
 
 /// Validates publish-message content, mirroring `validatePublishMessage`.
