@@ -168,6 +168,42 @@ pub struct MultipartUpload {
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
+pub struct LifecycleConfiguration {
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub xmlns: String,
+    pub rules: Vec<LifecycleRule>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LifecycleRule {
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub id: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub prefix: String,
+    pub filter: LifecycleFilter,
+    pub status: String,
+    pub expiration: LifecycleExpiration,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LifecycleFilter {
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub prefix: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LifecycleExpiration {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub days: Option<i64>,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub date: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct MultipartPart {
     #[serde(rename = "partNumber")]
     pub part_number: i64,

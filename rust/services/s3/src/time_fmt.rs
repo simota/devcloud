@@ -107,6 +107,22 @@ pub fn add_calendar_years_rfc3339(value: &str, years: i64) -> Option<String> {
     Some(rfc3339_seconds_from_unix(serial * 86_400 + sod))
 }
 
+/// Parses a lifecycle expiration date — either RFC3339 or a bare `YYYY-MM-DD`
+/// (midnight UTC) — to UNIX seconds. Mirrors Go's `parseLifecycleExpirationDate`.
+pub fn parse_lifecycle_date(value: &str) -> Option<i64> {
+    if let Some((secs, _)) = parse_rfc3339(value) {
+        return Some(secs);
+    }
+    let mut parts = value.split('-');
+    let y: i64 = parts.next()?.parse().ok()?;
+    let m: u32 = parts.next()?.parse().ok()?;
+    let d: u32 = parts.next()?.parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(days_from_civil(y, m, d) * 86_400)
+}
+
 /// Hinnant days-from-civil: (year, month, day) -> days since the UNIX epoch.
 fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };

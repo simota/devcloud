@@ -1,0 +1,23 @@
+{
+  "xmlns": "http://s3.amazonaws.com/doc/2006-03-01/",
+  "rules": [
+    {
+      "id": "rule1",
+      "prefix": "logs/",
+      "filter": {
+        "prefix": "logs/2026/"
+      },
+      "status": "Enabled",
+      "expiration": {
+        "days": 30
+      }
+    },
+    {
+      "filter": {},
+      "status": "Disabled",
+      "expiration": {
+        "date": "2027-01-01T00:00:00Z"
+      }
+    }
+  ]
+}
