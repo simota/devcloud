@@ -412,9 +412,390 @@ impl Server {
         ))
     }
 
+    // --- subscription operations ------------------------------------------
+
+    fn default_ack_deadline(&self) -> i64 {
+        if self.config.default_ack_deadline_seconds > 0 {
+            self.config.default_ack_deadline_seconds
+        } else {
+            10
+        }
+    }
+
+    fn max_ack_deadline(&self) -> i64 {
+        if self.config.max_ack_deadline_seconds > 0 {
+            self.config.max_ack_deadline_seconds
+        } else {
+            600
+        }
+    }
+
+    /// `PUT /v1/projects/<p>/subscriptions/<id>`.
+    pub fn create_subscription(
+        &mut self,
+        project: &str,
+        subscription_id: &str,
+        request: &Subscription,
+    ) -> Result<RestResponse, ApiError> {
+        let name = paths::subscription_name(project, subscription_id);
+        if !paths::valid_resource_id(subscription_id) {
+            return Err(ApiError::invalid_argument("invalid subscription name"));
+        }
+        if !paths::valid_project_id(project) {
+            return Err(ApiError::invalid_argument("invalid project name"));
+        }
+        if request.topic.is_empty() {
+            return Err(ApiError::invalid_argument("subscription topic is required"));
+        }
+        if !paths::valid_full_topic_name(&request.topic) {
+            return Err(ApiError::invalid_argument("invalid topic name"));
+        }
+        if request.ack_deadline_seconds < 0 {
+            return Err(ApiError::invalid_argument(
+                "ackDeadlineSeconds must be non-negative",
+            ));
+        }
+        let mut ack = request.ack_deadline_seconds;
+        if ack == 0 {
+            ack = self.default_ack_deadline();
+        }
+        if ack > self.max_ack_deadline() {
+            return Err(ApiError::invalid_argument(
+                "ackDeadlineSeconds exceeds maxAckDeadlineSeconds",
+            ));
+        }
+        crate::validation::validate_subscription_filter(&request.filter)?;
+        crate::validation::validate_subscription_metadata(
+            &request.message_retention_duration,
+            request.expiration_policy.as_ref(),
+        )?;
+        crate::validation::validate_dead_letter_policy(request.dead_letter_policy.as_ref())?;
+        crate::validation::validate_retry_policy(request.retry_policy.as_ref())?;
+        crate::validation::validate_push_config(request.push_config.as_ref())?;
+
+        if self.subscriptions.contains_key(&name) {
+            return Err(ApiError::already_exists("subscription already exists"));
+        }
+        if !self.topics.contains_key(&request.topic) {
+            return Err(ApiError::not_found("topic not found"));
+        }
+        if !self.dead_letter_topic_exists(request.dead_letter_policy.as_ref()) {
+            return Err(ApiError::not_found("dead-letter topic not found"));
+        }
+        let now = self.now();
+        let subscription = Subscription {
+            name: name.clone(),
+            ack_deadline_seconds: ack,
+            created_at: now.clone(),
+            updated_at: now,
+            labels: request.labels.clone(),
+            ..request.clone()
+        };
+        self.subscriptions
+            .insert(name.clone(), subscription.clone());
+        if let Err(err) = self.persist() {
+            self.subscriptions.remove(&name);
+            return Err(err);
+        }
+        Ok(RestResponse::ok_struct(&subscription))
+    }
+
+    /// `GET /v1/projects/<p>/subscriptions/<id>`.
+    pub fn get_subscription(
+        &self,
+        project: &str,
+        subscription_id: &str,
+    ) -> Result<RestResponse, ApiError> {
+        let name = paths::subscription_name(project, subscription_id);
+        if !paths::valid_resource_id(subscription_id) {
+            return Err(ApiError::invalid_argument("invalid subscription name"));
+        }
+        if !paths::valid_project_id(project) {
+            return Err(ApiError::invalid_argument("invalid project name"));
+        }
+        match self.subscriptions.get(&name) {
+            Some(s) => Ok(RestResponse::ok_struct(s)),
+            None => Err(ApiError::not_found("subscription not found")),
+        }
+    }
+
+    /// `PATCH /v1/projects/<p>/subscriptions/<id>`.
+    pub fn patch_subscription(
+        &mut self,
+        project: &str,
+        subscription_id: &str,
+        patch: &Subscription,
+        fields: &[String],
+    ) -> Result<RestResponse, ApiError> {
+        let name = paths::subscription_name(project, subscription_id);
+        if !paths::valid_resource_id(subscription_id) {
+            return Err(ApiError::invalid_argument("invalid subscription name"));
+        }
+        if !paths::valid_project_id(project) {
+            return Err(ApiError::invalid_argument("invalid project name"));
+        }
+        if !patch.name.is_empty() && patch.name != name {
+            return Err(ApiError::invalid_argument(
+                "subscription name does not match request path",
+            ));
+        }
+        if patch.ack_deadline_seconds < 0 {
+            return Err(ApiError::invalid_argument(
+                "ackDeadlineSeconds must be non-negative",
+            ));
+        }
+        if patch.ack_deadline_seconds > self.max_ack_deadline() {
+            return Err(ApiError::invalid_argument(
+                "ackDeadlineSeconds exceeds maxAckDeadlineSeconds",
+            ));
+        }
+        let has = |f: &str| fields.iter().any(|x| x == f);
+        if has("filter") {
+            crate::validation::validate_subscription_filter(&patch.filter)?;
+        }
+        if has("messageRetentionDuration") || has("expirationPolicy") {
+            crate::validation::validate_subscription_metadata(
+                &patch.message_retention_duration,
+                patch.expiration_policy.as_ref(),
+            )?;
+        }
+        if has("deadLetterPolicy") {
+            crate::validation::validate_dead_letter_policy(patch.dead_letter_policy.as_ref())?;
+        }
+        if has("retryPolicy") {
+            crate::validation::validate_retry_policy(patch.retry_policy.as_ref())?;
+        }
+        if has("pushConfig") {
+            crate::validation::validate_push_config(patch.push_config.as_ref())?;
+        }
+
+        let Some(mut sub) = self.subscriptions.get(&name).cloned() else {
+            return Err(ApiError::not_found("subscription not found"));
+        };
+        if has("deadLetterPolicy")
+            && !self.dead_letter_topic_exists(patch.dead_letter_policy.as_ref())
+        {
+            return Err(ApiError::not_found("dead-letter topic not found"));
+        }
+        if has("topic") && !patch.topic.is_empty() && patch.topic != sub.topic {
+            return Err(ApiError::failed_precondition(
+                "subscription topic cannot be changed",
+            ));
+        }
+        if has("labels") {
+            sub.labels = patch.labels.clone();
+        }
+        if has("ackDeadlineSeconds") {
+            sub.ack_deadline_seconds = if patch.ack_deadline_seconds == 0 {
+                self.default_ack_deadline()
+            } else {
+                patch.ack_deadline_seconds
+            };
+        }
+        if has("enableMessageOrdering") {
+            sub.enable_message_ordering = patch.enable_message_ordering;
+        }
+        if has("enableExactlyOnceDelivery") {
+            sub.enable_exactly_once_delivery = patch.enable_exactly_once_delivery;
+        }
+        if has("retainAckedMessages") {
+            sub.retain_acked_messages = patch.retain_acked_messages;
+        }
+        if has("messageRetentionDuration") {
+            sub.message_retention_duration = patch.message_retention_duration.clone();
+        }
+        if has("expirationPolicy") {
+            sub.expiration_policy = patch.expiration_policy.clone();
+        }
+        if has("filter") {
+            sub.filter = patch.filter.clone();
+        }
+        if has("deadLetterPolicy") {
+            sub.dead_letter_policy = patch.dead_letter_policy.clone();
+        }
+        if has("retryPolicy") {
+            sub.retry_policy = patch.retry_policy.clone();
+        }
+        if has("pushConfig") {
+            sub.push_config = patch.push_config.clone();
+        }
+        sub.updated_at = self.now();
+        let previous = self.subscriptions.insert(name.clone(), sub.clone());
+        if let Err(err) = self.persist() {
+            match previous {
+                Some(p) => {
+                    self.subscriptions.insert(name, p);
+                }
+                None => {
+                    self.subscriptions.remove(&name);
+                }
+            }
+            return Err(err);
+        }
+        Ok(RestResponse::ok_struct(&sub))
+    }
+
+    /// `DELETE /v1/projects/<p>/subscriptions/<id>`.
+    pub fn delete_subscription(
+        &mut self,
+        project: &str,
+        subscription_id: &str,
+    ) -> Result<RestResponse, ApiError> {
+        let name = paths::subscription_name(project, subscription_id);
+        if !paths::valid_resource_id(subscription_id) {
+            return Err(ApiError::invalid_argument("invalid subscription name"));
+        }
+        if !paths::valid_project_id(project) {
+            return Err(ApiError::invalid_argument("invalid project name"));
+        }
+        if !self.subscriptions.contains_key(&name) {
+            return Err(ApiError::not_found("subscription not found"));
+        }
+        let removed = self.subscriptions.remove(&name);
+        // Snapshots referencing this subscription are removed too.
+        let drop: Vec<String> = self
+            .snapshots
+            .iter()
+            .filter(|(_, snap)| snap.subscription == name)
+            .map(|(k, _)| k.clone())
+            .collect();
+        let removed_snaps: Vec<_> = drop
+            .iter()
+            .filter_map(|k| self.snapshots.remove(k).map(|v| (k.clone(), v)))
+            .collect();
+        if let Err(err) = self.persist() {
+            if let Some(s) = removed {
+                self.subscriptions.insert(name, s);
+            }
+            for (k, v) in removed_snaps {
+                self.snapshots.insert(k, v);
+            }
+            return Err(err);
+        }
+        Ok(RestResponse::no_content())
+    }
+
+    /// `GET /v1/projects/<p>/subscriptions` — list full subscriptions.
+    pub fn list_subscriptions(
+        &self,
+        project: &str,
+        page_size: i64,
+        page_token: i64,
+    ) -> Result<RestResponse, ApiError> {
+        if !paths::valid_project_id(project) {
+            return Err(ApiError::invalid_argument("invalid project name"));
+        }
+        let subs: Vec<Subscription> = self
+            .subscriptions
+            .values()
+            .filter(|s| paths::resource_project(&s.name) == project)
+            .cloned()
+            .collect();
+        let (start, end, next) = page_bounds(subs.len(), page_token, page_size);
+        Ok(RestResponse::ok_struct(
+            &crate::responses::ListSubscriptionsResponse {
+                next_page_token: next,
+                subscriptions: subs[start..end].to_vec(),
+            },
+        ))
+    }
+
+    /// `POST /v1/projects/<p>/subscriptions/<id>:modifyPushConfig`.
+    pub fn modify_push_config(
+        &mut self,
+        project: &str,
+        subscription_id: &str,
+        push_config: Option<&Value>,
+    ) -> Result<RestResponse, ApiError> {
+        let name = paths::subscription_name(project, subscription_id);
+        if !paths::valid_resource_id(subscription_id) {
+            return Err(ApiError::invalid_argument("invalid subscription name"));
+        }
+        if !paths::valid_project_id(project) {
+            return Err(ApiError::invalid_argument("invalid project name"));
+        }
+        crate::validation::validate_push_config(push_config)?;
+        let Some(mut sub) = self.subscriptions.get(&name).cloned() else {
+            return Err(ApiError::not_found("subscription not found"));
+        };
+        sub.push_config = normalize_any_map(push_config);
+        sub.updated_at = self.now();
+        let previous = self.subscriptions.insert(name.clone(), sub);
+        if let Err(err) = self.persist() {
+            if let Some(p) = previous {
+                self.subscriptions.insert(name, p);
+            }
+            return Err(err);
+        }
+        Ok(RestResponse::ok_struct(&serde_json::Map::new()))
+    }
+
+    /// `POST /v1/projects/<p>/subscriptions/<id>:detach`.
+    pub fn detach_subscription(
+        &mut self,
+        project: &str,
+        subscription_id: &str,
+    ) -> Result<RestResponse, ApiError> {
+        let name = paths::subscription_name(project, subscription_id);
+        if !paths::valid_resource_id(subscription_id) {
+            return Err(ApiError::invalid_argument("invalid subscription name"));
+        }
+        if !paths::valid_project_id(project) {
+            return Err(ApiError::invalid_argument("invalid project name"));
+        }
+        let Some(mut sub) = self.subscriptions.get(&name).cloned() else {
+            return Err(ApiError::not_found("subscription not found"));
+        };
+        sub.detached = true;
+        sub.updated_at = self.now();
+        let removed_snaps: Vec<String> = self
+            .snapshots
+            .iter()
+            .filter(|(_, snap)| snap.subscription == name)
+            .map(|(k, _)| k.clone())
+            .collect();
+        let backup: Vec<_> = removed_snaps
+            .iter()
+            .filter_map(|k| self.snapshots.remove(k).map(|v| (k.clone(), v)))
+            .collect();
+        let previous = self.subscriptions.insert(name.clone(), sub);
+        if let Err(err) = self.persist() {
+            match previous {
+                Some(p) => {
+                    self.subscriptions.insert(name, p);
+                }
+                None => {
+                    self.subscriptions.remove(&name);
+                }
+            }
+            for (k, v) in backup {
+                self.snapshots.insert(k, v);
+            }
+            return Err(err);
+        }
+        Ok(RestResponse::ok_struct(&serde_json::Map::new()))
+    }
+
+    fn dead_letter_topic_exists(&self, policy: Option<&Value>) -> bool {
+        let topic = crate::validation::dead_letter_topic(policy);
+        if topic.is_empty() {
+            return true;
+        }
+        self.topics.contains_key(&topic)
+    }
+
     /// The configured (defaulted) project, for tests/handlers.
     pub fn default_project(&self) -> &str {
         self.config.project()
+    }
+}
+
+/// Normalizes an optional any-map to `Some(empty-removed)` matching Go's
+/// `copyAnyMap` (an empty/absent map becomes `None`).
+fn normalize_any_map(value: Option<&Value>) -> Option<Value> {
+    match value.and_then(Value::as_object) {
+        Some(o) if !o.is_empty() => Some(Value::Object(o.clone())),
+        _ => None,
     }
 }
 

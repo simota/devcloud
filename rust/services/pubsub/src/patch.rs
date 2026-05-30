@@ -9,7 +9,7 @@
 
 use serde_json::{Map, Value};
 
-use crate::model::Topic;
+use crate::model::{Subscription, Topic};
 
 /// The decoded patch: the `Topic` (best-effort) and the resolved field set.
 pub struct TopicPatch {
@@ -97,6 +97,101 @@ fn normalize_field(field: &str) -> Option<String> {
         _ => return None,
     };
     Some(normalized.to_string())
+}
+
+/// The decoded subscription patch.
+pub struct SubscriptionPatch {
+    pub subscription: Subscription,
+    pub fields: Vec<String>,
+}
+
+/// Decodes a subscription PATCH, mirroring `decodeSubscriptionPatch`.
+pub fn decode_subscription_patch(
+    body: &[u8],
+    update_mask_query: &str,
+) -> Option<SubscriptionPatch> {
+    let bytes: &[u8] = if body.is_empty() { b"{}" } else { body };
+    let root: Map<String, Value> = serde_json::from_slice(bytes).ok()?;
+    let sub_body: Map<String, Value> = match root.get("subscription") {
+        Some(Value::Object(inner)) => inner.clone(),
+        Some(_) => return None,
+        None => root.clone(),
+    };
+    let subscription: Subscription =
+        serde_json::from_value(Value::Object(sub_body.clone())).ok()?;
+    let fields = resolve_fields_generic(&root, &sub_body, update_mask_query, normalize_sub_field)?;
+    Some(SubscriptionPatch {
+        subscription,
+        fields,
+    })
+}
+
+fn resolve_fields_generic(
+    root: &Map<String, Value>,
+    body: &Map<String, Value>,
+    update_mask_query: &str,
+    normalize: fn(&str) -> Option<String>,
+) -> Option<Vec<String>> {
+    if !update_mask_query.is_empty() {
+        return parse_mask_generic(update_mask_query, normalize);
+    }
+    if let Some(raw) = root.get("updateMask") {
+        if let Some(mask) = raw.as_str() {
+            return parse_mask_generic(mask, normalize);
+        }
+        let paths = raw.get("paths").and_then(Value::as_array)?;
+        let joined: Vec<String> = paths
+            .iter()
+            .filter_map(|p| p.as_str().map(str::to_string))
+            .collect();
+        return parse_mask_generic(&joined.join(","), normalize);
+    }
+    let mut fields = Vec::new();
+    for key in body.keys() {
+        if let Some(n) = normalize(key) {
+            if !fields.contains(&n) {
+                fields.push(n);
+            }
+        }
+    }
+    Some(fields)
+}
+
+fn parse_mask_generic(mask: &str, normalize: fn(&str) -> Option<String>) -> Option<Vec<String>> {
+    let mut fields = Vec::new();
+    for raw in mask.split(',') {
+        let field = raw.trim();
+        if field.is_empty() {
+            continue;
+        }
+        let n = normalize(field)?;
+        if !fields.contains(&n) {
+            fields.push(n);
+        }
+    }
+    Some(fields)
+}
+
+/// Normalizes a subscription patch field, mirroring `normalizeSubscriptionPatchField`.
+fn normalize_sub_field(field: &str) -> Option<String> {
+    let field = field.strip_prefix("subscription.").unwrap_or(field);
+    let n = match field {
+        "name" => "name",
+        "topic" => "topic",
+        "labels" => "labels",
+        "ackDeadlineSeconds" | "ack_deadline_seconds" => "ackDeadlineSeconds",
+        "enableMessageOrdering" | "enable_message_ordering" => "enableMessageOrdering",
+        "enableExactlyOnceDelivery" | "enable_exactly_once_delivery" => "enableExactlyOnceDelivery",
+        "retainAckedMessages" | "retain_acked_messages" => "retainAckedMessages",
+        "messageRetentionDuration" | "message_retention_duration" => "messageRetentionDuration",
+        "expirationPolicy" | "expiration_policy" => "expirationPolicy",
+        "filter" => "filter",
+        "deadLetterPolicy" | "dead_letter_policy" => "deadLetterPolicy",
+        "retryPolicy" | "retry_policy" => "retryPolicy",
+        "pushConfig" | "push_config" => "pushConfig",
+        _ => return None,
+    };
+    Some(n.to_string())
 }
 
 #[cfg(test)]

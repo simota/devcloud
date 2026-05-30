@@ -87,6 +87,31 @@ pub fn topic_name(project: &str, topic_id: &str) -> String {
     format!("projects/{project}/topics/{topic_id}")
 }
 
+/// `projects/<project>/subscriptions/<id>`.
+pub fn subscription_name(project: &str, subscription_id: &str) -> String {
+    format!("projects/{project}/subscriptions/{subscription_id}")
+}
+
+/// `projects/<project>/subscriptions/<id>` validity.
+pub fn valid_full_subscription_name(name: &str) -> bool {
+    let parts: Vec<&str> = name.split('/').collect();
+    parts.len() == 4
+        && parts[0] == "projects"
+        && parts[2] == "subscriptions"
+        && valid_project_id(parts[1])
+        && valid_resource_id(parts[3])
+}
+
+/// `projects/<project>/snapshots/<id>` validity.
+pub fn valid_full_snapshot_name(name: &str) -> bool {
+    let parts: Vec<&str> = name.split('/').collect();
+    parts.len() == 4
+        && parts[0] == "projects"
+        && parts[2] == "snapshots"
+        && valid_project_id(parts[1])
+        && valid_resource_id(parts[3])
+}
+
 /// The project component of a resource name (`projects/<p>/...`), mirroring
 /// `resourceProject`.
 pub fn resource_project(name: &str) -> String {
@@ -140,6 +165,75 @@ pub fn topic_subscriptions_parts(path: &str) -> Option<(String, String)> {
 /// `/v1/projects/<p>/topics/<id>/snapshots`.
 pub fn topic_snapshots_parts(path: &str) -> Option<(String, String)> {
     sub_collection_parts(path, "topics", "snapshots")
+}
+
+/// `/v1/projects/<p>/subscriptions` collection path.
+pub fn subscriptions_collection(path: &str) -> Option<String> {
+    let parts = path_parts(path);
+    if parts.len() == 4
+        && parts[0] == "v1"
+        && parts[1] == "projects"
+        && parts[3] == "subscriptions"
+        && !parts[2].is_empty()
+    {
+        Some(parts[2].clone())
+    } else {
+        None
+    }
+}
+
+/// `/v1/projects/<p>/subscriptions/<id>` — returns `(project, subscription_id)`.
+pub fn subscription_name_parts(path: &str) -> Option<(String, String)> {
+    let parts = path_parts(path);
+    if parts.len() == 5
+        && parts[0] == "v1"
+        && parts[1] == "projects"
+        && parts[3] == "subscriptions"
+        && !parts[2].is_empty()
+        && !parts[4].is_empty()
+        && !parts[4].contains(':')
+    {
+        Some((parts[2].clone(), parts[4].clone()))
+    } else {
+        None
+    }
+}
+
+/// `/v1/projects/<p>/subscriptions/<id>:<action>` — returns
+/// `(project, subscription_id, action)`.
+pub fn subscription_action_parts(path: &str) -> Option<(String, String, String)> {
+    let parts = path_parts(path);
+    if parts.len() != 5
+        || parts[0] != "v1"
+        || parts[1] != "projects"
+        || parts[3] != "subscriptions"
+        || parts[2].is_empty()
+    {
+        return None;
+    }
+    let (sub_id, action) = parts[4].split_once(':')?;
+    if sub_id.is_empty() || action.is_empty() {
+        return None;
+    }
+    Some((parts[2].clone(), sub_id.to_string(), action.to_string()))
+}
+
+/// `/v1/projects/<p>/topics/<id>:<action>` — returns `(project, topic_id, action)`.
+pub fn topic_action_parts(path: &str) -> Option<(String, String, String)> {
+    let parts = path_parts(path);
+    if parts.len() != 5
+        || parts[0] != "v1"
+        || parts[1] != "projects"
+        || parts[3] != "topics"
+        || parts[2].is_empty()
+    {
+        return None;
+    }
+    let (topic_id, action) = parts[4].split_once(':')?;
+    if topic_id.is_empty() || action.is_empty() {
+        return None;
+    }
+    Some((parts[2].clone(), topic_id.to_string(), action.to_string()))
 }
 
 fn sub_collection_parts(path: &str, collection: &str, sub: &str) -> Option<(String, String)> {
