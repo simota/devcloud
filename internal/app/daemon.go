@@ -493,6 +493,9 @@ func redshiftBackendMode(cfg RedshiftBackendConfig) string {
 func startRedisBackend(ctx context.Context, cfg Config) (managedRedisLifecycle, error) {
 	switch redisMode(cfg.Services.Redis) {
 	case "managed":
+		if binPath, ok := redisRustEngine(); ok {
+			return startRedisRust(ctx, cfg, binPath)
+		}
 		return startManagedRedisFromConfig(ctx, cfg)
 	case "external":
 		return nil, nil

@@ -52,7 +52,10 @@ Leaf → hub, per the Phase 1 dependency analysis:
    byte-compatible `resources.json` / `pubsub.json`. The gRPC protocol stays on
    the Go engine (avoids the tonic/prost + icu transitive-resolution risk); the
    REST seam switches only the REST port.
-6. redis — passthrough proxy
+6. **redis** ✅ (managed runner) — protocol parity remains delegated to upstream
+   `redis-server`; the Rust increment owns the managed child-process runner
+   behind `DEVCLOUD_REDIS_ENGINE=rust`, while the Go in-process dashboard client
+   continues to provide status/key/command management.
 7. **s3** ✅ — **hub**: owns the `BucketStore` boundary. The Rust engine now
    passes the S3 full acceptance gate: bucket/object CRUD, listing, metadata,
    range GET, copy, presigned URLs, multipart, versioning, policy/ACL,
@@ -80,7 +83,7 @@ cd rust && cargo test          # run all migrated crates
 cd rust && cargo test -p devcloud-mail
 ```
 
-## Daemon seam (mail, applicationautoscaling, sqs, dynamodb, pubsub, s3, gcs)
+## Daemon seam (mail, applicationautoscaling, sqs, dynamodb, pubsub, s3, gcs, redis)
 
 Each migrated service is wired into the Go daemon behind an **opt-in, dev-only**
 environment seam — the default path and the YAML config are unchanged. When the
@@ -98,6 +101,7 @@ DEVCLOUD_DYNAMODB_ENGINE=rust DEVCLOUD_DYNAMODB_RUST_BIN=rust/target/debug/devcl
 DEVCLOUD_PUBSUB_ENGINE=rust   DEVCLOUD_PUBSUB_RUST_BIN=rust/target/debug/devcloud-pubsub \
 DEVCLOUD_S3_ENGINE=rust       DEVCLOUD_S3_RUST_BIN=rust/target/debug/devcloud-s3 \
 DEVCLOUD_GCS_ENGINE=rust      DEVCLOUD_GCS_RUST_BIN=rust/target/debug/devcloud-gcs \
+DEVCLOUD_REDIS_ENGINE=rust    DEVCLOUD_REDIS_RUST_BIN=rust/target/debug/devcloud-redis \
   go run ./cmd/devcloud up
 ```
 

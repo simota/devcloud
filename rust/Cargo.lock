@@ -106,6 +106,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "devcloud-redis"
+version = "0.1.0"
+dependencies = [
+ "tokio",
+]
+
+[[package]]
 name = "devcloud-s3"
 version = "0.1.0"
 dependencies = [
