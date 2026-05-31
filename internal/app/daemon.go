@@ -284,7 +284,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 		}
 	}
 	if d.config.Services.GCS.Enabled {
-		go func() { errCh <- gcsServer.Run(ctx) }()
+		if binPath, ok := gcsRustEngine(); ok {
+			go func() { errCh <- runGCSRust(ctx, d.config, binPath) }()
+		} else {
+			go func() { errCh <- gcsServer.Run(ctx) }()
+		}
 	}
 	if d.config.Services.DynamoDB.Enabled {
 		if binPath, ok := dynamoDBRustEngine(); ok {

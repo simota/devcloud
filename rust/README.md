@@ -28,6 +28,10 @@ rust/
                              #   notification metadata, inventory/analytics,
                              #   replication, multipart, select, object lock,
                              #   SigV4, daemon seam, dashboard event bridge
+    gcs/                     # increment #8 — GCS JSON API core over the shared
+                             #   S3 FileBucketStore: bucket/object CRUD, media
+                             #   download/upload, range, copy/rewrite/compose,
+                             #   preconditions, resumable uploads, daemon seam
 ```
 
 ## Migration order
@@ -55,7 +59,14 @@ Leaf → hub, per the Phase 1 dependency analysis:
    lifecycle, notification metadata, select, replication, object lock,
    dashboard API/page smoke, strict SigV4 header auth, daemon seam, inherited
    auth/region config, and dashboard SSE event bridging.
-8. gcs, bigquery, redshift — depend on s3 / pgwire / managed Postgres
+8. **gcs** 🚧 — JSON API core over the shared S3 `FileBucketStore`: bucket CRUD,
+   object list/get/patch/delete, media upload/download, range,
+   copy/rewrite/compose, `ifGeneration*` / `ifMetageneration*` preconditions,
+   bearer auth, multipart/related uploads, chunked resumable persistence/status,
+   SDK smoke, dashboard events, and daemon seam. `scripts/gcs-e2e.sh` and
+   `scripts/gcs-sdk-e2e.sh` pass with `DEVCLOUD_GCS_ENGINE=rust`; broader
+   policy/admin surfaces remain later slices.
+9. bigquery, redshift — depend on s3/gcs object core / pgwire / managed Postgres
 
 ## Parity discipline
 
@@ -69,7 +80,7 @@ cd rust && cargo test          # run all migrated crates
 cd rust && cargo test -p devcloud-mail
 ```
 
-## Daemon seam (mail, applicationautoscaling, sqs, dynamodb, pubsub)
+## Daemon seam (mail, applicationautoscaling, sqs, dynamodb, pubsub, s3, gcs)
 
 Each migrated service is wired into the Go daemon behind an **opt-in, dev-only**
 environment seam — the default path and the YAML config are unchanged. When the
@@ -86,6 +97,7 @@ DEVCLOUD_SQS_ENGINE=rust      DEVCLOUD_SQS_RUST_BIN=rust/target/debug/devcloud-s
 DEVCLOUD_DYNAMODB_ENGINE=rust DEVCLOUD_DYNAMODB_RUST_BIN=rust/target/debug/devcloud-dynamodb \
 DEVCLOUD_PUBSUB_ENGINE=rust   DEVCLOUD_PUBSUB_RUST_BIN=rust/target/debug/devcloud-pubsub \
 DEVCLOUD_S3_ENGINE=rust       DEVCLOUD_S3_RUST_BIN=rust/target/debug/devcloud-s3 \
+DEVCLOUD_GCS_ENGINE=rust      DEVCLOUD_GCS_RUST_BIN=rust/target/debug/devcloud-gcs \
   go run ./cmd/devcloud up
 ```
 
@@ -98,4 +110,7 @@ only the JSON 1.0 protocol (which is the only protocol the Go engine speaks); th
 in-process Go server keeps serving gRPC while the Rust subprocess takes over the
 REST port (both share `resources.json` / `pubsub.json`). The S3 Rust subprocess
 emits safe JSONL dashboard events for bucket/object create/delete, and the Go
-daemon forwards those into the in-process `events.Bus` SSE feed.
+daemon forwards those into the in-process `events.Bus` SSE feed. The GCS Rust
+engine covers the JSON API core used by `scripts/gcs-e2e.sh` and
+`scripts/gcs-sdk-e2e.sh`; broader GCS policy/admin surfaces remain on the Go
+engine until subsequent slices.
