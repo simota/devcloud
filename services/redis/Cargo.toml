@@ -1,0 +1,16 @@
+[package]
+name = "devcloud-redis"
+version = "0.1.0"
+edition = "2021"
+description = "Rust managed Redis runner for devcloud, delegating protocol parity to redis-server."
+
+[lib]
+name = "devcloud_redis"
+path = "src/lib.rs"
+
+[[bin]]
+name = "devcloud-redis"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "process", "signal"] }
