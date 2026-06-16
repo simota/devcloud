@@ -1,0 +1,10 @@
+# Runtime artifacts (CLAUDE.md: do not commit runner.log, state.env, progress.md)
+runner.log
+runner.jsonl
+state.env
+state.env.sha256
+progress.md
+.run-loop.lock
+.circuit-state
+iteration-*.out
+done.md
