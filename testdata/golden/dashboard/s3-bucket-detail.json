@@ -1,0 +1,13 @@
+{
+  "route": "s3-bucket-detail",
+  "path": "/api/s3/buckets/parity-bucket",
+  "status": 200,
+  "contentType": "application/json",
+  "cacheControl": "",
+  "location": "",
+  "body": {
+    "creationDate": "\u003cTS\u003e",
+    "name": "parity-bucket",
+    "objectCount": 3
+  }
+}

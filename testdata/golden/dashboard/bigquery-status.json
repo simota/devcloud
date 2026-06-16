@@ -1,0 +1,20 @@
+{
+  "route": "bigquery-status",
+  "path": "/api/bigquery/status",
+  "status": 200,
+  "contentType": "application/json",
+  "cacheControl": "",
+  "location": "",
+  "body": {
+    "authMode": "relaxed",
+    "datasetCount": 1,
+    "endpoint": "http://\u003cADDR\u003e",
+    "jobCount": 0,
+    "location": "US",
+    "project": "devcloud",
+    "running": true,
+    "service": "bigquery",
+    "status": "running",
+    "storagePath": "\u003cPATH\u003e"
+  }
+}

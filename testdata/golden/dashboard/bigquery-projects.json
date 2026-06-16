@@ -1,0 +1,46 @@
+{
+  "route": "bigquery-projects",
+  "path": "/api/bigquery/projects",
+  "status": 200,
+  "contentType": "application/json",
+  "cacheControl": "",
+  "location": "",
+  "body": {
+    "projects": [
+      {
+        "datasetCount": 1,
+        "datasets": [
+          {
+            "datasetId": "parity_ds",
+            "id": "\u003cID\u003e",
+            "location": "US",
+            "projectId": "devcloud",
+            "tables": [
+              {
+                "datasetId": "parity_ds",
+                "id": "\u003cID\u003e",
+                "numBytes": "0",
+                "numRows": "0",
+                "projectId": "devcloud",
+                "schema": {
+                  "fields": [
+                    {
+                      "name": "id",
+                      "type": "STRING"
+                    }
+                  ]
+                },
+                "tableId": "parity_tbl",
+                "type": "TABLE"
+              }
+            ]
+          }
+        ],
+        "jobCount": 0,
+        "jobs": [],
+        "location": "US",
+        "projectId": "devcloud"
+      }
+    ]
+  }
+}

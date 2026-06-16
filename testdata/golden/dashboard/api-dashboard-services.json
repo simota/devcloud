@@ -1,0 +1,93 @@
+{
+  "route": "api-dashboard-services",
+  "path": "/api/dashboard/services",
+  "status": 200,
+  "contentType": "application/json",
+  "cacheControl": "",
+  "location": "",
+  "body": {
+    "services": [
+      {
+        "description": "Inspect messages received by the local SMTP server.",
+        "endpoint": "smtp://\u003cADDR\u003e",
+        "id": "\u003cID\u003e",
+        "name": "Mail",
+        "path": "\u003cPATH\u003e",
+        "status": "running",
+        "storagePath": "\u003cPATH\u003e"
+      },
+      {
+        "description": "Browse buckets, objects, metadata, and local S3 activity.",
+        "endpoint": "http://\u003cADDR\u003e",
+        "id": "\u003cID\u003e",
+        "name": "S3",
+        "path": "\u003cPATH\u003e",
+        "status": "running",
+        "storagePath": "\u003cPATH\u003e"
+      },
+      {
+        "description": "Browse buckets, objects, metadata, and local GCS activity.",
+        "endpoint": "http://\u003cADDR\u003e",
+        "id": "\u003cID\u003e",
+        "name": "GCS",
+        "path": "\u003cPATH\u003e",
+        "status": "running",
+        "storagePath": "\u003cPATH\u003e"
+      },
+      {
+        "description": "Inspect local DynamoDB tables, indexes, and item counts.",
+        "endpoint": "http://\u003cADDR\u003e",
+        "id": "\u003cID\u003e",
+        "name": "DynamoDB",
+        "path": "\u003cPATH\u003e",
+        "status": "running",
+        "storagePath": "\u003cPATH\u003e"
+      },
+      {
+        "description": "Inspect local BigQuery projects, datasets, tables, rows, and jobs.",
+        "endpoint": "http://\u003cADDR\u003e",
+        "id": "\u003cID\u003e",
+        "name": "BigQuery",
+        "path": "\u003cPATH\u003e",
+        "status": "running",
+        "storagePath": "\u003cPATH\u003e"
+      },
+      {
+        "description": "Inspect local Redshift clusters, catalog metadata, and statement history.",
+        "endpoint": "http://\u003cADDR\u003e",
+        "id": "\u003cID\u003e",
+        "name": "Redshift",
+        "path": "\u003cPATH\u003e",
+        "status": "disabled",
+        "storagePath": "\u003cPATH\u003e"
+      },
+      {
+        "description": "Inspect local Redis keys, TTLs, and command results.",
+        "endpoint": "redis://\u003cADDR\u003e",
+        "id": "\u003cID\u003e",
+        "name": "Redis",
+        "path": "\u003cPATH\u003e",
+        "status": "disabled",
+        "storagePath": "\u003cPATH\u003e"
+      },
+      {
+        "description": "Inspect local SQS queues, messages, leases, and attributes.",
+        "endpoint": "http://\u003cADDR\u003e",
+        "id": "\u003cID\u003e",
+        "name": "SQS",
+        "path": "\u003cPATH\u003e",
+        "status": "running",
+        "storagePath": "\u003cPATH\u003e"
+      },
+      {
+        "description": "Inspect local Pub/Sub topics, subscriptions, backlog, and leases.",
+        "endpoint": "http://\u003cADDR\u003e",
+        "id": "\u003cID\u003e",
+        "name": "Pub/Sub",
+        "path": "\u003cPATH\u003e",
+        "status": "running",
+        "storagePath": "\u003cPATH\u003e"
+      }
+    ]
+  }
+}

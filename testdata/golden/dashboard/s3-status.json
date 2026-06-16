@@ -1,0 +1,16 @@
+{
+  "route": "s3-status",
+  "path": "/api/s3/status",
+  "status": 200,
+  "contentType": "application/json",
+  "cacheControl": "",
+  "location": "",
+  "body": {
+    "authMode": "relaxed",
+    "endpoint": "http://\u003cADDR\u003e",
+    "region": "us-east-1",
+    "running": true,
+    "status": "running",
+    "storagePath": "\u003cPATH\u003e"
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "route": "pubsub-topics",
+  "path": "/api/pubsub/topics",
+  "status": 200,
+  "contentType": "application/json",
+  "cacheControl": "",
+  "location": "",
+  "body": {
+    "project": "devcloud",
+    "topics": [
+      {
+        "createdAt": "\u003cTS\u003e",
+        "name": "projects/devcloud/topics/parity-topic",
+        "subscriptionCount": 1,
+        "updatedAt": "\u003cTS\u003e"
+      }
+    ]
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "route": "gcs-status",
+  "path": "/api/gcs/status",
+  "status": 200,
+  "contentType": "application/json",
+  "cacheControl": "",
+  "location": "",
+  "body": {
+    "endpoint": "http://\u003cADDR\u003e",
+    "project": "devcloud",
+    "running": true,
+    "status": "running",
+    "storagePath": "\u003cPATH\u003e",
+    "uploadSessionPath": "\u003cPATH\u003e"
+  }
+}

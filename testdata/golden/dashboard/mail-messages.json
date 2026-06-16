@@ -1,0 +1,35 @@
+{
+  "route": "mail-messages",
+  "path": "/api/messages",
+  "status": 200,
+  "contentType": "application/json",
+  "cacheControl": "",
+  "location": "",
+  "body": {
+    "messages": [
+      {
+        "from": "a@example.com",
+        "headers": {
+          "From": [
+            "a@example.com"
+          ],
+          "Subject": [
+            "Parity"
+          ],
+          "To": [
+            "b@example.com"
+          ]
+        },
+        "id": "\u003cID\u003e",
+        "raw": "\u003cHASH\u003e",
+        "receivedAt": "\u003cTS\u003e",
+        "subject": "Parity",
+        "textBody": "Hello parity.\r\n",
+        "to": [
+          "b@example.com"
+        ]
+      }
+    ],
+    "nextCursor": ""
+  }
+}

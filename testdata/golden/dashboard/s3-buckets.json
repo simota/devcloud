@@ -1,0 +1,22 @@
+{
+  "route": "s3-buckets",
+  "path": "/api/s3/buckets",
+  "status": 200,
+  "contentType": "application/json",
+  "cacheControl": "",
+  "location": "",
+  "body": {
+    "buckets": [
+      {
+        "creationDate": "\u003cTS\u003e",
+        "name": "parity-bucket",
+        "objectCount": 3
+      },
+      {
+        "creationDate": "\u003cTS\u003e",
+        "name": "parity-gcs",
+        "objectCount": 1
+      }
+    ]
+  }
+}

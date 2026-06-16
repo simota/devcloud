@@ -1,0 +1,29 @@
+{
+  "route": "sqs-queues",
+  "path": "/api/sqs/queues",
+  "status": 200,
+  "contentType": "application/json",
+  "cacheControl": "",
+  "location": "",
+  "body": {
+    "queues": [
+      {
+        "arn": "arn:aws:sqs:us-east-1:000000000000:parity-queue",
+        "attributes": {
+          "DelaySeconds": "0",
+          "MaximumMessageSize": "1048576",
+          "MessageRetentionPeriod": "345600",
+          "ReceiveMessageWaitTimeSeconds": "0",
+          "VisibilityTimeout": "30"
+        },
+        "createdAt": "\u003cTS\u003e",
+        "delayedMessages": 0,
+        "name": "parity-queue",
+        "notVisibleMessages": 0,
+        "totalRetainedMessages": 1,
+        "url": "http://\u003cADDR\u003e/000000000000/parity-queue",
+        "visibleMessages": 1
+      }
+    ]
+  }
+}

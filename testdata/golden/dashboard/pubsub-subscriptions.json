@@ -1,0 +1,24 @@
+{
+  "route": "pubsub-subscriptions",
+  "path": "/api/pubsub/subscriptions",
+  "status": 200,
+  "contentType": "application/json",
+  "cacheControl": "",
+  "location": "",
+  "body": {
+    "project": "devcloud",
+    "subscriptions": [
+      {
+        "ackDeadlineSeconds": 30,
+        "backlogMessages": 0,
+        "createdAt": "\u003cTS\u003e",
+        "inFlightMessages": 0,
+        "maxDeliveryAttemptSeen": 0,
+        "name": "projects/devcloud/subscriptions/parity-sub",
+        "topic": "projects/devcloud/topics/parity-topic",
+        "totalRetainedMessages": 0,
+        "updatedAt": "\u003cTS\u003e"
+      }
+    ]
+  }
+}

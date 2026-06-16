@@ -1,0 +1,24 @@
+{
+  "route": "dynamodb-table-detail",
+  "path": "/api/dynamodb/tables/parity-table",
+  "status": 200,
+  "contentType": "application/json",
+  "cacheControl": "",
+  "location": "",
+  "body": {
+    "table": {
+      "itemCount": 1,
+      "keySchema": [
+        {
+          "AttributeName": "id",
+          "KeyType": "HASH"
+        }
+      ],
+      "tableName": "parity-table",
+      "tableStatus": "ACTIVE",
+      "timeToLiveDescription": {
+        "TimeToLiveStatus": "DISABLED"
+      }
+    }
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "route": "dynamodb-status",
+  "path": "/api/dynamodb/status",
+  "status": 200,
+  "contentType": "application/json",
+  "cacheControl": "",
+  "location": "",
+  "body": {
+    "endpoint": "http://\u003cADDR\u003e",
+    "region": "us-east-1",
+    "running": true,
+    "status": "running",
+    "storagePath": "\u003cPATH\u003e",
+    "tableCount": 1
+  }
+}

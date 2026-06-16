@@ -1,0 +1,11 @@
+{
+  "route": "gcs-uploads",
+  "path": "/api/gcs/uploads",
+  "status": 200,
+  "contentType": "application/json",
+  "cacheControl": "",
+  "location": "",
+  "body": {
+    "sessions": []
+  }
+}

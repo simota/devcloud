@@ -1,0 +1,24 @@
+{
+  "route": "gcs-buckets",
+  "path": "/api/gcs/buckets",
+  "status": 200,
+  "contentType": "application/json",
+  "cacheControl": "",
+  "location": "",
+  "body": {
+    "buckets": [
+      {
+        "gcsUri": "gs://parity-bucket",
+        "name": "parity-bucket",
+        "objectCount": 3,
+        "timeCreated": "\u003cTS\u003e"
+      },
+      {
+        "gcsUri": "gs://parity-gcs",
+        "name": "parity-gcs",
+        "objectCount": 1,
+        "timeCreated": "\u003cTS\u003e"
+      }
+    ]
+  }
+}

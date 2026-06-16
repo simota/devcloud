@@ -1,0 +1,18 @@
+{
+  "route": "sqs-status",
+  "path": "/api/sqs/status",
+  "status": 200,
+  "contentType": "application/json",
+  "cacheControl": "",
+  "location": "",
+  "body": {
+    "authMode": "relaxed",
+    "endpoint": "http://\u003cADDR\u003e",
+    "queueCount": 1,
+    "region": "us-east-1",
+    "running": true,
+    "service": "sqs",
+    "status": "running",
+    "storagePath": "\u003cPATH\u003e"
+  }
+}

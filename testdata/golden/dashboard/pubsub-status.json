@@ -1,0 +1,19 @@
+{
+  "route": "pubsub-status",
+  "path": "/api/pubsub/status",
+  "status": 200,
+  "contentType": "application/json",
+  "cacheControl": "",
+  "location": "",
+  "body": {
+    "grpcEndpoint": "127.0.0.1:8085",
+    "project": "devcloud",
+    "restEndpoint": "http://\u003cADDR\u003e",
+    "running": true,
+    "service": "pubsub",
+    "status": "running",
+    "storagePath": "\u003cPATH\u003e",
+    "subscriptionCount": 1,
+    "topicCount": 1
+  }
+}
