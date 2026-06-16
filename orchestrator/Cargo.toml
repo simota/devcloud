@@ -1,0 +1,45 @@
+[package]
+name = "devcloud-orchestrator"
+version = "0.1.0"
+edition = "2021"
+description = "Native Rust orchestrator for devcloud — single-binary supervisor + CLI (init/up/reset)."
+
+# The single user-facing binary:
+#   devcloud init | up [service ...] | reset | dashboard
+[[bin]]
+name = "devcloud"
+path = "src/main.rs"
+
+[dependencies]
+# Service engine libraries are linked in directly and run as tokio tasks inside
+# this one process — no subprocess spawning, no DEVCLOUD_<SVC>_ENGINE seams.
+# Added incrementally as each service is wired into the supervisor.
+devcloud-mail = { path = "../services/mail" }
+devcloud-s3 = { path = "../services/s3" }
+devcloud-gcs = { path = "../services/gcs" }
+devcloud-dynamodb = { path = "../services/dynamodb" }
+devcloud-bigquery = { path = "../services/bigquery" }
+devcloud-sqs = { path = "../services/sqs" }
+devcloud-applicationautoscaling = { path = "../services/applicationautoscaling" }
+devcloud-pubsub = { path = "../services/pubsub" }
+devcloud-redshift = { path = "../services/redshift" }
+devcloud-redis = { path = "../services/redis" }
+devcloud-dashboard = { path = "../services/dashboard" }
+devcloud-event-relay = { path = "../services/event-relay" }
+devcloud-redis-control = { path = "../services/redis-control" }
+
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal", "process"] }
+# pubsub gRPC transport (the pubsub crate serves Publisher/Subscriber/Schema).
+tonic = "0.12"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+# dashboard_conformance.rs replays the dashboard golden oracle: it drives
+# `devcloud up` and reuses the dashboard crate's hand-rolled HTTP client to seed
+# + probe. devcloud-dashboard / tokio / serde_json are already normal deps; these
+# entries make the test's usage explicit (tokio needs the test runtime features).
+devcloud-dashboard = { path = "../services/dashboard" }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "io-util", "time"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
