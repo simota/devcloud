@@ -1,0 +1,12 @@
+# Generated autoloop runtime state and transcripts.
+scripts/**/.run-loop.lock
+scripts/**/.circuit-state
+scripts/**/runner.jsonl
+scripts/**/runner.log
+scripts/**/state.env
+scripts/**/state.env.sha256
+scripts/**/progress.md
+scripts/**/done.md
+scripts/**/iteration-*.out
+scripts/**/verify-*.out
+scripts/**/prompt-*.*

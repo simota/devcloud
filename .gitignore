@@ -1,0 +1,36 @@
+# OS/editor noise
+.DS_Store
+*.swp
+*.swo
+
+# Local environment and runtime state
+.env
+.env.*
+!.env.example
+.devcloud/
+
+# Build outputs
+/target/
+/bin/
+dist/
+coverage/
+
+# JavaScript package artifacts for dashboard and mocks
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Generated autoloop runtime state and transcripts
+scripts/**/.run-loop.lock
+scripts/**/.circuit-state
+scripts/**/runner.jsonl
+scripts/**/runner.log
+scripts/**/state.env
+scripts/**/state.env.sha256
+scripts/**/progress.md
+scripts/**/done.md
+scripts/**/iteration-*.out
+scripts/**/verify-*.out
+scripts/**/prompt-*.*

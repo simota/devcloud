@@ -1,0 +1,22 @@
+# Rust workspace for devcloud.
+#
+# Each migrated service lives under `services/<svc>` as a workspace member and
+# shares this root's `target/` directory.
+[workspace]
+resolver = "2"
+members = [
+  "orchestrator",
+  "services/applicationautoscaling",
+  "services/bigquery",
+  "services/dashboard",
+  "services/dynamodb",
+  "services/event-relay",
+  "services/gcs",
+  "services/mail",
+  "services/pubsub",
+  "services/redis",
+  "services/redis-control",
+  "services/redshift",
+  "services/s3",
+  "services/sqs",
+]
