@@ -1,0 +1,37 @@
+[package]
+name = "devcloud-dashboard"
+version = "0.1.0"
+edition = "2021"
+description = "Rust reimplementation of the devcloud dashboard — Phase 2 of the legacy-to-Rust dashboard migration (docs/CHARTER.md §4). Hand-rolled HTTP server: embeds the React SPA, serves /dashboard/* with the legacy cache/redirect/fallback behavior, and forwards /api/<svc>/* to each service's Phase-1 /_introspect/ + /_control/ network endpoints."
+
+[lib]
+name = "devcloud_dashboard"
+path = "src/lib.rs"
+
+[[bin]]
+name = "devcloud-dashboard"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+# BTreeMap default (sorted keys) matches legacy map JSON marshaling — do NOT enable
+# preserve_order.
+serde_json = "1"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "io-util", "signal", "time"] }
+# include_dir embeds the already-built Vite output at
+# services/dashboard/assets/react/ at compile time. Chosen over rust-embed to
+# keep the dependency surface tiny and avoid a proc-macro runtime (same spirit
+# as the other crates' hand-rolled approach). The npm build step is unchanged.
+include_dir = "0.7"
+# WebSocket support for the /api/events proxy: the dashboard hijacks the
+# hand-rolled HTTP/1.1 stream after the RFC6455 handshake and drives frames with
+# tungstenite. Default features (handshake/connect/stream) only — no TLS, since
+# both the browser and the daemon relay are loopback ws://. This is the
+# sanctioned dependency growth for the events endpoint.
+tokio-tungstenite = "0.24"
+tungstenite = "0.24"
+# Re-exported by tokio-tungstenite; declared explicitly for the Sink/Stream
+# combinators (split/send/next) the bidirectional pump uses.
+futures-util = { version = "0.3", default-features = false }
+
+[dev-dependencies]
