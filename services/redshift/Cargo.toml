@@ -1,0 +1,25 @@
+[package]
+name = "devcloud-redshift"
+version = "0.1.0"
+edition = "2021"
+description = "Rust reimplementation of the devcloud Redshift service — strangler-fig increment #10: pgwire server, SQL translator, memory/postgres backends, Data API, cluster/serverless control plane, COPY/UNLOAD over the shared S3 FileBucketStore."
+
+[lib]
+name = "devcloud_redshift"
+path = "src/lib.rs"
+
+[[bin]]
+name = "devcloud-redshift"
+path = "src/main.rs"
+
+[dependencies]
+devcloud-s3 = { path = "../s3" }
+md-5 = "0.10"
+sha2 = "0.10"
+hmac = "0.12"
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+# serde_json's default Map is a BTreeMap (sorted keys), matching legacy sorted-key
+# map marshaling. Do NOT enable preserve_order.
+serde_json = "1"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "io-util", "signal", "sync"] }
