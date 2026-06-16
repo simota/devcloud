@@ -1,0 +1,50 @@
+{
+  "kind": "bigquery#table",
+  "id": "local-project:analytics.people",
+  "selfLink": "/bigquery/v2/projects/local-project/datasets/analytics/tables/people",
+  "tableReference": {
+    "projectId": "local-project",
+    "datasetId": "analytics",
+    "tableId": "people"
+  },
+  "type": "TABLE",
+  "schema": {
+    "fields": [
+      {
+        "name": "id",
+        "type": "STRING",
+        "mode": "REQUIRED"
+      },
+      {
+        "name": "age",
+        "type": "INTEGER"
+      },
+      {
+        "name": "score",
+        "type": "FLOAT"
+      },
+      {
+        "name": "note",
+        "type": "STRING"
+      }
+    ]
+  },
+  "labels": {
+    "team": "data"
+  },
+  "timePartitioning": {
+    "type": "DAY",
+    "field": "created"
+  },
+  "clustering": {
+    "fields": [
+      "id"
+    ]
+  },
+  "etag": "\"1781074048718049000\"",
+  "creationTime": "1781074048717",
+  "lastModifiedTime": "1781074048718",
+  "numRows": "2",
+  "numBytes": "88",
+  "location": "EU"
+}

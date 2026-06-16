@@ -1,0 +1,108 @@
+{
+  "job": {
+    "kind": "bigquery#job",
+    "id": "local-project:job-1",
+    "selfLink": "/bigquery/v2/projects/local-project/jobs/job-1",
+    "jobReference": {
+      "projectId": "local-project",
+      "jobId": "job-1",
+      "location": "US"
+    },
+    "configuration": {
+      "query": {
+        "query": "SELECT id, age FROM `local-project.analytics.people` WHERE age \u003e= 30 ORDER BY id",
+        "useLegacySql": false,
+        "destinationTable": {
+          "projectId": "",
+          "datasetId": "",
+          "tableId": ""
+        }
+      },
+      "copy": {
+        "sourceTable": {
+          "projectId": "",
+          "datasetId": "",
+          "tableId": ""
+        },
+        "destinationTable": {
+          "projectId": "",
+          "datasetId": "",
+          "tableId": ""
+        }
+      },
+      "load": {
+        "destinationTable": {
+          "projectId": "",
+          "datasetId": "",
+          "tableId": ""
+        },
+        "schema": {}
+      },
+      "extract": {
+        "sourceTable": {
+          "projectId": "",
+          "datasetId": "",
+          "tableId": ""
+        }
+      }
+    },
+    "status": {
+      "state": "DONE"
+    },
+    "statistics": {
+      "creationTime": "1781074048718",
+      "startTime": "1781074048718",
+      "endTime": "1781074048718",
+      "query": {
+        "totalRows": "2",
+        "cacheHit": false
+      }
+    }
+  },
+  "response": {
+    "kind": "bigquery#queryResponse",
+    "schema": {
+      "fields": [
+        {
+          "name": "id",
+          "type": "STRING",
+          "mode": "REQUIRED"
+        },
+        {
+          "name": "age",
+          "type": "INTEGER"
+        }
+      ]
+    },
+    "jobReference": {
+      "projectId": "local-project",
+      "jobId": "job-1",
+      "location": "US"
+    },
+    "totalRows": "2",
+    "rows": [
+      {
+        "f": [
+          {
+            "v": "1 \u003c\u0026\u003e"
+          },
+          {
+            "v": "37"
+          }
+        ]
+      },
+      {
+        "f": [
+          {
+            "v": "2"
+          },
+          {
+            "v": "31"
+          }
+        ]
+      }
+    ],
+    "jobComplete": true,
+    "cacheHit": false
+  }
+}

@@ -1,0 +1,1 @@
+{"version":1,"etag":"\"1781074048716778000\"","bindings":[{"role":"roles/bigquery.dataViewer","members":["user:a@example.com","group:eng@example.com"]}]}

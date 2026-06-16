@@ -1,0 +1,23 @@
+[package]
+name = "devcloud-bigquery"
+version = "0.1.0"
+edition = "2021"
+description = "Rust reimplementation of the devcloud BigQuery service — strangler-fig increment #9, sharing the S3 FileBucketStore object core for jobs.insert load/extract."
+
+[lib]
+name = "devcloud_bigquery"
+path = "src/lib.rs"
+
+[[bin]]
+name = "devcloud-bigquery"
+path = "src/main.rs"
+
+[dependencies]
+devcloud-s3 = { path = "../s3" }
+serde = { version = "1", features = ["derive"] }
+# serde_json's default Map is a BTreeMap (sorted keys), matching legacy sorted-key
+# map marshaling. Do NOT enable preserve_order. `raw_value` mirrors legacy
+# `json.RawMessage` for insertAll row values (preserves number literals like
+# `1.50` byte-for-byte in the streaming-buffer JSONL).
+serde_json = { version = "1", features = ["raw_value"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "io-util", "signal", "sync"] }
