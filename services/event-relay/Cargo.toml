@@ -1,0 +1,16 @@
+[package]
+name = "devcloud-event-relay"
+version = "0.1.0"
+edition = "2021"
+description = "WebSocket event relay for the devcloud dashboard — Rust port of internal/eventsrelay. Fans dashboard event JSON out to connected clients."
+
+[lib]
+name = "devcloud_event_relay"
+path = "src/lib.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal"] }
+tokio-tungstenite = "0.24"
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
