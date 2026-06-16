@@ -16,25 +16,25 @@ cargo run -p devcloud-orchestrator -- up
 Open the dashboard:
 
 ```text
-http://127.0.0.1:8025/
-http://127.0.0.1:8025/dashboard/
+http://127.0.0.1:18025/
+http://127.0.0.1:18025/dashboard/
 ```
 
 Default local endpoints:
 
 | Service | Endpoint | Dashboard |
 | --- | --- | --- |
-| Mail SMTP | `127.0.0.1:1025` | `http://127.0.0.1:8025/dashboard/mail` |
-| S3 | `http://127.0.0.1:4566` | `http://127.0.0.1:8025/dashboard/s3` |
-| GCS | `http://127.0.0.1:4443` | `http://127.0.0.1:8025/dashboard/gcs` |
-| DynamoDB | `http://127.0.0.1:8000` | `http://127.0.0.1:8025/dashboard/dynamodb` |
-| BigQuery | `http://127.0.0.1:9050` | `http://127.0.0.1:8025/dashboard/bigquery` |
-| SQS | `http://127.0.0.1:9324` | `http://127.0.0.1:8025/dashboard/sqs` |
-| Pub/Sub gRPC | `127.0.0.1:8085` | `http://127.0.0.1:8025/dashboard/pubsub` |
-| Pub/Sub REST | `http://127.0.0.1:8086` | `http://127.0.0.1:8025/dashboard/pubsub` |
-| Redshift SQL | `127.0.0.1:5439` | `http://127.0.0.1:8025/dashboard/redshift` |
-| Redshift API | `http://127.0.0.1:9099` | `http://127.0.0.1:8025/dashboard/redshift` |
-| Redis | `redis://127.0.0.1:6379` | `http://127.0.0.1:8025/dashboard/redis` |
+| Mail SMTP | `127.0.0.1:11025` | `http://127.0.0.1:18025/dashboard/mail` |
+| S3 | `http://127.0.0.1:14566` | `http://127.0.0.1:18025/dashboard/s3` |
+| GCS | `http://127.0.0.1:14443` | `http://127.0.0.1:18025/dashboard/gcs` |
+| DynamoDB | `http://127.0.0.1:18000` | `http://127.0.0.1:18025/dashboard/dynamodb` |
+| BigQuery | `http://127.0.0.1:19050` | `http://127.0.0.1:18025/dashboard/bigquery` |
+| SQS | `http://127.0.0.1:19324` | `http://127.0.0.1:18025/dashboard/sqs` |
+| Pub/Sub gRPC | `127.0.0.1:18085` | `http://127.0.0.1:18025/dashboard/pubsub` |
+| Pub/Sub REST | `http://127.0.0.1:18086` | `http://127.0.0.1:18025/dashboard/pubsub` |
+| Redshift SQL | `127.0.0.1:15439` | `http://127.0.0.1:18025/dashboard/redshift` |
+| Redshift API | `http://127.0.0.1:19099` | `http://127.0.0.1:18025/dashboard/redshift` |
+| Redis | `redis://127.0.0.1:16379` | `http://127.0.0.1:18025/dashboard/redis` |
 
 Useful commands:
 
@@ -79,18 +79,18 @@ Configuration lives at `.devcloud/config.yaml`. Runtime data is stored under `.d
 project: dev
 
 server:
-  smtpPort: 1025
-  dashboardPort: 8025
-  s3Port: 4566
-  gcsPort: 4443
-  dynamodbPort: 8000
-  bigqueryPort: 9050
-  sqsPort: 9324
-  pubsubGrpcPort: 8085
-  pubsubRestPort: 8086
-  redshiftPort: 5439
-  redshiftAPIPort: 9099
-  redisPort: 6379
+  smtpPort: 11025
+  dashboardPort: 18025
+  s3Port: 14566
+  gcsPort: 14443
+  dynamodbPort: 18000
+  bigqueryPort: 19050
+  sqsPort: 19324
+  pubsubGrpcPort: 18085
+  pubsubRestPort: 18086
+  redshiftPort: 15439
+  redshiftAPIPort: 19099
+  redisPort: 16379
 
 auth:
   smtp:
@@ -361,7 +361,7 @@ DynamoDB dashboard management is available under `/dashboard/dynamodb` and the l
 | --- | --- | --- |
 | gRPC emulator endpoint | Yes | Implements local `google.pubsub.v1.Publisher`, `Subscriber`, and `SchemaService` surfaces. |
 | REST v1 endpoint | Yes | Supports topic, subscription, publish, pull, ack, seek, schema, and IAM-compatible local workflows. |
-| Google Cloud Pub/Sub client libraries | Yes | Use `PUBSUB_EMULATOR_HOST=127.0.0.1:8085` and `PUBSUB_PROJECT_ID=devcloud`. |
+| Google Cloud Pub/Sub client libraries | Yes | Use `PUBSUB_EMULATOR_HOST=127.0.0.1:18085` and `PUBSUB_PROJECT_ID=devcloud`. |
 | Topic create/get/list/update/delete | Yes | Includes labels, retention, schema settings, and KMS metadata where applicable. |
 | Subscription create/get/list/update/delete | Yes | Includes ack deadline, retain acked messages, filters, retry policy, dead-letter policy, push config, and ordering flags. |
 | Publish / Pull / Acknowledge / ModifyAckDeadline | Yes | Local lease and redelivery behavior is covered by unit and E2E tests. |
@@ -387,7 +387,7 @@ Pub/Sub dashboard actions are available under `/dashboard/pubsub`:
 
 | Feature | Status | Notes |
 | --- | --- | --- |
-| PostgreSQL wire endpoint | Yes | Listens on `127.0.0.1:5439` by default for local Redshift-style SQL clients. |
+| PostgreSQL wire endpoint | Yes | Listens on `127.0.0.1:15439` by default for local Redshift-style SQL clients. |
 | PostgreSQL simple query protocol | Yes | Covers `psql` smoke workflows. |
 | PostgreSQL extended query protocol | Partial | Supports Parse, Bind, Describe, Execute, Sync, Close, text bind parameters, portal resume, and safe unsupported errors for binary formats. |
 | PostgreSQL execution backend | Yes | Default backend is managed local PostgreSQL; explicit memory fallback remains available for development continuity. |

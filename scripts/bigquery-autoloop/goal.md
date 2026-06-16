@@ -10,7 +10,7 @@ Implement a Google BigQuery REST v2 compatible local server for `devcloud`, foll
 
 ## Acceptance Criteria
 
-1. `devcloud up` starts a BigQuery-compatible REST endpoint on the configured local port, defaulting to `127.0.0.1:9050`.
+1. `devcloud up` starts a BigQuery-compatible REST endpoint on the configured local port, defaulting to `127.0.0.1:19050`.
 2. REST v2 project discovery works for `GET /bigquery/v2/projects`.
 3. Dataset operations work: `datasets.insert`, `datasets.get`, `datasets.list`, `datasets.patch`, and `datasets.delete`.
 4. Table operations work: `tables.insert`, `tables.get`, `tables.list`, `tables.patch`, and `tables.delete` for supported schema and metadata.

@@ -6,7 +6,7 @@
   "cacheControl": "",
   "location": "",
   "body": {
-    "grpcEndpoint": "127.0.0.1:8085",
+    "grpcEndpoint": "127.0.0.1:18085",
     "project": "devcloud",
     "restEndpoint": "http://\u003cADDR\u003e",
     "running": true,

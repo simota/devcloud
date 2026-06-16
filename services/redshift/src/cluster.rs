@@ -119,7 +119,7 @@ pub(crate) fn cluster_snapshot_from_config(config: &SharedConfig) -> ClusterSnap
         database_name: default_str(&config.database, "dev"),
         endpoint: ClusterEndpoint {
             address: host_from_addr(&config.sql_addr),
-            port: port_from_addr(&config.sql_addr, 5439),
+            port: port_from_addr(&config.sql_addr, 15439),
         },
         node_type: default_str(&config.node_type, "dc2.large"),
         number_of_nodes: positive_or_default(config.number_of_nodes, 1),
@@ -164,7 +164,7 @@ pub(crate) fn cluster_snapshot_from_snapshot_metadata(
         database_name: default_str(&snapshot.db_name, &default_str(&config.database, "dev")),
         endpoint: ClusterEndpoint {
             address: host_from_addr(&config.sql_addr),
-            port: positive_or_default(snapshot.port, port_from_addr(&config.sql_addr, 5439)),
+            port: positive_or_default(snapshot.port, port_from_addr(&config.sql_addr, 15439)),
         },
         node_type: default_str(
             &snapshot.node_type,
@@ -180,7 +180,7 @@ pub(crate) fn cluster_snapshot_from_snapshot_metadata(
 }
 
 /// Mirrors `normalizeClusterEndpoints`: rewrite every endpoint to the current
-/// config's SQL addr (host + port, default 5439).
+/// config's SQL addr (host + port, default 15439).
 pub(crate) fn normalize_cluster_endpoints(
     clusters: &mut BTreeMap<String, ClusterSnapshot>,
     config: &SharedConfig,
@@ -188,7 +188,7 @@ pub(crate) fn normalize_cluster_endpoints(
     for cluster in clusters.values_mut() {
         cluster.endpoint = ClusterEndpoint {
             address: host_from_addr(&config.sql_addr),
-            port: port_from_addr(&config.sql_addr, 5439),
+            port: port_from_addr(&config.sql_addr, 15439),
         };
     }
 }

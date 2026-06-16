@@ -1,7 +1,7 @@
 //! Standalone SQS server binary for the strangler-fig seam (JSON protocol).
 //!
 //! Config via environment (set by the legacy daemon):
-//!   DEVCLOUD_SQS_ADDR            listen address, e.g. 127.0.0.1:9324 (required)
+//!   DEVCLOUD_SQS_ADDR            listen address, e.g. 127.0.0.1:19324 (required)
 //!   DEVCLOUD_SQS_STORAGE         state.json directory                (required)
 //!   DEVCLOUD_SQS_REGION          AWS region (default us-east-1)
 //!   DEVCLOUD_SQS_ACCOUNT_ID      account id for ARNs (default 000000000000)

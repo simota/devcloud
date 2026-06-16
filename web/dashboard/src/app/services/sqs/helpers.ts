@@ -6,7 +6,7 @@ export function disabledStatus(service?: DashboardService): SQSStatus {
     service: 'sqs',
     status: 'disabled',
     running: false,
-    endpoint: service?.endpoint ?? 'http://127.0.0.1:9324',
+    endpoint: service?.endpoint ?? 'http://127.0.0.1:19324',
     region: 'us-east-1',
     authMode: 'relaxed',
     storagePath: service?.storagePath ?? '.devcloud/data/sqs',

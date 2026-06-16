@@ -1,6 +1,6 @@
 //! Rust reimplementation of the devcloud dashboard (Phase 2 foundation).
 //!
-//! The dashboard is the single user-facing HTTP entry point (`:8025`): it serves
+//! The dashboard is the single user-facing HTTP entry point (`:18025`): it serves
 //! the embedded React SPA and a set of `/api/<svc>/*` JSON endpoints. Unlike the
 //! legacy dashboard (which holds in-process pointers to every service), this Rust
 //! dashboard runs as its own subprocess and reaches each service over the

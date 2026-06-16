@@ -85,11 +85,11 @@ devcloud dashboard
 export AWS_ACCESS_KEY_ID=dev
 export AWS_SECRET_ACCESS_KEY=dev
 export AWS_REGION=ap-northeast-1
-export AWS_ENDPOINT_URL=http://localhost:4566
+export AWS_ENDPOINT_URL=http://localhost:14566
 
-export PUBSUB_EMULATOR_HOST=localhost:8085
-export STORAGE_EMULATOR_HOST=http://localhost:4443
-export BIGQUERY_API_ENDPOINT=http://localhost:9050
+export PUBSUB_EMULATOR_HOST=localhost:18085
+export STORAGE_EMULATOR_HOST=http://localhost:14443
+export BIGQUERY_API_ENDPOINT=http://localhost:19050
 ```
 
 ただし内部では、LocalStack などは一切使わず、すべて自前サーバーです。
@@ -104,14 +104,14 @@ export BIGQUERY_API_ENDPOINT=http://localhost:9050
 
 ```txt
 devcloud-orchestrator
-  ├─ AWS gateway       : localhost:4566
-  ├─ GCS endpoint      : localhost:4443
-  ├─ BigQuery REST     : localhost:9050
+  ├─ AWS gateway       : localhost:14566
+  ├─ GCS endpoint      : localhost:14443
+  ├─ BigQuery REST     : localhost:19050
   ├─ BigQuery gRPC     : localhost:9060
-  ├─ Pub/Sub gRPC      : localhost:8085
-  ├─ SMTP              : localhost:1025
-  ├─ Dashboard/API     : localhost:8025
-  ├─ Redshift wire     : localhost:5439
+  ├─ Pub/Sub gRPC      : localhost:18085
+  ├─ SMTP              : localhost:11025
+  ├─ Dashboard/API     : localhost:18025
+  ├─ Redshift wire     : localhost:15439
   └─ CDN proxy         : localhost:9090
 ```
 
@@ -993,7 +993,7 @@ AWS 系は protocol がバラバラです。
 なので AWS gateway はこう分けます。
 
 ```txt
-localhost:4566
+localhost:14566
   |
   +-- Host / path / x-amz-target で振り分け
       |
@@ -1062,14 +1062,14 @@ off     : 認証しない
 project: dev
 
 server:
-  awsGatewayPort: 4566
-  gcsPort: 4443
-  bigqueryRestPort: 9050
+  awsGatewayPort: 14566
+  gcsPort: 14443
+  bigqueryRestPort: 19050
   bigqueryGrpcPort: 9060
-  pubsubGrpcPort: 8085
-  smtpPort: 1025
-  dashboardPort: 8025
-  redshiftPort: 5439
+  pubsubGrpcPort: 18085
+  smtpPort: 11025
+  dashboardPort: 18025
+  redshiftPort: 15439
   cdnPort: 9090
 
 auth:
@@ -1170,16 +1170,16 @@ devcloud up
 ```
 
 ```bash
-aws s3 mb s3://app-assets --endpoint-url http://localhost:4566
-aws s3 cp ./hello.txt s3://app-assets/hello.txt --endpoint-url http://localhost:4566
-aws s3 cp s3://app-assets/hello.txt - --endpoint-url http://localhost:4566
+aws s3 mb s3://app-assets --endpoint-url http://localhost:14566
+aws s3 cp ./hello.txt s3://app-assets/hello.txt --endpoint-url http://localhost:14566
+aws s3 cp s3://app-assets/hello.txt - --endpoint-url http://localhost:14566
 ```
 
 同時に SMTP も動かします。
 
 ```txt
-localhost:1025 SMTP
-localhost:8025 dashboard
+localhost:11025 SMTP
+localhost:18025 dashboard
 ```
 
 この段階で dashboard に以下を出します。
@@ -1200,16 +1200,16 @@ Logs
 ```bash
 aws sqs create-queue \
   --queue-name events \
-  --endpoint-url http://localhost:4566
+  --endpoint-url http://localhost:14566
 
 aws sqs send-message \
-  --queue-url http://localhost:4566/queue/events \
+  --queue-url http://localhost:14566/queue/events \
   --message-body '{"hello":"world"}' \
-  --endpoint-url http://localhost:4566
+  --endpoint-url http://localhost:14566
 
 aws sqs receive-message \
-  --queue-url http://localhost:4566/queue/events \
-  --endpoint-url http://localhost:4566
+  --queue-url http://localhost:14566/queue/events \
+  --endpoint-url http://localhost:14566
 ```
 
 この段階で、Message Core の設計を固めます。

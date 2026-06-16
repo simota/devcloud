@@ -150,7 +150,7 @@ pub async fn run(cfg: Config) -> Result<(), String> {
         let sd = shutdown_future(rx.clone());
         set.spawn(async move { services::dashboard::run(&c, sd).await });
     }
-    // TODO(agent): wire event relay (:8027) + redis control surface (tasks #8/#9).
+    // TODO(agent): wire event relay (:18027) + redis control surface (tasks #8/#9).
 
     if set.is_empty() {
         return Ok(());

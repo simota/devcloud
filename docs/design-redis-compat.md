@@ -17,7 +17,7 @@ If `managed` is requested and `redis-server` is missing from `$PATH`, the daemon
 
 ```yaml
 server:
-  redisPort: 6379
+  redisPort: 16379
 
 auth:
   redis:
@@ -146,7 +146,7 @@ Cluster, Sentinel, replication, Modules, RESP self-impl, TLS cert management, AC
 | Risk | Mitigation |
 |------|-----------|
 | `redis-server` missing | install hint, fall back to `external` or disabled |
-| Port `6379` collision | explicit error with port from config; user reroutes via `server.redisPort` |
+| Port `16379` collision | explicit error with port from config; user reroutes via `server.redisPort` |
 | Zombie child on crash | SIGTERM with timeout then SIGKILL (same as `managed_postgres`) |
 | Large keyspace UI lag | dashboard uses `SCAN` only, `KEYS *` removed from allowlist |
 | Credential leak | redact password in handler logs; never echo args in command runner logs |

@@ -143,7 +143,7 @@ mod tests {
 
     fn cfg() -> Config {
         Config {
-            addr: "127.0.0.1:6380".to_string(),
+            addr: "127.0.0.1:16380".to_string(),
             data_dir: PathBuf::from("/tmp/devcloud-redis"),
             binary: String::new(),
             max_memory_mb: 128,
@@ -159,7 +159,7 @@ mod tests {
         let args = cfg().args().unwrap().join(" ");
         for want in [
             "--bind 127.0.0.1",
-            "--port 6380",
+            "--port 16380",
             "--dir /tmp/devcloud-redis",
             "--save 60 1",
             "--appendonly yes",

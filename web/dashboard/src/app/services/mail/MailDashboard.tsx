@@ -157,7 +157,7 @@ function MailMessageList({
     return (
       <EmptyState
         title="Inbox is empty"
-        description="Send mail to localhost:1025 (relaxed SMTP AUTH) and refresh."
+        description="Send mail to localhost:11025 (relaxed SMTP AUTH) and refresh."
       />
     )
   }

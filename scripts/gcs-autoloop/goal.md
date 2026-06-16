@@ -10,7 +10,7 @@ Implement a Google Cloud Storage compatible local server for `devcloud`, followi
 
 ## Acceptance Criteria
 
-1. `devcloud up` starts a GCS JSON API endpoint on the configured local port, defaulting to `127.0.0.1:4443`.
+1. `devcloud up` starts a GCS JSON API endpoint on the configured local port, defaulting to `127.0.0.1:14443`.
 2. JSON API bucket operations work: `buckets.insert`, `buckets.get`, `buckets.list`, and `buckets.delete`.
 3. JSON API object operations work: media upload, metadata get, media download, list, delete, and copy.
 4. Object metadata includes GCS-compatible `generation`, `metageneration`, `etag`, `size`, `contentType`, `md5Hash` or `crc32c` where practical, and user metadata.

@@ -10,13 +10,13 @@ Implement an Amazon Redshift compatible local server for `devcloud`, following `
 
 ## Acceptance Criteria
 
-1. `devcloud up` starts a Redshift SQL endpoint on the configured local port, defaulting to `127.0.0.1:5439`.
-2. `devcloud up` starts a Redshift HTTP API endpoint on the configured local port, defaulting to `127.0.0.1:9099`.
-3. `psql "host=127.0.0.1 port=5439 dbname=dev user=dev password=dev sslmode=disable"` can connect and run `select 1`.
+1. `devcloud up` starts a Redshift SQL endpoint on the configured local port, defaulting to `127.0.0.1:15439`.
+2. `devcloud up` starts a Redshift HTTP API endpoint on the configured local port, defaulting to `127.0.0.1:19099`.
+3. `psql "host=127.0.0.1 port=15439 dbname=dev user=dev password=dev sslmode=disable"` can connect and run `select 1`.
 4. SQL clients can create schema/table resources, insert rows, update/delete rows, and query rows through the SQL endpoint using the PostgreSQL backend.
 5. Redshift table attributes such as `DISTKEY`, `SORTKEY`, `ENCODE`, and identity/default metadata are stripped from backend SQL, persisted as Redshift metadata, and visible through catalog metadata.
 6. Redshift Data API supports `ExecuteStatement`, `DescribeStatement`, `GetStatementResult`, `ListStatements`, `ListDatabases`, `ListSchemas`, `ListTables`, and `DescribeTable` for the MVP workflow.
-7. Redshift management API supports `DescribeClusters` with local cluster metadata and endpoint port `5439`; metadata-only cluster lifecycle, tags, parameters, and credentials can be staged after the MVP.
+7. Redshift management API supports `DescribeClusters` with local cluster metadata and endpoint port `15439`; metadata-only cluster lifecycle, tags, parameters, and credentials can be staged after the MVP.
 8. `COPY` can load CSV data from local S3 or local file fixtures into PostgreSQL, and `UNLOAD` can export PostgreSQL query results to local S3 or local file fixtures.
 9. Redshift-specific functions and expressions such as `GETDATE`, `SYSDATE`, `NVL`, `DECODE`, `DATEADD`, `DATEDIFF`, and `LISTAGG` are translated to PostgreSQL equivalents or rejected with Redshift-like errors when unsupported.
 10. `pg_catalog`, `information_schema`, and representative `stl` / `stv` / `svv` system schema queries combine PostgreSQL catalog data with devcloud metadata enough for client introspection.

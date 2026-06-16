@@ -579,7 +579,7 @@ function disabledStatus(service?: DashboardService): GCSStatus {
   return {
     status: 'disabled',
     running: false,
-    endpoint: service?.endpoint ?? 'http://127.0.0.1:4443',
+    endpoint: service?.endpoint ?? 'http://127.0.0.1:14443',
     project: 'devcloud',
     storagePath: service?.storagePath ?? '.devcloud/data/s3',
     uploadSessionPath: '.devcloud/data/gcs/upload_sessions',

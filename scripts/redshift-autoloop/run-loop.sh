@@ -204,7 +204,7 @@ Current repository context:
 
 Recommended implementation order:
 1. Config and daemon wiring for services.redshift, auth.redshift, server.redshiftPort, and server.redshiftAPIPort.
-2. Minimal Redshift service lifecycle with SQL :5439 and HTTP API :9099 health/readiness.
+2. Minimal Redshift service lifecycle with SQL :15439 and HTTP API :19099 health/readiness.
 3. PostgreSQL wire protocol startup, SSLRequest rejection, password auth, ParameterStatus, simple Query, RowDescription, DataRow, CommandComplete, ReadyForQuery, ErrorResponse, and Terminate.
 4. Catalog store for clusters, databases, schemas, tables, columns, users, and query history.
 5. SQL engine MVP: select literals, CREATE/DROP SCHEMA, CREATE/DROP TABLE with Redshift attributes, INSERT, SELECT table scan, LIMIT, simple WHERE, and basic transactions.

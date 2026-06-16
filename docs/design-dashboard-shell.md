@@ -209,8 +209,8 @@ Initial response:
 ```json
 {
   "services": [
-    {"id":"mail","name":"Mail","path":"/mail","status":"running","endpoint":"smtp://127.0.0.1:1025"},
-    {"id":"s3","name":"S3","path":"/s3","status":"running","endpoint":"http://127.0.0.1:4566"}
+    {"id":"mail","name":"Mail","path":"/mail","status":"running","endpoint":"smtp://127.0.0.1:11025"},
+    {"id":"s3","name":"S3","path":"/s3","status":"running","endpoint":"http://127.0.0.1:14566"}
   ]
 }
 ```

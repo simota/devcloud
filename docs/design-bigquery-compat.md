@@ -79,7 +79,7 @@ devcloud up
 REST API with curl:
 
 ```bash
-export DEV_BQ=http://127.0.0.1:9050
+export DEV_BQ=http://127.0.0.1:19050
 export DEV_PROJECT=devcloud
 
 curl -sS -X POST \
@@ -106,7 +106,7 @@ curl -sS -X POST \
 Client libraries should use:
 
 ```txt
-endpoint: http://127.0.0.1:9050
+endpoint: http://127.0.0.1:19050
 project: devcloud
 credentials: local emulator credential or anonymous relaxed mode
 ```
@@ -117,8 +117,8 @@ credentials: local emulator credential or anonymous relaxed mode
 
 ```txt
 Daemon:
-  BigQuery REST API endpoint  http://127.0.0.1:9050
-  Dashboard/API               http://127.0.0.1:8025
+  BigQuery REST API endpoint  http://127.0.0.1:19050
+  Dashboard/API               http://127.0.0.1:18025
 
 Project API:
   GET  /bigquery/v2/projects
@@ -221,7 +221,7 @@ BigQuery client library / bq / REST client
         |
         v
 +--------------------------------+
-| BigQuery HTTP Gateway          | :9050
+| BigQuery HTTP Gateway          | :19050
 | REST v2 + Upload routes        |
 +--------------------------------+
         |
@@ -249,7 +249,7 @@ BigQuery client library / bq / REST client
                            |
                            v
               +---------------------------+
-              | Dashboard/API             | :8025
+              | Dashboard/API             | :18025
               +---------------------------+
 ```
 
@@ -306,12 +306,12 @@ Default config:
 project: dev
 
 server:
-  smtpPort: 1025
-  dashboardPort: 8025
-  s3Port: 4566
-  gcsPort: 4443
-  dynamodbPort: 8000
-  bigqueryPort: 9050
+  smtpPort: 11025
+  dashboardPort: 18025
+  s3Port: 14566
+  gcsPort: 14443
+  dynamodbPort: 18000
+  bigqueryPort: 19050
 
 auth:
   bigquery:
@@ -683,7 +683,7 @@ Copy duplicates table metadata and row segments inside local BigQuery storage. `
   "name": "BigQuery",
   "path": "/dashboard/bigquery",
   "status": "running",
-  "endpoint": "http://127.0.0.1:9050",
+  "endpoint": "http://127.0.0.1:19050",
   "storagePath": ".devcloud/data/bigquery"
 }
 ```
@@ -747,7 +747,7 @@ Acceptance:
 ```bash
 cargo test --workspace
 cargo run -p devcloud-orchestrator -- help
-curl -fsS http://127.0.0.1:9050/bigquery/v2/projects
+curl -fsS http://127.0.0.1:19050/bigquery/v2/projects
 ```
 
 ### Phase 2: Catalog and TableData MVP
@@ -904,7 +904,7 @@ full: all of the above + client smoke
 
 ## Open Questions
 
-1. Should BigQuery endpoint default to `9050` or another port to avoid common local service conflicts?
+1. Should BigQuery endpoint default to `19050` or another port to avoid common local service conflicts?
 2. Should query execution depend on an embedded SQL engine, or should MVP use a narrow internal evaluator?
 3. Should load/extract jobs integrate with devcloud GCS only first, or also S3 from the start?
 4. Which client library should be the first automated smoke target: compatibility, Python, or Node.js?
@@ -914,7 +914,7 @@ full: all of the above + client smoke
 
 | ID | Criterion |
 | --- | --- |
-| AC-001 | `cargo run -p devcloud-orchestrator -- up` starts BigQuery on `127.0.0.1:9050`. |
+| AC-001 | `cargo run -p devcloud-orchestrator -- up` starts BigQuery on `127.0.0.1:19050`. |
 | AC-002 | `GET /bigquery/v2/projects` returns local project metadata. |
 | AC-003 | A dataset can be created, listed, fetched, patched, and deleted. |
 | AC-004 | A table with schema can be created, listed, fetched, patched, and deleted. |

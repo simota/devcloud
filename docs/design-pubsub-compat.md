@@ -38,7 +38,7 @@
 
 | Level | Name | Purpose |
 | --- | --- | --- |
-| L0 | Emulator Smoke | `PUBSUB_EMULATOR_HOST=127.0.0.1:8085` で SDK が接続できる |
+| L0 | Emulator Smoke | `PUBSUB_EMULATOR_HOST=127.0.0.1:18085` で SDK が接続できる |
 | L1 | Resource Core | Create/Get/List/Delete Topic と Subscription が通る |
 | L2 | Publish and Pull | Publish、Pull、Acknowledge、ModifyAckDeadline が通る |
 | L3 | Lease and Retry | ack deadline expiration、redelivery、delivery attempt、message retention が通る |
@@ -86,7 +86,7 @@ devcloud up
 Client libraries:
 
 ```bash
-export PUBSUB_EMULATOR_HOST=127.0.0.1:8085
+export PUBSUB_EMULATOR_HOST=127.0.0.1:18085
 export PUBSUB_PROJECT_ID=devcloud
 ```
 
@@ -116,19 +116,19 @@ gcloud pubsub subscriptions pull demo-sub \
 REST:
 
 ```bash
-curl -sS -X PUT http://127.0.0.1:8086/v1/projects/devcloud/topics/demo-topic \
+curl -sS -X PUT http://127.0.0.1:18086/v1/projects/devcloud/topics/demo-topic \
   -H "Content-Type: application/json" \
   -d '{}'
 
-curl -sS -X PUT http://127.0.0.1:8086/v1/projects/devcloud/subscriptions/demo-sub \
+curl -sS -X PUT http://127.0.0.1:18086/v1/projects/devcloud/subscriptions/demo-sub \
   -H "Content-Type: application/json" \
   -d '{"topic":"projects/devcloud/topics/demo-topic","ackDeadlineSeconds":10}'
 
-curl -sS -X POST http://127.0.0.1:8086/v1/projects/devcloud/topics/demo-topic:publish \
+curl -sS -X POST http://127.0.0.1:18086/v1/projects/devcloud/topics/demo-topic:publish \
   -H "Content-Type: application/json" \
   -d '{"messages":[{"data":"eyJ0eXBlIjoiZGVtbyJ9","attributes":{"source":"curl"}}]}'
 
-curl -sS -X POST http://127.0.0.1:8086/v1/projects/devcloud/subscriptions/demo-sub:pull \
+curl -sS -X POST http://127.0.0.1:18086/v1/projects/devcloud/subscriptions/demo-sub:pull \
   -H "Content-Type: application/json" \
   -d '{"maxMessages":1}'
 ```
@@ -136,7 +136,7 @@ curl -sS -X POST http://127.0.0.1:8086/v1/projects/devcloud/subscriptions/demo-s
 Dashboard:
 
 ```txt
-http://127.0.0.1:8025/dashboard/pubsub
+http://127.0.0.1:18025/dashboard/pubsub
 ```
 
 ## Scope
@@ -144,8 +144,8 @@ http://127.0.0.1:8025/dashboard/pubsub
 ### v0.1 Pub/Sub Foundation
 
 - Config schema, daemon wiring, health endpoint, service registry.
-- gRPC listener on `server.pubsubGrpcPort`, default `8085`.
-- REST listener on `server.pubsubRestPort`, default `8086`.
+- gRPC listener on `server.pubsubGrpcPort`, default `18085`.
+- REST listener on `server.pubsubRestPort`, default `18086`.
 - Filesystem store under `.devcloud/data/pubsub`.
 - Empty service starts and reports ready in dashboard.
 - `scripts/pubsub-autoloop/verify.sh` foundation stage.
@@ -205,7 +205,7 @@ http://127.0.0.1:8025/dashboard/pubsub
 ```txt
 Google Pub/Sub SDK / gcloud
         |
-        | gRPC :8085
+        | gRPC :18085
         v
 +-------------------------------+
 | services/pubsub/grpc |
@@ -231,7 +231,7 @@ Google Pub/Sub SDK / gcloud
 
 REST / dashboard / e2e
         |
-        | HTTP :8086
+        | HTTP :18086
         v
 +-------------------------------+
 | services/pubsub/rest |
@@ -295,9 +295,9 @@ Generated protobuf code should be added only if needed. Prefer importing officia
 
 ```yaml
 server:
-  dashboardPort: 8025
-  pubsubGrpcPort: 8085
-  pubsubRestPort: 8086
+  dashboardPort: 18025
+  pubsubGrpcPort: 18085
+  pubsubRestPort: 18086
 
 auth:
   pubsub:
@@ -323,8 +323,8 @@ services:
 
 | Field | Default | Notes |
 | --- | --- | --- |
-| `server.pubsubGrpcPort` | `8085` | Google Pub/Sub emulator default port |
-| `server.pubsubRestPort` | `8086` | REST/dashboard/e2e convenience endpoint |
+| `server.pubsubGrpcPort` | `18085` | Google Pub/Sub emulator default port |
+| `server.pubsubRestPort` | `18086` | REST/dashboard/e2e convenience endpoint |
 | `auth.pubsub.mode` | `relaxed` | Accept emulator-style unauthenticated requests |
 | `auth.pubsub.projectID` | `devcloud` | Used when request omits project in local helpers |
 | `auth.pubsub.bearerToken` | `dev` | Local bearer token for strict REST auth |
@@ -757,8 +757,8 @@ scripts/pubsub-e2e.sh
 
 ### Acceptance Criteria
 
-- AC-001: `devcloud up` starts Pub/Sub gRPC server on `127.0.0.1:8085` by default.
-- AC-002: `PUBSUB_EMULATOR_HOST=127.0.0.1:8085` client can create topic and subscription.
+- AC-001: `devcloud up` starts Pub/Sub gRPC server on `127.0.0.1:18085` by default.
+- AC-002: `PUBSUB_EMULATOR_HOST=127.0.0.1:18085` client can create topic and subscription.
 - AC-003: Client can publish a message and receive it from a pull subscription.
 - AC-004: Acknowledged messages are not delivered again.
 - AC-005: Unacknowledged messages are delivered again after ack deadline expiration.
@@ -803,7 +803,7 @@ scripts/pubsub-e2e.sh
 
 ## Open Questions
 
-1. Should Pub/Sub REST run on a separate port (`8086`) or share the gRPC port through h2c / grpc-gateway?
+1. Should Pub/Sub REST run on a separate port (`18086`) or share the gRPC port through h2c / grpc-gateway?
 2. Should default topic deletion reject attached subscriptions or delete topic metadata while subscriptions remain detached?
 3. Should invalid or expired ack IDs be strict errors by default, or ignored in relaxed emulator mode?
 4. Which SDK languages are mandatory for e2e before claiming L2 compatibility?

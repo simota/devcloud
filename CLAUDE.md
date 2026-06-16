@@ -19,7 +19,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ### Dashboard (React)
 The dashboard lives in `web/dashboard/` (Vite + React 18 + TS) and is embedded into the Rust dashboard crate at `services/dashboard/assets/react` via `include_dir`.
 - `cd web/dashboard && npm install`
-- `npm run dev` — Vite dev server (proxies `/api` to a running `devcloud up` on `:8025`).
+- `npm run dev` — Vite dev server (proxies `/api` to a running `devcloud up` on `:18025`).
 - `npm run build` — typecheck and emit static assets into `services/dashboard/assets/react/`. Run before testing Rust dashboard changes that depend on the latest UI bundle.
 - `npm run typecheck` — TypeScript check only.
 
@@ -44,7 +44,7 @@ Each provider lives under `services/<svc>/` and exposes crate-local config/serve
 - **Pub/Sub serves both gRPC and REST** from the Rust Pub/Sub crate. The gRPC and REST handlers share in-memory state and persistence.
 
 ### Dashboard
-`services/dashboard` is the HTTP entry point users hit at `:8025`. It serves:
+`services/dashboard` is the HTTP entry point users hit at `:18025`. It serves:
 - The React SPA from `assets/react` (embedded). `assets.rs` mounts `/dashboard/` and falls back to `index.html` for client-side routes.
 - A set of `/api/*` JSON endpoints that forward to each service's introspection/control or provider-protocol surface.
 - **Route convention:** every service page lives under `/dashboard/<svc>` (`mail`, `s3`, `gcs`, `dynamodb`, `bigquery`, `sqs`, `pubsub`, `redshift`). The compatibility short paths `/mail`, `/s3`, `/gcs`, `/dynamodb`, `/bigquery` return 301 redirects to their `/dashboard/<svc>` counterpart — never add new functionality to the compatibility redirects.

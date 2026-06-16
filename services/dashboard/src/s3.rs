@@ -63,7 +63,7 @@ pub async fn handle_status(config: &Config, req: &Request) -> Response {
             "status": if running { "running" } else { "disabled" },
             "running": running,
             "endpoint": if config.s3_endpoint.is_empty() {
-                "http://127.0.0.1:4566".to_string()
+                "http://127.0.0.1:14566".to_string()
             } else {
                 config.s3_endpoint.clone()
             },
@@ -745,7 +745,7 @@ mod tests {
     #[tokio::test]
     async fn status_running_when_base_set() {
         let mut cfg = Config::default();
-        cfg.s3_base = "http://127.0.0.1:4566".to_string();
+        cfg.s3_base = "http://127.0.0.1:14566".to_string();
         let resp = handle_status(&cfg, &req("GET", "/api/s3/status")).await;
         let v: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
         assert_eq!(v["status"], "running");

@@ -1,4 +1,4 @@
-//! Dashboard: the single user-facing HTTP entry (`:8025`). Serves the embedded
+//! Dashboard: the single user-facing HTTP entry (`:18025`). Serves the embedded
 //! React SPA + `/api/*` forwarding to each service's network endpoint + the
 //! events WS proxy to the relay. Mirrors the legacy daemon's `dashboard.Config`
 //! wiring (`daemon.rs`) and the `dashboard_rust.rs` env contract, but builds the

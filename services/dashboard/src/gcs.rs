@@ -47,7 +47,7 @@ pub async fn handle_status(config: &Config, req: &Request) -> Response {
             "status": if running { "running" } else { "disabled" },
             "running": running,
             "endpoint": if config.gcs_endpoint.is_empty() {
-                "http://127.0.0.1:4443".to_string()
+                "http://127.0.0.1:14443".to_string()
             } else {
                 config.gcs_endpoint.clone()
             },

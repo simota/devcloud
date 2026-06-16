@@ -63,7 +63,7 @@ pub async fn handle_status(config: &Config, req: &Request) -> Response {
             "status": status,
             "running": running,
             "endpoint": if config.dynamodb_endpoint.is_empty() {
-                "http://127.0.0.1:8000".to_string()
+                "http://127.0.0.1:18000".to_string()
             } else {
                 config.dynamodb_endpoint.clone()
             },

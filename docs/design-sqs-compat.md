@@ -87,19 +87,19 @@ export AWS_ACCESS_KEY_ID=dev
 export AWS_SECRET_ACCESS_KEY=dev
 export AWS_REGION=us-east-1
 
-aws --endpoint-url http://127.0.0.1:9324 sqs create-queue \
+aws --endpoint-url http://127.0.0.1:19324 sqs create-queue \
   --queue-name demo
 
-QUEUE_URL=$(aws --endpoint-url http://127.0.0.1:9324 sqs get-queue-url \
+QUEUE_URL=$(aws --endpoint-url http://127.0.0.1:19324 sqs get-queue-url \
   --queue-name demo \
   --query QueueUrl \
   --output text)
 
-aws --endpoint-url http://127.0.0.1:9324 sqs send-message \
+aws --endpoint-url http://127.0.0.1:19324 sqs send-message \
   --queue-url "$QUEUE_URL" \
   --message-body '{"type":"demo","id":"msg-1"}'
 
-aws --endpoint-url http://127.0.0.1:9324 sqs receive-message \
+aws --endpoint-url http://127.0.0.1:19324 sqs receive-message \
   --queue-url "$QUEUE_URL" \
   --wait-time-seconds 1 \
   --attribute-names All \
@@ -109,7 +109,7 @@ aws --endpoint-url http://127.0.0.1:9324 sqs receive-message \
 SDK clients should use:
 
 ```txt
-endpoint: http://127.0.0.1:9324
+endpoint: http://127.0.0.1:19324
 region: us-east-1
 accessKeyId: dev
 secretAccessKey: dev
@@ -118,7 +118,7 @@ secretAccessKey: dev
 Query protocol with curl:
 
 ```bash
-curl -sS http://127.0.0.1:9324/ \
+curl -sS http://127.0.0.1:19324/ \
   -H "Content-Type: application/x-www-form-urlencoded" \
   --data-urlencode "Action=CreateQueue" \
   --data-urlencode "Version=2012-11-05" \
@@ -128,7 +128,7 @@ curl -sS http://127.0.0.1:9324/ \
 AWS JSON protocol with curl:
 
 ```bash
-curl -sS http://127.0.0.1:9324/ \
+curl -sS http://127.0.0.1:19324/ \
   -H "Content-Type: application/x-amz-json-1.0" \
   -H "X-Amz-Target: AmazonSQS.CreateQueue" \
   -d '{"QueueName":"demo"}'
@@ -140,8 +140,8 @@ curl -sS http://127.0.0.1:9324/ \
 
 ```txt
 Daemon:
-  SQS endpoint        http://127.0.0.1:9324
-  Dashboard/API       http://127.0.0.1:8025
+  SQS endpoint        http://127.0.0.1:19324
+  Dashboard/API       http://127.0.0.1:18025
 
 Queue API:
   CreateQueue
@@ -263,7 +263,7 @@ AWS CLI / SDK / SQS client
         |
         v
 +-----------------------------+
-| SQS HTTP Gateway            | :9324
+| SQS HTTP Gateway            | :19324
 | Query + AWS JSON protocol   |
 | SigV4 verifier              |
 +-----------------------------+
@@ -353,7 +353,7 @@ Default config:
 
 ```yaml
 server:
-  sqsPort: 9324
+  sqsPort: 19324
 
 auth:
   sqs:
@@ -755,7 +755,7 @@ System attribute MVP:
   "id": "sqs",
   "name": "SQS",
   "status": "running",
-  "endpoint": "http://127.0.0.1:9324",
+  "endpoint": "http://127.0.0.1:19324",
   "dashboardPath": "/dashboard/sqs"
 }
 ```
@@ -1000,7 +1000,7 @@ E2E_INTERACTIVE=true E2E_DELETE_DATA=false scripts/sqs-e2e.sh
 
 ## Open Questions
 
-1. Should SQS use dedicated port `9324`, or join an AWS unified gateway port `4566` with S3 later?
+1. Should SQS use dedicated port `19324`, or join an AWS unified gateway port `4566` with S3 later?
 2. Should Query protocol or AWS JSON protocol be the first SDK compatibility gate?
 3. Should `services/s3/sigv4.rs` and `services/dynamodb/sigv4.rs` be extracted before SQS, or should SQS start with a local copy and refactor later?
 4. Should FIFO queue creation be accepted before full FIFO delivery is implemented, or rejected until L4?

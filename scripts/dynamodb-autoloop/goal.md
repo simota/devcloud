@@ -10,7 +10,7 @@ Implement an Amazon DynamoDB compatible local server for `devcloud`, following `
 
 ## Acceptance Criteria
 
-1. `devcloud up` starts a DynamoDB JSON API endpoint on the configured local port, defaulting to `127.0.0.1:8000`.
+1. `devcloud up` starts a DynamoDB JSON API endpoint on the configured local port, defaulting to `127.0.0.1:18000`.
 2. DynamoDB low-level JSON protocol works with `POST /`, `Content-Type: application/x-amz-json-1.0`, and `X-Amz-Target: DynamoDB_20120810.{Operation}`.
 3. Table operations work: `CreateTable`, `DescribeTable`, `ListTables`, `UpdateTable` for supported metadata, and `DeleteTable`.
 4. Item operations work: `PutItem`, `GetItem`, `UpdateItem`, `DeleteItem`, `BatchGetItem`, and `BatchWriteItem`.

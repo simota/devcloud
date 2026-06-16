@@ -6,7 +6,7 @@
 //! on-disk format, the legacy dashboard keeps reading messages transparently.
 //!
 //! Configuration is passed via environment variables (set by the daemon):
-//!   DEVCLOUD_MAIL_ADDR        listen address, e.g. 127.0.0.1:1025 (required)
+//!   DEVCLOUD_MAIL_ADDR        listen address, e.g. 127.0.0.1:11025 (required)
 //!   DEVCLOUD_MAIL_STORAGE     mail metadata dir (messages.jsonl)   (required)
 //!   DEVCLOUD_MAIL_BLOBS       blob store dir                       (required)
 //!   DEVCLOUD_MAIL_MAX_BYTES   max message bytes (i64, 0 = no limit)

@@ -4,9 +4,9 @@
 //! `DEVCLOUD_DASHBOARD_ENGINE=rust`, fully replacing the in-process legacy dashboard.
 //!
 //! Config via environment (set by the legacy daemon):
-//!   DEVCLOUD_DASHBOARD_ADDR          listen address, e.g. 127.0.0.1:8025 (required)
-//!   DEVCLOUD_DASHBOARD_EVENT_RELAY   ws base for the event relay (e.g. ws://127.0.0.1:8027)
-//!   DEVCLOUD_DASHBOARD_SQS_BASE      SQS service HTTP base (http://127.0.0.1:9324)
+//!   DEVCLOUD_DASHBOARD_ADDR          listen address, e.g. 127.0.0.1:18025 (required)
+//!   DEVCLOUD_DASHBOARD_EVENT_RELAY   ws base for the event relay (e.g. ws://127.0.0.1:18027)
+//!   DEVCLOUD_DASHBOARD_SQS_BASE      SQS service HTTP base (http://127.0.0.1:19324)
 //!   DEVCLOUD_DASHBOARD_<SVC>_BASE    other service bases (later increments)
 //!   DEVCLOUD_DASHBOARD_<SVC>_ENDPOINT/_STORAGE/...  registry display metadata
 //!

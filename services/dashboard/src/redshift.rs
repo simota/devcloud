@@ -76,7 +76,7 @@ pub async fn handle_status(config: &Config, req: &Request) -> Response {
             "running": running,
             "sqlEndpoint": config.redshift_sql_endpoint.clone(),
             "apiEndpoint": if config.redshift_endpoint.is_empty() {
-                "http://127.0.0.1:9099".to_string()
+                "http://127.0.0.1:19099".to_string()
             } else {
                 config.redshift_endpoint.clone()
             },

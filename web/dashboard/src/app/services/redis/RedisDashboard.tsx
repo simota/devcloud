@@ -876,7 +876,7 @@ function disabledStatus(service?: DashboardService): RedisStatus {
     status: 'disabled',
     running: false,
     mode: 'managed',
-    address: service?.endpoint?.replace(/^redis:\/\//, '') ?? '127.0.0.1:6379',
+    address: service?.endpoint?.replace(/^redis:\/\//, '') ?? '127.0.0.1:16379',
     serverVersion: '',
     connectedClients: 0,
     usedMemoryHuman: '',

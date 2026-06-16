@@ -129,7 +129,7 @@ Desktop layout:
 
 ```txt
 +--------------------------------------------------------------------------------+
-| devcloud Mail      SMTP localhost:1025  Running    Refresh  Clear all          |
+| devcloud Mail      SMTP localhost:11025  Running    Refresh  Clear all          |
 +-------------------------------+------------------------------------------------+
 | Inbox                         | Subject                                        |
 | Search / filter               | From / To / Received                           |
@@ -252,7 +252,7 @@ Elements:
 
 ```txt
 logo text: devcloud Mail
-endpoint chip: localhost:1025
+endpoint chip: localhost:11025
 status: Running / Stopped
 actions:
   Refresh
@@ -339,14 +339,14 @@ Empty inbox copy:
 
 ```txt
 No messages yet
-Send mail to localhost:1025 and it will appear here.
+Send mail to localhost:11025 and it will appear here.
 ```
 
 Include a compact SMTP snippet:
 
 ```txt
 host localhost
-port 1025
+port 11025
 TLS off
 auth none
 ```

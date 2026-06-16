@@ -221,13 +221,13 @@ function RedshiftInspector({
           <div>
             <dt>SQL endpoint</dt>
             <dd>
-              <code>{status?.sqlEndpoint ?? '127.0.0.1:5439'}</code>
+              <code>{status?.sqlEndpoint ?? '127.0.0.1:15439'}</code>
             </dd>
           </div>
           <div>
             <dt>API endpoint</dt>
             <dd>
-              <code>{status?.apiEndpoint ?? 'http://127.0.0.1:9099'}</code>
+              <code>{status?.apiEndpoint ?? 'http://127.0.0.1:19099'}</code>
             </dd>
           </div>
           <div>
@@ -429,8 +429,8 @@ function disabledStatus(service?: DashboardService): RedshiftStatus {
     service: 'redshift',
     status: 'disabled',
     running: false,
-    sqlEndpoint: '127.0.0.1:5439',
-    apiEndpoint: service?.endpoint ?? 'http://127.0.0.1:9099',
+    sqlEndpoint: '127.0.0.1:15439',
+    apiEndpoint: service?.endpoint ?? 'http://127.0.0.1:19099',
     region: 'us-east-1',
     clusterCount: 0,
     storagePath: service?.storagePath ?? '.devcloud/data/redshift',

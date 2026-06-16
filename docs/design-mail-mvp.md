@@ -9,7 +9,7 @@
 ## Goals
 
 - `devcloud up` で SMTP server と dashboard/API server を起動する。
-- アプリケーションから `localhost:1025` にメールを送信できる。
+- アプリケーションから `localhost:11025` にメールを送信できる。
 - 受信したメールを raw RFC 5322 message として保存する。
 - dashboard/API から inbox 一覧、本文、raw source を確認できる。
 - `devcloud reset` でローカル保存データを削除できる。
@@ -33,7 +33,7 @@ SMTP client は次のように接続する。
 
 ```txt
 host: localhost
-port: 1025
+port: 11025
 tls: false
 auth: none
 ```
@@ -47,7 +47,7 @@ devcloud dashboard
 または直接:
 
 ```txt
-http://localhost:8025
+http://localhost:18025
 ```
 
 ## Scope
@@ -62,8 +62,8 @@ CLI:
   devcloud dashboard
 
 Daemon:
-  SMTP server      localhost:1025
-  HTTP dashboard  localhost:8025
+  SMTP server      localhost:11025
+  HTTP dashboard  localhost:18025
 
 SMTP commands:
   HELO
@@ -109,7 +109,7 @@ SMTP client
     |
     v
 +----------------+
-| SMTP Server    | localhost:1025
+| SMTP Server    | localhost:11025
 +----------------+
     |
     v
@@ -126,7 +126,7 @@ SMTP client
     |
     v
 +----------------+
-| HTTP API       | localhost:8025/api
+| HTTP API       | localhost:18025/api
 +----------------+
     |
     v
@@ -170,8 +170,8 @@ Default config:
 project: dev
 
 server:
-  smtpPort: 1025
-  dashboardPort: 8025
+  smtpPort: 11025
+  dashboardPort: 18025
 
 auth:
   smtp:
@@ -381,7 +381,7 @@ devcloud reset
   - remove .devcloud/data/mail and .devcloud/data/blobs
 
 devcloud dashboard
-  - open http://localhost:8025 when possible
+  - open http://localhost:18025 when possible
   - print URL as fallback
 ```
 
@@ -403,7 +403,7 @@ devcloud dashboard
 ### Manual SMTP
 
 ```bash
-nc localhost 1025
+nc localhost 11025
 ```
 
 ```txt
@@ -421,7 +421,7 @@ QUIT
 Expected:
 
 - SMTP returns `250 OK` after DATA.
-- `GET http://localhost:8025/api/messages` returns the message.
+- `GET http://localhost:18025/api/messages` returns the message.
 - dashboard shows the received message.
 - `GET /api/messages/{id}/raw` returns the original source.
 
@@ -456,7 +456,7 @@ dashboard/api:
 ## Definition of Done
 
 - `devcloud up` starts SMTP and dashboard/API.
-- A mail client can send a plain text email to `localhost:1025`.
+- A mail client can send a plain text email to `localhost:11025`.
 - Inbox API and dashboard show the message.
 - Raw source is retrievable.
 - `devcloud reset` clears stored messages.

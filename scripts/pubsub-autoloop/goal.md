@@ -10,9 +10,9 @@ Implement a Google Cloud Pub/Sub compatible local server for `devcloud`, followi
 
 ## Acceptance Criteria
 
-1. `devcloud up` starts a Pub/Sub gRPC endpoint on the configured local port, defaulting to `127.0.0.1:8085`.
-2. `devcloud up` starts a Pub/Sub REST v1 endpoint on the configured local port, defaulting to `127.0.0.1:8086`.
-3. `PUBSUB_EMULATOR_HOST=127.0.0.1:8085` clients can create topics and subscriptions through the gRPC Publisher and Subscriber services.
+1. `devcloud up` starts a Pub/Sub gRPC endpoint on the configured local port, defaulting to `127.0.0.1:18085`.
+2. `devcloud up` starts a Pub/Sub REST v1 endpoint on the configured local port, defaulting to `127.0.0.1:18086`.
+3. `PUBSUB_EMULATOR_HOST=127.0.0.1:18085` clients can create topics and subscriptions through the gRPC Publisher and Subscriber services.
 4. REST v1 endpoints work for `projects.topics` and `projects.subscriptions` create, get, list, and delete workflows.
 5. `Publish` stores data, attributes, ordering key, server publish time, and stable message IDs.
 6. Publishing to a topic fans out messages to every attached subscription without cross-subscription ack interference.

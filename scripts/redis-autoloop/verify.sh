@@ -110,7 +110,7 @@ PY
 
 assert_redis_design_contract() {
   test -f docs/design-redis-compat.md &&
-    env -u RIPGREP_CONFIG_PATH rg -q 'managed|external|allowlist|6379|design-redis' docs/design-redis-compat.md
+    env -u RIPGREP_CONFIG_PATH rg -q 'managed|external|allowlist|16379|design-redis' docs/design-redis-compat.md
 }
 
 assert_script_contract() {

@@ -275,7 +275,7 @@ ensure_started() {
 
 assert_redshift_design_contract() {
   test -f docs/design-redshift-compat.md &&
-    env -u RIPGREP_CONFIG_PATH rg -q 'Amazon Redshift Compatibility Design|5439|ExecuteStatement|DescribeClusters|COPY|UNLOAD|AC-001' docs/design-redshift-compat.md
+    env -u RIPGREP_CONFIG_PATH rg -q 'Amazon Redshift Compatibility Design|15439|ExecuteStatement|DescribeClusters|COPY|UNLOAD|AC-001' docs/design-redshift-compat.md
 }
 
 assert_script_contract() {

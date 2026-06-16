@@ -6,7 +6,7 @@
 
 目標は「Redshift を使う開発者が endpoint override と local credentials だけで、SQL client、AWS CLI / SDK の Redshift Data API、Redshift 管理 API の主要 workflow を実行できる」ことである。Redshift の完全互換は PostgreSQL 系 SQL wire protocol、Redshift SQL dialect、MPP / columnar behavior、Data API、provisioned cluster 管理 API、Serverless 管理 API、COPY / UNLOAD、system catalog、IAM / Secrets Manager 連携、WLM、snapshot、Spectrum、datashare まで広いため、実装は段階化する。
 
-初期実装では「local 開発とテストに必要な互換」を優先する。SQL endpoint は Redshift の既定 port である `5439` を使い、`psql`、JDBC / ODBC compatible clients、Redshift Data API の `ExecuteStatement` / `GetStatementResult` workflow を最短で成立させる。管理 API は cluster / namespace / workgroup を local metadata として返し、AWS SDK / CLI の起動確認、dashboard、e2e で使える control plane を提供する。
+初期実装では「local 開発とテストに必要な互換」を優先する。SQL endpoint は Redshift の既定 port (`5439`) との衝突を避けるため +10000 した `15439` を使い、`psql`、JDBC / ODBC compatible clients、Redshift Data API の `ExecuteStatement` / `GetStatementResult` workflow を最短で成立させる。管理 API は cluster / namespace / workgroup を local metadata として返し、AWS SDK / CLI の起動確認、dashboard、e2e で使える control plane を提供する。
 
 DB 実行部分は PostgreSQL backend を第一候補にする。`devcloud` は Redshift 互換 API / wire protocol / dialect translation / Data API lifecycle / control plane metadata を担当し、通常の SQL 実行、transaction、catalog の大部分は PostgreSQL に委譲する。`DISTKEY`、`SORTKEY`、`ENCODE`、`COPY FROM s3://...`、`UNLOAD TO s3://...`、Redshift 固有関数、`stl` / `stv` / `svv` system views は互換レイヤーで吸収し、PostgreSQL 向け SQL または devcloud side effect に変換する。
 
@@ -30,7 +30,7 @@ DB 実行部分は PostgreSQL backend を第一候補にする。`devcloud` は 
 
 ここでの Redshift 互換は、以下を満たす状態を指す。
 
-1. SQL client が `host=127.0.0.1 port=5439 sslmode=disable` で接続できる。
+1. SQL client が `host=127.0.0.1 port=15439 sslmode=disable` で接続できる。
 2. PostgreSQL startup / auth / query protocol のうち、Redshift client libraries と `psql` が使う主要 path を処理できる。
 3. Redshift SQL dialect の DDL / DML / query / transaction / COPY / UNLOAD の主要 subset を PostgreSQL backend と devcloud side effects の組み合わせで実行できる。
 4. AWS CLI / SDK の `redshift-data` client が endpoint override で `ExecuteStatement`、`BatchExecuteStatement`、`DescribeStatement`、`GetStatementResult`、`ListStatements`、metadata list 系を実行できる。
@@ -55,8 +55,8 @@ MVP は L0 + L1 + L2 + L3 を対象にする。最終的な「完全互換」は
 
 ## Goals
 
-- REQ-001: `devcloud up` で Redshift SQL listener を `127.0.0.1:5439` に起動する。
-- REQ-002: `devcloud up` で Redshift HTTP API listener を `127.0.0.1:9099` に起動する。
+- REQ-001: `devcloud up` で Redshift SQL listener を `127.0.0.1:15439` に起動する。
+- REQ-002: `devcloud up` で Redshift HTTP API listener を `127.0.0.1:19099` に起動する。
 - REQ-003: `psql` から password auth または relaxed auth で接続できる。
 - REQ-004: PostgreSQL simple query protocol を実装し、extended query protocol は段階的に追加できる boundary を用意する。
 - REQ-005: Redshift SQL dialect の parser / translator / backend boundary を定義し、SQL backend を service adapter から分離する。
@@ -95,20 +95,20 @@ devcloud up
 SQL client:
 
 ```bash
-psql "host=127.0.0.1 port=5439 dbname=dev user=dev password=dev sslmode=disable"
+psql "host=127.0.0.1 port=15439 dbname=dev user=dev password=dev sslmode=disable"
 ```
 
 JDBC:
 
 ```txt
-jdbc:redshift://127.0.0.1:5439/dev?ssl=false
+jdbc:redshift://127.0.0.1:15439/dev?ssl=false
 ```
 
 AWS CLI Data API:
 
 ```bash
 aws redshift-data execute-statement \
-  --endpoint-url http://127.0.0.1:9099 \
+  --endpoint-url http://127.0.0.1:19099 \
   --region us-east-1 \
   --cluster-identifier devcloud \
   --database dev \
@@ -118,7 +118,7 @@ aws redshift-data execute-statement \
 
 ```bash
 aws redshift-data get-statement-result \
-  --endpoint-url http://127.0.0.1:9099 \
+  --endpoint-url http://127.0.0.1:19099 \
   --region us-east-1 \
   --id "$STATEMENT_ID"
 ```
@@ -127,7 +127,7 @@ AWS CLI management API:
 
 ```bash
 aws redshift describe-clusters \
-  --endpoint-url http://127.0.0.1:9099 \
+  --endpoint-url http://127.0.0.1:19099 \
   --region us-east-1
 ```
 
@@ -150,7 +150,7 @@ csv;
 Dashboard:
 
 ```txt
-http://127.0.0.1:8025/dashboard/redshift
+http://127.0.0.1:18025/dashboard/redshift
 ```
 
 ## Scope
@@ -184,7 +184,7 @@ http://127.0.0.1:8025/dashboard/redshift
 
 ```txt
                          +-----------------------------+
- psql / JDBC / ODBC ---> | Redshift SQL Listener :5439 |
+ psql / JDBC / ODBC ---> | Redshift SQL Listener :15439 |
                          +-------------+---------------+
                                        |
                                        v
@@ -195,7 +195,7 @@ http://127.0.0.1:8025/dashboard/redshift
  AWS CLI / SDK ----------+             |
  redshift-data/redshift  |             v
                          | +-----------+---------------+
-                         +>| Redshift HTTP API :9099   |
+                         +>| Redshift HTTP API :19099   |
                            +-----------+---------------+
                                        |
  Dashboard API ----------+             v
@@ -311,8 +311,8 @@ docs/
 
 ```yaml
 server:
-  redshiftPort: 5439
-  redshiftAPIPort: 9099
+  redshiftPort: 15439
+  redshiftAPIPort: 19099
 
 auth:
   redshift:
@@ -358,7 +358,7 @@ services:
 - `ServerConfig` に `RedshiftPort` と `RedshiftAPIPort` を追加する。
 - `AuthConfig` に `RedshiftAuthConfig` を追加する。
 - `ServicesConfig` に `RedshiftServiceConfig` を追加する。
-- `DefaultConfig()` は local Redshift の一般的な接続を優先し、SQL port は `5439`、HTTP API port は `9099` とする。
+- `DefaultConfig()` は local Redshift の一般的な接続を優先し、SQL port は `15439`、HTTP API port は `19099` とする。
 - `services.redshift.backend.kind` は `postgres` を default backend とする。`backend.kind=memory` は明示設定された場合だけ使う開発継続用 fallback として残す。
 - `services.redshift.backend.mode` は `managed` または `external` を持つ。`managed` は devcloud が local PostgreSQL process を起動する。`external` は `externalDsn` で指定された local PostgreSQL に接続する。
 - managed PostgreSQL は bundled binary や container ではなく、`PATH` 上の system `initdb`、system `postgres`、system `psql` を利用する。見つからない場合は、PostgreSQL binaries のインストールまたは `services.redshift.backend.mode=external` と `externalDsn` の設定を促す actionable error を返す。
@@ -429,7 +429,7 @@ services:
 | `ClusterIdentifier` | config / create API | default `devcloud` |
 | `ClusterStatus` | service lifecycle | `available`, `creating`, `deleting` |
 | `Endpoint.Address` | config | `127.0.0.1` by default |
-| `Endpoint.Port` | config | `5439` |
+| `Endpoint.Port` | config | `15439` |
 | `DBName` | config / catalog | default `dev` |
 | `MasterUsername` | auth config | default `dev` |
 | `NodeType` | config | metadata only |
@@ -769,7 +769,7 @@ The current Redshift implementation passes the local full gate with a local memo
 
 PostgreSQL becomes the primary execution backend. The Redshift layer remains responsible for:
 
-- PostgreSQL wire compatibility on Redshift port `5439`.
+- PostgreSQL wire compatibility on Redshift port `15439`.
 - Redshift Data API and management API response shapes.
 - Redshift SQL dialect translation.
 - Redshift-only metadata such as dist/sort/encode and cluster descriptors.
@@ -837,14 +837,14 @@ scripts/redshift-e2e.sh
 
 ### Acceptance Criteria
 
-- AC-001: `devcloud up` starts Redshift SQL server on `127.0.0.1:5439` by default.
-- AC-002: `devcloud up` starts Redshift HTTP API server on `127.0.0.1:9099` by default.
+- AC-001: `devcloud up` starts Redshift SQL server on `127.0.0.1:15439` by default.
+- AC-002: `devcloud up` starts Redshift HTTP API server on `127.0.0.1:19099` by default.
 - AC-003: `psql` can connect with local credentials and run `select 1`.
 - AC-004: SQL client can create schema/table, insert rows, and query rows.
 - AC-005: Redshift table attributes such as dist/sort/encode are stripped from PostgreSQL SQL, persisted as Redshift metadata, and visible in catalog metadata.
 - AC-006: `aws redshift-data execute-statement` can run a query and return a statement id.
 - AC-007: `aws redshift-data get-statement-result` can fetch result rows with correct field shape.
-- AC-008: `aws redshift describe-clusters` returns local cluster metadata with endpoint port `5439`.
+- AC-008: `aws redshift describe-clusters` returns local cluster metadata with endpoint port `15439`.
 - AC-009: Dashboard shows Redshift endpoints, cluster status, catalog, and recent statements.
 - AC-010: `devcloud reset` removes Redshift local state.
 - AC-011: PostgreSQL backend mode passes SQL core, Data API, COPY / UNLOAD, dashboard, and e2e gates.
@@ -856,7 +856,7 @@ scripts/redshift-e2e.sh
 
 | Capability | Amazon Redshift | devcloud Current | devcloud Target |
 | --- | --- | --- | --- |
-| SQL endpoint on 5439 | Yes | Yes | Yes |
+| SQL endpoint on 15439 | Yes | Yes | Yes |
 | PostgreSQL simple query protocol | Yes | Yes | Yes |
 | PostgreSQL extended query protocol | Yes | Partial | Broader JDBC/ODBC and binary format parity |
 | Redshift JDBC / ODBC clients | Yes | Smoke only | Yes |

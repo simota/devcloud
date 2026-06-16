@@ -11,7 +11,7 @@ The project needs a local S3-compatible server that AWS CLI, AWS SDKs, and commo
 ## Acceptance Criteria
 
 1. Foundation remains healthy: `cargo test --workspace`, `devcloud help`, `cargo run -p devcloud-orchestrator -- help`, and `orchestrator` build all pass.
-2. Config and daemon support S3 settings, including endpoint port `4566`, region, auth mode, storage path, and service enablement while preserving existing Mail defaults.
+2. Config and daemon support S3 settings, including endpoint port `14566`, region, auth mode, storage path, and service enablement while preserving existing Mail defaults.
 3. S3 REST XML endpoint supports path-style ListBuckets, CreateBucket, HeadBucket, DeleteBucket, ListObjectsV2/ListObjects, PutObject, HeadObject, GetObject, DeleteObject, CopyObject, user metadata, ETag, content headers, and Range GET.
 4. SigV4 signed requests and presigned URLs validate against local credentials, with a documented relaxed mode for local development.
 5. Multipart upload supports create, upload part, list parts, complete, abort, and list multipart uploads with filesystem-backed persistence.

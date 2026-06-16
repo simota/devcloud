@@ -81,7 +81,7 @@ pub async fn handle_status(config: &Config, req: &Request) -> Response {
     }
 
     let endpoint = if config.sqs_base.is_empty() {
-        "http://127.0.0.1:9324".to_string()
+        "http://127.0.0.1:19324".to_string()
     } else {
         config.sqs_base.clone()
     };

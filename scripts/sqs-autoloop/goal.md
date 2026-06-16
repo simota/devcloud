@@ -10,7 +10,7 @@ Implement an Amazon SQS compatible local server for `devcloud`, following `docs/
 
 ## Acceptance Criteria
 
-1. `devcloud up` starts an SQS endpoint on the configured local port, defaulting to `127.0.0.1:9324`.
+1. `devcloud up` starts an SQS endpoint on the configured local port, defaulting to `127.0.0.1:19324`.
 2. AWS JSON protocol works with `POST /`, `Content-Type: application/x-amz-json-1.0`, and `X-Amz-Target: AmazonSQS.{Operation}`.
 3. Query protocol works with `Action`, `Version=2012-11-05`, form parameters, and SQS-compatible XML success/error responses.
 4. Queue operations work: `CreateQueue`, `DeleteQueue`, `GetQueueUrl`, `ListQueues`, `GetQueueAttributes`, `SetQueueAttributes`, and `PurgeQueue`.

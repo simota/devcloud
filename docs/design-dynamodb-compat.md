@@ -82,17 +82,17 @@ export AWS_ACCESS_KEY_ID=dev
 export AWS_SECRET_ACCESS_KEY=dev
 export AWS_REGION=us-east-1
 
-aws --endpoint-url http://127.0.0.1:8000 dynamodb create-table \
+aws --endpoint-url http://127.0.0.1:18000 dynamodb create-table \
   --table-name Demo \
   --attribute-definitions AttributeName=pk,AttributeType=S AttributeName=sk,AttributeType=S \
   --key-schema AttributeName=pk,KeyType=HASH AttributeName=sk,KeyType=RANGE \
   --billing-mode PAY_PER_REQUEST
 
-aws --endpoint-url http://127.0.0.1:8000 dynamodb put-item \
+aws --endpoint-url http://127.0.0.1:18000 dynamodb put-item \
   --table-name Demo \
   --item '{"pk":{"S":"user#1"},"sk":{"S":"profile"},"name":{"S":"Ada"}}'
 
-aws --endpoint-url http://127.0.0.1:8000 dynamodb get-item \
+aws --endpoint-url http://127.0.0.1:18000 dynamodb get-item \
   --table-name Demo \
   --key '{"pk":{"S":"user#1"},"sk":{"S":"profile"}}'
 ```
@@ -100,7 +100,7 @@ aws --endpoint-url http://127.0.0.1:8000 dynamodb get-item \
 SDK clients should use:
 
 ```txt
-endpoint: http://127.0.0.1:8000
+endpoint: http://127.0.0.1:18000
 region: us-east-1
 accessKeyId: dev
 secretAccessKey: dev
@@ -112,8 +112,8 @@ secretAccessKey: dev
 
 ```txt
 Daemon:
-  DynamoDB JSON endpoint  http://127.0.0.1:8000
-  Dashboard/API           http://127.0.0.1:8025
+  DynamoDB JSON endpoint  http://127.0.0.1:18000
+  Dashboard/API           http://127.0.0.1:18025
 
 Table API:
   CreateTable
@@ -210,7 +210,7 @@ AWS CLI / SDK / DynamoDB client
         |
         v
 +-----------------------------+
-| DynamoDB HTTP Gateway       | :8000
+| DynamoDB HTTP Gateway       | :18000
 | JSON 1.0 + X-Amz-Target     |
 | SigV4 verifier              |
 +-----------------------------+
@@ -239,7 +239,7 @@ AWS CLI / SDK / DynamoDB client
         |
         v
 +-----------------------------+
-| Dashboard/API               | :8025
+| Dashboard/API               | :18025
 +-----------------------------+
 ```
 
@@ -281,11 +281,11 @@ Default config:
 project: dev
 
 server:
-  smtpPort: 1025
-  dashboardPort: 8025
-  s3Port: 4566
-  gcsPort: 4443
-  dynamodbPort: 8000
+  smtpPort: 11025
+  dashboardPort: 18025
+  s3Port: 14566
+  gcsPort: 14443
+  dynamodbPort: 18000
 
 auth:
   dynamodb:
@@ -720,13 +720,13 @@ VERIFY_STAGE=full bash scripts/dynamodb-autoloop/verify.sh
 AWS CLI:
 
 ```bash
-aws --endpoint-url http://127.0.0.1:8000 dynamodb create-table ...
-aws --endpoint-url http://127.0.0.1:8000 dynamodb put-item ...
-aws --endpoint-url http://127.0.0.1:8000 dynamodb get-item ...
-aws --endpoint-url http://127.0.0.1:8000 dynamodb update-item ...
-aws --endpoint-url http://127.0.0.1:8000 dynamodb query ...
-aws --endpoint-url http://127.0.0.1:8000 dynamodb scan ...
-aws --endpoint-url http://127.0.0.1:8000 dynamodb delete-table ...
+aws --endpoint-url http://127.0.0.1:18000 dynamodb create-table ...
+aws --endpoint-url http://127.0.0.1:18000 dynamodb put-item ...
+aws --endpoint-url http://127.0.0.1:18000 dynamodb get-item ...
+aws --endpoint-url http://127.0.0.1:18000 dynamodb update-item ...
+aws --endpoint-url http://127.0.0.1:18000 dynamodb query ...
+aws --endpoint-url http://127.0.0.1:18000 dynamodb scan ...
+aws --endpoint-url http://127.0.0.1:18000 dynamodb delete-table ...
 ```
 
 SDK matrix:
@@ -773,7 +773,7 @@ Contract fixtures:
 
 ## Open Questions
 
-1. Should DynamoDB use dedicated port `8000`, or share a unified AWS gateway port `4566` with S3/SQS later?
+1. Should DynamoDB use dedicated port `18000`, or share a unified AWS gateway port `4566` with S3/SQS later?
 2. Should MVP implement `UpdateItem` before GSI, or stabilize GSI read paths first?
 3. Which compatibility target should gate v0.1: AWS CLI, AWS SDK v2, boto3, or JavaScript v3?
 4. Should `storage/kv` be introduced before DynamoDB, or start with `storage/dynamodb` and extract later?

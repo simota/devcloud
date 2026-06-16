@@ -154,7 +154,7 @@ impl Config {
     /// The SQS registry endpoint mirrors the legacy default of the SQS HTTP base.
     fn sqs_endpoint_display(&self) -> String {
         if self.sqs_base.is_empty() {
-            "http://127.0.0.1:9324".to_string()
+            "http://127.0.0.1:19324".to_string()
         } else {
             self.sqs_base.clone()
         }
@@ -193,7 +193,7 @@ mod tests {
     #[test]
     fn sqs_running_when_base_configured() {
         let mut cfg = Config::default();
-        cfg.sqs_base = "http://127.0.0.1:9324".to_string();
+        cfg.sqs_base = "http://127.0.0.1:19324".to_string();
         let resp = handle(&cfg, &req());
         let v: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
         let sqs = v["services"]

@@ -5,7 +5,7 @@
 //! legacy dashboard receives in-process pointers, but the Rust dashboard receives the
 //! same information as **network addresses** plus the display metadata the
 //! `/api/services` registry needs. Every endpoint is a full base URL
-//! (`http://127.0.0.1:9324`) the forwarding client can hit directly.
+//! (`http://127.0.0.1:19324`) the forwarding client can hit directly.
 
 /// Reads an env var, returning an empty string when unset. Empty means
 /// "not configured" — the registry reports such a service as `disabled`.
@@ -24,14 +24,14 @@ fn env_or(key: &str, fallback: &str) -> String {
 /// URLs the forwarding client targets; the display fields feed `/api/services`.
 #[derive(Clone, Debug, Default)]
 pub struct Config {
-    /// Listen address for the dashboard itself, e.g. `127.0.0.1:8025`.
+    /// Listen address for the dashboard itself, e.g. `127.0.0.1:18025`.
     pub addr: String,
-    /// WebSocket base for the daemon event relay, e.g. `ws://127.0.0.1:8027`.
+    /// WebSocket base for the daemon event relay, e.g. `ws://127.0.0.1:18027`.
     pub event_relay_endpoint: String,
 
     // SQS — the template service for Phase 2.
     /// Base URL of the SQS service HTTP listener (provider protocol +
-    /// `/_introspect/`), e.g. `http://127.0.0.1:9324`. Empty == disabled.
+    /// `/_introspect/`), e.g. `http://127.0.0.1:19324`. Empty == disabled.
     pub sqs_base: String,
     pub sqs_region: String,
     pub sqs_auth_mode: String,
@@ -84,19 +84,19 @@ impl Config {
             sqs_storage_path: env_or("DEVCLOUD_DASHBOARD_SQS_STORAGE", ".devcloud/data/sqs"),
 
             mail_base: env("DEVCLOUD_DASHBOARD_MAIL_BASE"),
-            mail_endpoint: env_or("DEVCLOUD_DASHBOARD_MAIL_ENDPOINT", "smtp://127.0.0.1:1025"),
+            mail_endpoint: env_or("DEVCLOUD_DASHBOARD_MAIL_ENDPOINT", "smtp://127.0.0.1:11025"),
             mail_storage_path: env_or("DEVCLOUD_DASHBOARD_MAIL_STORAGE", ".devcloud/data/mail"),
             mail_disabled: env("DEVCLOUD_DASHBOARD_MAIL_DISABLED") == "1",
             s3_base: env("DEVCLOUD_DASHBOARD_S3_BASE"),
-            s3_endpoint: env_or("DEVCLOUD_DASHBOARD_S3_ENDPOINT", "http://127.0.0.1:4566"),
+            s3_endpoint: env_or("DEVCLOUD_DASHBOARD_S3_ENDPOINT", "http://127.0.0.1:14566"),
             s3_storage_path: env_or("DEVCLOUD_DASHBOARD_S3_STORAGE", ".devcloud/data/s3"),
             gcs_base: env("DEVCLOUD_DASHBOARD_GCS_BASE"),
-            gcs_endpoint: env_or("DEVCLOUD_DASHBOARD_GCS_ENDPOINT", "http://127.0.0.1:4443"),
+            gcs_endpoint: env_or("DEVCLOUD_DASHBOARD_GCS_ENDPOINT", "http://127.0.0.1:14443"),
             gcs_storage_path: env_or("DEVCLOUD_DASHBOARD_GCS_STORAGE", ".devcloud/data/s3"),
             dynamodb_base: env("DEVCLOUD_DASHBOARD_DYNAMODB_BASE"),
             dynamodb_endpoint: env_or(
                 "DEVCLOUD_DASHBOARD_DYNAMODB_ENDPOINT",
-                "http://127.0.0.1:8000",
+                "http://127.0.0.1:18000",
             ),
             dynamodb_storage_path: env_or(
                 "DEVCLOUD_DASHBOARD_DYNAMODB_STORAGE",
@@ -105,7 +105,7 @@ impl Config {
             bigquery_base: env("DEVCLOUD_DASHBOARD_BIGQUERY_BASE"),
             bigquery_endpoint: env_or(
                 "DEVCLOUD_DASHBOARD_BIGQUERY_ENDPOINT",
-                "http://127.0.0.1:9050",
+                "http://127.0.0.1:19050",
             ),
             bigquery_storage_path: env_or(
                 "DEVCLOUD_DASHBOARD_BIGQUERY_STORAGE",
@@ -114,11 +114,11 @@ impl Config {
             redshift_base: env("DEVCLOUD_DASHBOARD_REDSHIFT_BASE"),
             redshift_sql_endpoint: env_or(
                 "DEVCLOUD_DASHBOARD_REDSHIFT_SQL_ENDPOINT",
-                "127.0.0.1:5439",
+                "127.0.0.1:15439",
             ),
             redshift_endpoint: env_or(
                 "DEVCLOUD_DASHBOARD_REDSHIFT_ENDPOINT",
-                "http://127.0.0.1:9099",
+                "http://127.0.0.1:19099",
             ),
             redshift_storage_path: env_or(
                 "DEVCLOUD_DASHBOARD_REDSHIFT_STORAGE",
@@ -127,14 +127,14 @@ impl Config {
             redis_base: env("DEVCLOUD_DASHBOARD_REDIS_BASE"),
             redis_endpoint: env_or(
                 "DEVCLOUD_DASHBOARD_REDIS_ENDPOINT",
-                "redis://127.0.0.1:6379",
+                "redis://127.0.0.1:16379",
             ),
             redis_storage_path: env_or("DEVCLOUD_DASHBOARD_REDIS_STORAGE", ".devcloud/data/redis"),
             redis_enabled: env("DEVCLOUD_DASHBOARD_REDIS_ENABLED") == "1",
             pubsub_base: env("DEVCLOUD_DASHBOARD_PUBSUB_BASE"),
             pubsub_endpoint: env_or(
                 "DEVCLOUD_DASHBOARD_PUBSUB_ENDPOINT",
-                "http://127.0.0.1:8086",
+                "http://127.0.0.1:18086",
             ),
             pubsub_storage_path: env_or(
                 "DEVCLOUD_DASHBOARD_PUBSUB_STORAGE",

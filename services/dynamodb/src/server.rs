@@ -507,7 +507,7 @@ impl Server {
     /// `DescribeEndpoints` — static.
     pub fn describe_endpoints(&self) -> Vec<u8> {
         let address = if self.config.addr.is_empty() {
-            "127.0.0.1:8000".to_string()
+            "127.0.0.1:18000".to_string()
         } else {
             self.config.addr.clone()
         };

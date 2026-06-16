@@ -76,7 +76,7 @@ devcloud up
 JSON API with curl:
 
 ```bash
-export DEV_GCS=http://127.0.0.1:4443
+export DEV_GCS=http://127.0.0.1:14443
 export DEV_PROJECT=devcloud
 
 curl -sS -X POST \
@@ -96,7 +96,7 @@ curl -sS "${DEV_GCS}/download/storage/v1/b/demo/o/hello.txt?alt=media"
 Client libraries should use:
 
 ```txt
-endpoint: http://127.0.0.1:4443
+endpoint: http://127.0.0.1:14443
 project: devcloud
 credentials: local emulator credential or anonymous relaxed mode
 ```
@@ -107,8 +107,8 @@ credentials: local emulator credential or anonymous relaxed mode
 
 ```txt
 Daemon:
-  GCS JSON API endpoint  http://127.0.0.1:4443
-  Dashboard/API          http://127.0.0.1:8025
+  GCS JSON API endpoint  http://127.0.0.1:14443
+  Dashboard/API          http://127.0.0.1:18025
 
 Bucket API:
   POST   /storage/v1/b?project={project}          buckets.insert
@@ -182,7 +182,7 @@ GCS client library / gcloud / gsutil / curl
         |
         v
 +----------------------------+
-| GCS HTTP Gateway           | :4443
+| GCS HTTP Gateway           | :14443
 | JSON API + Upload API      |
 +----------------------------+
         |
@@ -212,7 +212,7 @@ GCS client library / gcloud / gsutil / curl
         |
         v
 +----------------------------+
-| Dashboard/API              | :8025
+| Dashboard/API              | :18025
 +----------------------------+
 ```
 
@@ -586,7 +586,7 @@ credentials、外部 emulator には依存しない。
 
 ## Open Questions
 
-1. Should GCS use dedicated port `4443`, or share a unified Google API gateway port?
+1. Should GCS use dedicated port `14443`, or share a unified Google API gateway port?
 2. Should Object Core extraction happen before any GCS handler, or should GCS start with a temporary adapter over the current S3 store?
 3. Which clients are the first compatibility target: first-party client library, Python client library, `gcloud storage`, or `gsutil`?
 4. Should strict OAuth token validation ever call external Google services, or remain fully offline?

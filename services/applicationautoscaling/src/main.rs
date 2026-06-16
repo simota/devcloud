@@ -1,7 +1,7 @@
 //! Standalone Application Auto Scaling server binary for the strangler-fig seam.
 //!
 //! Config via environment (set by the legacy daemon):
-//!   DEVCLOUD_AAS_ADDR        listen address, e.g. 127.0.0.1:8030 (required)
+//!   DEVCLOUD_AAS_ADDR        listen address, e.g. 127.0.0.1:18030 (required)
 //!   DEVCLOUD_AAS_STORAGE     state.json directory                (required)
 //!   DEVCLOUD_AAS_REGION      AWS region (default us-east-1)
 //!   DEVCLOUD_AAS_ACCOUNT_ID  account id for ARNs (default 000000000000)

@@ -137,7 +137,7 @@ Desktop:
 
 ```txt
 +--------------------------------------------------------------------------------+
-| devcloud S3   :4566  us-east-1  relaxed auth     Refresh  Create bucket        |
+| devcloud S3   :14566  us-east-1  relaxed auth     Refresh  Create bucket        |
 +----------------------+----------------------------------+----------------------+
 | Buckets              | demo / assets /                  | Object inspector     |
 | + Create             | Search prefix                    | README.md            |
@@ -223,7 +223,7 @@ Elements:
 
 ```txt
 title: devcloud S3
-endpoint chip: http://127.0.0.1:4566
+endpoint chip: http://127.0.0.1:14566
 region chip: us-east-1
 auth chip: relaxed / strict / off
 status: Running / Stopped
@@ -442,7 +442,7 @@ No buckets:
 ```txt
 No buckets yet
 Create a bucket or run:
-aws --endpoint-url http://127.0.0.1:4566 s3api create-bucket --bucket demo
+aws --endpoint-url http://127.0.0.1:14566 s3api create-bucket --bucket demo
 ```
 
 Empty bucket:
@@ -450,7 +450,7 @@ Empty bucket:
 ```txt
 This bucket is empty
 Upload with:
-aws --endpoint-url http://127.0.0.1:4566 s3 cp README.md s3://demo/README.md
+aws --endpoint-url http://127.0.0.1:14566 s3 cp README.md s3://demo/README.md
 ```
 
 No object selected:
@@ -465,7 +465,7 @@ API unavailable:
 
 ```txt
 S3 API unavailable
-Check devcloud up and port 4566.
+Check devcloud up and port 14566.
 ```
 
 Auth mismatch:
@@ -568,7 +568,7 @@ Object detail:
   "lastModified": "2026-04-30T10:00:00Z",
   "versionId": "null",
   "s3Uri": "s3://demo/README.md",
-  "endpointUrl": "http://127.0.0.1:4566/demo/README.md"
+  "endpointUrl": "http://127.0.0.1:14566/demo/README.md"
 }
 ```
 
@@ -603,8 +603,8 @@ Bucket delete:
 Inspector should provide copy buttons:
 
 ```bash
-aws --endpoint-url http://127.0.0.1:4566 s3 cp s3://demo/README.md ./README.md
-aws --endpoint-url http://127.0.0.1:4566 s3api head-object --bucket demo --key README.md
+aws --endpoint-url http://127.0.0.1:14566 s3 cp s3://demo/README.md ./README.md
+aws --endpoint-url http://127.0.0.1:14566 s3api head-object --bucket demo --key README.md
 ```
 
 ## Accessibility

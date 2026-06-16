@@ -65,16 +65,16 @@ export AWS_ACCESS_KEY_ID=dev
 export AWS_SECRET_ACCESS_KEY=dev
 export AWS_REGION=us-east-1
 
-aws --endpoint-url http://127.0.0.1:4566 s3api create-bucket --bucket demo
-aws --endpoint-url http://127.0.0.1:4566 s3 cp README.md s3://demo/README.md
-aws --endpoint-url http://127.0.0.1:4566 s3 ls s3://demo/
-aws --endpoint-url http://127.0.0.1:4566 s3 cp s3://demo/README.md /tmp/devcloud-readme.md
+aws --endpoint-url http://127.0.0.1:14566 s3api create-bucket --bucket demo
+aws --endpoint-url http://127.0.0.1:14566 s3 cp README.md s3://demo/README.md
+aws --endpoint-url http://127.0.0.1:14566 s3 ls s3://demo/
+aws --endpoint-url http://127.0.0.1:14566 s3 cp s3://demo/README.md /tmp/devcloud-readme.md
 ```
 
 SDK clients should use:
 
 ```txt
-endpoint: http://127.0.0.1:4566
+endpoint: http://127.0.0.1:14566
 region: us-east-1
 accessKeyId: dev
 secretAccessKey: dev
@@ -89,8 +89,8 @@ Virtual-hosted style is supported after path-style compatibility is stable.
 
 ```txt
 Daemon:
-  S3 REST XML endpoint  http://127.0.0.1:4566
-  Dashboard/API         http://127.0.0.1:8025
+  S3 REST XML endpoint  http://127.0.0.1:14566
+  Dashboard/API         http://127.0.0.1:18025
 
 Bucket API:
   GET    /                         ListBuckets
@@ -150,7 +150,7 @@ AWS CLI / SDK / S3 client
         |
         v
 +-----------------------+
-| S3 HTTP Gateway       | :4566
+| S3 HTTP Gateway       | :14566
 | REST XML + SigV4      |
 +-----------------------+
         |
@@ -174,7 +174,7 @@ AWS CLI / SDK / S3 client
         |
         v
 +-----------------------+
-| Dashboard/API         | :8025
+| Dashboard/API         | :18025
 +-----------------------+
 ```
 
@@ -213,9 +213,9 @@ Default config:
 project: dev
 
 server:
-  smtpPort: 1025
-  dashboardPort: 8025
-  s3Port: 4566
+  smtpPort: 11025
+  dashboardPort: 18025
+  s3Port: 14566
 
 auth:
   smtp:
@@ -347,14 +347,14 @@ Path-style:
 
 ```txt
 GET /demo/README.md
-Host: 127.0.0.1:4566
+Host: 127.0.0.1:14566
 ```
 
 Virtual-hosted style:
 
 ```txt
 GET /README.md
-Host: demo.localhost:4566
+Host: demo.localhost:14566
 ```
 
 MVP は path-style を優先する。virtual-hosted style は `*.localhost` と explicit host mapping の両方を後続で扱う。
@@ -611,12 +611,12 @@ VERIFY_STAGE=s3-foundation bash scripts/s3-autoloop/verify.sh
 AWS CLI:
 
 ```bash
-aws --endpoint-url http://127.0.0.1:4566 s3api create-bucket --bucket demo
-aws --endpoint-url http://127.0.0.1:4566 s3api put-object --bucket demo --key hello.txt --body README.md
-aws --endpoint-url http://127.0.0.1:4566 s3api head-object --bucket demo --key hello.txt
-aws --endpoint-url http://127.0.0.1:4566 s3api get-object --bucket demo --key hello.txt /tmp/hello.txt
-aws --endpoint-url http://127.0.0.1:4566 s3api delete-object --bucket demo --key hello.txt
-aws --endpoint-url http://127.0.0.1:4566 s3api delete-bucket --bucket demo
+aws --endpoint-url http://127.0.0.1:14566 s3api create-bucket --bucket demo
+aws --endpoint-url http://127.0.0.1:14566 s3api put-object --bucket demo --key hello.txt --body README.md
+aws --endpoint-url http://127.0.0.1:14566 s3api head-object --bucket demo --key hello.txt
+aws --endpoint-url http://127.0.0.1:14566 s3api get-object --bucket demo --key hello.txt /tmp/hello.txt
+aws --endpoint-url http://127.0.0.1:14566 s3api delete-object --bucket demo --key hello.txt
+aws --endpoint-url http://127.0.0.1:14566 s3api delete-bucket --bucket demo
 ```
 
 SDK matrix:
@@ -651,7 +651,7 @@ Exit criteria:
 
 ```bash
 cargo test --workspace
-curl http://127.0.0.1:4566/ returns ListAllMyBucketsResult
+curl http://127.0.0.1:14566/ returns ListAllMyBucketsResult
 ```
 
 ### Phase 2: Bucket/Object CRUD
@@ -665,8 +665,8 @@ curl http://127.0.0.1:4566/ returns ListAllMyBucketsResult
 Exit criteria:
 
 ```bash
-aws --endpoint-url http://127.0.0.1:4566 s3 cp README.md s3://demo/README.md
-aws --endpoint-url http://127.0.0.1:4566 s3 cp s3://demo/README.md /tmp/README.md
+aws --endpoint-url http://127.0.0.1:14566 s3 cp README.md s3://demo/README.md
+aws --endpoint-url http://127.0.0.1:14566 s3 cp s3://demo/README.md /tmp/README.md
 ```
 
 ### Phase 3: SigV4 Strict + Presigned URL
@@ -679,7 +679,7 @@ aws --endpoint-url http://127.0.0.1:4566 s3 cp s3://demo/README.md /tmp/README.m
 Exit criteria:
 
 ```bash
-aws s3api --endpoint-url http://127.0.0.1:4566 list-buckets
+aws s3api --endpoint-url http://127.0.0.1:14566 list-buckets
 ```
 
 with `auth.aws.mode=strict`.
@@ -696,7 +696,7 @@ with `auth.aws.mode=strict`.
 Exit criteria:
 
 ```bash
-aws --endpoint-url http://127.0.0.1:4566 s3 cp large.bin s3://demo/large.bin
+aws --endpoint-url http://127.0.0.1:14566 s3 cp large.bin s3://demo/large.bin
 ```
 
 ### Phase 5: Versioning and Copy
@@ -717,7 +717,7 @@ aws --endpoint-url http://127.0.0.1:4566 s3 cp large.bin s3://demo/large.bin
 ## Acceptance Criteria
 
 1. `cargo test --workspace` passes.
-2. `devcloud up` starts S3 endpoint on `127.0.0.1:4566`.
+2. `devcloud up` starts S3 endpoint on `127.0.0.1:14566`.
 3. AWS CLI can create/delete buckets and put/get/head/delete/list objects.
 4. AWS SDK v2, boto3, and AWS SDK for JavaScript v3 pass smoke tests with endpoint override.
 5. SigV4 strict mode validates signed requests and presigned URLs.
@@ -741,7 +741,7 @@ aws --endpoint-url http://127.0.0.1:4566 s3 cp large.bin s3://demo/large.bin
 
 ## Open Questions
 
-1. Should S3 share the existing AWS gateway port `4566`, or use a dedicated S3 port like `9000`?
+1. Should S3 share the existing AWS gateway port `14566`, or use a dedicated S3 port like `9000`?
 2. Should `auth.aws.mode` default to `relaxed` for developer ergonomics, or `strict` for compatibility confidence?
 3. Should dashboard object download stream through dashboard API, or link directly to S3 endpoint?
 4. Should `mock/` include an S3 dashboard mock before implementation?

@@ -298,25 +298,25 @@ mod tests {
     #[test]
     fn relay_url_appends_events_path() {
         assert_eq!(
-            relay_url("ws://127.0.0.1:8027", "").unwrap(),
-            "ws://127.0.0.1:8027/_events"
+            relay_url("ws://127.0.0.1:18027", "").unwrap(),
+            "ws://127.0.0.1:18027/_events"
         );
         assert_eq!(
-            relay_url("ws://127.0.0.1:8027/", "").unwrap(),
-            "ws://127.0.0.1:8027/_events"
+            relay_url("ws://127.0.0.1:18027/", "").unwrap(),
+            "ws://127.0.0.1:18027/_events"
         );
     }
 
     #[test]
     fn relay_url_forwards_topics() {
         assert_eq!(
-            relay_url("ws://127.0.0.1:8027", "topics=sqs,s3").unwrap(),
-            "ws://127.0.0.1:8027/_events?topics=sqs,s3"
+            relay_url("ws://127.0.0.1:18027", "topics=sqs,s3").unwrap(),
+            "ws://127.0.0.1:18027/_events?topics=sqs,s3"
         );
         // Other params are dropped; topics among them is still forwarded.
         assert_eq!(
-            relay_url("ws://127.0.0.1:8027", "from=5&topics=mail").unwrap(),
-            "ws://127.0.0.1:8027/_events?topics=mail"
+            relay_url("ws://127.0.0.1:18027", "from=5&topics=mail").unwrap(),
+            "ws://127.0.0.1:18027/_events?topics=mail"
         );
     }
 

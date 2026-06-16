@@ -68,7 +68,7 @@ pub async fn handle_status(config: &Config, req: &Request) -> Response {
             "status": status,
             "running": running,
             "endpoint": if config.bigquery_endpoint.is_empty() {
-                "http://127.0.0.1:9050".to_string()
+                "http://127.0.0.1:19050".to_string()
             } else {
                 config.bigquery_endpoint.clone()
             },

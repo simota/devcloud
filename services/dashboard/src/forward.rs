@@ -16,7 +16,7 @@ use tokio::net::TcpStream;
 
 /// A forwarded request to a downstream service.
 pub struct ForwardRequest<'a> {
-    /// Base URL of the target service, e.g. `http://127.0.0.1:9324`.
+    /// Base URL of the target service, e.g. `http://127.0.0.1:19324`.
     pub base: &'a str,
     pub method: &'a str,
     /// Request target path, e.g. `/_introspect/queues` or `/`.
@@ -177,8 +177,8 @@ async fn read_response(stream: &mut TcpStream) -> Result<ForwardResponse, Forwar
     })
 }
 
-/// Splits a base URL like `http://127.0.0.1:9324` into a `connect` target
-/// (`127.0.0.1:9324`) and a `Host` header value. Only `http://` is supported
+/// Splits a base URL like `http://127.0.0.1:19324` into a `connect` target
+/// (`127.0.0.1:19324`) and a `Host` header value. Only `http://` is supported
 /// (every devcloud service base is loopback HTTP).
 fn parse_authority(base: &str) -> Option<(String, String)> {
     let trimmed = base.strip_prefix("http://")?;
@@ -208,20 +208,20 @@ mod tests {
 
     #[test]
     fn parse_authority_with_port() {
-        let (c, h) = parse_authority("http://127.0.0.1:9324").unwrap();
-        assert_eq!(c, "127.0.0.1:9324");
-        assert_eq!(h, "127.0.0.1:9324");
+        let (c, h) = parse_authority("http://127.0.0.1:19324").unwrap();
+        assert_eq!(c, "127.0.0.1:19324");
+        assert_eq!(h, "127.0.0.1:19324");
     }
 
     #[test]
     fn parse_authority_strips_path() {
-        let (c, _) = parse_authority("http://127.0.0.1:9324/ignored").unwrap();
-        assert_eq!(c, "127.0.0.1:9324");
+        let (c, _) = parse_authority("http://127.0.0.1:19324/ignored").unwrap();
+        assert_eq!(c, "127.0.0.1:19324");
     }
 
     #[test]
     fn parse_authority_rejects_non_http() {
-        assert!(parse_authority("ws://127.0.0.1:8027").is_none());
+        assert!(parse_authority("ws://127.0.0.1:18027").is_none());
         assert!(parse_authority("").is_none());
     }
 }

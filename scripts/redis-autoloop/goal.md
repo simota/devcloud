@@ -10,10 +10,10 @@ Add a Redis-compatible service to `devcloud` by managing a real `redis-server` p
 
 ## Acceptance Criteria
 
-1. `devcloud up` starts a Redis endpoint on the configured local port, defaulting to `127.0.0.1:6379`, when `services.redis.enabled=true`.
+1. `devcloud up` starts a Redis endpoint on the configured local port, defaulting to `127.0.0.1:16379`, when `services.redis.enabled=true`.
 2. In `managed` mode, `devcloud` spawns `redis-server` as a child process with data directory under `${storage.path}/redis`, terminates it gracefully on shutdown (SIGTERM then SIGKILL), and surfaces a clear install hint if the binary is missing.
 3. In `external` mode, `devcloud` validates connectivity to `services.redis.externalUrl` via `PING` and exposes the same dashboard surface without owning the process.
-4. `redis-cli -h 127.0.0.1 -p 6379 ping` returns `PONG`, and a first-party client using `Redis client crate` can `SET`, `GET`, `EXPIRE`, `DEL`, and `HSET`/`HGETALL` against the configured port.
+4. `redis-cli -h 127.0.0.1 -p 16379 ping` returns `PONG`, and a first-party client using `Redis client crate` can `SET`, `GET`, `EXPIRE`, `DEL`, and `HSET`/`HGETALL` against the configured port.
 5. Auth modes: `relaxed` (default) accepts any password; `strict` requires the configured password and rejects others with the upstream Redis error. Mode is consumed by the daemon when configuring `redis-server` `--requirepass` (managed) or supplied to clients (external).
 6. Existing dashboard service registry exposes `redis`, and `/dashboard/redis` loads with status, key browser (`SCAN`-based, pageable), and key inspector for `string`, `list`, `hash`, `set`, `zset`.
 7. `/api/redis/status` returns mode, address, server version, `connected_clients`, `used_memory_human`, and `db0` key count without leaking the password.

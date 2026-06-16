@@ -10,7 +10,7 @@ export function disabledStatus(service?: DashboardService): BigQueryStatus {
   return {
     status: 'disabled',
     running: false,
-    endpoint: service?.endpoint ?? 'http://127.0.0.1:9050',
+    endpoint: service?.endpoint ?? 'http://127.0.0.1:19050',
     project: 'devcloud',
     location: 'US',
     authMode: 'relaxed',

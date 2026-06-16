@@ -205,7 +205,7 @@ Current repository context:
 
 Recommended implementation order:
 1. Config and daemon wiring for services.pubsub, auth.pubsub, server.pubsubGrpcPort, and server.pubsubRestPort.
-2. Minimal service lifecycle with gRPC :8085 and REST :8086 health/readiness.
+2. Minimal service lifecycle with gRPC :18085 and REST :18086 health/readiness.
 3. Resource store and validation for projects/{project}/topics/{topic} and projects/{project}/subscriptions/{subscription}.
 4. REST v1 topic CRUD and subscription CRUD for dashboard and e2e.
 5. gRPC Publisher and Subscriber resource RPCs using official Pub/Sub v1 types.

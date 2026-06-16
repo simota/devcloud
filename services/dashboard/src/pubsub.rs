@@ -62,9 +62,9 @@ pub async fn handle_status(config: &Config, req: &Request) -> Response {
             "service": "pubsub",
             "status": status,
             "running": running,
-            "grpcEndpoint": "127.0.0.1:8085",
+            "grpcEndpoint": "127.0.0.1:18085",
             "restEndpoint": if config.pubsub_endpoint.is_empty() {
-                "http://127.0.0.1:8086".to_string()
+                "http://127.0.0.1:18086".to_string()
             } else {
                 config.pubsub_endpoint.clone()
             },
