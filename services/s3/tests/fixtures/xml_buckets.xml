@@ -1,0 +1,1 @@
+<ListAllMyBucketsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Owner><ID>devcloud</ID><DisplayName>devcloud</DisplayName></Owner><Buckets><Bucket><Name>alpha</Name><CreationDate>2026-05-30T12:00:00Z</CreationDate></Bucket><Bucket><Name>bravo</Name><CreationDate>2026-05-30T13:00:00Z</CreationDate></Bucket></Buckets></ListAllMyBucketsResult>

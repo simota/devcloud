@@ -1,0 +1,24 @@
+[package]
+name = "devcloud-s3"
+version = "0.1.0"
+edition = "2021"
+description = "Rust reimplementation of the devcloud S3 service — strangler-fig increment #7 (the hub: owns the BucketStore boundary shared with gcs/bigquery/redshift). Passes the repo S3 full acceptance gate with HTTP parity, persistence parity, SigV4, daemon seam, and dashboard event bridging."
+
+[lib]
+name = "devcloud_s3"
+path = "src/lib.rs"
+
+[[bin]]
+name = "devcloud-s3"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+# serde_json's default Map is a BTreeMap (sorted keys), matching legacy sorted-key
+# map marshaling. Do NOT enable preserve_order.
+serde_json = "1"
+md-5 = "0.10"
+sha2 = "0.10"
+hmac = "0.12"
+hex = "0.4"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "io-util", "signal", "sync"] }

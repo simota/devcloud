@@ -1,0 +1,14 @@
+{
+  "bucket": "my-bucket",
+  "key": "k",
+  "etag": "",
+  "size": 0,
+  "createdAt": "0001-01-01T00:00:00Z",
+  "lastModified": "2026-05-30T12:00:00Z",
+  "updatedAt": "2026-05-30T12:00:00Z",
+  "versionId": "v1",
+  "deleteMarker": true,
+  "encryption": {},
+  "retention": {},
+  "legalHold": {}
+}

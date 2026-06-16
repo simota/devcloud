@@ -1,0 +1,17 @@
+{
+  "id": "an1",
+  "filter": {
+    "prefix": "logs/"
+  },
+  "storageClassAnalysis": {
+    "dataExport": {
+      "outputSchemaVersion": "V_1",
+      "destination": {
+        "s3BucketDestination": {
+          "format": "CSV",
+          "bucket": "arn:aws:s3:::dest"
+        }
+      }
+    }
+  }
+}

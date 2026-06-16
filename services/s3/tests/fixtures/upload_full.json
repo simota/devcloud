@@ -1,0 +1,17 @@
+{
+  "bucket": "data",
+  "key": "big.bin",
+  "uploadId": "0123456789abcdef0123456789abcdef",
+  "createdAt": "2026-05-30T12:00:00Z",
+  "contentType": "text/plain",
+  "contentEncoding": "gzip",
+  "cacheControl": "max-age=60",
+  "contentDisposition": "attachment",
+  "metadata": {
+    "x-amz-meta-a": "1",
+    "x-amz-meta-b": "2"
+  },
+  "encryption": {
+    "algorithm": "AES256"
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "xmlns": "http://s3.amazonaws.com/doc/2006-03-01/",
+  "role": "arn:aws:iam::role",
+  "rules": [
+    {
+      "id": "r1",
+      "priority": 1,
+      "filter": {
+        "prefix": "logs/"
+      },
+      "status": "Enabled",
+      "destination": {
+        "bucket": "arn:aws:s3:::dest",
+        "storageClass": "STANDARD"
+      },
+      "deleteMarkerReplication": {}
+    }
+  ]
+}

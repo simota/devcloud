@@ -1,0 +1,33 @@
+{
+  "xmlns": "http://s3.amazonaws.com/doc/2006-03-01/",
+  "topicConfigurations": [
+    {
+      "id": "t1",
+      "topic": "arn:aws:sns:topic",
+      "events": [
+        "s3:ObjectCreated:*"
+      ],
+      "filter": {
+        "s3Key": {
+          "rules": [
+            {
+              "name": "prefix",
+              "value": "logs/"
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "queueConfigurations": [
+    {
+      "queue": "arn:aws:sqs:queue",
+      "events": [
+        "s3:ObjectRemoved:*"
+      ],
+      "filter": {
+        "s3Key": {}
+      }
+    }
+  ]
+}

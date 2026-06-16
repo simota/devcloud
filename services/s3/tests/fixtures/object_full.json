@@ -1,0 +1,29 @@
+{
+  "bucket": "my-bucket",
+  "key": "k",
+  "etag": "\"d41d8cd98f00b204e9800998ecf8427e\"",
+  "size": 0,
+  "createdAt": "2026-05-30T12:00:00.123456789Z",
+  "lastModified": "2026-05-30T12:00:00.123456789Z",
+  "updatedAt": "2026-05-30T12:00:00.123456789Z",
+  "metageneration": 1,
+  "contentType": "text/plain",
+  "contentEncoding": "gzip",
+  "crc32c": "AAAAAA==",
+  "cacheControl": "max-age=3600",
+  "contentDisposition": "attachment",
+  "versionId": "abc123",
+  "deleteMarker": true,
+  "acl": "private",
+  "encryption": {
+    "algorithm": "aws:kms",
+    "kmsKeyId": "key-1"
+  },
+  "retention": {
+    "mode": "GOVERNANCE",
+    "retainUntilDate": "2026-06-30T12:00:00Z"
+  },
+  "legalHold": {
+    "status": "ON"
+  }
+}
