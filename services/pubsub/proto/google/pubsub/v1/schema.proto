@@ -1,0 +1,131 @@
+// Trimmed local copy of google/pubsub/v1/schema.proto for the devcloud Rust
+// Pub/Sub gRPC server. Hand-authored from the canonical googleapis definition,
+// preserving EXACT package, message names, field numbers, types, and service +
+// method names — gRPC wire compatibility depends only on those. All
+// google.api.* annotations (http rules, field_behavior, resource) and IAM
+// service/methods are stripped because they do not affect wire behavior. Only
+// google.protobuf well-known types are imported (bundled by tonic-build).
+//
+// Source of canonical field numbers:
+//   https://raw.githubusercontent.com/googleapis/googleapis/master/google/pubsub/v1/schema.proto
+
+syntax = "proto3";
+
+package google.pubsub.v1;
+
+import "google/protobuf/empty.proto";
+import "google/protobuf/timestamp.proto";
+
+service SchemaService {
+  rpc CreateSchema(CreateSchemaRequest) returns (Schema) {}
+  rpc GetSchema(GetSchemaRequest) returns (Schema) {}
+  rpc ListSchemas(ListSchemasRequest) returns (ListSchemasResponse) {}
+  rpc ListSchemaRevisions(ListSchemaRevisionsRequest)
+      returns (ListSchemaRevisionsResponse) {}
+  rpc CommitSchema(CommitSchemaRequest) returns (Schema) {}
+  rpc RollbackSchema(RollbackSchemaRequest) returns (Schema) {}
+  rpc DeleteSchemaRevision(DeleteSchemaRevisionRequest) returns (Schema) {}
+  rpc DeleteSchema(DeleteSchemaRequest) returns (google.protobuf.Empty) {}
+  rpc ValidateSchema(ValidateSchemaRequest) returns (ValidateSchemaResponse) {}
+  rpc ValidateMessage(ValidateMessageRequest)
+      returns (ValidateMessageResponse) {}
+}
+
+message Schema {
+  enum Type {
+    TYPE_UNSPECIFIED = 0;
+    PROTOCOL_BUFFER = 1;
+    AVRO = 2;
+  }
+
+  string name = 1;
+  Type type = 2;
+  string definition = 3;
+  string revision_id = 4;
+  google.protobuf.Timestamp revision_create_time = 6;
+}
+
+enum SchemaView {
+  SCHEMA_VIEW_UNSPECIFIED = 0;
+  BASIC = 1;
+  FULL = 2;
+}
+
+message CreateSchemaRequest {
+  string parent = 1;
+  Schema schema = 2;
+  string schema_id = 3;
+}
+
+message GetSchemaRequest {
+  string name = 1;
+  SchemaView view = 2;
+}
+
+message ListSchemasRequest {
+  string parent = 1;
+  SchemaView view = 2;
+  int32 page_size = 3;
+  string page_token = 4;
+}
+
+message ListSchemasResponse {
+  repeated Schema schemas = 1;
+  string next_page_token = 2;
+}
+
+message ListSchemaRevisionsRequest {
+  string name = 1;
+  SchemaView view = 2;
+  int32 page_size = 3;
+  string page_token = 4;
+}
+
+message ListSchemaRevisionsResponse {
+  repeated Schema schemas = 1;
+  string next_page_token = 2;
+}
+
+message CommitSchemaRequest {
+  string name = 1;
+  Schema schema = 2;
+}
+
+message RollbackSchemaRequest {
+  string name = 1;
+  string revision_id = 2;
+}
+
+message DeleteSchemaRevisionRequest {
+  string name = 1;
+  string revision_id = 2;
+}
+
+message DeleteSchemaRequest {
+  string name = 1;
+}
+
+message ValidateSchemaRequest {
+  string parent = 1;
+  Schema schema = 2;
+}
+
+message ValidateSchemaResponse {}
+
+message ValidateMessageRequest {
+  string parent = 1;
+  oneof schema_spec {
+    string name = 2;
+    Schema schema = 3;
+  }
+  bytes message = 4;
+  Encoding encoding = 5;
+}
+
+message ValidateMessageResponse {}
+
+enum Encoding {
+  ENCODING_UNSPECIFIED = 0;
+  JSON = 1;
+  BINARY = 2;
+}

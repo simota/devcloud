@@ -1,0 +1,1 @@
+{"nextPageToken":"","schemas":[{"name":"projects/devcloud/schemas/sch1","type":"AVRO","revisionId":"1"},{"name":"projects/devcloud/schemas/sch2","type":"PROTOCOL_BUFFER","revisionId":"1"}]}

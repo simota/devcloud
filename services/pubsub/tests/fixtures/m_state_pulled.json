@@ -1,0 +1,39 @@
+{
+  "messages": [
+    {
+      "data": "aGVsbG8=",
+      "attributes": {
+        "k": "v"
+      },
+      "messageId": "1",
+      "publishTime": "2026-05-30T12:00:00Z"
+    },
+    {
+      "data": "d29ybGQ=",
+      "messageId": "2",
+      "publishTime": "2026-05-30T12:00:00Z"
+    }
+  ],
+  "deliveries": {
+    "projects/devcloud/subscriptions/sub1": [
+      {
+        "MessageID": "1",
+        "AckID": "1-1",
+        "LeaseDeadline": "2026-05-30T12:00:10Z",
+        "NextDeliveryTime": "0001-01-01T00:00:00Z",
+        "DeliveryAttempt": 1,
+        "Acked": false
+      },
+      {
+        "MessageID": "2",
+        "AckID": "2-2",
+        "LeaseDeadline": "2026-05-30T12:00:10Z",
+        "NextDeliveryTime": "0001-01-01T00:00:00Z",
+        "DeliveryAttempt": 1,
+        "Acked": false
+      }
+    ]
+  },
+  "nextMessageId": 2,
+  "nextAckId": 2
+}
