@@ -1,0 +1,1 @@
+{"ConsumedCapacity":[{"CapacityUnits":1,"TableName":"T"}],"Responses":{"T":[{"pk":{"S":"a"},"v":{"N":"1"}},{"pk":{"S":"c"},"v":{"N":"3"}}]},"UnprocessedKeys":{}}

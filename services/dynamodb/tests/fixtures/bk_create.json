@@ -1,0 +1,1 @@
+{"BackupDetails":{"BackupArn":"arn:aws:dynamodb:us-east-1:000000000000:table/T/backup/1780098846-snap1","BackupCreationDateTime":1780098846,"BackupName":"snap1","BackupSizeBytes":0,"BackupStatus":"AVAILABLE","BackupType":"USER"}}

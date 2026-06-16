@@ -1,0 +1,1 @@
+{"Count":4,"Items":[{"extra":{"S":"e1"},"gsiPk":{"S":"g1"},"name":{"S":"Ann"},"pk":{"S":"u1"},"sk":{"N":"1"}},{"extra":{"S":"e2"},"gsiPk":{"S":"g1"},"name":{"S":"Bob"},"pk":{"S":"u1"},"sk":{"N":"2"}},{"extra":{"S":"e3"},"name":{"S":"Cy"},"pk":{"S":"u1"},"sk":{"N":"3"}},{"gsiPk":{"S":"g2"},"name":{"S":"Dee"},"pk":{"S":"u2"},"sk":{"N":"1"}}],"ScannedCount":4}
