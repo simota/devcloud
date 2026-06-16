@@ -1,0 +1,20 @@
+[package]
+name = "devcloud-gcs"
+version = "0.1.0"
+edition = "2021"
+description = "Rust reimplementation of the devcloud GCS JSON API service, sharing the S3 FileBucketStore object core."
+
+[lib]
+name = "devcloud_gcs"
+path = "src/lib.rs"
+
+[[bin]]
+name = "devcloud-gcs"
+path = "src/main.rs"
+
+[dependencies]
+devcloud-s3 = { path = "../s3" }
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "io-util", "signal", "sync"] }
