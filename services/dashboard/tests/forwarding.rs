@@ -562,6 +562,29 @@ async fn s3_bucket_delete_forwards_provider_protocol() {
 }
 
 #[tokio::test]
+async fn s3_object_put_provider_error_relays_code_and_message() {
+    let (base, _record) = mock_upstream(
+        409,
+        r#"<Error><Code>BucketNotEmpty</Code><Message>bucket has objects</Message></Error>"#,
+    )
+    .await;
+    let mut cfg = Config::default();
+    cfg.s3_base = base;
+
+    let resp = route(
+        &cfg,
+        &req("PUT", "/api/s3/buckets/demo/objects/a.txt", b"payload"),
+    )
+    .await;
+
+    assert_eq!(resp.status, 409);
+    assert_eq!(
+        String::from_utf8(resp.body).unwrap(),
+        "BucketNotEmpty: bucket has objects\n"
+    );
+}
+
+#[tokio::test]
 async fn s3_object_delete_forwards_to_control_endpoint() {
     // Object delete forwards to the S3 service's /_control/ object-delete (NOT
     // the idempotent provider DELETE), relaying its 204 verbatim. The key is

@@ -565,12 +565,49 @@ fn relay_introspect_error(resp: ForwardResponse) -> Response {
 /// preserving the upstream status.
 fn relay_provider_error(resp: ForwardResponse) -> Response {
     let status = if resp.status >= 400 { resp.status } else { 400 };
-    Response::text_error(status, "s3 operation failed")
+    let msg = s3_error_message(&resp).unwrap_or_else(|| "s3 operation failed".to_string());
+    Response::text_error(status, &msg)
 }
 
 fn error_message(resp: &ForwardResponse) -> Option<String> {
     let v: Value = serde_json::from_slice(&resp.body).ok()?;
     v.get("error").and_then(Value::as_str).map(str::to_string)
+}
+
+fn s3_error_message(resp: &ForwardResponse) -> Option<String> {
+    let xml = std::str::from_utf8(&resp.body).ok()?;
+    let code = tag_text_in(xml, "Code").unwrap_or_default();
+    let message = tag_text_in(xml, "Message").unwrap_or_default();
+    match (code.trim(), message.trim()) {
+        ("", "") => None,
+        ("", message) => Some(message.to_string()),
+        (code, "") => Some(code.to_string()),
+        (code, message) => Some(format!("{code}: {message}")),
+    }
+}
+
+fn tag_text_in(xml: &str, tag: &str) -> Option<String> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let start = xml.find(&open)? + open.len();
+    let rest = &xml[start..];
+    let end = rest.find(&close)?;
+    let text = rest[..end].trim();
+    if text.is_empty() {
+        None
+    } else {
+        Some(xml_unescape(text))
+    }
+}
+
+fn xml_unescape(text: &str) -> String {
+    text.replace("&quot;", "\"")
+        .replace("&#34;", "\"")
+        .replace("&apos;", "'")
+        .replace("&#39;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
 }
 
 fn forward_failure(err: ForwardError) -> Response {
