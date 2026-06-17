@@ -738,6 +738,72 @@ fn split_select_clauses(rest: &str) -> (String, String, String, String) {
     (table_part, where_part, order_part, limit_part)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn split_select_clauses_splits_table_where_order_and_limit() {
+        let clauses =
+            split_select_clauses("orders where status = 'open' order by created_at desc limit 10");
+
+        assert_eq!(
+            clauses,
+            (
+                "orders".to_string(),
+                "status = 'open'".to_string(),
+                "created_at desc".to_string(),
+                "10".to_string(),
+            )
+        );
+    }
+
+    #[test]
+    fn split_select_clauses_splits_order_and_limit_without_where() {
+        let clauses = split_select_clauses("orders order by created_at desc limit 5");
+
+        assert_eq!(
+            clauses,
+            (
+                "orders".to_string(),
+                String::new(),
+                "created_at desc".to_string(),
+                "5".to_string(),
+            )
+        );
+    }
+
+    #[test]
+    fn split_select_clauses_strips_order_then_limit_from_where_tail() {
+        let clauses = split_select_clauses("orders where amount > 100 order by id limit 25");
+
+        assert_eq!(
+            clauses,
+            (
+                "orders".to_string(),
+                "amount > 100".to_string(),
+                "id".to_string(),
+                "25".to_string(),
+            )
+        );
+    }
+
+    #[test]
+    fn split_select_clauses_matches_uppercase_keywords_case_insensitively() {
+        let clauses = split_select_clauses("orders WHERE amount > 100 ORDER BY id LIMIT 25");
+
+        assert_eq!(
+            clauses,
+            (
+                "orders".to_string(),
+                "amount > 100".to_string(),
+                "id".to_string(),
+                "25".to_string(),
+            )
+        );
+    }
+}
+
 /// Mirrors `selectLiterals` (`SELECT 1 AS id, 'x' label` with no FROM).
 fn select_literals(statement: &str) -> Result<QueryResult, SqlError> {
     let column_part = statement["select".len()..].trim();
