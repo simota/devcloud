@@ -34,3 +34,6 @@ scripts/**/done.md
 scripts/**/iteration-*.out
 scripts/**/verify-*.out
 scripts/**/prompt-*.*
+
+# Agent runtime logs and journals
+.agents/
