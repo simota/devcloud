@@ -80,7 +80,12 @@ impl Server {
         let now = now_rfc3339();
 
         // Plan the moves first (need a separate &mut borrow per destination).
-        let messages = self.queues.get(&source_name).unwrap().messages.clone();
+        let messages = self
+            .queues
+            .get(&source_name)
+            .ok_or_else(|| "queue does not exist".to_string())?
+            .messages
+            .clone();
         let mut moves: Vec<(usize, String, crate::model::MessageState)> = Vec::new();
         for (i, message) in messages.iter().enumerate() {
             if message.deleted {
@@ -104,8 +109,18 @@ impl Server {
         }
         let moved_count = moves.len() as i64;
         for (i, target, moved) in moves {
-            self.queues.get_mut(&target).unwrap().messages.push(moved);
-            let src_msg = &mut self.queues.get_mut(&source_name).unwrap().messages[i];
+            self.queues
+                .get_mut(&target)
+                .ok_or_else(|| "destination queue does not exist".to_string())?
+                .messages
+                .push(moved);
+            let src_msg = self
+                .queues
+                .get_mut(&source_name)
+                .ok_or_else(|| "queue does not exist".to_string())?
+                .messages
+                .get_mut(i)
+                .ok_or_else(|| "queue does not exist".to_string())?;
             src_msg.deleted = true;
             src_msg.receipt_handle = String::new();
         }
