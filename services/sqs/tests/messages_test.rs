@@ -224,6 +224,52 @@ fn receive_sets_handle_and_increments_count() {
 }
 
 #[test]
+fn receive_rolls_back_memory_when_persist_fails() {
+    let storage_path = std::env::temp_dir().join(format!(
+        "devcloud-sqs-receive-rollback-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&storage_path);
+    let _ = std::fs::remove_dir_all(&storage_path);
+
+    let mut c = cfg();
+    c.storage_path = storage_path.to_string_lossy().into_owned();
+    let mut s = Server::new(c);
+    s.create_queue("Orders", &BTreeMap::new(), &BTreeMap::new())
+        .unwrap();
+    send(&mut s, "keep-me");
+    let before = s.queue_by_name("Orders").unwrap().messages[0].clone();
+
+    std::fs::remove_dir_all(&storage_path).unwrap();
+    std::fs::write(&storage_path, b"not a directory").unwrap();
+
+    assert!(s
+        .receive_messages(&ReceiveMessageRequest {
+            queue_url: URL.to_string(),
+            max_number_of_messages: Some(1),
+            visibility_timeout: Some(30),
+            wait_time_seconds: Some(0),
+            ..Default::default()
+        })
+        .is_err());
+
+    let after = s.queue_by_name("Orders").unwrap().messages[0].clone();
+    assert_eq!(after.receive_count, before.receive_count);
+    assert_eq!(after.receipt_handle, before.receipt_handle);
+    assert_eq!(after.invisible_until, before.invisible_until);
+    assert_eq!(after.first_receive_at, before.first_receive_at);
+
+    std::fs::remove_file(&storage_path).unwrap();
+    std::fs::create_dir_all(&storage_path).unwrap();
+
+    let retry = receive(&mut s, 1, Some(30));
+    assert_eq!(retry.len(), 1);
+    assert_eq!(retry[0].attributes["ApproximateReceiveCount"], "1");
+
+    std::fs::remove_dir_all(&storage_path).unwrap();
+}
+
+#[test]
 fn visibility_zero_keeps_message_visible() {
     let mut s = server_with_queue();
     send(&mut s, "m1");

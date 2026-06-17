@@ -314,6 +314,7 @@ impl Server {
         if !self.queues.contains_key(name) {
             return Err("queue does not exist".into());
         }
+        let previous_queues = self.queues.clone();
         let now = now_rfc3339();
         cleanup_expired_messages(self.queues.get_mut(name).unwrap(), &now);
 
@@ -392,7 +393,10 @@ impl Server {
             }
         }
         if changed {
-            self.persist()?;
+            if let Err(e) = self.persist() {
+                self.queues = previous_queues;
+                return Err(e);
+            }
         }
         Ok(messages)
     }
