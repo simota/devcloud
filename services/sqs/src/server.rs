@@ -428,16 +428,33 @@ impl Server {
         if name.is_empty() || !self.queues.contains_key(&name) {
             return Err("queue does not exist".into());
         }
+        for k in tags.keys() {
+            if k.is_empty() {
+                return Err("tag key is required".into());
+            }
+        }
+        let previous_tags = self
+            .queues
+            .get(&name)
+            .ok_or_else(|| "queue does not exist".to_string())?
+            .tags
+            .clone();
         {
-            let q = self.queues.get_mut(&name).unwrap();
+            let q = self
+                .queues
+                .get_mut(&name)
+                .ok_or_else(|| "queue does not exist".to_string())?;
             for (k, v) in tags {
-                if k.is_empty() {
-                    return Err("tag key is required".into());
-                }
                 q.tags.insert(k.clone(), v.clone());
             }
         }
-        self.persist()
+        if let Err(e) = self.persist() {
+            if let Some(q) = self.queues.get_mut(&name) {
+                q.tags = previous_tags;
+            }
+            return Err(e);
+        }
+        Ok(())
     }
 
     pub fn untag_queue(&mut self, queue_url: &str, tag_keys: &[String]) -> Result<(), String> {
