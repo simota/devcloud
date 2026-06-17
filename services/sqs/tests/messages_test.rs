@@ -93,6 +93,72 @@ fn purge_queue_rolls_back_memory_when_persist_fails() {
 }
 
 #[test]
+fn fifo_send_rolls_back_dedup_and_sequence_when_persist_fails() {
+    let storage_path = std::env::temp_dir().join(format!(
+        "devcloud-sqs-fifo-send-rollback-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&storage_path);
+    let _ = std::fs::remove_dir_all(&storage_path);
+
+    let mut c = cfg();
+    c.storage_path = storage_path.to_string_lossy().into_owned();
+    let mut s = Server::new(c);
+    s.create_queue(
+        "Orders.fifo",
+        &map(&[("FifoQueue", "true")]),
+        &BTreeMap::new(),
+    )
+    .unwrap();
+    let furl = "http://127.0.0.1:9324/000000000000/Orders.fifo";
+
+    let first = s
+        .send_message(&SendMessageRequest {
+            queue_url: furl.to_string(),
+            message_body: "first".to_string(),
+            message_group_id: "g1".to_string(),
+            message_deduplication_id: "d1".to_string(),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(first.sequence_number, "1");
+
+    std::fs::remove_dir_all(&storage_path).unwrap();
+    std::fs::write(&storage_path, b"not a directory").unwrap();
+
+    assert!(s
+        .send_message(&SendMessageRequest {
+            queue_url: furl.to_string(),
+            message_body: "second".to_string(),
+            message_group_id: "g1".to_string(),
+            message_deduplication_id: "d2".to_string(),
+            ..Default::default()
+        })
+        .is_err());
+
+    let queue = s.queue_by_name("Orders.fifo").unwrap();
+    assert_eq!(queue.messages.len(), 1);
+    assert_eq!(queue.sequence, 1);
+    assert!(!queue.dedup.contains_key("d2"));
+
+    std::fs::remove_file(&storage_path).unwrap();
+    std::fs::create_dir_all(&storage_path).unwrap();
+
+    let retry = s
+        .send_message(&SendMessageRequest {
+            queue_url: furl.to_string(),
+            message_body: "second".to_string(),
+            message_group_id: "g1".to_string(),
+            message_deduplication_id: "d2".to_string(),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(retry.sequence_number, "2");
+
+    std::fs::remove_dir_all(&storage_path).unwrap();
+}
+
+#[test]
 fn send_basic_sets_body_md5() {
     let mut s = server_with_queue();
     let m = s

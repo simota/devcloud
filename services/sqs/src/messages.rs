@@ -152,6 +152,7 @@ impl Server {
         if name.is_empty() || !self.queues.contains_key(&name) {
             return Err("queue does not exist".into());
         }
+        let previous_queue = self.queues.get(&name).cloned().unwrap();
 
         let fifo = is_fifo_queue(self.queues.get(&name).unwrap());
         if fifo && input.delay_seconds.is_some() {
@@ -211,8 +212,7 @@ impl Server {
         let queue = self.queues.get_mut(&name).unwrap();
         queue.messages.push(message.clone());
         if let Err(e) = self.persist() {
-            let q = self.queues.get_mut(&name).unwrap();
-            q.messages.pop();
+            self.queues.insert(name, previous_queue);
             return Err(e);
         }
         Ok(message)
