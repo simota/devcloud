@@ -262,6 +262,42 @@ fn tag_queue_rolls_back_memory_when_persist_fails() {
 }
 
 #[test]
+fn untag_queue_rolls_back_memory_when_persist_fails() {
+    let storage_path = std::env::temp_dir().join(format!(
+        "devcloud-sqs-untags-rollback-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&storage_path);
+    let _ = std::fs::remove_dir_all(&storage_path);
+
+    let mut c = cfg();
+    c.storage_path = storage_path.to_string_lossy().into_owned();
+    let mut s = Server::new(c);
+    let url = "http://127.0.0.1:9324/000000000000/Orders";
+    s.create_queue("Orders", &BTreeMap::new(), &BTreeMap::new())
+        .unwrap();
+    s.tag_queue(url, &map(&[("env", "prod"), ("team", "core")]))
+        .unwrap();
+
+    std::fs::remove_dir_all(&storage_path).unwrap();
+    std::fs::write(&storage_path, b"not a directory").unwrap();
+
+    assert!(s.untag_queue(url, &["env".to_string()]).is_err());
+    assert_eq!(
+        s.list_queue_tags(url).unwrap(),
+        map(&[("env", "prod"), ("team", "core")])
+    );
+
+    std::fs::remove_file(&storage_path).unwrap();
+    std::fs::create_dir_all(&storage_path).unwrap();
+
+    s.untag_queue(url, &["env".to_string()]).unwrap();
+    assert_eq!(s.list_queue_tags(url).unwrap(), map(&[("team", "core")]));
+
+    std::fs::remove_dir_all(&storage_path).unwrap();
+}
+
+#[test]
 fn add_permission_policy_json_matches_legacy() {
     let mut s = Server::new(cfg());
     let url = "http://127.0.0.1:9324/000000000000/Orders";

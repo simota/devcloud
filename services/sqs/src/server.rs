@@ -468,13 +468,28 @@ impl Server {
         if name.is_empty() || !self.queues.contains_key(&name) {
             return Err("queue does not exist".into());
         }
+        let previous_tags = self
+            .queues
+            .get(&name)
+            .ok_or_else(|| "queue does not exist".to_string())?
+            .tags
+            .clone();
         {
-            let q = self.queues.get_mut(&name).unwrap();
+            let q = self
+                .queues
+                .get_mut(&name)
+                .ok_or_else(|| "queue does not exist".to_string())?;
             for k in tag_keys {
                 q.tags.remove(k);
             }
         }
-        self.persist()
+        if let Err(e) = self.persist() {
+            if let Some(q) = self.queues.get_mut(&name) {
+                q.tags = previous_tags;
+            }
+            return Err(e);
+        }
+        Ok(())
     }
 
     pub fn list_queue_tags(&self, queue_url: &str) -> Result<BTreeMap<String, String>, String> {
