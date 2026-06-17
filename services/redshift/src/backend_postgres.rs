@@ -51,9 +51,41 @@ struct ConnInfo {
     database: String,
 }
 
+/// A current-thread tokio runtime whose `Drop` never blocks, so it is safe to
+/// drop from within an ambient async context.
+///
+/// Dropping a bare `Runtime` blocks to shut down its (blocking) thread pool,
+/// which panics ("Cannot drop a runtime in a context where blocking is not
+/// allowed") when the drop lands on a tokio worker thread. The orchestrator
+/// holds the backend behind `Arc<Server>` cloned into spawned tasks, so the
+/// final `Backend`/`Transaction` drop runs on a worker thread at shutdown.
+/// `shutdown_background` releases the runtime without blocking on those threads.
+struct SafeRuntime(Option<Runtime>);
+
+impl SafeRuntime {
+    fn new(runtime: Runtime) -> Self {
+        SafeRuntime(Some(runtime))
+    }
+}
+
+impl std::ops::Deref for SafeRuntime {
+    type Target = Runtime;
+    fn deref(&self) -> &Runtime {
+        self.0.as_ref().expect("runtime present until drop")
+    }
+}
+
+impl Drop for SafeRuntime {
+    fn drop(&mut self) {
+        if let Some(runtime) = self.0.take() {
+            runtime.shutdown_background();
+        }
+    }
+}
+
 /// Mirrors `postgres.Backend`.
 pub struct Backend {
-    runtime: Runtime,
+    runtime: SafeRuntime,
     conn: Mutex<Option<PgConn>>,
     info: ConnInfo,
     #[allow(dead_code)]
@@ -79,7 +111,7 @@ impl Backend {
             .block_on(PgConn::connect(&info))
             .map_err(|err| wrap_error("ping", err))?;
         Ok(Backend {
-            runtime,
+            runtime: SafeRuntime::new(runtime),
             conn: Mutex::new(Some(conn)),
             info,
             query_timeout: cfg.query_timeout,
@@ -122,7 +154,7 @@ impl SqlBackend for Backend {
             drive(&runtime, PgConn::connect(&info)).map_err(|err| wrap_error("begin", err))?;
         drive(&runtime, conn.simple_query("BEGIN")).map_err(|err| wrap_error("begin", err))?;
         Ok(Box::new(Transaction {
-            runtime,
+            runtime: SafeRuntime::new(runtime),
             conn: Some(conn),
         }))
     }
@@ -149,7 +181,7 @@ impl SqlBackend for Backend {
 
 /// Mirrors `transaction`.
 struct Transaction {
-    runtime: Runtime,
+    runtime: SafeRuntime,
     conn: Option<PgConn>,
 }
 
@@ -906,5 +938,127 @@ mod scram_tests {
         block.extend_from_slice(&1u32.to_be_bytes());
         let expected = hmac_sha256(b"pw", &block);
         assert_eq!(pbkdf2_hmac_sha256(b"pw", salt, 1), expected);
+    }
+
+    // ---- parse_dsn variants ----
+
+    #[test]
+    fn parse_dsn_postgres_and_postgresql_prefix() {
+        let a = parse_dsn("postgres://u:p@host:5433/db").unwrap();
+        let b = parse_dsn("postgresql://u:p@host:5433/db").unwrap();
+        assert_eq!(a.host, "host");
+        assert_eq!(a.port, 5433);
+        assert_eq!(a.user, "u");
+        assert_eq!(a.password, "p");
+        assert_eq!(a.database, "db");
+        assert_eq!(b.host, a.host);
+        assert_eq!(b.port, a.port);
+    }
+
+    #[test]
+    fn parse_dsn_missing_port_defaults_5432() {
+        let info = parse_dsn("postgres://u:p@host/db").unwrap();
+        assert_eq!(info.port, 5432);
+        assert_eq!(info.host, "host");
+        assert_eq!(info.database, "db");
+    }
+
+    #[test]
+    fn parse_dsn_no_credentials() {
+        let info = parse_dsn("postgres://host/db").unwrap();
+        assert_eq!(info.user, "");
+        assert_eq!(info.password, "");
+        assert_eq!(info.host, "host");
+    }
+
+    #[test]
+    fn parse_dsn_strips_query_and_fragment() {
+        let info = parse_dsn("postgres://u:p@host:5432/db?sslmode=disable#tag").unwrap();
+        assert_eq!(info.host, "host");
+        assert_eq!(info.port, 5432);
+        assert_eq!(info.database, "db");
+    }
+
+    #[test]
+    fn parse_dsn_empty_host_returns_none() {
+        assert!(parse_dsn("postgres:///db").is_none());
+        assert!(parse_dsn("postgres://:5432/db").is_none());
+    }
+
+    #[test]
+    fn parse_dsn_user_only_no_password() {
+        let info = parse_dsn("postgres://user@host/db").unwrap();
+        assert_eq!(info.user, "user");
+        assert_eq!(info.password, "");
+        assert_eq!(info.host, "host");
+    }
+
+    // ---- md5_password ----
+
+    #[test]
+    fn md5_password_matches_known_vector() {
+        // Hand-computed: inner = md5("secretdev") = md5(password+user),
+        // outer = md5(inner_hex + salt) prefixed with "md5".
+        // Use user="dev", password="secret", salt=b"\x01\x02\x03\x04".
+        use md5::{Digest, Md5};
+        let user = "dev";
+        let password = "secret";
+        let salt = b"\x01\x02\x03\x04";
+
+        let mut inner = Md5::new();
+        inner.update(password.as_bytes());
+        inner.update(user.as_bytes());
+        let inner_hex = hex::encode(inner.finalize());
+
+        let mut outer = Md5::new();
+        outer.update(inner_hex.as_bytes());
+        outer.update(salt);
+        let expected = format!("md5{}", hex::encode(outer.finalize()));
+
+        assert_eq!(md5_password(user, password, salt), expected);
+        assert!(md5_password(user, password, salt).starts_with("md5"));
+        // length: "md5" + 32 hex chars
+        assert_eq!(md5_password(user, password, salt).len(), 35);
+    }
+
+    // ---- SCRAM error paths ----
+
+    #[test]
+    fn parse_server_first_missing_field_is_err() {
+        // Missing iteration count.
+        assert!(parse_server_first("r=nonce,s=c2FsdA==").is_err());
+        // Missing nonce.
+        assert!(parse_server_first("s=c2FsdA==,i=4096").is_err());
+        // Missing salt.
+        assert!(parse_server_first("r=nonce,i=4096").is_err());
+        // Iteration count zero is rejected.
+        assert!(parse_server_first("r=nonce,s=c2FsdA==,i=0").is_err());
+    }
+
+    #[test]
+    fn parse_server_first_invalid_base64_salt_is_err() {
+        assert!(parse_server_first("r=nonce,s=!!!invalid!!!,i=4096").is_err());
+    }
+
+    #[test]
+    fn parse_server_first_non_numeric_iterations_is_err() {
+        assert!(parse_server_first("r=nonce,s=c2FsdA==,i=abc").is_err());
+    }
+
+    #[test]
+    fn parse_server_final_missing_v_attribute_is_err() {
+        assert!(parse_server_final("other=value").is_err());
+        assert!(parse_server_final("").is_err());
+    }
+
+    #[test]
+    fn parse_server_final_invalid_base64_is_err() {
+        assert!(parse_server_final("v=!!!bad!!!").is_err());
+    }
+
+    #[test]
+    fn parse_server_final_error_attribute_is_err() {
+        let err = parse_server_final("e=unknown-user").unwrap_err();
+        assert!(err.contains("unknown-user"), "error = {err}");
     }
 }

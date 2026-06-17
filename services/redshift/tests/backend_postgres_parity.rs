@@ -657,3 +657,84 @@ fn postgres_backend_scram_sha256_handshake() {
     assert_eq!(result.rows, vec![vec!["42".to_string()]]);
     backend.close().unwrap();
 }
+
+// ---- SafeRuntime drop-safety regression tests ----
+//
+// A bare tokio `Runtime` panics when dropped from inside an async task running
+// on another tokio runtime's worker ("Cannot drop a runtime in a context where
+// blocking is not allowed"): its `Drop` blocks to shut the thread pool down, and
+// blocking is forbidden in async context. `SafeRuntime::drop` calls
+// `shutdown_background()` instead, which does not block and therefore never
+// panics there.
+//
+// This is the orchestrator-shutdown scenario: the backend is held behind
+// `Arc<Server>` cloned into spawned tasks, so the final `Backend`/`Transaction`
+// drop runs on a tokio worker thread. The tests open the backend OUTSIDE any
+// runtime (so `Backend::open`'s own `block_on` succeeds), then move it into a
+// `tokio::spawn`ed task and drop it there — pure async context, where a bare
+// `Runtime` drop panics and `SafeRuntime` must not. (Note: `spawn_blocking`
+// would NOT reproduce this — blocking IS allowed on the blocking pool, so the
+// drop never panics there and the test would not guard the fix.)
+
+/// Dropping a `Backend` from within a `tokio::spawn`ed task (async worker
+/// context) on a multi-thread runtime must not panic.
+#[test]
+fn postgres_backend_drop_from_worker_thread_does_not_panic() {
+    let server = start_fake_server(false);
+    let dsn = server.dsn.clone();
+
+    // Open outside any runtime so the backend's internal `block_on` succeeds.
+    let backend = Backend::open(Config {
+        dsn,
+        ..Config::default()
+    })
+    .expect("open backend");
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("build multi-thread runtime");
+
+    rt.block_on(async move {
+        // A spawned task runs in pure async context: blocking is forbidden, so a
+        // bare `Runtime` drop panics here. `SafeRuntime::shutdown_background()`
+        // must not.
+        tokio::spawn(async move {
+            drop(backend);
+        })
+        .await
+        .expect("dropping Backend on a worker thread must not panic");
+    });
+}
+
+/// Dropping a `Transaction` from within a `tokio::spawn`ed task (async worker
+/// context) on a multi-thread runtime must not panic.
+#[test]
+fn postgres_backend_transaction_drop_from_worker_thread_does_not_panic() {
+    let server = start_fake_server(false);
+    let dsn = server.dsn.clone();
+
+    let backend = Backend::open(Config {
+        dsn,
+        ..Config::default()
+    })
+    .expect("open backend");
+    // `begin()` creates a Transaction with its own SafeRuntime.
+    let tx = backend.begin().expect("begin transaction");
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("build multi-thread runtime");
+
+    rt.block_on(async move {
+        tokio::spawn(async move {
+            drop(tx);
+            drop(backend);
+        })
+        .await
+        .expect("dropping Transaction on a worker thread must not panic");
+    });
+}
