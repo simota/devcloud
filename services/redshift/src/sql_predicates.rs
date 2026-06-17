@@ -356,3 +356,438 @@ pub fn column_index(table: &Table, name: &str) -> Option<usize> {
         .iter()
         .position(|column| column.name.eq_ignore_ascii_case(name))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{Column, QualifiedName, Table};
+
+    fn make_table(col_names: &[&str]) -> Table {
+        Table {
+            name: QualifiedName {
+                schema: "public".to_string(),
+                table: "t".to_string(),
+            },
+            columns: col_names
+                .iter()
+                .map(|n| Column {
+                    name: n.to_string(),
+                    data_type: "text".to_string(),
+                    ..Column::default()
+                })
+                .collect(),
+            ..Table::default()
+        }
+    }
+
+    // ---- split_where_comparison ----
+
+    #[test]
+    fn split_where_comparison_eq() {
+        let (left, op, right) = split_where_comparison("id = 1").unwrap();
+        assert_eq!(left, "id");
+        assert_eq!(op, CompareOp::Eq);
+        assert_eq!(right, "1");
+    }
+
+    #[test]
+    fn split_where_comparison_ne_bang() {
+        let (_, op, _) = split_where_comparison("id != 1").unwrap();
+        assert_eq!(op, CompareOp::Ne);
+    }
+
+    #[test]
+    fn split_where_comparison_ne_ansi() {
+        let (_, op, _) = split_where_comparison("id <> 1").unwrap();
+        assert_eq!(op, CompareOp::Ne);
+    }
+
+    #[test]
+    fn split_where_comparison_ge() {
+        let (_, op, _) = split_where_comparison("age >= 18").unwrap();
+        assert_eq!(op, CompareOp::Ge);
+    }
+
+    #[test]
+    fn split_where_comparison_le() {
+        let (_, op, _) = split_where_comparison("age <= 100").unwrap();
+        assert_eq!(op, CompareOp::Le);
+    }
+
+    #[test]
+    fn split_where_comparison_gt() {
+        let (_, op, _) = split_where_comparison("age > 18").unwrap();
+        assert_eq!(op, CompareOp::Gt);
+    }
+
+    #[test]
+    fn split_where_comparison_lt() {
+        let (_, op, _) = split_where_comparison("age < 18").unwrap();
+        assert_eq!(op, CompareOp::Lt);
+    }
+
+    #[test]
+    fn split_where_comparison_no_operator_returns_none() {
+        assert!(split_where_comparison("just_a_column").is_none());
+    }
+
+    #[test]
+    fn split_where_comparison_empty_left_returns_none() {
+        // operator at the start — no left side
+        assert!(split_where_comparison("= 1").is_none());
+    }
+
+    #[test]
+    fn split_where_comparison_empty_right_returns_none() {
+        assert!(split_where_comparison("id =").is_none());
+    }
+
+    #[test]
+    fn split_where_comparison_string_value() {
+        let (left, op, right) = split_where_comparison("name = 'alice'").unwrap();
+        assert_eq!(left, "name");
+        assert_eq!(op, CompareOp::Eq);
+        assert_eq!(right, "'alice'");
+    }
+
+    // ---- compare_sql_values ----
+
+    #[test]
+    fn compare_sql_values_numeric_ordering() {
+        use std::cmp::Ordering;
+        // Numeric: 9 < 10 (would be reversed in lexical order: "9" > "10")
+        assert_eq!(compare_sql_values("9", "10"), Ordering::Less);
+        assert_eq!(compare_sql_values("10", "9"), Ordering::Greater);
+        assert_eq!(compare_sql_values("5", "5"), Ordering::Equal);
+    }
+
+    #[test]
+    fn compare_sql_values_negative_numbers() {
+        use std::cmp::Ordering;
+        assert_eq!(compare_sql_values("-1", "1"), Ordering::Less);
+        assert_eq!(compare_sql_values("0", "-0"), Ordering::Equal);
+    }
+
+    #[test]
+    fn compare_sql_values_string_fallback() {
+        use std::cmp::Ordering;
+        // Non-numeric: falls back to lexical byte-wise comparison
+        assert_eq!(compare_sql_values("abc", "abd"), Ordering::Less);
+        assert_eq!(compare_sql_values("z", "a"), Ordering::Greater);
+    }
+
+    #[test]
+    fn compare_sql_values_mixed_not_both_numeric_falls_back_to_string() {
+        use std::cmp::Ordering;
+        // one is numeric, other is not: both parse as i64 required for numeric path
+        assert_eq!(compare_sql_values("42", "abc"), Ordering::Less); // "42" < "abc" lexically
+    }
+
+    // ---- WherePredicate::matches ----
+
+    #[test]
+    fn where_predicate_match_all_always_true() {
+        let pred = WherePredicate::match_all();
+        assert!(pred.matches(&["a".to_string(), "b".to_string()]));
+        assert!(pred.matches(&[]));
+    }
+
+    #[test]
+    fn where_predicate_eq_match() {
+        let pred = WherePredicate {
+            index: Some(0),
+            op: CompareOp::Eq,
+            value: "alice".to_string(),
+        };
+        assert!(pred.matches(&["alice".to_string()]));
+        assert!(!pred.matches(&["bob".to_string()]));
+    }
+
+    #[test]
+    fn where_predicate_ne_match() {
+        let pred = WherePredicate {
+            index: Some(0),
+            op: CompareOp::Ne,
+            value: "alice".to_string(),
+        };
+        assert!(pred.matches(&["bob".to_string()]));
+        assert!(!pred.matches(&["alice".to_string()]));
+    }
+
+    #[test]
+    fn where_predicate_gt_numeric() {
+        let pred = WherePredicate {
+            index: Some(0),
+            op: CompareOp::Gt,
+            value: "5".to_string(),
+        };
+        assert!(pred.matches(&["10".to_string()]));
+        assert!(!pred.matches(&["5".to_string()]));
+        assert!(!pred.matches(&["3".to_string()]));
+    }
+
+    #[test]
+    fn where_predicate_ge_numeric() {
+        let pred = WherePredicate {
+            index: Some(0),
+            op: CompareOp::Ge,
+            value: "5".to_string(),
+        };
+        assert!(pred.matches(&["5".to_string()]));
+        assert!(pred.matches(&["6".to_string()]));
+        assert!(!pred.matches(&["4".to_string()]));
+    }
+
+    #[test]
+    fn where_predicate_lt_le() {
+        let lt = WherePredicate {
+            index: Some(0),
+            op: CompareOp::Lt,
+            value: "5".to_string(),
+        };
+        assert!(lt.matches(&["3".to_string()]));
+        assert!(!lt.matches(&["5".to_string()]));
+
+        let le = WherePredicate {
+            index: Some(0),
+            op: CompareOp::Le,
+            value: "5".to_string(),
+        };
+        assert!(le.matches(&["5".to_string()]));
+        assert!(!le.matches(&["6".to_string()]));
+    }
+
+    #[test]
+    fn where_predicate_index_out_of_bounds_returns_false() {
+        let pred = WherePredicate {
+            index: Some(99),
+            op: CompareOp::Eq,
+            value: "x".to_string(),
+        };
+        assert!(!pred.matches(&["a".to_string()]));
+    }
+
+    // ---- parse_where_predicate ----
+
+    #[test]
+    fn parse_where_predicate_empty_is_match_all() {
+        let table = make_table(&["id"]);
+        let pred = parse_where_predicate(&table, "").unwrap();
+        assert!(pred.index.is_none());
+    }
+
+    #[test]
+    fn parse_where_predicate_simple_eq() {
+        let table = make_table(&["id", "name"]);
+        let pred = parse_where_predicate(&table, "name = 'alice'").unwrap();
+        assert_eq!(pred.index, Some(1));
+        assert_eq!(pred.op, CompareOp::Eq);
+        assert_eq!(pred.value, "alice");
+    }
+
+    #[test]
+    fn parse_where_predicate_unknown_column_is_err() {
+        let table = make_table(&["id"]);
+        assert!(parse_where_predicate(&table, "unknown = 1").is_err());
+    }
+
+    #[test]
+    fn parse_where_predicate_no_operator_is_err() {
+        let table = make_table(&["id"]);
+        assert!(parse_where_predicate(&table, "id").is_err());
+    }
+
+    // ---- parse_order_by / sort_rows_by_source_column ----
+
+    #[test]
+    fn parse_order_by_empty_returns_none() {
+        let table = make_table(&["id"]);
+        assert_eq!(parse_order_by(&table, "").unwrap(), None);
+    }
+
+    #[test]
+    fn parse_order_by_asc() {
+        let table = make_table(&["id", "name"]);
+        assert_eq!(parse_order_by(&table, "id ASC").unwrap(), Some(0));
+    }
+
+    #[test]
+    fn parse_order_by_bare_column() {
+        let table = make_table(&["id", "name"]);
+        assert_eq!(parse_order_by(&table, "name").unwrap(), Some(1));
+    }
+
+    #[test]
+    fn parse_order_by_desc_is_err() {
+        // Only ASC is supported
+        let table = make_table(&["id"]);
+        assert!(parse_order_by(&table, "id DESC").is_err());
+    }
+
+    #[test]
+    fn parse_order_by_unknown_column_is_err() {
+        let table = make_table(&["id"]);
+        assert!(parse_order_by(&table, "unknown").is_err());
+    }
+
+    #[test]
+    fn sort_rows_by_source_column_numeric() {
+        let mut rows = vec![
+            vec!["10".to_string()],
+            vec!["2".to_string()],
+            vec!["5".to_string()],
+        ];
+        sort_rows_by_source_column(&mut rows, &[0], 0);
+        assert_eq!(rows[0][0], "2");
+        assert_eq!(rows[1][0], "5");
+        assert_eq!(rows[2][0], "10");
+    }
+
+    #[test]
+    fn sort_rows_by_source_column_order_index_not_selected_is_noop() {
+        // order_index=1 not in selected_indexes=[0] — should be a no-op
+        let mut rows = vec![vec!["z".to_string()], vec!["a".to_string()]];
+        sort_rows_by_source_column(&mut rows, &[0], 1);
+        assert_eq!(rows[0][0], "z"); // unchanged
+    }
+
+    // ---- parse_assignments ----
+
+    #[test]
+    fn parse_assignments_single() {
+        let table = make_table(&["id", "name"]);
+        let assignments = parse_assignments(&table, "name = 'alice'").unwrap();
+        assert_eq!(assignments.len(), 1);
+        assert_eq!(assignments[0].index, 1);
+        assert_eq!(assignments[0].value, "alice");
+    }
+
+    #[test]
+    fn parse_assignments_multiple() {
+        let table = make_table(&["id", "name", "age"]);
+        let assignments = parse_assignments(&table, "name = 'bob', age = '30'").unwrap();
+        assert_eq!(assignments.len(), 2);
+    }
+
+    #[test]
+    fn parse_assignments_unknown_column_is_err() {
+        let table = make_table(&["id"]);
+        assert!(parse_assignments(&table, "missing = 1").is_err());
+    }
+
+    #[test]
+    fn parse_assignments_empty_is_err() {
+        let table = make_table(&["id"]);
+        assert!(parse_assignments(&table, "").is_err());
+    }
+
+    #[test]
+    fn parse_assignments_no_equals_is_err() {
+        let table = make_table(&["id"]);
+        assert!(parse_assignments(&table, "id").is_err());
+    }
+
+    // ---- selected_columns ----
+
+    #[test]
+    fn selected_columns_star_returns_all() {
+        let table = make_table(&["id", "name", "age"]);
+        let (indexes, fields) = selected_columns(&table, "*").unwrap();
+        assert_eq!(indexes, vec![0, 1, 2]);
+        assert_eq!(fields.len(), 3);
+    }
+
+    #[test]
+    fn selected_columns_subset() {
+        let table = make_table(&["id", "name", "age"]);
+        let (indexes, fields) = selected_columns(&table, "name, id").unwrap();
+        assert_eq!(indexes, vec![1, 0]);
+        assert_eq!(fields[0].name, "name");
+        assert_eq!(fields[1].name, "id");
+    }
+
+    #[test]
+    fn selected_columns_unknown_is_err() {
+        let table = make_table(&["id"]);
+        assert!(selected_columns(&table, "missing").is_err());
+    }
+
+    // ---- build_insert_row ----
+
+    #[test]
+    fn build_insert_row_positional_values() {
+        let table = make_table(&["id", "name"]);
+        let row = build_insert_row(&table, &[], &["1".to_string(), "alice".to_string()]).unwrap();
+        assert_eq!(row, vec!["1", "alice"]);
+    }
+
+    #[test]
+    fn build_insert_row_positional_count_mismatch_is_err() {
+        let table = make_table(&["id", "name"]);
+        assert!(build_insert_row(&table, &[], &["1".to_string()]).is_err());
+    }
+
+    #[test]
+    fn build_insert_row_named_columns() {
+        let table = make_table(&["id", "name"]);
+        let cols = vec!["name".to_string(), "id".to_string()];
+        let vals = vec!["alice".to_string(), "42".to_string()];
+        let row = build_insert_row(&table, &cols, &vals).unwrap();
+        assert_eq!(row[0], "42"); // id at index 0
+        assert_eq!(row[1], "alice"); // name at index 1
+    }
+
+    #[test]
+    fn build_insert_row_named_count_mismatch_is_err() {
+        let table = make_table(&["id", "name"]);
+        let cols = vec!["id".to_string()];
+        let vals = vec!["1".to_string(), "extra".to_string()];
+        assert!(build_insert_row(&table, &cols, &vals).is_err());
+    }
+
+    #[test]
+    fn build_insert_row_unknown_column_is_err() {
+        let table = make_table(&["id"]);
+        let cols = vec!["missing".to_string()];
+        let vals = vec!["1".to_string()];
+        assert!(build_insert_row(&table, &cols, &vals).is_err());
+    }
+
+    #[test]
+    fn build_insert_row_default_keyword_uses_column_default() {
+        let mut table = make_table(&["id", "status"]);
+        table.columns[1].default_value = "'active'".to_string();
+        let row = build_insert_row(&table, &[], &["1".to_string(), "DEFAULT".to_string()]).unwrap();
+        assert_eq!(row[1], "active");
+    }
+
+    #[test]
+    fn build_insert_row_omitted_column_gets_empty_default() {
+        let table = make_table(&["id", "name"]);
+        let cols = vec!["id".to_string()];
+        let vals = vec!["1".to_string()];
+        let row = build_insert_row(&table, &cols, &vals).unwrap();
+        assert_eq!(row[0], "1");
+        assert_eq!(row[1], ""); // omitted, no default
+    }
+
+    #[test]
+    fn build_insert_row_identity_column_auto_increments() {
+        let mut table = make_table(&["id", "name"]);
+        table.columns[0].identity = true;
+        // existing row with id=5
+        table.rows = vec![vec!["5".to_string(), "prev".to_string()]];
+        let cols = vec!["name".to_string()];
+        let vals = vec!["new".to_string()];
+        let row = build_insert_row(&table, &cols, &vals).unwrap();
+        assert_eq!(row[0], "6"); // max(5) + 1
+    }
+
+    #[test]
+    fn build_insert_row_duplicate_column_is_err() {
+        let table = make_table(&["id", "name"]);
+        let cols = vec!["id".to_string(), "id".to_string()];
+        let vals = vec!["1".to_string(), "2".to_string()];
+        assert!(build_insert_row(&table, &cols, &vals).is_err());
+    }
+}
