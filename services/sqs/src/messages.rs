@@ -521,14 +521,22 @@ impl Server {
             &now,
             &self.queues.get(&name).unwrap().messages[idx].invisible_until,
         );
+        let previous_message = self.queues.get(&name).unwrap().messages[idx].clone();
         if expired {
             self.queues.get_mut(&name).unwrap().messages[idx].receipt_handle = String::new();
-            self.persist()?;
+            if let Err(e) = self.persist() {
+                self.queues.get_mut(&name).unwrap().messages[idx] = previous_message;
+                return Err(e);
+            }
             return Err("receipt handle is invalid".into());
         }
         self.queues.get_mut(&name).unwrap().messages[idx].invisible_until =
             add_seconds(&now, visibility_seconds);
-        self.persist()
+        if let Err(e) = self.persist() {
+            self.queues.get_mut(&name).unwrap().messages[idx] = previous_message;
+            return Err(e);
+        }
+        Ok(())
     }
 
     // --- batch delete / change visibility ---

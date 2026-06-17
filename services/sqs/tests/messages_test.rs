@@ -353,6 +353,85 @@ fn change_visibility_extends_then_zero_makes_visible() {
 }
 
 #[test]
+fn change_visibility_rolls_back_memory_when_persist_fails() {
+    let storage_path = std::env::temp_dir().join(format!(
+        "devcloud-sqs-change-visibility-rollback-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&storage_path);
+    let _ = std::fs::remove_dir_all(&storage_path);
+
+    let mut c = cfg();
+    c.storage_path = storage_path.to_string_lossy().into_owned();
+    let mut s = Server::new(c);
+    s.create_queue("Orders", &BTreeMap::new(), &BTreeMap::new())
+        .unwrap();
+    send(&mut s, "keep-me");
+    let got = receive(&mut s, 1, Some(30));
+    let handle = got[0].receipt_handle.clone();
+    let before = s.queue_by_name("Orders").unwrap().messages[0].clone();
+
+    std::fs::remove_dir_all(&storage_path).unwrap();
+    std::fs::write(&storage_path, b"not a directory").unwrap();
+
+    assert!(s.change_message_visibility(URL, &handle, 0).is_err());
+    let after = s.queue_by_name("Orders").unwrap().messages[0].clone();
+    assert_eq!(after.receipt_handle, before.receipt_handle);
+    assert_eq!(after.invisible_until, before.invisible_until);
+
+    std::fs::remove_file(&storage_path).unwrap();
+    std::fs::create_dir_all(&storage_path).unwrap();
+    s.change_message_visibility(URL, &handle, 0).unwrap();
+    assert_ne!(
+        s.queue_by_name("Orders").unwrap().messages[0].invisible_until,
+        before.invisible_until
+    );
+
+    std::fs::remove_dir_all(&storage_path).unwrap();
+}
+
+#[test]
+fn change_visibility_expired_handle_rolls_back_clear_when_persist_fails() {
+    let storage_path = std::env::temp_dir().join(format!(
+        "devcloud-sqs-change-visibility-expired-rollback-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&storage_path);
+    let _ = std::fs::remove_dir_all(&storage_path);
+
+    let mut c = cfg();
+    c.storage_path = storage_path.to_string_lossy().into_owned();
+    let mut s = Server::new(c);
+    s.create_queue("Orders", &BTreeMap::new(), &BTreeMap::new())
+        .unwrap();
+    send(&mut s, "keep-me");
+    let got = receive(&mut s, 1, Some(0));
+    let handle = got[0].receipt_handle.clone();
+
+    std::fs::remove_dir_all(&storage_path).unwrap();
+    std::fs::write(&storage_path, b"not a directory").unwrap();
+
+    assert!(s.change_message_visibility(URL, &handle, 0).is_err());
+    assert_eq!(
+        s.queue_by_name("Orders").unwrap().messages[0].receipt_handle,
+        handle
+    );
+
+    std::fs::remove_file(&storage_path).unwrap();
+    std::fs::create_dir_all(&storage_path).unwrap();
+    assert!(s
+        .change_message_visibility(URL, &handle, 0)
+        .unwrap_err()
+        .contains("receipt handle is invalid"));
+    assert_eq!(
+        s.queue_by_name("Orders").unwrap().messages[0].receipt_handle,
+        ""
+    );
+
+    std::fs::remove_dir_all(&storage_path).unwrap();
+}
+
+#[test]
 fn max_messages_caps_at_10_and_batch_size() {
     let mut s = server_with_queue();
     for i in 0..5 {
