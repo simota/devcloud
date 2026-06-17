@@ -39,9 +39,9 @@ fn redis_display_endpoint(cfg: &AppConfig) -> String {
     }
 }
 
-pub async fn run(cfg: &AppConfig, shutdown: impl Future<Output = ()>) -> Result<(), String> {
+fn build_config(cfg: &AppConfig) -> Config {
     let s = &cfg.storage.path;
-    let config = Config {
+    Config {
         addr: format!("127.0.0.1:{}", cfg.server.dashboard_port),
         event_relay_endpoint: format!("ws://127.0.0.1:{}", cfg.server.event_relay_port),
 
@@ -61,7 +61,7 @@ pub async fn run(cfg: &AppConfig, shutdown: impl Future<Output = ()>) -> Result<
 
         gcs_base: http_ep(cfg.server.gcs_port),
         gcs_endpoint: http_ep(cfg.server.gcs_port),
-        gcs_storage_path: join(s, "s3"),
+        gcs_storage_path: join(s, "gcs"),
 
         dynamodb_base: http_ep(cfg.server.dynamodb_port),
         dynamodb_endpoint: http_ep(cfg.server.dynamodb_port),
@@ -84,8 +84,11 @@ pub async fn run(cfg: &AppConfig, shutdown: impl Future<Output = ()>) -> Result<
         pubsub_base: http_ep(cfg.server.pubsub_rest_port),
         pubsub_endpoint: http_ep(cfg.server.pubsub_rest_port),
         pubsub_storage_path: default_string(&cfg.services.pubsub.data_dir, &join(s, "pubsub")),
-    };
+    }
+}
 
+pub async fn run(cfg: &AppConfig, shutdown: impl Future<Output = ()>) -> Result<(), String> {
+    let config = build_config(cfg);
     let addr = config.addr.clone();
     let config = Arc::new(config);
     let listener = TcpListener::bind(&addr)
@@ -94,4 +97,18 @@ pub async fn run(cfg: &AppConfig, shutdown: impl Future<Output = ()>) -> Result<
     http::serve(listener, config, shutdown)
         .await
         .map_err(|e| format!("dashboard: serve error: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_config_uses_distinct_s3_and_gcs_storage_paths() {
+        let cfg = AppConfig::default();
+        let dashboard = build_config(&cfg);
+
+        assert_eq!(dashboard.s3_storage_path, ".devcloud/data/s3");
+        assert_eq!(dashboard.gcs_storage_path, ".devcloud/data/gcs");
+    }
 }

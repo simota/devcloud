@@ -92,7 +92,7 @@ impl Config {
             s3_storage_path: env_or("DEVCLOUD_DASHBOARD_S3_STORAGE", ".devcloud/data/s3"),
             gcs_base: env("DEVCLOUD_DASHBOARD_GCS_BASE"),
             gcs_endpoint: env_or("DEVCLOUD_DASHBOARD_GCS_ENDPOINT", "http://127.0.0.1:14443"),
-            gcs_storage_path: env_or("DEVCLOUD_DASHBOARD_GCS_STORAGE", ".devcloud/data/s3"),
+            gcs_storage_path: env_or("DEVCLOUD_DASHBOARD_GCS_STORAGE", ".devcloud/data/gcs"),
             dynamodb_base: env("DEVCLOUD_DASHBOARD_DYNAMODB_BASE"),
             dynamodb_endpoint: env_or(
                 "DEVCLOUD_DASHBOARD_DYNAMODB_ENDPOINT",
@@ -141,5 +141,47 @@ impl Config {
                 ".devcloud/data/pubsub",
             ),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvRestore {
+        key: &'static str,
+        value: Option<String>,
+    }
+
+    impl EnvRestore {
+        fn unset(key: &'static str) -> Self {
+            let value = std::env::var(key).ok();
+            std::env::remove_var(key);
+            EnvRestore { key, value }
+        }
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            match &self.value {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
+    #[test]
+    fn from_env_defaults_s3_and_gcs_to_distinct_storage_paths() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _s3 = EnvRestore::unset("DEVCLOUD_DASHBOARD_S3_STORAGE");
+        let _gcs = EnvRestore::unset("DEVCLOUD_DASHBOARD_GCS_STORAGE");
+
+        let cfg = Config::from_env();
+
+        assert_eq!(cfg.s3_storage_path, ".devcloud/data/s3");
+        assert_eq!(cfg.gcs_storage_path, ".devcloud/data/gcs");
     }
 }

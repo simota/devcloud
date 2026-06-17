@@ -191,6 +191,23 @@ mod tests {
     }
 
     #[test]
+    fn registry_reports_distinct_s3_and_gcs_storage_paths() {
+        let cfg = Config {
+            s3_storage_path: ".devcloud/data/s3".to_string(),
+            gcs_storage_path: ".devcloud/data/gcs".to_string(),
+            ..Config::default()
+        };
+        let resp = handle(&cfg, &req());
+        let v: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+        let services = v["services"].as_array().unwrap();
+        let s3 = services.iter().find(|s| s["id"] == "s3").unwrap();
+        let gcs = services.iter().find(|s| s["id"] == "gcs").unwrap();
+
+        assert_eq!(s3["storagePath"], ".devcloud/data/s3");
+        assert_eq!(gcs["storagePath"], ".devcloud/data/gcs");
+    }
+
+    #[test]
     fn sqs_running_when_base_configured() {
         let mut cfg = Config::default();
         cfg.sqs_base = "http://127.0.0.1:19324".to_string();
