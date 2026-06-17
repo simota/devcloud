@@ -163,6 +163,10 @@ fn computed_attributes_present() {
         )
         .unwrap_err()
         .contains("unknown queue attribute name"));
+    assert!(s
+        .get_queue_attributes("http://127.0.0.1:9324/000000000000/Missing", &[])
+        .unwrap_err()
+        .contains("queue does not exist"));
 }
 
 #[test]

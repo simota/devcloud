@@ -328,7 +328,9 @@ impl Server {
         if name.is_empty() || !self.queues.contains_key(&name) {
             return Err("queue does not exist".into());
         }
-        let queue = self.queues.get(&name).unwrap();
+        let Some(queue) = self.queues.get(&name) else {
+            return Err("queue does not exist".into());
+        };
         let attrs = queue_attributes_with_computed(queue);
         filter_queue_attributes(attrs, names)
     }
