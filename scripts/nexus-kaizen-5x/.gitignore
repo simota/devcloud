@@ -1,0 +1,11 @@
+.action-sig.log
+.cost-usd
+.goal.sha256
+.run-loop.lock
+iteration-*.out
+iteration-*.prompt
+progress.md
+runner.jsonl
+runner.log
+state.env
+state.env.sha256

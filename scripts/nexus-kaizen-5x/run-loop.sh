@@ -20,7 +20,6 @@ CODEX_BIN="${CODEX_BIN:-codex}"
 CODEX_MODEL="${CODEX_MODEL:-gpt-5.5}"
 REASONING_EFFORT="${REASONING_EFFORT:-high}"
 SANDBOX_MODE="${SANDBOX_MODE:-workspace-write}"
-APPROVAL_POLICY="${APPROVAL_POLICY:-never}"
 ALLOW_DIRTY="${ALLOW_DIRTY:-false}"
 USD_PER_RUN_CAP="${USD_PER_RUN_CAP:-0}"
 
@@ -209,10 +208,10 @@ record_progress() {
   local output_file="$3"
   {
     printf '## Iteration %s\n\n' "${iteration}"
-    printf '- UTC: `%s`\n' "$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
-    printf '- Status: `%s`\n' "${status}"
-    printf '- Output: `%s`\n' "${output_file}"
-    printf '- HEAD: `%s`\n' "$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+    printf '%s\n' "- UTC: \`$(date -u +"%Y-%m-%dT%H:%M:%SZ")\`"
+    printf '%s\n' "- Status: \`${status}\`"
+    printf '%s\n' "- Output: \`${output_file}\`"
+    printf '%s\n' "- HEAD: \`$(git rev-parse --short HEAD 2>/dev/null || echo unknown)\`"
     printf '\n'
   } >> "${PROGRESS_FILE}"
 }
@@ -257,7 +256,6 @@ main() {
         -m "${CODEX_MODEL}" \
         -C "${ROOT_DIR}" \
         -s "${SANDBOX_MODE}" \
-        -a "${APPROVAL_POLICY}" \
         -c "model_reasoning_effort=\"${REASONING_EFFORT}\"" \
         --json \
         -o "${output_file}" \
