@@ -362,7 +362,9 @@ impl Server {
             now_nanos - (self.config.message_retention_seconds as i128) * 1_000_000_000;
         let snap_names: Vec<String> = self.snapshots.keys().cloned().collect();
         for name in snap_names {
-            let snapshot = self.snapshots.get(&name).cloned().unwrap();
+            let Some(snapshot) = self.snapshots.get(&name).cloned() else {
+                continue;
+            };
             let kept: Vec<crate::model::DeliveryRecord> = snapshot
                 .deliveries
                 .into_iter()
