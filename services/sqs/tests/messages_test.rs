@@ -44,6 +44,15 @@ fn send(s: &mut Server, body: &str) -> String {
     .id
 }
 
+fn live_message_count(s: &Server, name: &str) -> usize {
+    s.queue_by_name(name)
+        .unwrap()
+        .messages
+        .iter()
+        .filter(|m| !m.deleted)
+        .count()
+}
+
 /// Receive immediately-visible messages (visibility override 0 so repeated
 /// receives keep seeing the same message — used to drive DLQ redrive).
 fn receive(s: &mut Server, max: i64, vis: Option<i64>) -> Vec<devcloud_sqs::ReceivedMessage> {
@@ -55,6 +64,32 @@ fn receive(s: &mut Server, max: i64, vis: Option<i64>) -> Vec<devcloud_sqs::Rece
         ..Default::default()
     })
     .unwrap()
+}
+
+#[test]
+fn purge_queue_rolls_back_memory_when_persist_fails() {
+    let storage_path = std::env::temp_dir().join(format!(
+        "devcloud-sqs-purge-rollback-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&storage_path);
+    let _ = std::fs::remove_dir_all(&storage_path);
+
+    let mut c = cfg();
+    c.storage_path = storage_path.to_string_lossy().into_owned();
+    let mut s = Server::new(c);
+    s.create_queue("Orders", &BTreeMap::new(), &BTreeMap::new())
+        .unwrap();
+    send(&mut s, "keep-me");
+    assert_eq!(live_message_count(&s, "Orders"), 1);
+
+    std::fs::remove_dir_all(&storage_path).unwrap();
+    std::fs::write(&storage_path, b"not a directory").unwrap();
+
+    assert!(s.purge_queue(URL).is_err());
+    assert_eq!(live_message_count(&s, "Orders"), 1);
+
+    std::fs::remove_file(&storage_path).unwrap();
 }
 
 #[test]

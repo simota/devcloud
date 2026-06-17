@@ -301,8 +301,20 @@ impl Server {
         if name.is_empty() || !self.queues.contains_key(&name) {
             return Err("queue does not exist".into());
         }
-        self.queues.get_mut(&name).unwrap().messages.clear();
-        self.persist()
+        let previous_messages = {
+            let queue = self
+                .queues
+                .get_mut(&name)
+                .ok_or_else(|| "queue does not exist".to_string())?;
+            std::mem::take(&mut queue.messages)
+        };
+        if let Err(e) = self.persist() {
+            if let Some(queue) = self.queues.get_mut(&name) {
+                queue.messages = previous_messages;
+            }
+            return Err(e);
+        }
+        Ok(())
     }
 
     // --- attributes (mirror queue_attributes.rs) ---
