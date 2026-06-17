@@ -112,18 +112,9 @@ async function fetchS3ObjectMutation(path: string, options: FetchS3ObjectMutatio
     }
   }
 
-  const response = await fetch(path, {
-    body: options.body,
+  return fetchJSON<S3ObjectSummary>(path, {
+    rawBody: options.body,
     headers,
     method: 'PUT',
   })
-  if (!response.ok) {
-    throw new Error(await readS3MutationError(response))
-  }
-  return (await response.json()) as S3ObjectSummary
-}
-
-async function readS3MutationError(response: Response): Promise<string> {
-  const text = await response.text().catch(() => '')
-  return text.trim() || `S3 mutation failed with status ${response.status}`
 }

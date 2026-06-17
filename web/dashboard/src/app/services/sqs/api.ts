@@ -1,4 +1,4 @@
-import { fetchJSON } from '../../api/client'
+import { fetchJSON, fetchNoContent } from '../../api/client'
 import type {
   SQSCreateQueueInput,
   SQSCreateQueueResponse,
@@ -76,9 +76,5 @@ export async function getSQSDeadLetter(queueName: string): Promise<SQSDeadLetter
 }
 
 export async function purgeSQSQueue(queueName: string): Promise<void> {
-  const response = await fetch(`/api/sqs/queues/${encodeURIComponent(queueName)}/purge`, { method: 'POST' })
-  if (!response.ok) {
-    const detail = await response.text()
-    throw new Error(detail || `Request failed with ${response.status}`)
-  }
+  return fetchNoContent(`/api/sqs/queues/${encodeURIComponent(queueName)}/purge`, { method: 'POST' })
 }
