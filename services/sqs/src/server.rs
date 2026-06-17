@@ -532,6 +532,7 @@ impl Server {
             return Err("queue does not exist".into());
         }
         let queue = self.queues.get(&name).unwrap();
+        let previous_queue = clone_queue(queue);
         let mut policy = queue_policy_from_attribute(queue)?;
         let statement = QueuePolicyStatement {
             sid: label.to_string(),
@@ -553,7 +554,11 @@ impl Server {
             .unwrap()
             .attributes
             .insert("Policy".into(), encoded);
-        self.persist()
+        if let Err(e) = self.persist() {
+            self.queues.insert(name, previous_queue);
+            return Err(e);
+        }
+        Ok(())
     }
 
     pub fn remove_permission(&mut self, queue_url: &str, label: &str) -> Result<(), String> {
@@ -568,16 +573,25 @@ impl Server {
             return Err("queue does not exist".into());
         }
         let queue = self.queues.get(&name).unwrap();
+        let previous_queue = clone_queue(queue);
         let mut policy = queue_policy_from_attribute(queue)?;
         policy.statement.retain(|s| s.sid != label);
         let q = self.queues.get_mut(&name).unwrap();
         if policy.statement.is_empty() {
             q.attributes.remove("Policy");
-            return self.persist();
+            if let Err(e) = self.persist() {
+                self.queues.insert(name, previous_queue);
+                return Err(e);
+            }
+            return Ok(());
         }
         let encoded = serde_json::to_string(&policy).map_err(|e| e.to_string())?;
         q.attributes.insert("Policy".into(), encoded);
-        self.persist()
+        if let Err(e) = self.persist() {
+            self.queues.insert(name, previous_queue);
+            return Err(e);
+        }
+        Ok(())
     }
 
     // --- persistence (mirror persistence.rs) ---

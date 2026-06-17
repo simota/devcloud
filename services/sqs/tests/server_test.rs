@@ -328,6 +328,159 @@ fn add_permission_policy_json_matches_legacy() {
 }
 
 #[test]
+fn add_permission_rolls_back_memory_when_persist_fails() {
+    let storage_path = std::env::temp_dir().join(format!(
+        "devcloud-sqs-add-permission-rollback-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&storage_path);
+    let _ = std::fs::remove_dir_all(&storage_path);
+
+    let mut c = cfg();
+    c.storage_path = storage_path.to_string_lossy().into_owned();
+    let mut s = Server::new(c);
+    let url = "http://127.0.0.1:9324/000000000000/Orders";
+    s.create_queue("Orders", &BTreeMap::new(), &BTreeMap::new())
+        .unwrap();
+
+    std::fs::remove_dir_all(&storage_path).unwrap();
+    std::fs::write(&storage_path, b"not a directory").unwrap();
+
+    assert!(s
+        .add_permission(
+            url,
+            "L1",
+            &["111".to_string()],
+            &["SendMessage".to_string()]
+        )
+        .is_err());
+    assert!(!s
+        .get_queue_attributes(url, &[])
+        .unwrap()
+        .contains_key("Policy"));
+
+    std::fs::remove_file(&storage_path).unwrap();
+    std::fs::create_dir_all(&storage_path).unwrap();
+    s.add_permission(
+        url,
+        "L1",
+        &["111".to_string()],
+        &["SendMessage".to_string()],
+    )
+    .unwrap();
+    assert!(s
+        .get_queue_attributes(url, &["Policy".to_string()])
+        .unwrap()
+        .contains_key("Policy"));
+
+    std::fs::remove_dir_all(&storage_path).unwrap();
+}
+
+#[test]
+fn remove_permission_rolls_back_last_statement_when_persist_fails() {
+    let storage_path = std::env::temp_dir().join(format!(
+        "devcloud-sqs-remove-last-permission-rollback-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&storage_path);
+    let _ = std::fs::remove_dir_all(&storage_path);
+
+    let mut c = cfg();
+    c.storage_path = storage_path.to_string_lossy().into_owned();
+    let mut s = Server::new(c);
+    let url = "http://127.0.0.1:9324/000000000000/Orders";
+    s.create_queue("Orders", &BTreeMap::new(), &BTreeMap::new())
+        .unwrap();
+    s.add_permission(
+        url,
+        "L1",
+        &["111".to_string()],
+        &["SendMessage".to_string()],
+    )
+    .unwrap();
+    let original_policy = s
+        .get_queue_attributes(url, &["Policy".to_string()])
+        .unwrap()["Policy"]
+        .clone();
+
+    std::fs::remove_dir_all(&storage_path).unwrap();
+    std::fs::write(&storage_path, b"not a directory").unwrap();
+
+    assert!(s.remove_permission(url, "L1").is_err());
+    assert_eq!(
+        s.get_queue_attributes(url, &["Policy".to_string()])
+            .unwrap()["Policy"],
+        original_policy
+    );
+
+    std::fs::remove_file(&storage_path).unwrap();
+    std::fs::create_dir_all(&storage_path).unwrap();
+    s.remove_permission(url, "L1").unwrap();
+    assert!(!s
+        .get_queue_attributes(url, &[])
+        .unwrap()
+        .contains_key("Policy"));
+
+    std::fs::remove_dir_all(&storage_path).unwrap();
+}
+
+#[test]
+fn remove_permission_rolls_back_non_empty_policy_when_persist_fails() {
+    let storage_path = std::env::temp_dir().join(format!(
+        "devcloud-sqs-remove-policy-rollback-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&storage_path);
+    let _ = std::fs::remove_dir_all(&storage_path);
+
+    let mut c = cfg();
+    c.storage_path = storage_path.to_string_lossy().into_owned();
+    let mut s = Server::new(c);
+    let url = "http://127.0.0.1:9324/000000000000/Orders";
+    s.create_queue("Orders", &BTreeMap::new(), &BTreeMap::new())
+        .unwrap();
+    s.add_permission(
+        url,
+        "L1",
+        &["111".to_string()],
+        &["SendMessage".to_string()],
+    )
+    .unwrap();
+    s.add_permission(
+        url,
+        "L2",
+        &["222".to_string()],
+        &["ReceiveMessage".to_string()],
+    )
+    .unwrap();
+    let original_policy = s
+        .get_queue_attributes(url, &["Policy".to_string()])
+        .unwrap()["Policy"]
+        .clone();
+
+    std::fs::remove_dir_all(&storage_path).unwrap();
+    std::fs::write(&storage_path, b"not a directory").unwrap();
+
+    assert!(s.remove_permission(url, "L1").is_err());
+    assert_eq!(
+        s.get_queue_attributes(url, &["Policy".to_string()])
+            .unwrap()["Policy"],
+        original_policy
+    );
+
+    std::fs::remove_file(&storage_path).unwrap();
+    std::fs::create_dir_all(&storage_path).unwrap();
+    s.remove_permission(url, "L1").unwrap();
+    let attrs = s
+        .get_queue_attributes(url, &["Policy".to_string()])
+        .unwrap();
+    assert!(attrs["Policy"].contains("\"Sid\":\"L2\""));
+    assert!(!attrs["Policy"].contains("\"Sid\":\"L1\""));
+
+    std::fs::remove_dir_all(&storage_path).unwrap();
+}
+
+#[test]
 fn normalized_permission_actions_matches_legacy() {
     let actions = vec![
         "SendMessage".to_string(),
