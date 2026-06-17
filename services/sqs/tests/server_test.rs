@@ -170,6 +170,45 @@ fn computed_attributes_present() {
 }
 
 #[test]
+fn update_queue_attributes_rolls_back_memory_when_persist_fails() {
+    let storage_path = std::env::temp_dir().join(format!(
+        "devcloud-sqs-attrs-rollback-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&storage_path);
+    let _ = std::fs::remove_dir_all(&storage_path);
+
+    let mut c = cfg();
+    c.storage_path = storage_path.to_string_lossy().into_owned();
+    let mut s = Server::new(c);
+    let url = "http://127.0.0.1:9324/000000000000/Orders";
+    s.create_queue("Orders", &BTreeMap::new(), &BTreeMap::new())
+        .unwrap();
+
+    std::fs::remove_dir_all(&storage_path).unwrap();
+    std::fs::write(&storage_path, b"not a directory").unwrap();
+
+    assert!(s
+        .update_queue_attributes(url, &map(&[("VisibilityTimeout", "7")]))
+        .is_err());
+    assert_eq!(
+        s.get_queue_attributes(url, &["VisibilityTimeout".to_string()])
+            .unwrap()["VisibilityTimeout"],
+        "30"
+    );
+
+    std::fs::remove_file(&storage_path).unwrap();
+    std::fs::create_dir_all(&storage_path).unwrap();
+
+    let queue = s
+        .update_queue_attributes(url, &map(&[("VisibilityTimeout", "7")]))
+        .unwrap();
+    assert_eq!(queue.attributes["VisibilityTimeout"], "7");
+
+    std::fs::remove_dir_all(&storage_path).unwrap();
+}
+
+#[test]
 fn tags_lifecycle() {
     let mut s = Server::new(cfg());
     let url = "http://127.0.0.1:9324/000000000000/Orders";

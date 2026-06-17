@@ -344,15 +344,30 @@ impl Server {
         if name.is_empty() || !self.queues.contains_key(&name) {
             return Err("queue does not exist".into());
         }
-        let queue = clone_queue(self.queues.get(&name).unwrap());
-        self.validate_queue_attributes(&queue, attrs)?;
-        let q = self.queues.get_mut(&name).unwrap();
-        for (k, v) in attrs {
-            q.attributes.insert(k.clone(), v.clone());
+        let previous_queue = clone_queue(
+            self.queues
+                .get(&name)
+                .ok_or_else(|| "queue does not exist".to_string())?,
+        );
+        self.validate_queue_attributes(&previous_queue, attrs)?;
+        {
+            let q = self
+                .queues
+                .get_mut(&name)
+                .ok_or_else(|| "queue does not exist".to_string())?;
+            for (k, v) in attrs {
+                q.attributes.insert(k.clone(), v.clone());
+            }
+            q.modified_at = now_rfc3339();
         }
-        q.modified_at = now_rfc3339();
-        self.persist()?;
-        Ok(clone_queue(self.queues.get(&name).unwrap()))
+        if let Err(e) = self.persist() {
+            self.queues.insert(name.clone(), previous_queue);
+            return Err(e);
+        }
+        self.queues
+            .get(&name)
+            .map(clone_queue)
+            .ok_or_else(|| "queue does not exist".to_string())
     }
 
     fn validate_queue_attributes(
