@@ -81,30 +81,8 @@ impl ServerShared {
                 tag: "SELECT 1".to_string(),
             });
         }
-        if normalized.eq_ignore_ascii_case("select current_database()") {
-            return Ok(string_function_result(
-                "current_database",
-                &default_str(&self.config.database, "dev"),
-            ));
-        }
-        if normalized.eq_ignore_ascii_case("select current_schema()") {
-            return Ok(string_function_result("current_schema", "public"));
-        }
-        if normalized.eq_ignore_ascii_case("select current_user")
-            || normalized.eq_ignore_ascii_case("select current_user()")
-        {
-            return Ok(string_function_result(
-                "current_user",
-                &default_str(&self.config.user, "dev"),
-            ));
-        }
-        if normalized.eq_ignore_ascii_case("select session_user")
-            || normalized.eq_ignore_ascii_case("select session_user()")
-        {
-            return Ok(string_function_result(
-                "session_user",
-                &default_str(&self.config.user, "dev"),
-            ));
+        if let Some(result) = self.builtin_scalar_select(normalized) {
+            return Ok(result);
         }
         if normalized.eq_ignore_ascii_case("select pg_backend_pid()") {
             return Ok(QueryResult {
@@ -116,12 +94,6 @@ impl ServerShared {
                 rows: vec![vec![PG_DEFAULT_BACKEND_PID.to_string()]],
                 tag: "SELECT 1".to_string(),
             });
-        }
-        if normalized.eq_ignore_ascii_case("select version()") {
-            return Ok(string_function_result(
-                "version",
-                "PostgreSQL 8.0.2 on devcloud Redshift-compatible local server",
-            ));
         }
         if lower.starts_with("set ") {
             return Ok(QueryResult::tag_only("SET"));
@@ -195,6 +167,45 @@ impl ServerShared {
     /// exactly the memory engine. Part 2 rewires this through the translator.
     fn execute_sql_nested(self: &Arc<Self>, statement: &str) -> Result<QueryResult, SqlError> {
         self.execute_sql_memory(statement)
+    }
+
+    /// Returns a `string_function_result` for the handful of no-arg scalar
+    /// SELECTs that share an identical response shape.  Returns `None` for
+    /// any statement that is not one of these builtins (falls through to the
+    /// rest of the dispatcher).
+    fn builtin_scalar_select(&self, normalized: &str) -> Option<QueryResult> {
+        if normalized.eq_ignore_ascii_case("select current_database()") {
+            return Some(string_function_result(
+                "current_database",
+                &default_str(&self.config.database, "dev"),
+            ));
+        }
+        if normalized.eq_ignore_ascii_case("select current_schema()") {
+            return Some(string_function_result("current_schema", "public"));
+        }
+        if normalized.eq_ignore_ascii_case("select current_user")
+            || normalized.eq_ignore_ascii_case("select current_user()")
+        {
+            return Some(string_function_result(
+                "current_user",
+                &default_str(&self.config.user, "dev"),
+            ));
+        }
+        if normalized.eq_ignore_ascii_case("select session_user")
+            || normalized.eq_ignore_ascii_case("select session_user()")
+        {
+            return Some(string_function_result(
+                "session_user",
+                &default_str(&self.config.user, "dev"),
+            ));
+        }
+        if normalized.eq_ignore_ascii_case("select version()") {
+            return Some(string_function_result(
+                "version",
+                "PostgreSQL 8.0.2 on devcloud Redshift-compatible local server",
+            ));
+        }
+        None
     }
 
     /// Mirrors `showParameter`.
@@ -653,23 +664,7 @@ impl ServerShared {
             .ok_or_else(|| SqlError::new("SELECT requires FROM"))?;
         let column_part = statement["select".len()..from_index].trim().to_string();
         let rest = statement[from_index + " from ".len()..].trim();
-        let (table_part, where_part) = split_clause(rest, " where ");
-        let (table_part, mut order_part) = split_clause(&table_part, " order by ");
-        let (table_part, mut limit_part) = split_clause(&table_part, " limit ");
-        let mut where_part = where_part;
-        if !where_part.is_empty() {
-            let (next_where, next_order) = split_clause(&where_part, " order by ");
-            where_part = next_where;
-            order_part = next_order;
-            let (next_where, next_limit) = split_clause(&where_part, " limit ");
-            where_part = next_where;
-            limit_part = next_limit;
-        }
-        if !order_part.is_empty() {
-            let (next_order, next_limit) = split_clause(&order_part, " limit ");
-            order_part = next_order;
-            limit_part = next_limit;
-        }
+        let (table_part, where_part, order_part, limit_part) = split_select_clauses(rest);
         let name = parse_qualified_name(&table_part);
 
         enum Source {
@@ -712,6 +707,35 @@ impl ServerShared {
             ),
         }
     }
+}
+
+/// Splits the tail of a SELECT statement (everything after `FROM <table>`)
+/// into the four clause parts: (table_part, where_part, order_part, limit_part).
+///
+/// The splitting order is load-bearing — it mirrors the exact precedence used
+/// by the legacy `selectFromTable` implementation:
+///   1. Split on WHERE first (so ORDER BY / LIMIT inside WHERE are handled).
+///   2. Strip ORDER BY and LIMIT from the WHERE clause if present.
+///   3. Strip LIMIT from the ORDER BY clause if present.
+fn split_select_clauses(rest: &str) -> (String, String, String, String) {
+    let (table_part, where_part) = split_clause(rest, " where ");
+    let (table_part, mut order_part) = split_clause(&table_part, " order by ");
+    let (table_part, mut limit_part) = split_clause(&table_part, " limit ");
+    let mut where_part = where_part;
+    if !where_part.is_empty() {
+        let (next_where, next_order) = split_clause(&where_part, " order by ");
+        where_part = next_where;
+        order_part = next_order;
+        let (next_where, next_limit) = split_clause(&where_part, " limit ");
+        where_part = next_where;
+        limit_part = next_limit;
+    }
+    if !order_part.is_empty() {
+        let (next_order, next_limit) = split_clause(&order_part, " limit ");
+        order_part = next_order;
+        limit_part = next_limit;
+    }
+    (table_part, where_part, order_part, limit_part)
 }
 
 /// Mirrors `selectLiterals` (`SELECT 1 AS id, 'x' label` with no FROM).
