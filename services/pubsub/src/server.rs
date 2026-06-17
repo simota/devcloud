@@ -3346,7 +3346,11 @@ impl Server {
         if !deleted {
             return Err(ApiError::not_found("schema revision not found"));
         }
-        let current = kept.last().cloned().unwrap();
+        let Some(current) = kept.last().cloned() else {
+            return Err(ApiError::failed_precondition(
+                "cannot delete the only schema revision",
+            ));
+        };
         schema.type_ = current.type_.clone();
         schema.definition = current.definition.clone();
         schema.revision_id = current.revision_id.clone();
@@ -3422,7 +3426,11 @@ impl Server {
             }
             return Ok(());
         }
-        let inline = inline.unwrap();
+        let Some(inline) = inline else {
+            return Err(ApiError::invalid_argument(
+                "schema name or inline schema is required",
+            ));
+        };
         let schema = grpc_schema_from_request(inline)?;
         if !schema.name.is_empty() {
             if !paths::valid_full_schema_name(&schema.name) {
