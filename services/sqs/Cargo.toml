@@ -21,6 +21,6 @@ serde = { version = "1", features = ["derive"] }
 # Default serde_json Map is a BTreeMap (sorted keys), matching legacy sorted-key
 # map JSON marshaling — do NOT enable preserve_order.
 serde_json = "1"
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "io-util", "signal"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "io-util", "signal", "time"] }
 
 [dev-dependencies]

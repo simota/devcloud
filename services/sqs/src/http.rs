@@ -12,11 +12,13 @@
 
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::time::Duration;
 
+use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-use crate::http_json::JsonOutcome;
+use crate::http_json::{mapped_error, parse_receive_message, receive_message_success, JsonOutcome};
 use crate::http_query::QueryOutcome;
 use crate::introspect::IntrospectOutcome;
 use crate::server::Server;
@@ -68,11 +70,82 @@ async fn handle_conn(
         Ok(Some(req)) => req,
         _ => return Ok(()),
     };
+    // ReceiveMessage's long poll is handled separately from the generic
+    // dispatch below: it must not hold the server lock for the whole wait
+    // (see `long_poll_receive_message`).
+    if is_async_receive_request(&request) {
+        let outcome = long_poll_receive_message(&server, &request.body).await;
+        return write_json_response(&mut stream, outcome).await;
+    }
     match process(&server, &request) {
         Outcome::Json(outcome) => write_json_response(&mut stream, outcome).await,
         Outcome::Introspect(outcome) => write_introspect_response(&mut stream, outcome).await,
         Outcome::Query(outcome) => write_query_response(&mut stream, outcome).await,
     }
+}
+
+/// True when `req` is exactly the JSON `ReceiveMessage` request that `process`
+/// would otherwise hand to `dispatch_json`'s `"ReceiveMessage"` arm. Mirrors
+/// `process`'s own gating (introspection path takes priority; method must be
+/// GET/POST) so this fast path never intercepts anything else.
+fn is_async_receive_request(req: &Request) -> bool {
+    if crate::introspect::is_introspect_path(&req.path) {
+        return false;
+    }
+    if req.method != "POST" && req.method != "GET" {
+        return false;
+    }
+    req.header("x-amz-target") == "AmazonSQS.ReceiveMessage"
+}
+
+/// Long-polls `ReceiveMessage` without holding the server lock across the
+/// wait. Each attempt takes the lock just long enough for one non-waiting
+/// scan (`Server::receive_messages_once`), releases it, then sleeps on the
+/// tokio clock — mirroring the `wait_for_pull` pattern in
+/// `services/pubsub/src/grpc.rs`. Attempt count/cadence
+/// (`wait_seconds * 10 + 1` attempts, 100ms apart) matches
+/// `Server::receive_messages` exactly, so response timing is unchanged from
+/// the caller's point of view; only the server lock's hold time shrinks.
+async fn long_poll_receive_message(server: &Mutex<Server>, body: &[u8]) -> JsonOutcome {
+    let req: Value = if body.is_empty() {
+        json!({})
+    } else {
+        match serde_json::from_slice(body) {
+            Ok(v) => v,
+            Err(_) => {
+                return JsonOutcome::error(400, "InvalidParameterValue", "invalid json request")
+            }
+        }
+    };
+    let input = parse_receive_message(&req);
+
+    let attempt = {
+        let mut guard = server.lock().unwrap();
+        guard.receive_messages_once(&input)
+    };
+    let (first, wait_seconds) = match attempt {
+        Ok(r) => r,
+        Err(e) => return mapped_error(&e),
+    };
+    let attempts = (wait_seconds * 10 + 1).max(1);
+    if !first.is_empty() || attempts == 1 {
+        return receive_message_success(&first);
+    }
+    for attempt_n in 1..attempts {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let attempt = {
+            let mut guard = server.lock().unwrap();
+            guard.receive_messages_once(&input)
+        };
+        let (messages, _) = match attempt {
+            Ok(r) => r,
+            Err(e) => return mapped_error(&e),
+        };
+        if !messages.is_empty() || attempt_n == attempts - 1 {
+            return receive_message_success(&messages);
+        }
+    }
+    receive_message_success(&[])
 }
 
 /// A rendered response in either protocol — JSON (modern), the read-only

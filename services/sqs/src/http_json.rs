@@ -55,7 +55,10 @@ fn json_error(status: u16, code: &str, message: &str) -> JsonOutcome {
 
 /// Maps a logic error to its AWS code (via the responses.rs substring rules) at
 /// HTTP 400, matching the per-operation `writeProtocolError(errorCode(err), …)`.
-fn mapped_error(err: &str) -> JsonOutcome {
+/// `pub(crate)`: also used by the async `ReceiveMessage` long-poll dispatcher
+/// in `http.rs`, which bypasses `dispatch_json` to avoid holding the server
+/// lock across the wait (see `Server::receive_messages_once`).
+pub(crate) fn mapped_error(err: &str) -> JsonOutcome {
     json_error(400, &error_code(err), err)
 }
 
@@ -353,20 +356,9 @@ impl Server {
     }
 
     fn json_receive_message(&mut self, req: &Value) -> JsonOutcome {
-        let input = ReceiveMessageRequest {
-            queue_url: str_field(req, "QueueUrl"),
-            max_number_of_messages: int_field(req, "MaxNumberOfMessages"),
-            visibility_timeout: int_field(req, "VisibilityTimeout"),
-            wait_time_seconds: int_field(req, "WaitTimeSeconds"),
-            attribute_names: string_array(req.get("AttributeNames")),
-            message_attribute_names: string_array(req.get("MessageAttributeNames")),
-            message_system_attribute_names: string_array(req.get("MessageSystemAttributeNames")),
-        };
+        let input = parse_receive_message(req);
         match self.receive_messages(&input) {
-            Ok(messages) => {
-                let arr: Vec<Value> = messages.iter().map(received_message_to_json).collect();
-                JsonOutcome::ok(json!({ "Messages": arr }))
-            }
+            Ok(messages) => receive_message_success(&messages),
             Err(e) => mapped_error(&e),
         }
     }
@@ -504,6 +496,28 @@ fn parse_send_message(v: &Value, queue_url: &str) -> SendMessageRequest {
         message_group_id: str_field(v, "MessageGroupId"),
         message_deduplication_id: str_field(v, "MessageDeduplicationId"),
     }
+}
+
+/// Parses a `ReceiveMessage` JSON request body. `pub(crate)`: shared with the
+/// async long-poll dispatcher in `http.rs`, which parses the body itself
+/// instead of going through `dispatch_json` (see `Server::receive_messages_once`).
+pub(crate) fn parse_receive_message(req: &Value) -> ReceiveMessageRequest {
+    ReceiveMessageRequest {
+        queue_url: str_field(req, "QueueUrl"),
+        max_number_of_messages: int_field(req, "MaxNumberOfMessages"),
+        visibility_timeout: int_field(req, "VisibilityTimeout"),
+        wait_time_seconds: int_field(req, "WaitTimeSeconds"),
+        attribute_names: string_array(req.get("AttributeNames")),
+        message_attribute_names: string_array(req.get("MessageAttributeNames")),
+        message_system_attribute_names: string_array(req.get("MessageSystemAttributeNames")),
+    }
+}
+
+/// Builds the `{"Messages": [...]}` success body shared by `json_receive_message`
+/// and the async long-poll dispatcher in `http.rs`.
+pub(crate) fn receive_message_success(messages: &[ReceivedMessage]) -> JsonOutcome {
+    let arr: Vec<Value> = messages.iter().map(received_message_to_json).collect();
+    JsonOutcome::ok(json!({ "Messages": arr }))
 }
 
 // --- JSON encoding helpers (typed → Value, matching legacy shapes) ---

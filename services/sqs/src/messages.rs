@@ -4,10 +4,15 @@
 //! redrive), delete, change-visibility, their batch variants, retention
 //! cleanup, and the `receivedMessage` projection.
 //!
-//! Receive long-polling is implemented as a bounded `std::thread::sleep` loop
-//! (this crate has no async runtime); `wait_time_seconds == 0` returns
-//! immediately, matching the legacy fast path. The legacy wait-channel is purely an
-//! early-wake optimization and is not behaviorally required.
+//! `receive_messages_once` performs a single non-waiting attempt (validate +
+//! scan); `receive_messages` layers a bounded `std::thread::sleep` retry loop
+//! on top for synchronous callers (tests, the Query protocol path).
+//! `wait_time_seconds == 0` returns immediately, matching the legacy fast
+//! path. The async JSON HTTP server (`http.rs`) instead drives
+//! `receive_messages_once` from a tokio loop so the server lock is released
+//! between attempts rather than held across the whole wait; the legacy
+//! wait-channel is purely an early-wake optimization and is not behaviorally
+//! required either way.
 
 use std::collections::{BTreeMap, HashSet};
 use std::time::Duration;
@@ -267,11 +272,16 @@ impl Server {
 
     // --- receive (mirror message_core.rs) ---
 
-    /// Long-poll receive. `wait_time_seconds == 0` returns immediately.
-    pub fn receive_messages(
+    /// Single non-waiting attempt: validates the request, then performs one
+    /// scan for available messages. Returns the scan result alongside the
+    /// effective (clamped) `WaitTimeSeconds`, so a caller driving its own
+    /// poll loop knows how many ~100ms slices to keep polling for. Safe to
+    /// call repeatedly — the validation only reads immutable `Config` fields
+    /// and `input`, never mutable queue state.
+    pub fn receive_messages_once(
         &mut self,
         input: &ReceiveMessageRequest,
-    ) -> Result<Vec<ReceivedMessage>, String> {
+    ) -> Result<(Vec<ReceivedMessage>, i64), String> {
         if input.queue_url.is_empty() {
             return Err("QueueUrl is required".into());
         }
@@ -296,19 +306,36 @@ impl Server {
             return Err("WaitTimeSeconds must be no greater than 20".into());
         }
 
-        let attempts = wait_seconds * 10 + 1; // ~100ms slices, mirroring the legacy loop
-        for attempt in 0..attempts.max(1) {
-            let messages = self.receive_available_messages(
-                &name,
-                max_messages,
-                input.visibility_timeout,
-                &input.message_attribute_names,
-                &requested_system_attribute_names(input),
-            )?;
-            if !messages.is_empty() || attempt == attempts.max(1) - 1 {
+        let messages = self.receive_available_messages(
+            &name,
+            max_messages,
+            input.visibility_timeout,
+            &input.message_attribute_names,
+            &requested_system_attribute_names(input),
+        )?;
+        Ok((messages, wait_seconds))
+    }
+
+    /// Long-poll receive. `wait_time_seconds == 0` returns immediately.
+    /// Blocks the calling thread for the wait via `std::thread::sleep` — used
+    /// directly by tests and the Query protocol path. The JSON HTTP path
+    /// instead drives `receive_messages_once` from an async loop in
+    /// `http.rs` so the server lock isn't held across the sleeps.
+    pub fn receive_messages(
+        &mut self,
+        input: &ReceiveMessageRequest,
+    ) -> Result<Vec<ReceivedMessage>, String> {
+        let (first, wait_seconds) = self.receive_messages_once(input)?;
+        let attempts = (wait_seconds * 10 + 1).max(1); // ~100ms slices, mirroring the legacy loop
+        if !first.is_empty() || attempts == 1 {
+            return Ok(first);
+        }
+        for attempt in 1..attempts {
+            std::thread::sleep(Duration::from_millis(100));
+            let (messages, _) = self.receive_messages_once(input)?;
+            if !messages.is_empty() || attempt == attempts - 1 {
                 return Ok(messages);
             }
-            std::thread::sleep(Duration::from_millis(100));
         }
         Ok(Vec::new())
     }
