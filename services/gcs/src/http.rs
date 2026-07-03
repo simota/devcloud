@@ -1306,6 +1306,12 @@ fn put_resumable_upload(server: &mut Server, req: &Request) -> Response {
         return r;
     }
     let mut payload = req.body.clone();
+    // Set when the final chunk has already been durably appended (`body.part`
+    // and `session.json` on disk reflect the post-chunk state) so the
+    // `put_object` failure branch below can roll both back to this pre-chunk
+    // offset. `None` covers one-shot and headerless commits, where nothing was
+    // persisted before `put_object` and no rollback is needed.
+    let mut committed_chunk_rollback: Option<i64> = None;
     if !req.header("content-range").trim().is_empty() {
         let upload_range = match parse_resumable_content_range(
             req.header("content-range"),
@@ -1321,6 +1327,7 @@ fn put_resumable_upload(server: &mut Server, req: &Request) -> Response {
                 "upload chunk does not start at committed offset",
             );
         }
+        let prior_received_bytes = session.received_bytes;
         session.received_bytes = upload_range.end + 1;
         let one_shot = upload_range.start == 0 && session.received_bytes == upload_range.total;
         if !one_shot {
@@ -1329,6 +1336,7 @@ fn put_resumable_upload(server: &mut Server, req: &Request) -> Response {
             {
                 return json_error(500, "backendError", "internal error");
             }
+            committed_chunk_rollback = Some(prior_received_bytes);
         }
         if session.received_bytes < upload_range.total {
             server.sessions.insert(id, session);
@@ -1369,11 +1377,20 @@ fn put_resumable_upload(server: &mut Server, req: &Request) -> Response {
             );
             Response::json(200, &object_resource(&object))
         }
-        Err(e) => json_error(
-            404,
-            "notFound",
-            &store_error_text(&e, &session.bucket, &session.name),
-        ),
+        Err(e) => {
+            let message = store_error_text(&e, &session.bucket, &session.name);
+            if let Some(prior_received_bytes) = committed_chunk_rollback {
+                // Only chunks that were durably appended before this failed
+                // `put_object` need undoing here — otherwise a retried final
+                // chunk re-appends onto bytes already persisted, doubling the
+                // stored object.
+                session.received_bytes = prior_received_bytes;
+                let _ = server.truncate_session_body(&id, prior_received_bytes);
+                let _ = server.save_session(&id, &session);
+                server.sessions.insert(id, session);
+            }
+            json_error(404, "notFound", &message)
+        }
     }
 }
 
@@ -1669,6 +1686,23 @@ impl Server {
             ));
         };
         fs::read(dir.join("body.part"))
+    }
+
+    /// Truncates `body.part` back to `len` bytes, undoing an `append_session_body`
+    /// call whose chunk was never committed (the store rejected the finalizing
+    /// `put_object`), so a client retry appends onto the correct pre-chunk offset
+    /// instead of duplicating already-persisted bytes.
+    fn truncate_session_body(&self, id: &str, len: i64) -> std::io::Result<()> {
+        let Some(dir) = self.session_dir(id) else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "upload session storage is not configured",
+            ));
+        };
+        let f = fs::OpenOptions::new()
+            .write(true)
+            .open(dir.join("body.part"))?;
+        f.set_len(len as u64)
     }
 
     fn delete_session(&self, id: &str) -> std::io::Result<()> {

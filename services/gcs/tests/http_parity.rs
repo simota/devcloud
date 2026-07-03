@@ -1309,6 +1309,111 @@ fn resumable_upload_persists_chunk_status_across_server_restart() {
     assert_eq!(download.body, b"resumable body");
 }
 
+/// Regression (OMEN-2): a failed finalize on the last chunk of a chunked
+/// resumable upload must roll the durable append back to the pre-chunk
+/// offset. Otherwise a client retry of the same final chunk re-appends onto
+/// bytes the failed attempt already persisted, silently doubling the stored
+/// object.
+#[test]
+fn resumable_upload_rolls_back_final_chunk_after_commit_failure() {
+    let root = temp_root("resumable-rollback");
+    let sessions = root.join("sessions");
+    let buckets = root.join("buckets");
+    let mut s = Server::new(
+        Config {
+            upload_session_path: sessions.to_string_lossy().to_string(),
+            ..Default::default()
+        },
+        FileBucketStore::new(&buckets),
+    );
+    create_bucket(&mut s, "demo-bucket");
+
+    let init = perform_h(
+        &mut s,
+        "POST",
+        "/upload/storage/v1/b/demo-bucket/o?uploadType=resumable&name=docs/rollback.txt",
+        r#"{"name":"docs/rollback.txt","contentType":"text/plain"}"#,
+        &[
+            ("Host", "example.com"),
+            ("Content-Type", "application/json"),
+            ("X-Upload-Content-Type", "text/plain"),
+        ],
+    );
+    assert_eq!(init.status, 200, "{}", body_str(&init));
+    let target = session_target(&init);
+
+    let first_chunk = perform_h(
+        &mut s,
+        "PUT",
+        &target,
+        "resumable ",
+        &[
+            ("Content-Type", "text/plain"),
+            ("Content-Range", "bytes 0-9/14"),
+        ],
+    );
+    assert_eq!(first_chunk.status, 308, "{}", body_str(&first_chunk));
+    assert_eq!(header(&first_chunk, "Range"), "bytes=0-9");
+
+    // Sabotage the store so the finalizing `put_object` fails on its `body`
+    // write without touching the precondition check (which only reads
+    // `object.json`, never `body`): pre-create `body` as a directory so
+    // `fs::write` errors out instead of succeeding.
+    let probe_store = FileBucketStore::new(&buckets);
+    let object_dir = probe_store.object_path("demo-bucket", "docs/rollback.txt");
+    fs::create_dir_all(object_dir.join("body")).unwrap();
+
+    let failed_commit = perform_h(
+        &mut s,
+        "PUT",
+        &target,
+        "body",
+        &[
+            ("Content-Type", "text/plain"),
+            ("Content-Range", "bytes 10-13/14"),
+        ],
+    );
+    assert_eq!(failed_commit.status, 404, "{}", body_str(&failed_commit));
+
+    // The session must report the pre-chunk offset again, not the failed
+    // chunk's post-append offset.
+    let status = perform_h(
+        &mut s,
+        "PUT",
+        &target,
+        "",
+        &[("Content-Range", "bytes */14")],
+    );
+    assert_eq!(status.status, 308, "{}", body_str(&status));
+    assert_eq!(header(&status, "Range"), "bytes=0-9");
+
+    // Clear the sabotage and retry the identical final chunk.
+    fs::remove_dir(object_dir.join("body")).unwrap();
+    let commit = perform_h(
+        &mut s,
+        "PUT",
+        &target,
+        "body",
+        &[
+            ("Content-Type", "text/plain"),
+            ("Content-Range", "bytes 10-13/14"),
+        ],
+    );
+    assert_eq!(commit.status, 200, "{}", body_str(&commit));
+
+    let download = perform(
+        &mut s,
+        "GET",
+        "/download/storage/v1/b/demo-bucket/o/docs%2Frollback.txt?alt=media",
+        "",
+    );
+    assert_eq!(download.status, 200, "{}", body_str(&download));
+    assert_eq!(
+        download.body, b"resumable body",
+        "retried commit must not duplicate the chunk from the failed attempt"
+    );
+}
+
 /// legacy: TestResumableUploadRejectsMalformedCommitRequests
 #[test]
 fn resumable_upload_rejects_malformed_commit_requests() {
