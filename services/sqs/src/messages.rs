@@ -152,7 +152,12 @@ impl Server {
         if name.is_empty() || !self.queues.contains_key(&name) {
             return Err("queue does not exist".into());
         }
-        let previous_queue = self.queues.get(&name).cloned().unwrap();
+        // Snapshot only the fields this function mutates (messages, sequence,
+        // dedup) rather than the whole QueueState — attributes/tags/name/url/
+        // arn/timestamps are never touched here.
+        let previous_messages = self.queues.get(&name).unwrap().messages.clone();
+        let previous_sequence = self.queues.get(&name).unwrap().sequence;
+        let previous_dedup = self.queues.get(&name).unwrap().dedup.clone();
 
         let fifo = is_fifo_queue(self.queues.get(&name).unwrap());
         if fifo && input.delay_seconds.is_some() {
@@ -170,7 +175,9 @@ impl Server {
             return Err("DelaySeconds must be non-negative".into());
         }
         if delay_seconds > MAX_DELAY_SECONDS {
-            return Err("DelaySeconds must be no greater than 900".into());
+            return Err(format!(
+                "DelaySeconds must be no greater than {MAX_DELAY_SECONDS}"
+            ));
         }
 
         let mut message = MessageState {
@@ -212,7 +219,10 @@ impl Server {
         let queue = self.queues.get_mut(&name).unwrap();
         queue.messages.push(message.clone());
         if let Err(e) = self.persist() {
-            self.queues.insert(name, previous_queue);
+            let queue = self.queues.get_mut(&name).unwrap();
+            queue.messages = previous_messages;
+            queue.sequence = previous_sequence;
+            queue.dedup = previous_dedup;
             return Err(e);
         }
         Ok(message)
@@ -314,7 +324,21 @@ impl Server {
         if !self.queues.contains_key(name) {
             return Err("queue does not exist".into());
         }
-        let previous_queues = self.queues.clone();
+        // Snapshot only the queues this scan can mutate: the target queue
+        // itself, plus its redrive-policy DLQ target (if any) since expired
+        // messages may be redriven there via `move_to_dlq_if_needed` below.
+        // The policy is read once here since it does not change mid-scan.
+        let dlq_name = redrive_policy_from_queue(self.queues.get(name).unwrap()).and_then(|p| {
+            self.queues
+                .iter()
+                .find(|(_, q)| q.arn == p.dead_letter_target_arn)
+                .map(|(n, _)| n.clone())
+        });
+        let previous_queue = self.queues.get(name).unwrap().clone();
+        let previous_dlq = dlq_name
+            .as_ref()
+            .filter(|n| n.as_str() != name)
+            .map(|n| (n.clone(), self.queues.get(n).unwrap().clone()));
         let now = now_rfc3339();
         cleanup_expired_messages(self.queues.get_mut(name).unwrap(), &now);
 
@@ -328,7 +352,9 @@ impl Server {
             return Err("VisibilityTimeout must be non-negative".into());
         }
         if visibility > MAX_VISIBILITY_TIMEOUT_SECONDS {
-            return Err("VisibilityTimeout must be no greater than 43200".into());
+            return Err(format!(
+                "VisibilityTimeout must be no greater than {MAX_VISIBILITY_TIMEOUT_SECONDS}"
+            ));
         }
 
         let fifo = is_fifo_queue(queue);
@@ -394,7 +420,10 @@ impl Server {
         }
         if changed {
             if let Err(e) = self.persist() {
-                self.queues = previous_queues;
+                self.queues.insert(name.to_string(), previous_queue);
+                if let Some((n, snapshot)) = previous_dlq {
+                    self.queues.insert(n, snapshot);
+                }
                 return Err(e);
             }
         }
@@ -452,39 +481,10 @@ impl Server {
         if name.is_empty() || !self.queues.contains_key(&name) {
             return Err("queue does not exist".into());
         }
-        let now = now_rfc3339();
-        let idx = self
-            .queues
-            .get(&name)
-            .unwrap()
-            .messages
-            .iter()
-            .position(|m| !m.deleted && m.receipt_handle == receipt_handle);
-        let idx = match idx {
-            None => return Err("receipt handle is invalid".into()),
-            Some(i) => i,
-        };
-        let expired = !before(
-            &now,
-            &self.queues.get(&name).unwrap().messages[idx].invisible_until,
-        );
-        let previous_message = self.queues.get(&name).unwrap().messages[idx].clone();
-        if expired {
-            self.queues.get_mut(&name).unwrap().messages[idx].receipt_handle = String::new();
-            if let Err(e) = self.persist() {
-                self.queues.get_mut(&name).unwrap().messages[idx] = previous_message;
-                return Err(e);
-            }
-            return Err("receipt handle is invalid".into());
-        }
-        let m = &mut self.queues.get_mut(&name).unwrap().messages[idx];
-        m.deleted = true;
-        m.receipt_handle = String::new();
-        if let Err(e) = self.persist() {
-            self.queues.get_mut(&name).unwrap().messages[idx] = previous_message;
-            return Err(e);
-        }
-        Ok(())
+        self.apply_to_receipted_message(&name, receipt_handle, |m, _now| {
+            m.deleted = true;
+            m.receipt_handle = String::new();
+        })
     }
 
     pub fn change_message_visibility(
@@ -503,44 +503,90 @@ impl Server {
             return Err("VisibilityTimeout must be non-negative".into());
         }
         if visibility_seconds > MAX_VISIBILITY_TIMEOUT_SECONDS {
-            return Err("VisibilityTimeout must be no greater than 43200".into());
+            return Err(format!(
+                "VisibilityTimeout must be no greater than {MAX_VISIBILITY_TIMEOUT_SECONDS}"
+            ));
         }
         let name = queue_name_from_url(queue_url);
         if name.is_empty() || !self.queues.contains_key(&name) {
             return Err("queue does not exist".into());
         }
+        self.apply_to_receipted_message(&name, receipt_handle, |m, now| {
+            m.invisible_until = add_seconds(now, visibility_seconds);
+        })
+    }
+
+    /// Shared shape for `delete_message` / `change_message_visibility`:
+    /// stage the mutation in memory via `stage_receipted_mutation`, persist
+    /// once, and roll back the single affected message on persist failure.
+    fn apply_to_receipted_message(
+        &mut self,
+        name: &str,
+        receipt_handle: &str,
+        mutate: impl FnOnce(&mut MessageState, &str),
+    ) -> Result<(), String> {
+        match self.stage_receipted_mutation(name, receipt_handle, mutate) {
+            StagedMutation::Rejected(e) => Err(e),
+            StagedMutation::Applied {
+                idx,
+                previous,
+                pending_err,
+            } => {
+                if let Err(e) = self.persist() {
+                    self.queues.get_mut(name).unwrap().messages[idx] = previous;
+                    return Err(e);
+                }
+                match pending_err {
+                    Some(e) => Err(e),
+                    None => Ok(()),
+                }
+            }
+        }
+    }
+
+    /// Locates the non-deleted message with receipt handle `receipt_handle`
+    /// in queue `name` and, unless its visibility has already expired,
+    /// applies `mutate` in memory (does not persist). An expired handle is
+    /// tombstoned (receipt handle cleared) same as legacy, but reported via
+    /// `pending_err` rather than persisted immediately, so callers — single
+    /// item or batch — can persist once for however many entries they stage.
+    fn stage_receipted_mutation(
+        &mut self,
+        name: &str,
+        receipt_handle: &str,
+        mutate: impl FnOnce(&mut MessageState, &str),
+    ) -> StagedMutation {
+        if receipt_handle.is_empty() {
+            return StagedMutation::Rejected("ReceiptHandle is required".into());
+        }
         let now = now_rfc3339();
         let idx = self
             .queues
-            .get(&name)
+            .get(name)
             .unwrap()
             .messages
             .iter()
             .position(|m| !m.deleted && m.receipt_handle == receipt_handle);
         let idx = match idx {
-            None => return Err("receipt handle is invalid".into()),
+            None => return StagedMutation::Rejected("receipt handle is invalid".into()),
             Some(i) => i,
         };
-        let expired = !before(
-            &now,
-            &self.queues.get(&name).unwrap().messages[idx].invisible_until,
-        );
-        let previous_message = self.queues.get(&name).unwrap().messages[idx].clone();
+        let previous = self.queues.get(name).unwrap().messages[idx].clone();
+        let expired = !before(&now, &previous.invisible_until);
         if expired {
-            self.queues.get_mut(&name).unwrap().messages[idx].receipt_handle = String::new();
-            if let Err(e) = self.persist() {
-                self.queues.get_mut(&name).unwrap().messages[idx] = previous_message;
-                return Err(e);
-            }
-            return Err("receipt handle is invalid".into());
+            self.queues.get_mut(name).unwrap().messages[idx].receipt_handle = String::new();
+            return StagedMutation::Applied {
+                idx,
+                previous,
+                pending_err: Some("receipt handle is invalid".into()),
+            };
         }
-        self.queues.get_mut(&name).unwrap().messages[idx].invisible_until =
-            add_seconds(&now, visibility_seconds);
-        if let Err(e) = self.persist() {
-            self.queues.get_mut(&name).unwrap().messages[idx] = previous_message;
-            return Err(e);
+        mutate(&mut self.queues.get_mut(name).unwrap().messages[idx], &now);
+        StagedMutation::Applied {
+            idx,
+            previous,
+            pending_err: None,
         }
-        Ok(())
     }
 
     // --- batch delete / change visibility ---
@@ -554,15 +600,35 @@ impl Server {
             return Err("QueueUrl is required".into());
         }
         validate_batch_entries(entries.iter().map(|e| e.id.as_str()))?;
+        let name = queue_name_from_url(queue_url);
         let mut result = BatchResult::default();
+        let mut staged: Vec<StagedBatchEntry> = Vec::new();
         for entry in entries {
-            match self.delete_message(queue_url, &entry.receipt_handle) {
-                Ok(()) => result.successful.push(IdResultEntry {
-                    id: entry.id.clone(),
-                }),
-                Err(e) => result.failed.push(batch_error(&entry.id, &e)),
+            if entry.receipt_handle.is_empty() {
+                result
+                    .failed
+                    .push(batch_error(&entry.id, "ReceiptHandle is required"));
+                continue;
+            }
+            if name.is_empty() || !self.queues.contains_key(&name) {
+                result
+                    .failed
+                    .push(batch_error(&entry.id, "queue does not exist"));
+                continue;
+            }
+            match self.stage_receipted_mutation(&name, &entry.receipt_handle, |m, _now| {
+                m.deleted = true;
+                m.receipt_handle = String::new();
+            }) {
+                StagedMutation::Rejected(e) => result.failed.push(batch_error(&entry.id, &e)),
+                StagedMutation::Applied {
+                    idx,
+                    previous,
+                    pending_err,
+                } => staged.push((entry.id.clone(), idx, previous, pending_err)),
             }
         }
+        apply_staged_batch(self, &name, staged, &mut result);
         Ok(result)
     }
 
@@ -575,20 +641,101 @@ impl Server {
             return Err("QueueUrl is required".into());
         }
         validate_batch_entries(entries.iter().map(|e| e.id.as_str()))?;
+        let name = queue_name_from_url(queue_url);
         let mut result = BatchResult::default();
+        let mut staged: Vec<StagedBatchEntry> = Vec::new();
         for entry in entries {
-            match self.change_message_visibility(
-                queue_url,
-                &entry.receipt_handle,
-                entry.visibility_timeout,
-            ) {
-                Ok(()) => result.successful.push(IdResultEntry {
-                    id: entry.id.clone(),
-                }),
-                Err(e) => result.failed.push(batch_error(&entry.id, &e)),
+            if entry.receipt_handle.is_empty() {
+                result
+                    .failed
+                    .push(batch_error(&entry.id, "ReceiptHandle is required"));
+                continue;
+            }
+            if entry.visibility_timeout < 0 {
+                result.failed.push(batch_error(
+                    &entry.id,
+                    "VisibilityTimeout must be non-negative",
+                ));
+                continue;
+            }
+            if entry.visibility_timeout > MAX_VISIBILITY_TIMEOUT_SECONDS {
+                result.failed.push(batch_error(
+                    &entry.id,
+                    &format!(
+                        "VisibilityTimeout must be no greater than {MAX_VISIBILITY_TIMEOUT_SECONDS}"
+                    ),
+                ));
+                continue;
+            }
+            if name.is_empty() || !self.queues.contains_key(&name) {
+                result
+                    .failed
+                    .push(batch_error(&entry.id, "queue does not exist"));
+                continue;
+            }
+            let visibility_timeout = entry.visibility_timeout;
+            match self.stage_receipted_mutation(&name, &entry.receipt_handle, move |m, now| {
+                m.invisible_until = add_seconds(now, visibility_timeout);
+            }) {
+                StagedMutation::Rejected(e) => result.failed.push(batch_error(&entry.id, &e)),
+                StagedMutation::Applied {
+                    idx,
+                    previous,
+                    pending_err,
+                } => staged.push((entry.id.clone(), idx, previous, pending_err)),
             }
         }
+        apply_staged_batch(self, &name, staged, &mut result);
         Ok(result)
+    }
+}
+
+/// Outcome of `stage_receipted_mutation`: either the entry never touched
+/// state (`Rejected`, a pure validation failure), or a mutation was applied
+/// in memory at `messages[idx]` and awaits the batch's single persist.
+/// `pending_err` is set when the mutation itself represents an eventual
+/// failure (the expired-handle case) that should still surface once
+/// persisted.
+enum StagedMutation {
+    Applied {
+        idx: usize,
+        previous: MessageState,
+        pending_err: Option<String>,
+    },
+    Rejected(String),
+}
+
+/// (batch entry id, message index, pre-mutation message, pending failure).
+type StagedBatchEntry = (String, usize, MessageState, Option<String>);
+
+/// Persists all staged mutations for a batch once; on failure, restores
+/// every affected message (in reverse staging order, so repeated indices —
+/// e.g. duplicate receipt handles in one batch — unwind correctly) and
+/// reports the persist error for every staged entry. On success, resolves
+/// each entry's `pending_err` into the final successful/failed split.
+fn apply_staged_batch(
+    server: &mut Server,
+    name: &str,
+    staged: Vec<StagedBatchEntry>,
+    result: &mut BatchResult,
+) {
+    if staged.is_empty() {
+        return;
+    }
+    if let Err(e) = server.persist() {
+        for (_, idx, previous, _) in staged.iter().rev() {
+            server.queues.get_mut(name).unwrap().messages[*idx] = previous.clone();
+        }
+        for (id, _, _, _) in staged {
+            result.failed.push(batch_error(&id, &e));
+        }
+        return;
+    }
+    for (id, _, _, pending_err) in staged {
+        match pending_err {
+            Some(e) => result.failed.push(batch_error(&id, &e)),
+            None => result.successful.push(IdResultEntry { id }),
+        }
     }
 }
 
