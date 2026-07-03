@@ -7,11 +7,7 @@
 //!
 //! Subcommands mirror the legacy CLI: `init`, `up [service ...]`, `reset`, `dashboard`.
 
-// Config ported from legacy `internal/app/config.rs`. Many fields are read only once
-// their service is wired into the supervisor, so the module is dead-code-allowed
-// to keep the crate warning-clean during incremental wiring (Phase 1).
-// TODO(agent): drop this allow once all services are wired (task #5).
-#[allow(dead_code)]
+// Config ported from legacy `internal/app/config.rs`.
 mod config;
 mod services;
 mod supervisor;

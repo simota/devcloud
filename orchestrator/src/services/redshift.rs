@@ -7,10 +7,8 @@
 use std::future::Future;
 use std::sync::Arc;
 
-use devcloud_redshift::backend::SqlBackend;
-use devcloud_redshift::backend_postgres::{self, Backend as PostgresBackend};
+use devcloud_redshift::backend::select_sql_backend;
 use devcloud_redshift::server::{Config, Server};
-use devcloud_redshift::translator::{RedshiftToPostgres, RedshiftTranslator};
 use devcloud_s3::store::FileBucketStore;
 use tokio::net::TcpListener;
 
@@ -77,29 +75,17 @@ pub async fn run(
     };
 
     // ---- backend + translator (mirror devcloud-redshift main.rs) ----
-    let (sql_backend, translator): (
-        Option<Arc<dyn SqlBackend>>,
-        Option<Arc<dyn RedshiftTranslator>>,
-    ) = match kind.as_str() {
-        "postgres" | "postgresql" => {
-            // `PostgresBackend::open` drives its own runtime with `block_on`, which
-            // panics ("runtime within runtime") if called on a tokio worker thread.
-            // Open it on a blocking thread (no runtime entered); later queries use
-            // the backend's `drive()` which `block_in_place`s safely on workers.
-            let open_dsn = dsn.clone();
-            let pg = tokio::task::spawn_blocking(move || {
-                PostgresBackend::open(backend_postgres::Config {
-                    dsn: open_dsn,
-                    ..backend_postgres::Config::default()
-                })
-            })
+    // `PostgresBackend::open` drives its own runtime with `block_on`, which
+    // panics ("runtime within runtime") if called on a tokio worker thread.
+    // Run the shared selection on a blocking thread (no runtime entered);
+    // later queries use the backend's `drive()` which `block_in_place`s safely
+    // on workers.
+    let select_kind = kind.clone();
+    let (sql_backend, translator) =
+        tokio::task::spawn_blocking(move || select_sql_backend(&select_kind, dsn))
             .await
             .map_err(|e| format!("redshift: backend open join: {e}"))?
             .map_err(|e| format!("redshift: open postgres backend: {e}"))?;
-            (Some(Arc::new(pg)), Some(Arc::new(RedshiftToPostgres)))
-        }
-        _ => (None, None),
-    };
 
     // ObjectStore exists whenever S3 or GCS is enabled (shared bucket root).
     let object_store = if cfg.services.s3.enabled || cfg.services.gcs.enabled {

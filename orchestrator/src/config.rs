@@ -1851,6 +1851,55 @@ mod tests {
     }
 
     #[test]
+    fn every_service_has_dashboard_entry_and_e2e_script() {
+        // Fitness function: a supervisor-wired service must be visible in the
+        // dashboard registry and ship an e2e smoke script. Application Auto
+        // Scaling once shipped fully wired but dashboard-invisible with no
+        // acceptance gate; this test turns that checklist into a build break.
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("repo root");
+
+        let resp = devcloud_dashboard::services::handle(
+            &devcloud_dashboard::config::Config::default(),
+            &devcloud_dashboard::http::Request {
+                method: "GET".to_string(),
+                path: "/api/services".to_string(),
+                raw_path: "/api/services".to_string(),
+                query: String::new(),
+                headers: std::collections::HashMap::new(),
+                body: Vec::new(),
+            },
+        );
+        let body: serde_json::Value =
+            serde_json::from_slice(&resp.body).expect("registry response is JSON");
+        let ids: Vec<&str> = body["services"]
+            .as_array()
+            .expect("services array")
+            .iter()
+            .map(|s| s["id"].as_str().expect("service id"))
+            .collect();
+
+        for name in service_names() {
+            // Canonical config name -> dashboard id / e2e script stem.
+            let id = match name.as_str() {
+                "appautoscaling" => "applicationautoscaling",
+                other => other,
+            };
+            assert!(
+                ids.contains(&id),
+                "service `{name}` has no dashboard registry entry `{id}` (/api/services)"
+            );
+            let script = repo.join("scripts").join(format!("{id}-e2e.sh"));
+            assert!(
+                script.is_file(),
+                "service `{name}` has no e2e smoke script at {}",
+                script.display()
+            );
+        }
+    }
+
+    #[test]
     fn selection_enables_only_chosen() {
         let cfg = default_config();
         let out = apply_service_selection(&cfg, &["s3".to_string(), "bq".to_string()]).unwrap();

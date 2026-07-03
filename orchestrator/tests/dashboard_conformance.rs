@@ -53,6 +53,11 @@
 //! and the shipped product, so it is masked symmetrically. Every other service's
 //! status is asserted unmasked.
 //!
+//! One deliberate post-legacy addition: the `applicationautoscaling` entry in the
+//! two registry goldens. The legacy dashboard never had that service; the entry
+//! was appended when the Rust dashboard gained its page, so the goldens track
+//! intended current behavior, not a byte-frozen legacy capture, for that row.
+//!
 //! ── ROUTE SET ─────────────────────────────────────────────────────────────────
 //!
 //! The 20 body-bearing routes captured by the legacy side (compareBody=true rows).

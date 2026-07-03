@@ -84,6 +84,11 @@ fn build_config(cfg: &AppConfig) -> Config {
         pubsub_base: http_ep(cfg.server.pubsub_rest_port),
         pubsub_endpoint: http_ep(cfg.server.pubsub_rest_port),
         pubsub_storage_path: default_string(&cfg.services.pubsub.data_dir, &join(s, "pubsub")),
+
+        app_auto_scaling_base: http_ep(cfg.server.app_auto_scaling_port),
+        app_auto_scaling_endpoint: http_ep(cfg.server.app_auto_scaling_port),
+        app_auto_scaling_storage_path: join(s, "applicationautoscaling"),
+        app_auto_scaling_region: cfg.services.app_auto_scaling.region.clone(),
     }
 }
 
