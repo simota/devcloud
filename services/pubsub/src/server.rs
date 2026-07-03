@@ -89,6 +89,15 @@ pub struct Server {
     load_err: Option<String>,
     /// Test hook for `createdAt`/`updatedAt` (RFC3339Nano string).
     fixed_now: Option<String>,
+    /// Set whenever `topics`/`subscriptions`/`snapshots`/`schemas` changed
+    /// since the last successful `persist`. Lets `persist` skip rewriting
+    /// `resources.json` for message-only mutations (e.g. Acknowledge).
+    resource_dirty: bool,
+    /// Set whenever `messages`/`deliveries` changed since the last successful
+    /// persist of the message store. Lets `persist` skip the
+    /// clone-the-whole-backlog + `cleanup_unreferenced_messages` + file write
+    /// for mutations that never touch a message (e.g. CreateTopic).
+    messages_dirty: bool,
 }
 
 impl Server {
@@ -105,6 +114,8 @@ impl Server {
             next_ack_id: 0,
             load_err: None,
             fixed_now: None,
+            resource_dirty: false,
+            messages_dirty: false,
         };
         if !server.config.storage_path.is_empty() || !server.config.message_storage_path.is_empty()
         {
@@ -242,24 +253,51 @@ impl Server {
     /// Persists state byte-compatibly with `saveResourcesLocked`: resources.json
     /// (topics/subscriptions/snapshots/schemas, plus message state when no
     /// separate message store) and pubsub.json (message state) when a message
-    /// store is configured. Cleanup of unreferenced messages runs first.
+    /// store is configured.
+    ///
+    /// Cost is scoped to what actually changed since the last successful call:
+    /// `resource_dirty` gates the (cheap) topics/subscriptions/snapshots/schemas
+    /// write, `messages_dirty` gates `cleanup_unreferenced_messages` plus the
+    /// (potentially large) messages/deliveries clone and file write. A caller
+    /// that only touched resources (e.g. CreateTopic) never pays the message
+    /// store's cost; one that only touched messages (e.g. Acknowledge) never
+    /// rewrites `resources.json`. When no separate message store is configured,
+    /// message state is embedded in `resources.json` itself, so that write is
+    /// still required whenever messages are dirty.
     pub(crate) fn persist(&mut self) -> Result<(), ApiError> {
-        if self.config.storage_path.is_empty() && self.config.message_storage_path.is_empty() {
+        if self.messages_dirty {
             self.cleanup_unreferenced_messages();
+        }
+        if self.config.storage_path.is_empty() && self.config.message_storage_path.is_empty() {
+            self.resource_dirty = false;
+            self.messages_dirty = false;
             return Ok(());
         }
-        self.cleanup_unreferenced_messages();
 
-        let messages: Vec<crate::model::PubsubMessage> = self.messages.values().cloned().collect();
-        let deliveries: BTreeMap<String, Vec<crate::model::DeliveryRecord>> = self
-            .deliveries
-            .iter()
-            .filter(|(_, r)| !r.is_empty())
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
         let include_message_state = self.config.message_storage_path.is_empty();
+        let write_resources = !self.config.storage_path.is_empty()
+            && (self.resource_dirty || (include_message_state && self.messages_dirty));
+        let write_message_file =
+            !self.config.message_storage_path.is_empty() && self.messages_dirty;
+        if !write_resources && !write_message_file {
+            return Ok(());
+        }
 
-        if !self.config.storage_path.is_empty() {
+        let (messages, deliveries) = if include_message_state || write_message_file {
+            let messages: Vec<crate::model::PubsubMessage> =
+                self.messages.values().cloned().collect();
+            let deliveries: BTreeMap<String, Vec<crate::model::DeliveryRecord>> = self
+                .deliveries
+                .iter()
+                .filter(|(_, r)| !r.is_empty())
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            (messages, deliveries)
+        } else {
+            (Vec::new(), BTreeMap::new())
+        };
+
+        if write_resources {
             std::fs::create_dir_all(&self.config.storage_path)
                 .map_err(|_| ApiError::internal("pubsub resource store unavailable"))?;
             let mut file = ResourceFile {
@@ -276,19 +314,21 @@ impl Server {
                 file.next_ack_id = self.next_ack_id;
             }
             write_atomic(&self.resource_file_path(), &file.to_bytes())?;
+            self.resource_dirty = false;
         }
-        if self.config.message_storage_path.is_empty() {
-            return Ok(());
+        if write_message_file {
+            std::fs::create_dir_all(&self.config.message_storage_path)
+                .map_err(|_| ApiError::internal("pubsub resource store unavailable"))?;
+            let msg_file = MessageStateFile {
+                messages,
+                deliveries,
+                next_message_id: self.next_message_id,
+                next_ack_id: self.next_ack_id,
+            };
+            write_atomic(&self.message_state_file_path(), &msg_file.to_bytes())?;
+            self.messages_dirty = false;
         }
-        std::fs::create_dir_all(&self.config.message_storage_path)
-            .map_err(|_| ApiError::internal("pubsub resource store unavailable"))?;
-        let msg_file = MessageStateFile {
-            messages,
-            deliveries,
-            next_message_id: self.next_message_id,
-            next_ack_id: self.next_ack_id,
-        };
-        write_atomic(&self.message_state_file_path(), &msg_file.to_bytes())
+        Ok(())
     }
 
     /// Drops messages no subscription/snapshot references, mirroring
@@ -316,7 +356,11 @@ impl Server {
                 referenced.insert(r.message_id.clone());
             }
         }
+        let before = self.messages.len();
         self.messages.retain(|id, _| referenced.contains(id));
+        if self.messages.len() != before {
+            self.messages_dirty = true;
+        }
     }
 
     /// Mirrors `cleanupRetainedMessagesLocked`: folds (a) expired-snapshot
@@ -336,6 +380,7 @@ impl Server {
             let retention_nanos = self.subscription_message_retention_nanos(&sub_name);
             let cutoff = now_nanos - retention_nanos;
             let deliveries = self.deliveries.get(&sub_name).cloned().unwrap_or_default();
+            let before = deliveries.len();
             let kept: Vec<crate::model::DeliveryRecord> = deliveries
                 .into_iter()
                 .filter(|d| match self.messages.get(&d.message_id) {
@@ -351,6 +396,9 @@ impl Server {
                     None => false,
                 })
                 .collect();
+            if kept.len() != before {
+                self.messages_dirty = true;
+            }
             if kept.is_empty() {
                 self.deliveries.remove(&sub_name);
             } else {
@@ -365,6 +413,7 @@ impl Server {
             let Some(snapshot) = self.snapshots.get(&name).cloned() else {
                 continue;
             };
+            let before = snapshot.deliveries.len();
             let kept: Vec<crate::model::DeliveryRecord> = snapshot
                 .deliveries
                 .into_iter()
@@ -379,6 +428,9 @@ impl Server {
                     None => false,
                 })
                 .collect();
+            if kept.len() != before {
+                self.resource_dirty = true;
+            }
             if let Some(snap) = self.snapshots.get_mut(&name) {
                 snap.deliveries = kept;
             }
@@ -397,6 +449,9 @@ impl Server {
             .filter(|(_, snap)| self.snapshot_expired(snap))
             .map(|(name, _)| name.clone())
             .collect();
+        if !expired.is_empty() {
+            self.resource_dirty = true;
+        }
         for name in expired {
             self.snapshots.remove(&name);
         }
@@ -464,6 +519,7 @@ impl Server {
             return Err(ApiError::already_exists("topic already exists"));
         }
         self.topics.insert(name.clone(), topic.clone());
+        self.resource_dirty = true;
         if let Err(err) = self.persist() {
             self.topics.remove(&name);
             return Err(err);
@@ -523,6 +579,7 @@ impl Server {
         }
         topic.updated_at = self.now();
         let previous = self.topics.insert(name.clone(), topic.clone());
+        self.resource_dirty = true;
         if let Err(err) = self.persist() {
             match previous {
                 Some(p) => {
@@ -561,6 +618,7 @@ impl Server {
             }
         }
         let removed = self.topics.remove(&name);
+        self.resource_dirty = true;
         if let Err(err) = self.persist() {
             if let Some(t) = removed {
                 self.topics.insert(name, t);
@@ -753,6 +811,7 @@ impl Server {
         };
         self.subscriptions
             .insert(name.clone(), subscription.clone());
+        self.resource_dirty = true;
         if let Err(err) = self.persist() {
             self.subscriptions.remove(&name);
             return Err(err);
@@ -881,6 +940,7 @@ impl Server {
         }
         sub.updated_at = self.now();
         let previous = self.subscriptions.insert(name.clone(), sub.clone());
+        self.resource_dirty = true;
         if let Err(err) = self.persist() {
             match previous {
                 Some(p) => {
@@ -923,6 +983,7 @@ impl Server {
             .iter()
             .filter_map(|k| self.snapshots.remove(k).map(|v| (k.clone(), v)))
             .collect();
+        self.resource_dirty = true;
         if let Err(err) = self.persist() {
             if let Some(s) = removed {
                 self.subscriptions.insert(name, s);
@@ -981,6 +1042,7 @@ impl Server {
         sub.push_config = normalize_any_map(push_config);
         sub.updated_at = self.now();
         let previous = self.subscriptions.insert(name.clone(), sub);
+        self.resource_dirty = true;
         if let Err(err) = self.persist() {
             if let Some(p) = previous {
                 self.subscriptions.insert(name, p);
@@ -1019,6 +1081,7 @@ impl Server {
             .filter_map(|k| self.snapshots.remove(k).map(|v| (k.clone(), v)))
             .collect();
         let previous = self.subscriptions.insert(name.clone(), sub);
+        self.resource_dirty = true;
         if let Err(err) = self.persist() {
             match previous {
                 Some(p) => {
@@ -1081,6 +1144,7 @@ impl Server {
             ..Default::default()
         };
         self.snapshots.insert(name.clone(), snapshot.clone());
+        self.resource_dirty = true;
         if let Err(err) = self.persist() {
             self.snapshots.remove(&name);
             return Err(err);
@@ -1122,6 +1186,7 @@ impl Server {
             return Err(ApiError::not_found("snapshot not found"));
         }
         let removed = self.snapshots.remove(&name);
+        self.resource_dirty = true;
         if let Err(err) = self.persist() {
             if let Some(s) = removed {
                 self.snapshots.insert(name, s);
@@ -1223,6 +1288,7 @@ impl Server {
             ..request.clone()
         };
         self.schemas.insert(name.clone(), schema.clone());
+        self.resource_dirty = true;
         if let Err(err) = self.persist() {
             self.schemas.remove(&name);
             return Err(err);
@@ -1267,6 +1333,7 @@ impl Server {
             return Err(ApiError::not_found("schema not found"));
         }
         let removed = self.schemas.remove(&name);
+        self.resource_dirty = true;
         if let Err(err) = self.persist() {
             if let Some(s) = removed {
                 self.schemas.insert(name, s);
@@ -1475,6 +1542,7 @@ impl Server {
             }
             message_ids.push(message_id);
         }
+        self.messages_dirty = true;
         if let Err(e) = self.persist() {
             self.next_message_id = previous_next_message_id;
             self.messages = previous_messages;
@@ -1631,6 +1699,7 @@ impl Server {
 
         let compacted = compact_acked(deliveries, sub.retain_acked_messages);
         self.deliveries.insert(name.clone(), compacted);
+        self.messages_dirty = true;
         if let Err(e) = self.persist() {
             self.messages = previous_messages;
             self.deliveries = previous_deliveries;
@@ -1752,6 +1821,7 @@ impl Server {
         }
         let compacted = compact_acked(deliveries, sub.retain_acked_messages);
         self.deliveries.insert(name, compacted);
+        self.messages_dirty = true;
         if let Err(e) = self.persist() {
             self.deliveries = previous_deliveries;
             self.messages = previous_messages;
@@ -1785,6 +1855,7 @@ impl Server {
             }
             if changed {
                 self.deliveries.insert(sub_name, deliveries);
+                self.messages_dirty = true;
             }
         }
     }
@@ -1920,6 +1991,7 @@ impl Server {
         if !time.is_empty() {
             let replayed = self.seek_deliveries_by_time(&name, seek_secs);
             let previous = self.deliveries.insert(name.clone(), replayed);
+            self.messages_dirty = true;
             if let Err(e) = self.persist() {
                 restore_deliveries_entry(&mut self.deliveries, name, previous);
                 self.messages = previous_messages;
@@ -1938,6 +2010,7 @@ impl Server {
         }
         let replayed = snapshot_deliveries(&snap.deliveries);
         let previous = self.deliveries.insert(name.clone(), replayed);
+        self.messages_dirty = true;
         if let Err(e) = self.persist() {
             restore_deliveries_entry(&mut self.deliveries, name, previous);
             self.messages = previous_messages;
@@ -2042,6 +2115,7 @@ impl Server {
             return Err(ApiError::already_exists("topic already exists"));
         }
         self.topics.insert(topic.name.clone(), topic.clone());
+        self.resource_dirty = true;
         if let Err(_err) = self.persist() {
             self.topics.remove(&topic.name);
             return Err(ApiError::internal("pubsub resource store unavailable"));
@@ -2093,6 +2167,7 @@ impl Server {
         }
         topic.updated_at = self.now();
         self.topics.insert(topic.name.clone(), topic.clone());
+        self.resource_dirty = true;
         if self.persist().is_err() {
             return Err(ApiError::internal("pubsub resource store unavailable"));
         }
@@ -2230,6 +2305,7 @@ impl Server {
             }
             message_ids.push(message_id);
         }
+        self.messages_dirty = true;
         if self.persist().is_err() {
             self.next_message_id = previous_next_message_id;
             self.messages = previous_messages;
@@ -2267,6 +2343,7 @@ impl Server {
                 sub.updated_at = now.clone();
             }
         }
+        self.resource_dirty = true;
         if self.persist().is_err() {
             self.topics.insert(topic.to_string(), previous_topic);
             for (name, sub) in previous_subscriptions {
@@ -2308,6 +2385,8 @@ impl Server {
         for k in &drop {
             self.snapshots.remove(k);
         }
+        self.resource_dirty = true;
+        self.messages_dirty = true;
         if self.persist().is_err() {
             self.subscriptions
                 .insert(subscription.to_string(), previous_sub);
@@ -2367,6 +2446,7 @@ impl Server {
         }
         self.subscriptions
             .insert(request.name.clone(), request.clone());
+        self.resource_dirty = true;
         if let Err(_err) = self.persist() {
             self.subscriptions.remove(&request.name);
             self.deliveries.remove(&request.name);
@@ -2466,6 +2546,7 @@ impl Server {
         }
         sub.updated_at = self.now();
         self.subscriptions.insert(sub.name.clone(), sub.clone());
+        self.resource_dirty = true;
         if self.persist().is_err() {
             return Err(ApiError::internal("pubsub resource store unavailable"));
         }
@@ -2501,6 +2582,8 @@ impl Server {
         }
         self.subscriptions.remove(subscription);
         self.deliveries.remove(subscription);
+        self.resource_dirty = true;
+        self.messages_dirty = true;
         if self.persist().is_err() {
             return Err(ApiError::internal("pubsub resource store unavailable"));
         }
@@ -2524,6 +2607,7 @@ impl Server {
         sub.push_config = normalize_any_map(push_config);
         sub.updated_at = self.now();
         self.subscriptions.insert(sub.name.clone(), sub);
+        self.resource_dirty = true;
         if self.persist().is_err() {
             return Err(ApiError::internal("pubsub resource store unavailable"));
         }
@@ -2580,6 +2664,7 @@ impl Server {
             self.pull_with_ack_deadline_core(&sub, max, now_secs, ack_deadline);
         let compacted = compact_acked(deliveries, sub.retain_acked_messages);
         self.deliveries.insert(sub.name.clone(), compacted);
+        self.messages_dirty = true;
         if self.persist().is_err() {
             self.messages = previous_messages;
             self.deliveries = previous_deliveries;
@@ -2854,6 +2939,7 @@ impl Server {
         }
         let compacted = compact_acked(deliveries, sub.retain_acked_messages);
         self.deliveries.insert(sub.name.clone(), compacted);
+        self.messages_dirty = true;
         if self.persist().is_err() {
             self.messages = previous_messages;
             self.deliveries = previous_deliveries;
@@ -2926,6 +3012,7 @@ impl Server {
         }
         let compacted = compact_acked(deliveries, sub.retain_acked_messages);
         let previous = self.deliveries.insert(subscription.to_string(), compacted);
+        self.messages_dirty = true;
         // Best-effort by contract: called from the streaming-pull task after it
         // has already torn down (see `grpc.rs`), with no channel left to report
         // an error through. Still restore in-memory state on persist failure so
@@ -3034,6 +3121,7 @@ impl Server {
         }
         let compacted = compact_acked(deliveries, sub.retain_acked_messages);
         self.deliveries.insert(subscription.to_string(), compacted);
+        self.messages_dirty = true;
         if self.persist().is_err() {
             return Err(ApiError::internal("pubsub resource store unavailable"));
         }
@@ -3105,6 +3193,7 @@ impl Server {
         };
         self.snapshots
             .insert(snapshot_name.clone(), snapshot.clone());
+        self.resource_dirty = true;
         if let Err(_err) = self.persist() {
             self.snapshots.remove(&snapshot_name);
             return Err(ApiError::internal("pubsub resource store unavailable"));
@@ -3121,6 +3210,7 @@ impl Server {
             return Err(ApiError::not_found("snapshot not found"));
         }
         self.snapshots.remove(snapshot);
+        self.resource_dirty = true;
         if self.persist().is_err() {
             return Err(ApiError::internal("pubsub resource store unavailable"));
         }
@@ -3162,6 +3252,7 @@ impl Server {
         }
         self.snapshots
             .insert(snapshot.name.clone(), snapshot.clone());
+        self.resource_dirty = true;
         if self.persist().is_err() {
             return Err(ApiError::internal("pubsub resource store unavailable"));
         }
@@ -3204,6 +3295,7 @@ impl Server {
             let replayed = snapshot_deliveries(&snap.deliveries);
             self.deliveries.insert(subscription.to_string(), replayed);
         }
+        self.messages_dirty = true;
         if self.persist().is_err() {
             return Err(ApiError::internal("pubsub resource store unavailable"));
         }
@@ -3292,6 +3384,7 @@ impl Server {
             return Err(ApiError::already_exists("schema already exists"));
         }
         self.schemas.insert(schema.name.clone(), schema.clone());
+        self.resource_dirty = true;
         if let Err(_err) = self.persist() {
             self.schemas.remove(&schema.name);
             return Err(ApiError::internal("pubsub resource store unavailable"));
@@ -3386,6 +3479,7 @@ impl Server {
         revs.push(grpc_current_revision(&rev));
         schema.revisions = revs;
         self.schemas.insert(schema.name.clone(), schema.clone());
+        self.resource_dirty = true;
         if self.persist().is_err() {
             return Err(ApiError::internal("pubsub resource store unavailable"));
         }
@@ -3426,6 +3520,7 @@ impl Server {
         revs.push(target);
         schema.revisions = revs;
         self.schemas.insert(schema.name.clone(), schema.clone());
+        self.resource_dirty = true;
         if self.persist().is_err() {
             return Err(ApiError::internal("pubsub resource store unavailable"));
         }
@@ -3475,6 +3570,7 @@ impl Server {
         schema.revision_create_time = current.revision_create_time.clone();
         schema.revisions = kept;
         self.schemas.insert(schema.name.clone(), schema.clone());
+        self.resource_dirty = true;
         if self.persist().is_err() {
             return Err(ApiError::internal("pubsub resource store unavailable"));
         }
@@ -3490,6 +3586,7 @@ impl Server {
             return Err(ApiError::not_found("schema not found"));
         }
         self.schemas.remove(name);
+        self.resource_dirty = true;
         if self.persist().is_err() {
             return Err(ApiError::internal("pubsub resource store unavailable"));
         }

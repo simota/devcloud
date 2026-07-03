@@ -423,6 +423,53 @@ fn acknowledge_rolls_back_when_persist_fails() {
     assert_eq!(received[0]["deliveryAttempt"], 2);
 }
 
+#[test]
+fn resource_only_mutation_skips_message_store_rewrite() {
+    let (dir, md) = (tempdir(), tempdir());
+    let mut s = server(&dir, &md);
+    // Seed the message store so pubsub.json exists and messages_dirty clears
+    // back to false once this publish's own persist() succeeds.
+    s.publish(
+        "devcloud",
+        "orders",
+        &msgs(r#"{"messages":[{"data":"aGk="}]}"#),
+    )
+    .expect("seed");
+
+    // Break the message store. A resource-only mutation's persist() must not
+    // need to touch it at all.
+    std::fs::remove_dir_all(&md).unwrap();
+    std::fs::write(&md, b"not a directory").unwrap();
+
+    // CreateTopic never touches messages/deliveries, so it must succeed even
+    // though the message store is unwritable — proving persist() skipped the
+    // messages/deliveries clone + cleanup + pubsub.json write entirely for it.
+    s.create_topic("devcloud", "other", &Default::default())
+        .expect("resource-only mutation must not depend on the message store");
+
+    // Contrast: a message-touching mutation still needs the message store and
+    // must fail while it's broken, confirming the skip above is scoped to
+    // resource-only ops rather than a blanket bypass.
+    assert!(s
+        .publish(
+            "devcloud",
+            "orders",
+            &msgs(r#"{"messages":[{"data":"d29ybGQ="}]}"#)
+        )
+        .is_err());
+
+    // Restore and confirm normal operation (and the new topic) resumed.
+    std::fs::remove_file(&md).unwrap();
+    std::fs::create_dir_all(&md).unwrap();
+    s.publish(
+        "devcloud",
+        "orders",
+        &msgs(r#"{"messages":[{"data":"aGVsbG8="}]}"#),
+    )
+    .expect("resume");
+    s.get_topic("devcloud", "other").expect("topic persisted");
+}
+
 // --- minimal tempdir -------------------------------------------------------
 
 fn tempdir() -> std::path::PathBuf {
