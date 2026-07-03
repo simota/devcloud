@@ -271,6 +271,158 @@ fn pull_detached_and_push_rejected() {
     );
 }
 
+#[test]
+fn publish_rolls_back_when_persist_fails() {
+    let (dir, md) = (tempdir(), tempdir());
+    let mut s = server(&dir, &md);
+    s.publish(
+        "devcloud",
+        "orders",
+        &msgs(r#"{"messages":[{"data":"aGk="}]}"#),
+    )
+    .expect("seed"); // message_id "1"
+    s.pull("devcloud", "sub1", 10).expect("drain seed"); // clear the seed's delivery
+
+    std::fs::remove_dir_all(&md).unwrap();
+    std::fs::write(&md, b"not a directory").unwrap();
+    assert!(s
+        .publish(
+            "devcloud",
+            "orders",
+            &msgs(r#"{"messages":[{"data":"d29ybGQ="}]}"#)
+        )
+        .is_err());
+
+    std::fs::remove_file(&md).unwrap();
+    std::fs::create_dir_all(&md).unwrap();
+    s.publish(
+        "devcloud",
+        "orders",
+        &msgs(r#"{"messages":[{"data":"aGVsbG8="}]}"#),
+    )
+    .expect("resume");
+
+    // If next_message_id/messages/deliveries hadn't rolled back, the failed
+    // publish would leave a phantom, never-persisted delivery here too.
+    let resp = s.pull("devcloud", "sub1", 10).expect("pull");
+    let parsed: Value = serde_json::from_slice(&resp.body).unwrap();
+    let received = parsed["receivedMessages"].as_array().unwrap();
+    assert_eq!(received.len(), 1);
+    assert_eq!(received[0]["message"]["messageId"], "2");
+}
+
+#[test]
+fn grpc_publish_rolls_back_when_persist_fails() {
+    let (dir, md) = (tempdir(), tempdir());
+    let mut s = server(&dir, &md);
+    s.grpc_publish(
+        "projects/devcloud/topics/orders",
+        &[(
+            "aGk=".to_string(),
+            std::collections::BTreeMap::new(),
+            String::new(),
+        )],
+    )
+    .expect("seed"); // message_id "1"
+    s.pull("devcloud", "sub1", 10).expect("drain seed"); // clear the seed's delivery
+
+    std::fs::remove_dir_all(&md).unwrap();
+    std::fs::write(&md, b"not a directory").unwrap();
+    assert!(s
+        .grpc_publish(
+            "projects/devcloud/topics/orders",
+            &[(
+                "d29ybGQ=".to_string(),
+                std::collections::BTreeMap::new(),
+                String::new()
+            )],
+        )
+        .is_err());
+
+    std::fs::remove_file(&md).unwrap();
+    std::fs::create_dir_all(&md).unwrap();
+    s.grpc_publish(
+        "projects/devcloud/topics/orders",
+        &[(
+            "aGVsbG8=".to_string(),
+            std::collections::BTreeMap::new(),
+            String::new(),
+        )],
+    )
+    .expect("resume");
+
+    let resp = s.pull("devcloud", "sub1", 10).expect("pull");
+    let parsed: Value = serde_json::from_slice(&resp.body).unwrap();
+    let received = parsed["receivedMessages"].as_array().unwrap();
+    assert_eq!(received.len(), 1);
+    assert_eq!(received[0]["message"]["messageId"], "2");
+}
+
+#[test]
+fn pull_rolls_back_when_persist_fails() {
+    let (dir, md) = (tempdir(), tempdir());
+    let mut s = server(&dir, &md);
+    s.publish(
+        "devcloud",
+        "orders",
+        &msgs(r#"{"messages":[{"data":"aGk="}]}"#),
+    )
+    .expect("publish");
+
+    std::fs::remove_dir_all(&md).unwrap();
+    std::fs::write(&md, b"not a directory").unwrap();
+    assert!(s.pull("devcloud", "sub1", 10).is_err());
+
+    std::fs::remove_file(&md).unwrap();
+    std::fs::create_dir_all(&md).unwrap();
+    // If the failed pull's lease/ack_id/next_ack_id mutation hadn't rolled
+    // back, this would redeliver as attempt 2 with ackId "1-2" instead.
+    let resp = s.pull("devcloud", "sub1", 10).expect("pull after restore");
+    let parsed: Value = serde_json::from_slice(&resp.body).unwrap();
+    let received = parsed["receivedMessages"].as_array().unwrap();
+    assert_eq!(received.len(), 1);
+    assert_eq!(received[0]["deliveryAttempt"], 1);
+    assert_eq!(received[0]["ackId"], "1-1");
+}
+
+#[test]
+fn acknowledge_rolls_back_when_persist_fails() {
+    let (dir, md) = (tempdir(), tempdir());
+    let mut s = server(&dir, &md);
+    s.publish(
+        "devcloud",
+        "orders",
+        &msgs(r#"{"messages":[{"data":"aGk="}]}"#),
+    )
+    .expect("publish");
+    let pulled: Value =
+        serde_json::from_slice(&s.pull("devcloud", "sub1", 10).expect("pull").body).unwrap();
+    let ack_id = pulled["receivedMessages"][0]["ackId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    std::fs::remove_dir_all(&md).unwrap();
+    std::fs::write(&md, b"not a directory").unwrap();
+    assert!(s.acknowledge("devcloud", "sub1", &[ack_id]).is_err());
+
+    std::fs::remove_file(&md).unwrap();
+    std::fs::create_dir_all(&md).unwrap();
+    // Past the original 10s lease: if the ack had not rolled back, compaction
+    // would already have dropped the (unpersisted) delivery, so nothing would
+    // be left to redeliver here.
+    s.set_fixed_now("2026-05-30T12:00:15Z");
+    let resp = s.pull("devcloud", "sub1", 10).expect("pull after restore");
+    let parsed: Value = serde_json::from_slice(&resp.body).unwrap();
+    let received = parsed["receivedMessages"].as_array().unwrap();
+    assert_eq!(
+        received.len(),
+        1,
+        "the failed ack must not have dropped the delivery"
+    );
+    assert_eq!(received[0]["deliveryAttempt"], 2);
+}
+
 // --- minimal tempdir -------------------------------------------------------
 
 fn tempdir() -> std::path::PathBuf {

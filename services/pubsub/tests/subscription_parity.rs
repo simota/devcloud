@@ -257,6 +257,43 @@ fn delete_subscription() {
 }
 
 #[test]
+fn grpc_detach_subscription_rolls_back_when_persist_fails() {
+    let dir = tempdir();
+    let mut s = server(&dir);
+    s.create_subscription(
+        "devcloud",
+        "sub1",
+        &sub_from(r#"{"topic":"projects/devcloud/topics/orders"}"#),
+    )
+    .expect("sub1");
+    let messages: Vec<serde_json::Value> = serde_json::from_str(r#"[{"data":"aGk="}]"#).unwrap();
+    s.publish("devcloud", "orders", &messages).expect("publish");
+    s.create_snapshot("devcloud", "snap1", "projects/devcloud/subscriptions/sub1")
+        .expect("snapshot");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+    std::fs::write(&dir, b"not a directory").unwrap();
+
+    assert!(s
+        .grpc_detach_subscription("projects/devcloud/subscriptions/sub1")
+        .is_err());
+    // Detach flag, delivery removal, and cascaded snapshot removal must all roll back.
+    assert!(
+        !s.grpc_get_subscription("projects/devcloud/subscriptions/sub1")
+            .expect("subscription still present")
+            .detached
+    );
+    assert!(s
+        .grpc_get_snapshot("projects/devcloud/snapshots/snap1")
+        .is_ok());
+
+    std::fs::remove_file(&dir).unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    let resp = s.pull("devcloud", "sub1", 10).expect("pull after restore");
+    assert!(String::from_utf8_lossy(&resp.body).contains("receivedMessages"));
+}
+
+#[test]
 fn full_scenario_state_matches_oracle() {
     let dir = tempdir();
     let mut s = server(&dir);

@@ -1422,6 +1422,9 @@ impl Server {
             validate_message_against_topic_schema(data, topic.schema_settings.as_ref())?;
         }
         let now = self.now();
+        let previous_next_message_id = self.next_message_id;
+        let previous_messages = self.messages.clone();
+        let previous_deliveries = self.deliveries.clone();
         let mut message_ids = Vec::with_capacity(messages.len());
         for incoming in messages {
             self.next_message_id += 1;
@@ -1472,7 +1475,12 @@ impl Server {
             }
             message_ids.push(message_id);
         }
-        self.persist()?;
+        if let Err(e) = self.persist() {
+            self.next_message_id = previous_next_message_id;
+            self.messages = previous_messages;
+            self.deliveries = previous_deliveries;
+            return Err(e);
+        }
         Ok(RestResponse::ok_struct(&serde_json::json!({
             "messageIds": message_ids,
         })))
@@ -1508,6 +1516,14 @@ impl Server {
             ));
         }
         let (now_secs, _) = self.now_parts();
+        // Snapshot before the retention/lease cleanup below, since both cascade
+        // across every subscription's deliveries (and messages/snapshots), not
+        // just the one being pulled.
+        let previous_messages = self.messages.clone();
+        let previous_deliveries = self.deliveries.clone();
+        let previous_snapshots = self.snapshots.clone();
+        let previous_next_message_id = self.next_message_id;
+        let previous_next_ack_id = self.next_ack_id;
         self.cleanup_retained_messages(now_secs);
         self.expire_leases(now_secs);
         let ack_deadline = if sub.ack_deadline_seconds > 0 {
@@ -1615,7 +1631,14 @@ impl Server {
 
         let compacted = compact_acked(deliveries, sub.retain_acked_messages);
         self.deliveries.insert(name.clone(), compacted);
-        self.persist()?;
+        if let Err(e) = self.persist() {
+            self.messages = previous_messages;
+            self.deliveries = previous_deliveries;
+            self.snapshots = previous_snapshots;
+            self.next_message_id = previous_next_message_id;
+            self.next_ack_id = previous_next_ack_id;
+            return Err(e);
+        }
         if received.is_empty() {
             return Ok(RestResponse::ok_struct(&serde_json::Map::new()));
         }
@@ -1697,6 +1720,12 @@ impl Server {
             return Err(ApiError::not_found("subscription not found"));
         };
         let (now_secs, _) = self.now_parts();
+        // Snapshot before `expire_leases`, which cascades across every
+        // subscription's deliveries, not just this one. `messages` is also
+        // snapshotted because `persist` unconditionally prunes unreferenced
+        // messages first, and an ack here can drop a message's last reference.
+        let previous_deliveries = self.deliveries.clone();
+        let previous_messages = self.messages.clone();
         self.expire_leases(now_secs);
         let id_set: std::collections::BTreeSet<&String> = ack_ids.iter().collect();
         let mut deliveries = self.deliveries.get(&name).cloned().unwrap_or_default();
@@ -1723,7 +1752,11 @@ impl Server {
         }
         let compacted = compact_acked(deliveries, sub.retain_acked_messages);
         self.deliveries.insert(name, compacted);
-        self.persist()?;
+        if let Err(e) = self.persist() {
+            self.deliveries = previous_deliveries;
+            self.messages = previous_messages;
+            return Err(e);
+        }
         Ok(RestResponse::ok_struct(&serde_json::Map::new()))
     }
 
@@ -1880,10 +1913,18 @@ impl Server {
         if !self.subscriptions.contains_key(&name) {
             return Err(ApiError::not_found("subscription not found"));
         }
+        // Replacing the subscription's deliveries can drop a message's last
+        // reference; `messages` is snapshotted too since `persist` prunes
+        // unreferenced messages unconditionally before it can fail.
+        let previous_messages = self.messages.clone();
         if !time.is_empty() {
             let replayed = self.seek_deliveries_by_time(&name, seek_secs);
-            self.deliveries.insert(name, replayed);
-            self.persist()?;
+            let previous = self.deliveries.insert(name.clone(), replayed);
+            if let Err(e) = self.persist() {
+                restore_deliveries_entry(&mut self.deliveries, name, previous);
+                self.messages = previous_messages;
+                return Err(e);
+            }
             return Ok(RestResponse::ok_struct(&serde_json::Map::new()));
         }
         let snap = match self.snapshots.get(snapshot) {
@@ -1896,8 +1937,12 @@ impl Server {
             ));
         }
         let replayed = snapshot_deliveries(&snap.deliveries);
-        self.deliveries.insert(name, replayed);
-        self.persist()?;
+        let previous = self.deliveries.insert(name.clone(), replayed);
+        if let Err(e) = self.persist() {
+            restore_deliveries_entry(&mut self.deliveries, name, previous);
+            self.messages = previous_messages;
+            return Err(e);
+        }
         Ok(RestResponse::ok_struct(&serde_json::Map::new()))
     }
 
@@ -2149,6 +2194,9 @@ impl Server {
             validate_message_against_topic_schema(data, topic.schema_settings.as_ref())?;
         }
         let now = self.now();
+        let previous_next_message_id = self.next_message_id;
+        let previous_messages = self.messages.clone();
+        let previous_deliveries = self.deliveries.clone();
         let mut message_ids = Vec::with_capacity(messages.len());
         for (data, attrs, ordering_key) in messages {
             self.next_message_id += 1;
@@ -2183,6 +2231,9 @@ impl Server {
             message_ids.push(message_id);
         }
         if self.persist().is_err() {
+            self.next_message_id = previous_next_message_id;
+            self.messages = previous_messages;
+            self.deliveries = previous_deliveries;
             return Err(ApiError::internal("pubsub resource store unavailable"));
         }
         Ok(message_ids)
@@ -2195,9 +2246,9 @@ impl Server {
         if !paths::valid_full_topic_name(topic) {
             return Err(ApiError::invalid_argument("invalid topic name"));
         }
-        if !self.topics.contains_key(topic) {
+        let Some(previous_topic) = self.topics.get(topic).cloned() else {
             return Err(ApiError::not_found("topic not found"));
-        }
+        };
         self.topics.remove(topic);
         let now = self.now();
         let affected: Vec<String> = self
@@ -2206,13 +2257,21 @@ impl Server {
             .filter(|(_, sub)| sub.topic == topic)
             .map(|(name, _)| name.clone())
             .collect();
-        for name in affected {
-            if let Some(sub) = self.subscriptions.get_mut(&name) {
+        let previous_subscriptions: Vec<(String, Subscription)> = affected
+            .iter()
+            .map(|name| (name.clone(), self.subscriptions[name].clone()))
+            .collect();
+        for name in &affected {
+            if let Some(sub) = self.subscriptions.get_mut(name) {
                 sub.topic = "_deleted-topic_".to_string();
                 sub.updated_at = now.clone();
             }
         }
         if self.persist().is_err() {
+            self.topics.insert(topic.to_string(), previous_topic);
+            for (name, sub) in previous_subscriptions {
+                self.subscriptions.insert(name, sub);
+            }
             return Err(ApiError::internal("pubsub resource store unavailable"));
         }
         Ok(())
@@ -2227,20 +2286,38 @@ impl Server {
         let Some(mut sub) = self.subscriptions.get(subscription).cloned() else {
             return Err(ApiError::not_found("subscription not found"));
         };
+        let previous_sub = sub.clone();
         sub.detached = true;
         sub.updated_at = self.now();
         self.subscriptions.insert(sub.name.clone(), sub);
-        self.deliveries.remove(subscription);
+        let previous_deliveries = self.deliveries.remove(subscription);
         let drop: Vec<String> = self
             .snapshots
             .iter()
             .filter(|(_, snap)| snap.subscription == subscription)
             .map(|(k, _)| k.clone())
             .collect();
-        for k in drop {
-            self.snapshots.remove(&k);
+        let previous_snapshots: Vec<(String, Snapshot)> = drop
+            .iter()
+            .map(|k| (k.clone(), self.snapshots[k].clone()))
+            .collect();
+        // Dropping this subscription's deliveries/snapshots can leave messages
+        // unreferenced; `persist` prunes those unconditionally before it can
+        // fail, so `messages` needs a full snapshot to be restorable too.
+        let previous_messages = self.messages.clone();
+        for k in &drop {
+            self.snapshots.remove(k);
         }
         if self.persist().is_err() {
+            self.subscriptions
+                .insert(subscription.to_string(), previous_sub);
+            if let Some(prev) = previous_deliveries {
+                self.deliveries.insert(subscription.to_string(), prev);
+            }
+            for (name, snap) in previous_snapshots {
+                self.snapshots.insert(name, snap);
+            }
+            self.messages = previous_messages;
             return Err(ApiError::internal("pubsub resource store unavailable"));
         }
         Ok(())
@@ -2484,6 +2561,14 @@ impl Server {
             ));
         }
         let (now_secs, _) = self.now_parts();
+        // Snapshot before the retention/lease cleanup below, since both cascade
+        // across every subscription's deliveries (and messages/snapshots), not
+        // just the one being pulled.
+        let previous_messages = self.messages.clone();
+        let previous_deliveries = self.deliveries.clone();
+        let previous_snapshots = self.snapshots.clone();
+        let previous_next_message_id = self.next_message_id;
+        let previous_next_ack_id = self.next_ack_id;
         self.cleanup_retained_messages(now_secs);
         self.expire_leases(now_secs);
         let ack_deadline = if sub.ack_deadline_seconds > 0 {
@@ -2496,6 +2581,11 @@ impl Server {
         let compacted = compact_acked(deliveries, sub.retain_acked_messages);
         self.deliveries.insert(sub.name.clone(), compacted);
         if self.persist().is_err() {
+            self.messages = previous_messages;
+            self.deliveries = previous_deliveries;
+            self.snapshots = previous_snapshots;
+            self.next_message_id = previous_next_message_id;
+            self.next_ack_id = previous_next_ack_id;
             return Err(ApiError::internal("pubsub resource store unavailable"));
         }
         Ok(received)
@@ -2721,7 +2811,22 @@ impl Server {
                 "subscription is configured for push delivery",
             ));
         }
+        // Idle-stream fast path: with no delivery records the pull below cannot
+        // return anything, so skip the rollback snapshot and cleanup entirely —
+        // the gRPC adapter calls this on a 10ms tick per open stream, and the
+        // snapshot clones the whole message/delivery/snapshot maps.
+        if self.deliveries.get(&sub.name).is_none_or(|d| d.is_empty()) {
+            return Ok(Vec::new());
+        }
         let (now_secs, _) = self.now_parts();
+        // Snapshot before the retention/lease cleanup below, since both cascade
+        // across every subscription's deliveries (and messages/snapshots), not
+        // just the one being pulled.
+        let previous_messages = self.messages.clone();
+        let previous_deliveries = self.deliveries.clone();
+        let previous_snapshots = self.snapshots.clone();
+        let previous_next_message_id = self.next_message_id;
+        let previous_next_ack_id = self.next_ack_id;
         self.cleanup_retained_messages(now_secs);
         self.expire_leases(now_secs);
         let (mut received, mut deliveries) =
@@ -2750,6 +2855,11 @@ impl Server {
         let compacted = compact_acked(deliveries, sub.retain_acked_messages);
         self.deliveries.insert(sub.name.clone(), compacted);
         if self.persist().is_err() {
+            self.messages = previous_messages;
+            self.deliveries = previous_deliveries;
+            self.snapshots = previous_snapshots;
+            self.next_message_id = previous_next_message_id;
+            self.next_ack_id = previous_next_ack_id;
             return Err(ApiError::internal("pubsub resource store unavailable"));
         }
         Ok(received)
@@ -2815,8 +2925,14 @@ impl Server {
             return;
         }
         let compacted = compact_acked(deliveries, sub.retain_acked_messages);
-        self.deliveries.insert(subscription.to_string(), compacted);
-        let _ = self.persist();
+        let previous = self.deliveries.insert(subscription.to_string(), compacted);
+        // Best-effort by contract: called from the streaming-pull task after it
+        // has already torn down (see `grpc.rs`), with no channel left to report
+        // an error through. Still restore in-memory state on persist failure so
+        // it doesn't silently diverge from what's on disk.
+        if self.persist().is_err() {
+            restore_deliveries_entry(&mut self.deliveries, subscription.to_string(), previous);
+        }
     }
 
     /// `Subscriber.Acknowledge`, mirroring `pull_grpc.rs:Acknowledge`.
@@ -3820,6 +3936,24 @@ fn pull_message_value(message: &crate::model::PubsubMessage) -> Value {
         "publishTime": message.publish_time,
         "orderingKey": message.ordering_key,
     })
+}
+
+/// Restores a single `deliveries` map entry to its pre-mutation value (as
+/// captured by `BTreeMap::insert`'s return), removing the key if it didn't
+/// exist before.
+fn restore_deliveries_entry(
+    deliveries: &mut BTreeMap<String, Vec<crate::model::DeliveryRecord>>,
+    name: String,
+    previous: Option<Vec<crate::model::DeliveryRecord>>,
+) {
+    match previous {
+        Some(records) => {
+            deliveries.insert(name, records);
+        }
+        None => {
+            deliveries.remove(&name);
+        }
+    }
 }
 
 /// Drops acked deliveries unless `retain_acked`, mirroring

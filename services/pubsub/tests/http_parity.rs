@@ -205,6 +205,32 @@ fn seek_match_and_errors() {
 }
 
 #[test]
+fn seek_rolls_back_when_persist_fails() {
+    let (dir, md) = (tempdir(), tempdir());
+    let mut s = server(&dir, &md);
+    let messages: Vec<serde_json::Value> = serde_json::from_str(r#"[{"data":"aGk="}]"#).unwrap();
+    s.publish("devcloud", "orders", &messages).expect("publish");
+    s.pull("devcloud", "sub1", 10).expect("pull"); // leases the delivery (attempt 1)
+    assert_eq!(
+        String::from_utf8_lossy(&s.pull("devcloud", "sub1", 10).expect("pull2").body),
+        "{}\n"
+    ); // still under lease, nothing to redeliver
+
+    std::fs::remove_dir_all(&md).unwrap();
+    std::fs::write(&md, b"not a directory").unwrap();
+    assert!(s.seek("devcloud", "sub1", "", NOW).is_err());
+
+    std::fs::remove_file(&md).unwrap();
+    std::fs::create_dir_all(&md).unwrap();
+    // If seek's replayed-deliveries insert hadn't rolled back, the lease would
+    // already have been reset and this would redeliver immediately.
+    assert_eq!(
+        String::from_utf8_lossy(&s.pull("devcloud", "sub1", 10).expect("pull3").body),
+        "{}\n"
+    );
+}
+
+#[test]
 fn health_and_notfound() {
     let (dir, md) = (tempdir(), tempdir());
     let mut s = server(&dir, &md);

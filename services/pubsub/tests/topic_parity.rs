@@ -1,7 +1,7 @@
 //! Differential-parity tests for topic operations against golden oracles
 //! captured from the legacy Pub/Sub REST service.
 
-use devcloud_pubsub::model::Topic;
+use devcloud_pubsub::model::{Subscription, Topic};
 use devcloud_pubsub::patch::decode_topic_patch;
 use devcloud_pubsub::server::{Config, Server};
 
@@ -227,6 +227,43 @@ fn delete_topic() {
     let err = s.delete_topic("devcloud", "orders").expect_err("gone");
     assert_eq!(err.status, 404);
     assert_eq!(err.message, "topic not found");
+}
+
+#[test]
+fn grpc_delete_topic_rolls_back_when_persist_fails() {
+    let dir = tempdir();
+    let mut s = server(&dir);
+    s.create_topic("devcloud", "orders", &Topic::default())
+        .expect("orders");
+    s.create_subscription(
+        "devcloud",
+        "sub1",
+        &serde_json::from_str::<Subscription>(r#"{"topic":"projects/devcloud/topics/orders"}"#)
+            .unwrap(),
+    )
+    .expect("sub1");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+    std::fs::write(&dir, b"not a directory").unwrap();
+
+    assert!(s
+        .grpc_delete_topic("projects/devcloud/topics/orders")
+        .is_err());
+    // Topic removal and subscription orphaning must both be rolled back.
+    assert_eq!(
+        s.grpc_get_topic("projects/devcloud/topics/orders")
+            .expect("topic still present")
+            .name,
+        "projects/devcloud/topics/orders"
+    );
+    assert_eq!(
+        s.grpc_get_subscription("projects/devcloud/subscriptions/sub1")
+            .expect("subscription still present")
+            .topic,
+        "projects/devcloud/topics/orders"
+    );
+
+    std::fs::remove_file(&dir).unwrap();
 }
 
 #[test]
