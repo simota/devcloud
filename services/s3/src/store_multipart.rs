@@ -8,7 +8,9 @@ use crate::model::{MultipartPart, MultipartUpload, Object};
 use crate::objops::{
     clean_metadata, clean_server_side_encryption, CreateMultipartUploadInput, PutObjectInput,
 };
-use crate::store::{remove_dir_all_ignoring_missing, FileBucketStore, Result, StoreError};
+use crate::store::{
+    remove_dir_all_ignoring_missing, write_atomic, FileBucketStore, Result, StoreError,
+};
 use crate::validation::valid_upload_id;
 use std::fs;
 use std::io;
@@ -88,7 +90,7 @@ impl FileBucketStore {
         };
         let path = self.multipart_part_path(bucket, upload_id, part_number);
         fs::create_dir_all(&path)?;
-        fs::write(path.join("body"), body)?;
+        write_atomic(&path.join("body"), body)?;
         Self::write_json(&path.join("part.json"), &part)?;
         Ok(part)
     }
@@ -111,7 +113,8 @@ impl FileBucketStore {
 
     /// Concatenates the listed parts into the final object (stamping the
     /// composite multipart ETag) and removes the upload. `None` if the upload is
-    /// absent; `InvalidPart` if a listed part is missing.
+    /// absent; `InvalidPart` if a listed part is missing or its on-disk body
+    /// length no longer matches the size recorded in `part.json`.
     pub fn complete_multipart_upload(
         &self,
         bucket: &str,
@@ -136,6 +139,9 @@ impl FileBucketStore {
                 }
                 Err(e) => return Err(StoreError::Io(e)),
             };
+            if body.len() as i64 != part.size {
+                return Err(StoreError::InvalidPart(part_number));
+            }
             combined.extend_from_slice(&body);
             part_etags.push(part.etag);
         }

@@ -5,7 +5,7 @@
 
 use devcloud_s3::model::{MultipartPart, MultipartUpload, ServerSideEncryption};
 use devcloud_s3::objops::CreateMultipartUploadInput;
-use devcloud_s3::store::FileBucketStore;
+use devcloud_s3::store::{FileBucketStore, StoreError};
 use devcloud_s3::wire_json::to_vec_indent;
 use std::collections::BTreeMap;
 
@@ -157,4 +157,36 @@ fn list_uploads_and_abort_match_oracle() {
         store.list_multipart_uploads("data").unwrap().unwrap().len(),
         1
     );
+}
+
+/// A part whose on-disk body was truncated (or otherwise no longer matches the
+/// size recorded in `part.json`) must fail completion instead of silently
+/// stitching a corrupt body into the final object.
+#[test]
+fn complete_rejects_part_with_truncated_body() {
+    let root = tempdir();
+    let store = FileBucketStore::new(&root);
+    store.create_bucket("data").unwrap();
+    store.push_version_ids(&[UID]);
+
+    store
+        .create_multipart_upload(CreateMultipartUploadInput {
+            bucket: "data".to_string(),
+            key: "big.bin".to_string(),
+            ..Default::default()
+        })
+        .unwrap();
+    store
+        .upload_part("data", "big.bin", UID, 1, b"hello", "")
+        .unwrap();
+
+    // Simulate a crash mid-write: the body on disk is shorter than the size
+    // recorded in part.json.
+    let body_path = store.multipart_part_path("data", UID, 1).join("body");
+    std::fs::write(&body_path, b"he").unwrap();
+
+    match store.complete_multipart_upload("data", "big.bin", UID, &[1]) {
+        Err(StoreError::InvalidPart(1)) => {}
+        other => panic!("expected InvalidPart(1), got {other:?}"),
+    }
 }

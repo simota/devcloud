@@ -120,8 +120,7 @@ impl FileBucketStore {
     }
 
     pub(crate) fn write_json<T: serde::Serialize>(path: &Path, value: &T) -> Result<()> {
-        fs::write(path, wire_json::to_vec_indent(value))?;
-        Ok(())
+        write_atomic(path, &wire_json::to_vec_indent(value))
     }
 
     // --- path layout --------------------------------------------------------
@@ -291,6 +290,33 @@ impl FileBucketStore {
         fs::remove_dir(&path)?;
         Ok(true)
     }
+}
+
+/// Writes `data` to `path` via a temp file in the same directory + rename, so a
+/// crash mid-write cannot leave a truncated file at `path` while metadata (or a
+/// concurrent read) claims it is complete. Callers already serialize access to
+/// the store, so a fixed `.tmp` sibling name is sufficient — no uniqueness
+/// tricks needed.
+pub(crate) fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
+    let tmp = atomic_tmp_path(path);
+    if let Err(e) = fs::write(&tmp, data) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e.into());
+    }
+    if let Err(e) = fs::rename(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e.into());
+    }
+    Ok(())
+}
+
+fn atomic_tmp_path(path: &Path) -> PathBuf {
+    let mut name = path
+        .file_name()
+        .expect("write_atomic: path must have a file name")
+        .to_os_string();
+    name.push(".tmp");
+    path.with_file_name(name)
 }
 
 /// Reads and JSON-decodes a file; `None` if it does not exist.

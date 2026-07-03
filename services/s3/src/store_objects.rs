@@ -10,7 +10,8 @@ use crate::objops::{
     UpdateObjectMetadataInput,
 };
 use crate::store::{
-    remove_dir_all_ignoring_missing, remove_if_exists, FileBucketStore, Result, StoreError,
+    remove_dir_all_ignoring_missing, remove_if_exists, write_atomic, FileBucketStore, Result,
+    StoreError,
 };
 use crate::time_fmt::{time_after, GO_ZERO_TIME};
 use crate::validation::{valid_bucket_name, valid_object_key};
@@ -115,7 +116,7 @@ impl FileBucketStore {
 
         let path = self.object_path(&input.bucket, &input.key);
         fs::create_dir_all(&path)?;
-        fs::write(path.join("body"), &input.body)?;
+        write_atomic(&path.join("body"), &input.body)?;
         Self::write_json(&path.join("object.json"), &object)?;
         if !object.version_id.is_empty() {
             self.write_object_version(&path, &object, &input.body)?;
@@ -453,7 +454,7 @@ impl FileBucketStore {
             let _ = remove_if_exists(&version_path.join("body"));
             return Ok(());
         }
-        fs::write(version_path.join("body"), body)?;
+        write_atomic(&version_path.join("body"), body)?;
         Ok(())
     }
 
@@ -528,7 +529,7 @@ impl FileBucketStore {
             let _ = remove_if_exists(&body_path);
             return Ok(());
         }
-        fs::write(body_path, &latest_body)?;
+        write_atomic(&body_path, &latest_body)?;
         Ok(())
     }
 }
