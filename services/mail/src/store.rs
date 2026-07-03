@@ -93,11 +93,22 @@ impl Store for RecordingStore {
 
 const MAX_LIST_LIMIT: i32 = 100;
 
+/// In-memory mirror of `messages.jsonl` (every record, including tombstones, in
+/// file order). `None` until the on-disk log has been parsed successfully at
+/// least once; kept `None` on parse failure so the failing read is retried (and
+/// the same error re-surfaced) on the next call, matching the pre-index
+/// behavior of re-reading the file on every access.
+#[derive(Default)]
+struct Index {
+    messages: Option<Vec<Message>>,
+}
+
 pub struct FileStore {
     root: PathBuf,
     blobs: Arc<dyn BlobStore>,
-    /// Serializes all file access, mirroring the legacy store's `sync.Mutex`.
-    lock: Mutex<()>,
+    /// Serializes all file access AND guards the in-memory index, mirroring the
+    /// legacy store's `sync.Mutex`.
+    index: Mutex<Index>,
 }
 
 impl FileStore {
@@ -105,7 +116,7 @@ impl FileStore {
         Self {
             root: root.into(),
             blobs,
-            lock: Mutex::new(()),
+            index: Mutex::new(Index::default()),
         }
     }
 
@@ -113,8 +124,9 @@ impl FileStore {
         self.root.join("messages.jsonl")
     }
 
-    /// Loads every record (including tombstones), in file order.
-    fn load_all_locked(&self) -> Result<Vec<Message>, String> {
+    /// Parses every record (including tombstones) straight from disk, in file
+    /// order. Caller must hold `index`'s lock.
+    fn read_log(&self) -> Result<Vec<Message>, String> {
         let data = match fs::read(self.messages_path()) {
             Ok(d) => d,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -132,21 +144,21 @@ impl FileStore {
         Ok(messages)
     }
 
-    /// Loads only active (non-tombstoned) records.
-    fn load_active(&self) -> Result<Vec<Message>, String> {
-        let _g = self.lock.lock().unwrap();
-        Ok(self
-            .load_all_locked()?
-            .into_iter()
-            .filter(|m| m.deleted_at.is_none())
-            .collect())
+    /// Ensures `guard.messages` holds the parsed log, loading it from disk on
+    /// first use. Caller must hold `index`'s lock.
+    fn ensure_loaded<'a>(&self, guard: &'a mut Index) -> Result<&'a mut Vec<Message>, String> {
+        if guard.messages.is_none() {
+            guard.messages = Some(self.read_log()?);
+        }
+        Ok(guard.messages.as_mut().unwrap())
     }
 
-    /// Rewrites the log, applying `mutate` to every record (active + tombstoned),
-    /// via a temp file + atomic rename. Mirrors legacy `FileStore.rewrite`.
+    /// Rewrites the log, applying `mutate` to every in-memory record (active +
+    /// tombstoned), via a temp file + atomic rename, and updates the index to
+    /// match. Mirrors legacy `FileStore.rewrite`.
     fn rewrite(&self, mutate: impl Fn(Message) -> Message) -> Result<(), String> {
-        let _g = self.lock.lock().unwrap();
-        let messages = self.load_all_locked()?;
+        let mut guard = self.index.lock().unwrap();
+        let messages = self.ensure_loaded(&mut guard)?.clone();
         fs::create_dir_all(&self.root).map_err(|e| format!("create mail store: {e}"))?;
 
         let tmp = self.root.join(format!(
@@ -155,14 +167,19 @@ impl FileStore {
             now_nanos()
         ));
         let mut buf = Vec::new();
+        let mut mutated = Vec::with_capacity(messages.len());
         for message in messages {
-            let line = serde_json::to_vec(&mutate(message))
-                .map_err(|e| format!("write messages temp log: {e}"))?;
+            let m = mutate(message);
+            let line =
+                serde_json::to_vec(&m).map_err(|e| format!("write messages temp log: {e}"))?;
             buf.extend_from_slice(&line);
             buf.push(b'\n');
+            mutated.push(m);
         }
         write_atomic(&tmp, &self.messages_path(), &buf)
-            .map_err(|e| format!("replace messages log: {e}"))
+            .map_err(|e| format!("replace messages log: {e}"))?;
+        guard.messages = Some(mutated);
+        Ok(())
     }
 }
 
@@ -175,7 +192,7 @@ impl Store for FileStore {
             message.received_at = Some(now_rfc3339());
         }
 
-        let _g = self.lock.lock().unwrap();
+        let mut guard = self.index.lock().unwrap();
         let line =
             serde_json::to_vec(&message).map_err(|e| format!("append message metadata: {e}"))?;
         let mut f = fs::OpenOptions::new()
@@ -186,11 +203,23 @@ impl Store for FileStore {
         f.write_all(&line)
             .and_then(|_| f.write_all(b"\n"))
             .map_err(|e| format!("append message metadata: {e}"))?;
+        // Only keep the index in sync if it is already loaded — do not force a
+        // load here, since a load failure (e.g. a pre-existing corrupt line)
+        // must not fail an append that would otherwise have succeeded.
+        if let Some(messages) = guard.messages.as_mut() {
+            messages.push(message.clone());
+        }
         Ok(message)
     }
 
     fn list(&self, input: ListMessagesInput) -> Result<ListMessagesResult, String> {
-        let mut messages = self.load_active()?;
+        let mut guard = self.index.lock().unwrap();
+        let mut messages: Vec<Message> = self
+            .ensure_loaded(&mut guard)?
+            .iter()
+            .filter(|m| m.deleted_at.is_none())
+            .cloned()
+            .collect();
         // Newest first, by received time. Parse to a UNIX key so trimmed-zero
         // fractional seconds order chronologically (lexicographic would not).
         messages.sort_by(|a, b| {
@@ -210,7 +239,12 @@ impl Store for FileStore {
     }
 
     fn get(&self, id: &str) -> Result<Option<Message>, String> {
-        Ok(self.load_active()?.into_iter().find(|m| m.id == id))
+        let mut guard = self.index.lock().unwrap();
+        Ok(self
+            .ensure_loaded(&mut guard)?
+            .iter()
+            .find(|m| m.deleted_at.is_none() && m.id == id)
+            .cloned())
     }
 
     fn get_raw(&self, id: &str) -> Result<Option<Vec<u8>>, String> {

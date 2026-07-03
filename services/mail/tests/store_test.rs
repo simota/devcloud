@@ -140,6 +140,77 @@ fn file_store_concurrent_append_and_list_does_not_read_partial_metadata() {
     assert_eq!(list.messages.len(), 40);
 }
 
+/// Regression test for the in-memory index added on top of the JSONL log:
+/// `list`/`get` must reflect appends and deletes served from the index, and a
+/// fresh `Store` opened over the same on-disk directory (e.g. after a process
+/// restart) must recover the identical view purely from the log file.
+#[test]
+fn file_store_index_reflects_deletes_and_survives_restart() {
+    let blob_dir = temp_dir("idx-blob");
+    let msg_dir = temp_dir("idx-msg");
+    let blobs: Arc<dyn BlobStore> = Arc::new(FileBlobStore::new(&blob_dir));
+    let store = FileStore::new(&msg_dir, Arc::clone(&blobs));
+
+    const N: usize = 5;
+    for i in 0..N {
+        let ts = format!("2026-04-30T10:{:02}:00Z", i);
+        let msg = fixed_msg(
+            &format!("msg_{i:02}"),
+            "b@example.com",
+            &format!("Hello {i:02}"),
+            &ts,
+        );
+        store
+            .append(
+                msg,
+                format!("Subject: Hello {i:02}\r\n\r\nBody", i = i).as_bytes(),
+            )
+            .expect("append");
+    }
+
+    // list()/get() must serve the just-appended records from the index.
+    let list = store.list(ListMessagesInput::default()).expect("list");
+    assert_eq!(list.messages.len(), N);
+    for i in 0..N {
+        assert!(
+            store.get(&format!("msg_{i:02}")).expect("get").is_some(),
+            "msg_{i:02} missing before delete"
+        );
+    }
+
+    store.delete("msg_02").expect("delete");
+
+    // The index must reflect the delete immediately, without re-reading the file.
+    let list = store.list(ListMessagesInput::default()).expect("list");
+    assert_eq!(list.messages.len(), N - 1);
+    assert!(store.get("msg_02").expect("get").is_none());
+    for i in [0, 1, 3, 4] {
+        assert!(
+            store.get(&format!("msg_{i:02}")).expect("get").is_some(),
+            "msg_{i:02} missing after unrelated delete"
+        );
+    }
+
+    // A brand-new Store over the same directory (simulating a process restart)
+    // must recover the identical view purely by re-parsing messages.jsonl.
+    let restarted = FileStore::new(&msg_dir, blobs);
+    let mut restarted_ids: Vec<String> = restarted
+        .list(ListMessagesInput::default())
+        .expect("list after restart")
+        .messages
+        .into_iter()
+        .map(|m| m.id)
+        .collect();
+    restarted_ids.sort();
+    let mut original_ids: Vec<String> = list.messages.into_iter().map(|m| m.id).collect();
+    original_ids.sort();
+    assert_eq!(restarted_ids, original_ids);
+    assert!(restarted
+        .get("msg_02")
+        .expect("get after restart")
+        .is_none());
+}
+
 // --- Byte-exact golden oracle (captured from the legacy FileStore) ---
 
 #[test]
