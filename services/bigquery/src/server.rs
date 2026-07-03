@@ -5,6 +5,8 @@
 //! Handlers are plain methods on [`Server`]; the HTTP routing layer lives in
 //! `routes` and the binary entrypoint in `main.rs`.
 
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use devcloud_s3::store::FileBucketStore;
@@ -38,6 +40,12 @@ pub struct Server {
     /// events bridge — same payloads as the legacy `events.Emit` calls. The legacy
     /// tests run with a nil publisher, so this defaults to off.
     pub(crate) events_enabled: bool,
+    /// Per-table mutex registry. Handlers that must serialize a
+    /// read-check-mutate sequence against one table (e.g. insertAll's
+    /// insertId dedup + row-quota check) hold the corresponding lock for the
+    /// whole sequence so concurrent requests against the same table can't
+    /// both observe the pre-mutation snapshot before either one writes.
+    table_locks: Mutex<HashMap<(String, String, String), Arc<Mutex<()>>>>,
 }
 
 impl Server {
@@ -46,6 +54,7 @@ impl Server {
             config,
             object_store: None,
             events_enabled: false,
+            table_locks: Mutex::new(HashMap::new()),
         }
     }
 
@@ -83,6 +92,25 @@ impl Server {
 
     pub fn config(&self) -> &Config {
         &self.config
+    }
+
+    /// Returns the mutex guarding `(project_id, dataset_id, table_id)`,
+    /// creating it on first use. Callers hold this for the duration of a
+    /// read-check-mutate sequence to close TOCTOU windows between concurrent
+    /// requests against the same table.
+    pub(crate) fn table_lock(
+        &self,
+        project_id: &str,
+        dataset_id: &str,
+        table_id: &str,
+    ) -> Arc<Mutex<()>> {
+        let key = (
+            project_id.to_string(),
+            dataset_id.to_string(),
+            table_id.to_string(),
+        );
+        let mut locks = self.table_locks.lock().unwrap();
+        Arc::clone(locks.entry(key).or_insert_with(|| Arc::new(Mutex::new(()))))
     }
 
     /// legacy `defaultLocation`.

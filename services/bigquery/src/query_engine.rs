@@ -39,12 +39,10 @@ impl Server {
         if use_legacy_sql {
             return Err("legacy SQL is not supported; set useLegacySql to false".to_string());
         }
-        let effective_query = bind_query_parameters(&config.query, &config.query_parameters)?;
-        let result = self.execute_query_for_job(request_project_id, &effective_query, dry_run)?;
-        if !config.destination_table.table_id.is_empty() && !dry_run {
-            self.write_query_destination_table(request_project_id, &config, &result)?;
-        }
         let now = now_unix_nanos();
+        // Check job-id idempotency before the destination-table write below:
+        // a client retry with the same explicit jobId must be rejected
+        // before the query result gets written a second time, not after.
         let mut job_id = requested_ref.job_id.trim().to_string();
         if job_id.is_empty() {
             job_id = format!("devcloud_query_{now}");
@@ -56,6 +54,11 @@ impl Server {
             if existing.is_some() {
                 return Err(format!("already exists: job {request_project_id}:{job_id}"));
             }
+        }
+        let effective_query = bind_query_parameters(&config.query, &config.query_parameters)?;
+        let result = self.execute_query_for_job(request_project_id, &effective_query, dry_run)?;
+        if !config.destination_table.table_id.is_empty() && !dry_run {
+            self.write_query_destination_table(request_project_id, &config, &result)?;
         }
         let job_ref = JobReference {
             project_id: request_project_id.to_string(),

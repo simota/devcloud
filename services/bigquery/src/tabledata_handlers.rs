@@ -43,6 +43,14 @@ impl Server {
             Ok(request) => request,
             Err(()) => return ApiResponse::error(400, "invalid", "invalid json request"),
         };
+
+        // Hold the per-table lock across the whole read-check-append
+        // sequence: without it, two concurrent requests can each snapshot
+        // `existing_rows`, both pass the insertId dedup / row-quota checks
+        // against that stale snapshot, and both append.
+        let table_lock = self.table_lock(project_id, dataset_id, table_id);
+        let _table_guard = table_lock.lock().unwrap();
+
         let existing_rows = match self.read_rows(project_id, dataset_id, table_id) {
             Ok(rows) => rows,
             Err(_) => return ApiResponse::error(500, "backendError", "internal error"),
@@ -88,7 +96,13 @@ impl Server {
             {
                 return ApiResponse::error(500, "backendError", "internal error");
             }
-            if self.refresh_table_row_stats(&table).is_err() {
+            // Recompute numRows/numBytes from what's already in memory
+            // (existing snapshot + just-accepted rows) instead of reading the
+            // whole streaming buffer back from disk a second time.
+            if self
+                .refresh_table_row_stats_incremental(&table, &existing_rows, &accepted)
+                .is_err()
+            {
                 return ApiResponse::error(500, "backendError", "internal error");
             }
         }

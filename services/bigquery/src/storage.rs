@@ -378,10 +378,44 @@ impl Server {
         for row in &rows {
             bytes += wire_json::marshal(&row.json).len();
         }
+        self.write_table_row_stats(table, rows.len(), bytes)
+    }
+
+    /// Same effect as [`Server::refresh_table_row_stats`], but for a caller
+    /// that already holds both the pre-mutation row snapshot and the rows it
+    /// just appended (e.g. `insertAll`) — avoids re-reading the whole
+    /// streaming buffer back from disk just to recompute stats.
+    ///
+    /// `new_rows` are compacted the same way `append_rows` compacts them
+    /// before writing, so the byte total matches what a full re-read would
+    /// produce; `existing_rows` must already be in the on-disk (compacted)
+    /// form, which holds for anything returned by `read_rows`.
+    pub fn refresh_table_row_stats_incremental(
+        &self,
+        table: &TableResource,
+        existing_rows: &[StoredRow],
+        new_rows: &[StoredRow],
+    ) -> StorageResult<()> {
+        let mut bytes = 0usize;
+        for row in existing_rows {
+            bytes += wire_json::marshal(&row.json).len();
+        }
+        for row in new_rows {
+            bytes += wire_json::marshal(&compact_row(row)?.json).len();
+        }
+        self.write_table_row_stats(table, existing_rows.len() + new_rows.len(), bytes)
+    }
+
+    fn write_table_row_stats(
+        &self,
+        table: &TableResource,
+        num_rows: usize,
+        num_bytes: usize,
+    ) -> StorageResult<()> {
         let now = now_unix_nanos();
         let mut table = table.clone();
-        table.num_rows = rows.len().to_string();
-        table.num_bytes = bytes.to_string();
+        table.num_rows = num_rows.to_string();
+        table.num_bytes = num_bytes.to_string();
         table.etag = dataset_etag(now);
         table.last_modified_time = unix_millis_string(now);
         self.write_table(&table)

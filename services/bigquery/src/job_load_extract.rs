@@ -32,6 +32,7 @@ impl Server {
         requested_ref: &JobReference,
         config: CopyJobConfiguration,
     ) -> Result<QueryJobRecord, String> {
+        self.check_job_id_available(request_project_id, &requested_ref.job_id)?;
         let source_table_refs = copy_source_tables(&config)?;
         let destination_ref =
             normalize_table_reference(config.destination_table.clone(), request_project_id);
@@ -189,6 +190,7 @@ impl Server {
         requested_ref: &JobReference,
         config: LoadJobConfiguration,
     ) -> Result<QueryJobRecord, String> {
+        self.check_job_id_available(request_project_id, &requested_ref.job_id)?;
         if self.object_store.is_none() {
             return Err("local GCS object store is not configured".to_string());
         }
@@ -287,6 +289,7 @@ impl Server {
         config: LoadJobConfiguration,
         media: &[u8],
     ) -> Result<QueryJobRecord, String> {
+        self.check_job_id_available(request_project_id, &requested_ref.job_id)?;
         let destination_ref =
             normalize_table_reference(config.destination_table.clone(), request_project_id);
         validate_table_reference(&destination_ref)?;
@@ -472,6 +475,7 @@ impl Server {
         requested_ref: &JobReference,
         config: ExtractJobConfiguration,
     ) -> Result<QueryJobRecord, String> {
+        self.check_job_id_available(request_project_id, &requested_ref.job_id)?;
         let Some(store) = &self.object_store else {
             return Err("local GCS object store is not configured".to_string());
         };
@@ -567,6 +571,26 @@ impl Server {
             rows.extend(loaded_rows);
         }
         Ok(rows)
+    }
+
+    /// The job-id existence check `createCompletedJob` performs, hoisted out
+    /// so load/copy/extract entry points can run it as their first step —
+    /// before any table/object mutation — so a client retry with the same
+    /// explicit jobId is rejected instead of duplicating data. An empty
+    /// jobId (auto-generated later) is always available.
+    fn check_job_id_available(&self, request_project_id: &str, job_id: &str) -> Result<(), String> {
+        let job_id = job_id.trim();
+        if job_id.is_empty() {
+            return Ok(());
+        }
+        validate_resource_id(job_id, "job")?;
+        let existing = self
+            .read_query_job(request_project_id, job_id)
+            .map_err(|err| err.to_string())?;
+        if existing.is_some() {
+            return Err(format!("already exists: job {request_project_id}:{job_id}"));
+        }
+        Ok(())
     }
 
     /// legacy `createCompletedJob` (job_handlers.rs): persists a DONE job record

@@ -507,6 +507,58 @@ fn jobs_query_rejects_unsupported_query_without_leaking_query_text() {
     );
 }
 
+// devcloud-only regression coverage: a client retry with the same explicit
+// jobId must be rejected before the destination-table write runs a second
+// time, not after (OMEN-3) — the job-id existence check has to happen
+// before `write_query_destination_table` mutates anything.
+#[test]
+fn jobs_query_same_job_id_is_rejected_without_duplicating_destination_rows() {
+    let dir = tempdir();
+    let server = new_server(&dir);
+    create_dataset_for_test(&server, "local-project", "analytics");
+    create_table_for_test(&server, "local-project", "analytics", "people");
+    insert_rows_for_test(&server, "local-project", "analytics", "people");
+
+    let body = "{\"jobReference\":{\"jobId\":\"retry_query\"},\"configuration\":{\"query\":{\"query\":\"SELECT id, age FROM `local-project.analytics.people`\",\"useLegacySql\":false,\"destinationTable\":{\"datasetId\":\"analytics\",\"tableId\":\"query_dest\"}}}}";
+
+    let first = server.insert_job("local-project", body.as_bytes());
+    assert_eq!(
+        first.status,
+        200,
+        "first query job status = {}, body = {}",
+        first.status,
+        first.body_str()
+    );
+    let first_job: JobResource = serde_json::from_slice(&first.body).expect("decode first job");
+    assert_eq!(first_job.job_reference.job_id, "retry_query");
+
+    let second = server.insert_job("local-project", body.as_bytes());
+    assert_eq!(
+        second.status,
+        400,
+        "retried query job with the same jobId must fail, body = {}",
+        second.body_str()
+    );
+    assert!(
+        second.body_str().contains("already exists"),
+        "retried query job error should report already exists, body = {}",
+        second.body_str()
+    );
+
+    let rows = server.list_rows(
+        "local-project",
+        "analytics",
+        "query_dest",
+        &Query::parse(""),
+    );
+    let row_list: devcloud_bigquery::model::TableDataListResponse =
+        serde_json::from_slice(&rows.body).expect("decode destination rows after retry");
+    assert_eq!(
+        row_list.total_rows, "2",
+        "retried jobId must not duplicate the destination-table rows, rows = {row_list:?}"
+    );
+}
+
 // --- minimal tempdir --------------------------------------------------------
 
 fn tempdir() -> std::path::PathBuf {
