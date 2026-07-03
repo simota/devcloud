@@ -27,7 +27,7 @@ use crate::model::{
     KeySchemaElement, LocalSecondaryIndexDescription, PointInTimeRecoveryDescription,
     SourceTableDetails, StreamSpecification, TableDescription, Tag, TimeToLiveDescription,
 };
-use crate::persistence::{PersistedState, PersistedTable};
+use crate::persistence::PersistedState;
 use crate::requests::{
     BackupArnRequest, BatchExecuteStatementRequest, BatchGetItemRequest, BatchWriteItemRequest,
     CreateBackupRequest, CreateTableRequest, DeleteItemRequest, DescribeStreamRequest,
@@ -124,6 +124,17 @@ pub struct Server {
     backup_tables: BTreeMap<String, TableDescription>,
     backup_items: BTreeMap<String, BTreeMap<String, Item>>,
     load_err: Option<String>,
+    /// Encoded (HTML-escaped, no trailing newline) `PersistedTable` JSON per
+    /// table, valid as of the last successful `persist()`. Reused verbatim
+    /// for tables not in `dirty_tables` so `persist()` doesn't re-encode the
+    /// whole database on every mutation. Only updated after a persist write
+    /// succeeds — see `persist()`.
+    table_cache: BTreeMap<String, Vec<u8>>,
+    /// Tables mutated since the last successful `persist()`; must be
+    /// re-encoded on the next call. Cleared only on a successful persist, so
+    /// a failed attempt leaves a table dirty until it is (re)persisted
+    /// correctly — this never leaves a stale cache entry behind.
+    dirty_tables: std::collections::BTreeSet<String>,
     /// Test hook: when set, used in place of the wall clock for `now_unix` /
     /// stream labels so success bodies are byte-reproducible.
     fixed_now_unix: Option<i64>,
@@ -140,6 +151,8 @@ impl Server {
             backup_tables: BTreeMap::new(),
             backup_items: BTreeMap::new(),
             load_err: None,
+            table_cache: BTreeMap::new(),
+            dirty_tables: std::collections::BTreeSet::new(),
             fixed_now_unix: None,
             fixed_now_millis: None,
         };
@@ -250,37 +263,76 @@ impl Server {
     }
 
     /// Writes `state.json` byte-compatibly with legacy `persistLocked`.
-    fn persist(&self) -> Result<(), ApiError> {
+    ///
+    /// Only tables in `dirty_tables` (or missing from `table_cache`, e.g.
+    /// right after `load()`) are re-encoded; every other table reuses its
+    /// cached encoded bytes untouched, with no clone of its `items` /
+    /// `stream_records`. The cache and dirty set are committed only after
+    /// the write succeeds: if persisting fails, both are left exactly as
+    /// they were, so a caller's in-memory rollback and the next persist
+    /// attempt naturally re-encode the (now-reverted) table from scratch
+    /// rather than reusing anything derived from the failed attempt.
+    fn persist(&mut self) -> Result<(), ApiError> {
         if self.config.storage_path.is_empty() {
             return Ok(());
         }
         let dir = std::path::Path::new(&self.config.storage_path);
         std::fs::create_dir_all(dir)
             .map_err(|_| ApiError::internal("failed to persist dynamodb state"))?;
-        let mut persisted = PersistedState::default();
+
+        let mut fresh: BTreeMap<String, Vec<u8>> = BTreeMap::new();
         for (name, state) in &self.tables {
-            persisted.tables.insert(
-                name.clone(),
-                PersistedTable {
-                    description: state.description.clone(),
-                    items: state.items.clone(),
-                    stream_records: state.stream_records.clone(),
-                    tags: state.tags.clone(),
-                    continuous_backups: state.continuous_backups.clone(),
-                    resource_policy: state.resource_policy.clone(),
-                    resource_policy_revision: state.resource_policy_revision.clone(),
-                },
-            );
+            if self.dirty_tables.contains(name) || !self.table_cache.contains_key(name) {
+                fresh.insert(name.clone(), encode_persisted_table(state));
+            }
         }
-        persisted.backups = self.backups.clone();
-        persisted.backup_tables = self.backup_tables.clone();
-        persisted.backup_items = self.backup_items.clone();
-        let bytes = wire_json::to_vec(&persisted);
+
+        // Assemble `state.json` field-by-field so untouched tables reuse
+        // their cached bytes verbatim. This must byte-for-byte match what
+        // `wire_json::to_vec(&PersistedState { .. })` produces via derive.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"{\"tables\":{");
+        let mut first = true;
+        for name in self.tables.keys() {
+            if !first {
+                buf.push(b',');
+            }
+            first = false;
+            buf.extend_from_slice(&wire_json::marshal(name));
+            buf.push(b':');
+            let encoded = fresh
+                .get(name)
+                .or_else(|| self.table_cache.get(name))
+                .expect("every table has fresh or cached encoded bytes");
+            buf.extend_from_slice(encoded);
+        }
+        buf.push(b'}');
+        if !self.backups.is_empty() {
+            buf.extend_from_slice(b",\"backups\":");
+            buf.extend_from_slice(&wire_json::marshal(&self.backups));
+        }
+        if !self.backup_tables.is_empty() {
+            buf.extend_from_slice(b",\"backupTables\":");
+            buf.extend_from_slice(&wire_json::marshal(&self.backup_tables));
+        }
+        if !self.backup_items.is_empty() {
+            buf.extend_from_slice(b",\"backupItems\":");
+            buf.extend_from_slice(&wire_json::marshal(&self.backup_items));
+        }
+        buf.push(b'}');
+        buf.push(b'\n');
+
         let tmp = self.state_path().with_extension("json.tmp");
-        std::fs::write(&tmp, &bytes)
+        std::fs::write(&tmp, &buf)
             .map_err(|_| ApiError::internal("failed to persist dynamodb state"))?;
         std::fs::rename(&tmp, self.state_path())
             .map_err(|_| ApiError::internal("failed to persist dynamodb state"))?;
+
+        // Only commit cache/dirty updates once the write has landed.
+        self.table_cache.extend(fresh);
+        self.dirty_tables.clear();
+        self.table_cache
+            .retain(|name, _| self.tables.contains_key(name));
         Ok(())
     }
 
@@ -383,8 +435,10 @@ impl Server {
             request.table_name.clone(),
             TableState::new(description.clone()),
         );
+        self.dirty_tables.insert(request.table_name.clone());
         if let Err(err) = self.persist() {
             self.tables.remove(&request.table_name);
+            self.dirty_tables.remove(&request.table_name);
             return Err(err);
         }
         Ok(encode(&TableDescriptionResponse {
@@ -482,6 +536,7 @@ impl Server {
         state.description = description.clone();
         update_index_item_counts(state);
         let committed = state.description.clone();
+        self.dirty_tables.insert(request.table_name.clone());
         if let Err(err) = self.persist() {
             self.tables
                 .get_mut(&request.table_name)
@@ -594,6 +649,7 @@ impl Server {
         state.items.insert(key.clone(), request.item.clone());
         state.description.item_count = state.items.len() as i64;
         update_index_item_counts(state);
+        self.dirty_tables.insert(request.table_name.clone());
         self.append_stream_record(
             &request.table_name,
             crate::streams::stream_event_name(existed, false),
@@ -715,6 +771,7 @@ impl Server {
         // Append the REMOVE record (no-op if the stream is disabled or the item
         // did not exist).
         self.append_stream_record(&request.table_name, "REMOVE", old_item.as_ref(), None);
+        self.dirty_tables.insert(request.table_name.clone());
         if let Err(err) = self.persist() {
             let state = self.tables.get_mut(&request.table_name).unwrap();
             if let Some(prev) = &old_item {
@@ -806,6 +863,7 @@ impl Server {
         state.items.insert(key.clone(), updated.clone());
         state.description.item_count = state.items.len() as i64;
         update_index_item_counts(state);
+        self.dirty_tables.insert(request.table_name.clone());
         self.append_stream_record(
             &request.table_name,
             crate::streams::stream_event_name(existed, false),
@@ -1201,6 +1259,9 @@ impl Server {
             let state = self.tables.get_mut(table).unwrap();
             state.description.item_count = state.items.len() as i64;
             update_index_item_counts(state);
+        }
+        for table in &touched {
+            self.dirty_tables.insert(table.clone());
         }
         if let Err(err) = self.persist() {
             for (table, key, prev) in backups.into_iter().rev() {
@@ -1802,6 +1863,7 @@ impl Server {
             attribute_name: spec.attribute_name.clone(),
             time_to_live_status: if spec.enabled { "ENABLED" } else { "DISABLED" }.to_string(),
         });
+        self.dirty_tables.insert(request.table_name.clone());
         if let Err(err) = self.persist() {
             self.tables
                 .get_mut(&request.table_name)
@@ -1852,6 +1914,9 @@ impl Server {
             }
             state.description.item_count = state.items.len() as i64;
             update_index_item_counts(state);
+        }
+        for (table, _) in &changed_tables {
+            self.dirty_tables.insert(table.clone());
         }
         if let Err(err) = self.persist() {
             for (table, key, item) in backups {
@@ -1918,6 +1983,7 @@ impl Server {
             .ok_or_else(|| ApiError::not_found("table not found"))?;
         let previous = state.continuous_backups.clone();
         state.continuous_backups = Some(description.clone());
+        self.dirty_tables.insert(request.table_name.clone());
         if let Err(err) = self.persist() {
             self.tables
                 .get_mut(&request.table_name)
@@ -2123,8 +2189,10 @@ impl Server {
         update_index_item_counts(&mut state);
         let committed = state.description.clone();
         self.tables.insert(request.target_table_name.clone(), state);
+        self.dirty_tables.insert(request.target_table_name.clone());
         if let Err(err) = self.persist() {
             self.tables.remove(&request.target_table_name);
+            self.dirty_tables.remove(&request.target_table_name);
             return Err(err);
         }
         Ok(encode(&TableDescriptionResponse {
@@ -2228,6 +2296,7 @@ impl Server {
         }
         let previous = state.tags.clone();
         self.tables.get_mut(&name).unwrap().tags = projected;
+        self.dirty_tables.insert(name.clone());
         if let Err(err) = self.persist() {
             self.tables.get_mut(&name).unwrap().tags = previous;
             return Err(err);
@@ -2280,6 +2349,7 @@ impl Server {
         for key in &request.tag_keys {
             state.tags.remove(key);
         }
+        self.dirty_tables.insert(name.clone());
         if let Err(err) = self.persist() {
             self.tables.get_mut(&name).unwrap().tags = previous;
             return Err(err);
@@ -2310,6 +2380,7 @@ impl Server {
         let state = self.tables.get_mut(&name).unwrap();
         state.resource_policy = request.policy.clone();
         state.resource_policy_revision = revision.clone();
+        self.dirty_tables.insert(name.clone());
         if let Err(err) = self.persist() {
             let state = self.tables.get_mut(&name).unwrap();
             state.resource_policy = prev_policy;
@@ -2365,6 +2436,7 @@ impl Server {
         let state = self.tables.get_mut(&name).unwrap();
         state.resource_policy = String::new();
         state.resource_policy_revision = String::new();
+        self.dirty_tables.insert(name.clone());
         if let Err(err) = self.persist() {
             let state = self.tables.get_mut(&name).unwrap();
             state.resource_policy = prev_policy;
@@ -2401,6 +2473,62 @@ impl Server {
             stream_view_type: spec.stream_view_type.clone(),
         });
     }
+}
+
+/// Mirrors [`crate::persistence::PersistedTable`]'s shape, field order, and
+/// `omitempty` rules exactly, but borrows `items` / `stream_records` instead
+/// of cloning them — encoding a dirty table costs one pass over data it
+/// already owns, not a clone followed by a pass.
+#[derive(serde::Serialize)]
+struct PersistedTableRef<'a> {
+    description: &'a TableDescription,
+    items: &'a BTreeMap<String, Item>,
+    #[serde(rename = "streamRecords", skip_serializing_if = "ref_vec_is_empty")]
+    stream_records: &'a Vec<crate::model::StreamRecord>,
+    #[serde(skip_serializing_if = "ref_map_is_empty")]
+    tags: &'a BTreeMap<String, String>,
+    #[serde(
+        rename = "continuousBackups",
+        skip_serializing_if = "ref_option_is_none"
+    )]
+    continuous_backups: &'a Option<ContinuousBackupsDescription>,
+    #[serde(rename = "resourcePolicy", skip_serializing_if = "ref_string_is_empty")]
+    resource_policy: &'a String,
+    #[serde(
+        rename = "resourcePolicyRevision",
+        skip_serializing_if = "ref_string_is_empty"
+    )]
+    resource_policy_revision: &'a String,
+}
+
+fn ref_vec_is_empty<T>(value: &&Vec<T>) -> bool {
+    value.is_empty()
+}
+
+fn ref_map_is_empty<K: Ord, V>(value: &&BTreeMap<K, V>) -> bool {
+    value.is_empty()
+}
+
+fn ref_option_is_none<T>(value: &&Option<T>) -> bool {
+    value.is_none()
+}
+
+fn ref_string_is_empty(value: &&String) -> bool {
+    value.is_empty()
+}
+
+/// Encodes one table's persisted JSON object: HTML-escaped, no trailing
+/// newline — the unit of work cached in `Server::table_cache`.
+fn encode_persisted_table(state: &TableState) -> Vec<u8> {
+    wire_json::marshal(&PersistedTableRef {
+        description: &state.description,
+        items: &state.items,
+        stream_records: &state.stream_records,
+        tags: &state.tags,
+        continuous_backups: &state.continuous_backups,
+        resource_policy: &state.resource_policy,
+        resource_policy_revision: &state.resource_policy_revision,
+    })
 }
 
 fn billing_mode(value: &str) -> String {
