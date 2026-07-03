@@ -3,7 +3,7 @@
 //! listing and the message-move-task lifecycle (start / list / cancel).
 
 use crate::model::{MoveTaskState, ZERO_TIME};
-use crate::server::{queue_name_from_url, Server};
+use crate::server::{queue_name_from_url, QueueState, Server};
 use crate::time_fmt::{now_rfc3339, unix_nanos_from_rfc3339};
 
 /// A single move-task result projection (mirrors legacy `messageMoveTaskResult`).
@@ -108,6 +108,22 @@ impl Server {
             }
         }
         let moved_count = moves.len() as i64;
+
+        // Snapshot every queue this loop is about to mutate (the source plus
+        // each distinct destination) so a persist failure below can be
+        // rolled back cleanly instead of leaving moved/tombstoned messages
+        // applied with no matching move-task record.
+        let mut affected_names: Vec<String> = vec![source_name.clone()];
+        for (_, target, _) in &moves {
+            if !affected_names.contains(target) {
+                affected_names.push(target.clone());
+            }
+        }
+        let snapshots: Vec<(String, QueueState)> = affected_names
+            .iter()
+            .map(|n| (n.clone(), self.queues.get(n).unwrap().clone()))
+            .collect();
+
         for (i, target, moved) in moves {
             self.queues
                 .get_mut(&target)
@@ -135,7 +151,13 @@ impl Server {
         };
         self.move_tasks
             .insert(task.task_handle.clone(), task.clone());
-        self.persist()?;
+        if let Err(e) = self.persist() {
+            for (n, snapshot) in snapshots {
+                self.queues.insert(n, snapshot);
+            }
+            self.move_tasks.remove(&task.task_handle);
+            return Err(e);
+        }
         Ok(task)
     }
 
