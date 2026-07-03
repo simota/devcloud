@@ -213,8 +213,9 @@ impl Server {
         if let Some(suspended) = req.SuspendedState {
             target.SuspendedState = suspended;
         }
-        st.scalable_targets.insert(key, target);
+        let previous = st.scalable_targets.insert(key.clone(), target);
         if self.persist(&st).is_err() {
+            restore_entry(&mut st.scalable_targets, key, previous);
             return Self::persist_error();
         }
         Outcome::ok(json!({}))
@@ -273,11 +274,14 @@ impl Server {
         if !st.scalable_targets.contains_key(&key) {
             return error_outcome(400, "ObjectNotFoundException", "scalable target not found");
         }
-        st.scalable_targets.remove(&key);
+        let removed_target = st.scalable_targets.remove(&key).unwrap();
         let prefix = format!("{key}|");
-        st.scaling_policies.retain(|k, _| !k.starts_with(&prefix));
-        st.scheduled_actions.retain(|k, _| !k.starts_with(&prefix));
+        let removed_policies = drain_matching(&mut st.scaling_policies, &prefix);
+        let removed_actions = drain_matching(&mut st.scheduled_actions, &prefix);
         if self.persist(&st).is_err() {
+            st.scalable_targets.insert(key, removed_target);
+            st.scaling_policies.extend(removed_policies);
+            st.scheduled_actions.extend(removed_actions);
             return Self::persist_error();
         }
         Outcome::ok(json!({}))
@@ -345,8 +349,9 @@ impl Server {
             }
         }
         let arn = policy.PolicyARN.clone();
-        st.scaling_policies.insert(key, policy);
+        let previous = st.scaling_policies.insert(key.clone(), policy);
         if self.persist(&st).is_err() {
+            restore_entry(&mut st.scaling_policies, key, previous);
             return Self::persist_error();
         }
         Outcome::ok(
@@ -418,8 +423,9 @@ impl Server {
         if !st.scaling_policies.contains_key(&key) {
             return error_outcome(400, "ObjectNotFoundException", "scaling policy not found");
         }
-        st.scaling_policies.remove(&key);
+        let removed = st.scaling_policies.remove(&key).unwrap();
         if self.persist(&st).is_err() {
+            st.scaling_policies.insert(key, removed);
             return Self::persist_error();
         }
         Outcome::ok(json!({}))
@@ -478,8 +484,9 @@ impl Server {
         if let Some(existing) = existing {
             action.CreationTime = existing.CreationTime;
         }
-        st.scheduled_actions.insert(key, action);
+        let previous = st.scheduled_actions.insert(key.clone(), action);
         if self.persist(&st).is_err() {
+            restore_entry(&mut st.scheduled_actions, key, previous);
             return Self::persist_error();
         }
         Outcome::ok(json!({}))
@@ -547,8 +554,9 @@ impl Server {
         if !st.scheduled_actions.contains_key(&key) {
             return error_outcome(400, "ObjectNotFoundException", "scheduled action not found");
         }
-        st.scheduled_actions.remove(&key);
+        let removed = st.scheduled_actions.remove(&key).unwrap();
         if self.persist(&st).is_err() {
+            st.scheduled_actions.insert(key, removed);
             return Self::persist_error();
         }
         Outcome::ok(json!({}))
@@ -563,11 +571,13 @@ impl Server {
             return validation("ResourceARN is required");
         }
         let mut st = self.state.lock().unwrap();
+        let previous_bucket = st.tags.get(&req.ResourceARN).cloned();
         let bucket = st.tags.entry(req.ResourceARN.clone()).or_default();
         for (k, v) in req.Tags {
             bucket.insert(k, v);
         }
         if self.persist(&st).is_err() {
+            restore_entry(&mut st.tags, req.ResourceARN, previous_bucket);
             return Self::persist_error();
         }
         Outcome::ok(json!({}))
@@ -582,6 +592,7 @@ impl Server {
             return validation("ResourceARN is required");
         }
         let mut st = self.state.lock().unwrap();
+        let previous_bucket = st.tags.get(&req.ResourceARN).cloned();
         if let Some(bucket) = st.tags.get_mut(&req.ResourceARN) {
             for k in &req.TagKeys {
                 bucket.remove(k);
@@ -591,6 +602,7 @@ impl Server {
             }
         }
         if self.persist(&st).is_err() {
+            restore_entry(&mut st.tags, req.ResourceARN, previous_bucket);
             return Self::persist_error();
         }
         Outcome::ok(json!({}))
@@ -611,6 +623,32 @@ impl Server {
 }
 
 // --- Free helpers (mirror store.rs + handlers.rs) ---
+
+/// Restores a map entry to its pre-mutation snapshot: re-inserts `previous` if
+/// the key held a value before, or removes the key if it didn't exist yet.
+fn restore_entry<T>(map: &mut BTreeMap<String, T>, key: String, previous: Option<T>) {
+    match previous {
+        Some(value) => {
+            map.insert(key, value);
+        }
+        None => {
+            map.remove(&key);
+        }
+    }
+}
+
+/// Removes and returns every entry whose key starts with `prefix`, for
+/// restoring on persist failure after a `retain` filtered them out.
+fn drain_matching<T>(map: &mut BTreeMap<String, T>, prefix: &str) -> Vec<(String, T)> {
+    let keys: Vec<String> = map
+        .keys()
+        .filter(|k| k.starts_with(prefix))
+        .cloned()
+        .collect();
+    keys.into_iter()
+        .filter_map(|k| map.remove(&k).map(|v| (k, v)))
+        .collect()
+}
 
 fn scalable_target_key(namespace: &str, resource_id: &str, dimension: &str) -> String {
     [namespace, resource_id, dimension].join("|")
