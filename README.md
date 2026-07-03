@@ -258,7 +258,7 @@ Legend:
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | Local endpoint | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
 | Dashboard view | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
-| Dashboard mutation actions | Partial | Partial | Partial | No | No | Partial | Yes | Yes | Partial |
+| Dashboard mutation actions | Partial | Partial | Partial | Partial | Partial | Partial | Yes | Yes | Partial |
 | Persistent local storage | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
 | Configurable port | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
 | Enable/disable via config | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
