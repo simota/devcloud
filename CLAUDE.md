@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-`devcloud` is a local cloud service emulator: a single Rust binary that runs compatible development endpoints for Mail (SMTP), S3, GCS, DynamoDB, BigQuery, SQS, Pub/Sub, Redshift, Redis, and a React dashboard. It targets deterministic local tests and manual inspection — not production parity. New provider behavior should be added deliberately, backed by tests in the relevant Rust crate and usually an acceptance gate under `scripts/*-autoloop/`.
+`devcloud` is a local cloud service emulator: a single Rust binary that runs compatible development endpoints for Mail (SMTP), S3, GCS, DynamoDB, BigQuery, SQS, Pub/Sub, Redshift, Redis, Application Auto Scaling, and a React dashboard. It targets deterministic local tests and manual inspection — not production parity. New provider behavior should be added deliberately, backed by tests in the relevant Rust crate and usually an acceptance gate under `scripts/*-autoloop/`. Application Auto Scaling (`services/applicationautoscaling`, port 18030) is fully wired into the supervisor and config but has no dashboard page and no acceptance gate under `scripts/` yet.
 
 ## Commands
 
@@ -47,14 +47,18 @@ Each provider lives under `services/<svc>/` and exposes crate-local config/serve
 `services/dashboard` is the HTTP entry point users hit at `:18025`. It serves:
 - The React SPA from `assets/react` (embedded). `assets.rs` mounts `/dashboard/` and falls back to `index.html` for client-side routes.
 - A set of `/api/*` JSON endpoints that forward to each service's introspection/control or provider-protocol surface.
-- **Route convention:** every service page lives under `/dashboard/<svc>` (`mail`, `s3`, `gcs`, `dynamodb`, `bigquery`, `sqs`, `pubsub`, `redshift`). The compatibility short paths `/mail`, `/s3`, `/gcs`, `/dynamodb`, `/bigquery` return 301 redirects to their `/dashboard/<svc>` counterpart — never add new functionality to the compatibility redirects.
+- **Route convention:** every service page lives under `/dashboard/<svc>` (`mail`, `s3`, `gcs`, `dynamodb`, `bigquery`, `sqs`, `pubsub`, `redshift`, `redis`). The compatibility short paths `/mail`, `/s3`, `/gcs`, `/dynamodb`, `/bigquery`, `/redis` return 301 redirects to their `/dashboard/<svc>` counterpart — never add new functionality to the compatibility redirects.
 - **Safety rule:** dashboard mutations MUST go through the provider-protocol path (`/api/<svc>/*` forwarding into the in-process service) — never directly through storage. Never log credentials, Authorization headers, signatures, message bodies, or object payloads. See `AGENTS.md` and the per-service notes in `README.md`.
+
+### Always-on auxiliary services
+- **`services/event-relay`** (port 18027) is a WebSocket fan-out server: it consumes a single in-process event channel fed by the other services and broadcasts each event to every connected WebSocket client, with hello/ping/resync framing and per-client topic filtering.
+- **`services/redis-control`** (bound to `redis_http_port`, default 16380) is the dashboard's control/introspection surface for Redis. It is not the Redis data plane — that's the real `redis-server` child process — it only issues RESP commands against it and never logs credentials or key values.
 
 ### Auth modes
 Every service supports a `relaxed` mode (default, used by all local tooling) and a stricter mode that validates configured credentials. Relaxed mode is what tests and autoloops assume; if you add credential checks, gate them on the mode string so the existing scripts still pass.
 
 ### Configuration & storage
-Config lives at `.devcloud/config.yaml` (custom YAML-ish parser in `orchestrator/src/config.rs`). Runtime data is rooted at `Storage.Path` (default `.devcloud/data`) with per-service subdirectories (`mail`, `s3`, `dynamodb`, `bigquery`, `sqs`, `pubsub`, `redshift`, `gcs/upload_sessions`). `.devcloud/` is gitignored and must not be committed.
+Config lives at `.devcloud/config.yaml` (custom YAML-ish parser in `orchestrator/src/config.rs`). Runtime data is rooted at `Storage.Path` (default `.devcloud/data`) with per-service subdirectories (`mail`, `s3`, `dynamodb`, `bigquery`, `sqs`, `pubsub`, `redshift`, `gcs/upload_sessions`, `applicationautoscaling`, `kv`). `kv` is reserved for a future key-value store — `init_workspace` creates it but no service currently reads or writes it. `.devcloud/` is gitignored and must not be committed.
 
 ## Conventions
 

@@ -1,5 +1,7 @@
 # Common Dashboard Shell Design
 
+> **Superseded:** the Route Model below (`/mail`, `/s3`, ... as target routes) describes an earlier target shape. Current code treats `/dashboard/<svc>` as canonical and the top-level short paths (`/mail`, `/s3`, `/gcs`, `/dynamodb`, `/bigquery`, `/redis`) as legacy 301-redirect-only compatibility routes — never given new functionality. See the route convention in `CLAUDE.md`. The rest of this document is kept as historical design record and is not updated to match.
+
 ## Summary
 
 `devcloud` の dashboard は、Mail、S3、今後追加される SQS、DynamoDB、GCS などを横断して使う operational console とする。

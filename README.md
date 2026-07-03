@@ -35,6 +35,7 @@ Default local endpoints:
 | Redshift SQL | `127.0.0.1:15439` | `http://127.0.0.1:18025/dashboard/redshift` |
 | Redshift API | `http://127.0.0.1:19099` | `http://127.0.0.1:18025/dashboard/redshift` |
 | Redis | `redis://127.0.0.1:16379` | `http://127.0.0.1:18025/dashboard/redis` |
+| Application Auto Scaling | `http://127.0.0.1:18030` | _(no dashboard page yet)_ |
 
 Useful commands:
 
@@ -80,7 +81,9 @@ project: dev
 
 server:
   smtpPort: 11025
+  mailHttpPort: 11080
   dashboardPort: 18025
+  eventRelayPort: 18027
   s3Port: 14566
   gcsPort: 14443
   dynamodbPort: 18000
@@ -91,6 +94,8 @@ server:
   redshiftPort: 15439
   redshiftAPIPort: 19099
   redisPort: 16379
+  redisHttpPort: 16380
+  appAutoScalingPort: 18030
 
 auth:
   smtp:
@@ -131,6 +136,11 @@ auth:
   redis:
     mode: relaxed
     password: ""
+  appAutoScaling:
+    mode: relaxed
+    accessKeyId: dev
+    secretAccessKey: dev
+    accountId: "000000000000"
 
 storage:
   path: .devcloud/data
@@ -227,6 +237,9 @@ services:
     dataDir: redis
     maxMemoryMB: 256
     appendOnly: false
+  appAutoScaling:
+    enabled: true
+    region: us-east-1
 ```
 
 ## Support Matrix
@@ -429,7 +442,7 @@ Pub/Sub dashboard actions are available under `/dashboard/pubsub`:
 | Pub/Sub dashboard API | Yes | Status, topics, subscriptions, publish, pull, ack, and message metadata. |
 | Redshift dashboard API | Yes | Status, clusters, catalog, table detail, query runner, and statement history. |
 | Redis dashboard API | Yes | Status, SCAN-based keys, key inspector, allowlisted command runner, delete, expire, and guarded `FLUSHDB`. |
-| Common React dashboard shell | Yes | All service pages are served under `/dashboard/<svc>` from the shared React shell; compatibility `/mail`, `/s3`, `/gcs`, `/dynamodb`, `/bigquery` paths return 301 redirects. |
+| Common React dashboard shell | Yes | All service pages are served under `/dashboard/<svc>` from the shared React shell; compatibility `/mail`, `/s3`, `/gcs`, `/dynamodb`, `/bigquery`, `/redis` paths return 301 redirects. |
 
 ## Verification
 
@@ -473,6 +486,8 @@ Run before claiming a service MVP is complete or when investigating a service-le
 | SQS | `scripts/sqs-e2e.sh` | none |
 | Pub/Sub | `scripts/pubsub-e2e.sh` | none |
 | Redshift | `scripts/redshift-e2e.sh` | `psql`, `aws`, and `postgres` server binary on `PATH` for managed mode |
+| Redshift managed PostgreSQL | `scripts/redshift-managed-postgres-e2e.sh` | `initdb`, `postgres`, `psql` on `PATH` |
+| Redshift SQL translator | `scripts/redshift-translator-e2e.sh` | `psql`, `aws`, and `postgres` server binary on `PATH` |
 | Redis | `scripts/redis-e2e.sh` | `redis-cli` |
 
 Useful env vars:
