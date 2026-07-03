@@ -41,6 +41,19 @@ struct ControlQueryRequest {
     max_rows: Option<usize>,
 }
 
+/// Params for `Server::new_statement` (Data API `ExecuteStatement` /
+/// `BatchExecuteStatement` share this shape; grouped into a struct to avoid
+/// an 8-argument function).
+struct NewStatementParams<'a> {
+    cluster_identifier: &'a str,
+    database: &'a str,
+    db_user: &'a str,
+    session_id: String,
+    query_string: String,
+    result_format: String,
+    created_at: SystemTime,
+}
+
 /// An already-rendered HTTP response.
 pub struct HttpResponse {
     pub status: u16,
@@ -392,15 +405,15 @@ impl Server {
             Err(err) => return data_api_error(400, "ValidationException", &err.to_string()),
         };
         let execution = self.execute_sql(&request.sql);
-        let mut stmt = self.new_statement(
-            &request.cluster_identifier,
-            &request.database,
-            &request.db_user,
+        let mut stmt = self.new_statement(NewStatementParams {
+            cluster_identifier: &request.cluster_identifier,
+            database: &request.database,
+            db_user: &request.db_user,
             session_id,
-            request.sql.clone(),
+            query_string: request.sql.clone(),
             result_format,
             created_at,
-        );
+        });
         match execution {
             Ok(result) => {
                 stmt.has_result_set = !result.fields.is_empty();
@@ -453,15 +466,15 @@ impl Server {
         };
         let query_string = sqls.join(";\n");
         let execution = self.execute_sql_batch(&sqls);
-        let mut stmt = self.new_statement(
-            &request.cluster_identifier,
-            &request.database,
-            &request.db_user,
+        let mut stmt = self.new_statement(NewStatementParams {
+            cluster_identifier: &request.cluster_identifier,
+            database: &request.database,
+            db_user: &request.db_user,
             session_id,
             query_string,
             result_format,
             created_at,
-        );
+        });
         match execution {
             Ok(result) => {
                 stmt.has_result_set = !result.fields.is_empty();
@@ -513,7 +526,9 @@ impl Server {
                 .client_token_index
                 .insert(client_token.to_string(), stmt.id.clone());
         }
-        let _ = self.shared.persist_locked(&state);
+        if let Err(err) = self.shared.persist_locked(&state) {
+            eprintln!("devcloud-redshift: persist statement history failed: {err}");
+        }
         drop(state);
         HttpResponse::data_api(200, &response)
     }
@@ -530,30 +545,21 @@ impl Server {
         ))
     }
 
-    fn new_statement(
-        &self,
-        cluster_identifier: &str,
-        database: &str,
-        db_user: &str,
-        session_id: String,
-        query_string: String,
-        result_format: String,
-        created_at: SystemTime,
-    ) -> StatementRecord {
+    fn new_statement(&self, params: NewStatementParams) -> StatementRecord {
         let config = &self.shared.config;
         StatementRecord {
             id: self.shared.next_statement_id_value(),
             cluster_identifier: default_str(
-                cluster_identifier,
+                params.cluster_identifier,
                 &default_str(&config.cluster_identifier, "devcloud"),
             ),
-            database: default_str(database, &default_str(&config.database, "dev")),
-            db_user: default_str(db_user, &default_str(&config.user, "dev")),
-            session_id,
-            query_string,
-            result_format,
-            created_at,
-            updated_at: created_at,
+            database: default_str(params.database, &default_str(&config.database, "dev")),
+            db_user: default_str(params.db_user, &default_str(&config.user, "dev")),
+            session_id: params.session_id,
+            query_string: params.query_string,
+            result_format: params.result_format,
+            created_at: params.created_at,
+            updated_at: params.created_at,
             status: "FINISHED".to_string(),
             error: String::new(),
             has_result_set: false,
@@ -662,7 +668,9 @@ impl Server {
         if cancelled {
             stmt.status = "ABORTED".to_string();
             stmt.updated_at = SystemTime::now();
-            let _ = self.shared.persist_locked(&state);
+            if let Err(err) = self.shared.persist_locked(&state) {
+                eprintln!("devcloud-redshift: persist cancelled statement failed: {err}");
+            }
         }
         drop(state);
         HttpResponse::data_api_value(200, serde_json::json!({ "Status": cancelled }))
@@ -887,6 +895,7 @@ impl Server {
             .clusters
             .insert(cluster.cluster_identifier.clone(), cluster.clone());
         if self.shared.persist_locked(&state).is_err() {
+            state.clusters.remove(&cluster.cluster_identifier);
             return json_error(
                 500,
                 "InternalFailure",
@@ -906,12 +915,15 @@ impl Server {
         );
         let mut state = self.shared.lock_state();
         let cluster = state.clusters.remove(&identifier);
-        if cluster.is_some() && self.shared.persist_locked(&state).is_err() {
-            return json_error(
-                500,
-                "InternalFailure",
-                "persist redshift cluster metadata failed",
-            );
+        if let Some(removed) = &cluster {
+            if self.shared.persist_locked(&state).is_err() {
+                state.clusters.insert(identifier.clone(), removed.clone());
+                return json_error(
+                    500,
+                    "InternalFailure",
+                    "persist redshift cluster metadata failed",
+                );
+            }
         }
         drop(state);
         match cluster {
@@ -1019,6 +1031,7 @@ impl Server {
             .snapshots
             .insert(snapshot_identifier.clone(), snapshot.clone());
         if self.shared.persist_locked(&state).is_err() {
+            state.snapshots.remove(&snapshot_identifier);
             return json_error(
                 500,
                 "InternalFailure",
@@ -1047,12 +1060,17 @@ impl Server {
         }
         let mut state = self.shared.lock_state();
         let snapshot = state.snapshots.remove(&snapshot_identifier);
-        if snapshot.is_some() && self.shared.persist_locked(&state).is_err() {
-            return json_error(
-                500,
-                "InternalFailure",
-                "persist redshift snapshot metadata failed",
-            );
+        if let Some(removed) = &snapshot {
+            if self.shared.persist_locked(&state).is_err() {
+                state
+                    .snapshots
+                    .insert(snapshot_identifier.clone(), removed.clone());
+                return json_error(
+                    500,
+                    "InternalFailure",
+                    "persist redshift snapshot metadata failed",
+                );
+            }
         }
         drop(state);
         match snapshot {
@@ -1112,6 +1130,7 @@ impl Server {
             .clusters
             .insert(cluster_identifier.clone(), cluster.clone());
         if self.shared.persist_locked(&state).is_err() {
+            state.clusters.remove(&cluster_identifier);
             return json_error(
                 500,
                 "InternalFailure",
@@ -1220,9 +1239,11 @@ impl Server {
         let Some((id, mut cluster)) = self.cluster_by_resource_name(&state, &resource_name) else {
             return json_error(404, "ClusterNotFound", "cluster does not exist");
         };
+        let previous = cluster.clone();
         cluster.tags = merge_tags(&cluster.tags, &tags);
-        state.clusters.insert(id, cluster);
+        state.clusters.insert(id.clone(), cluster);
         if self.shared.persist_locked(&state).is_err() {
+            state.clusters.insert(id, previous);
             return json_error(
                 500,
                 "InternalFailure",
@@ -1250,9 +1271,11 @@ impl Server {
         let Some((id, mut cluster)) = self.cluster_by_resource_name(&state, &resource_name) else {
             return json_error(404, "ClusterNotFound", "cluster does not exist");
         };
+        let previous = cluster.clone();
         cluster.tags = delete_tags(&cluster.tags, &keys);
-        state.clusters.insert(id, cluster);
+        state.clusters.insert(id.clone(), cluster);
         if self.shared.persist_locked(&state).is_err() {
+            state.clusters.insert(id, previous);
             return json_error(
                 500,
                 "InternalFailure",

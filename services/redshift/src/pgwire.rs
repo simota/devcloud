@@ -219,7 +219,9 @@ impl Server {
         let snapshot = statement_snapshot_from_record(&stmt);
         let mut state = self.shared.lock_state();
         state.statements.insert(stmt.id.clone(), stmt);
-        let _ = self.shared.persist_locked(&state);
+        if let Err(err) = self.shared.persist_locked(&state) {
+            eprintln!("devcloud-redshift: persist sql history failed: {err}");
+        }
         snapshot
     }
 

@@ -5,7 +5,11 @@
 //! plug pgwire (part 3), the Data API (part 4), and the managed Postgres
 //! backend (part 5) into this trait.
 
+use std::sync::Arc;
+
+use crate::backend_postgres::{self, Backend as PostgresBackend};
 use crate::errors::SqlError;
+use crate::translator::{RedshiftToPostgres, RedshiftTranslator};
 
 pub trait SqlBackend: Send + Sync {
     fn exec(&self, statement: &str) -> Result<ExecResult, SqlError>;
@@ -73,5 +77,37 @@ impl CatalogSnapshot {
             .filter(|schema| schema.name == schema_name)
             .flat_map(|schema| schema.tables.iter())
             .find(|table| table.name == table_name)
+    }
+}
+
+/// Shared postgres-backend + translator selection used by both the
+/// `devcloud-redshift` binary's `main()` and the orchestrator's
+/// `services::redshift::run()`: a `postgres`/`postgresql` kind opens a
+/// Postgres backend against `dsn` and pairs it with the Redshift→Postgres
+/// translator; any other kind runs the in-process memory engine with the
+/// passthrough translator, represented here as `(None, None)` (`Server::new`
+/// fills in those defaults). `PostgresBackend::open` blocks on its own tokio
+/// runtime, so callers already running on a tokio worker thread must invoke
+/// this from `spawn_blocking`.
+#[allow(clippy::type_complexity)]
+pub fn select_sql_backend(
+    kind: &str,
+    dsn: String,
+) -> Result<
+    (
+        Option<Arc<dyn SqlBackend>>,
+        Option<Arc<dyn RedshiftTranslator>>,
+    ),
+    SqlError,
+> {
+    match kind.to_lowercase().as_str() {
+        "postgres" | "postgresql" => {
+            let pg = PostgresBackend::open(backend_postgres::Config {
+                dsn,
+                ..backend_postgres::Config::default()
+            })?;
+            Ok((Some(Arc::new(pg)), Some(Arc::new(RedshiftToPostgres))))
+        }
+        _ => Ok((None, None)),
     }
 }

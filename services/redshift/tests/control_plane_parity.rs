@@ -78,6 +78,52 @@ fn create_and_delete_cluster_update_management_metadata() {
 }
 
 #[test]
+fn create_cluster_rolls_back_when_persist_fails() {
+    let dir = temp_dir("create-rollback");
+    let storage_path = dir.to_string_lossy().to_string();
+    let server = Server::new(Config {
+        sql_addr: "127.0.0.1:15439".to_string(),
+        storage_path: storage_path.clone(),
+        cluster_identifier: "devcloud".to_string(),
+        database: "dev".to_string(),
+        user: "dev".to_string(),
+        ..cfg()
+    });
+
+    // Break persistence: replace the storage directory with a plain file so
+    // `create_dir_all` inside `persist_locked` fails.
+    std::fs::remove_dir_all(&dir).unwrap();
+    std::fs::write(&dir, b"not a directory").unwrap();
+
+    let create = query_request(
+        &server,
+        "Action=CreateCluster&ClusterIdentifier=analytics&DBName=warehouse&MasterUsername=analyst&NodeType=ra3.xlplus&NumberOfNodes=2",
+    );
+    assert_eq!(create.status, 500, "body = {}", create.body);
+
+    let snapshot = server.service_snapshot();
+    assert_eq!(
+        snapshot.clusters.len(),
+        1,
+        "failed create must not leave a phantom cluster in memory"
+    );
+    assert_eq!(snapshot.clusters[0].cluster_identifier, "devcloud");
+
+    // Restore persistence and confirm the identifier is free to reuse (i.e.
+    // the rollback actually removed it rather than leaving it dangling).
+    std::fs::remove_file(&dir).unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    let retry = query_request(
+        &server,
+        "Action=CreateCluster&ClusterIdentifier=analytics&DBName=warehouse&MasterUsername=analyst&NodeType=ra3.xlplus&NumberOfNodes=2",
+    );
+    assert_eq!(retry.status, 200, "body = {}", retry.body);
+    assert_eq!(server.service_snapshot().clusters.len(), 2);
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn management_cluster_snapshots_are_created_listed_deleted_and_persisted() {
     let dir = temp_dir("snapshots");
     let storage_path = dir.to_string_lossy().to_string();

@@ -258,7 +258,7 @@ pub fn parse_columns(value: &str) -> Result<Vec<Column>, SqlError> {
     let definitions = split_comma_separated(value);
     let mut columns = Vec::with_capacity(definitions.len());
     for definition in &definitions {
-        let fields: Vec<&str> = definition.trim().split_whitespace().collect();
+        let fields: Vec<&str> = definition.split_whitespace().collect();
         if fields.len() < 2 {
             return Err(SqlError::new(
                 "CREATE TABLE column definition requires name and type",

@@ -31,10 +31,8 @@
 
 use std::sync::Arc;
 
-use devcloud_redshift::backend::SqlBackend;
-use devcloud_redshift::backend_postgres::{self, Backend as PostgresBackend};
+use devcloud_redshift::backend::select_sql_backend;
 use devcloud_redshift::server::{Config, Server};
-use devcloud_redshift::translator::{RedshiftToPostgres, RedshiftTranslator};
 use devcloud_s3::store::FileBucketStore;
 
 fn env(name: &str) -> String {
@@ -69,24 +67,12 @@ fn main() {
     // Mirror the daemon's backend selection: postgres kind connects to the DSN
     // (managed or external) and rewrites Redshift SQL via the translator;
     // memory kind runs the in-process engine with the passthrough translator.
-    let (sql_backend, translator): (
-        Option<Arc<dyn SqlBackend>>,
-        Option<Arc<dyn RedshiftTranslator>>,
-    ) = match backend_kind.to_lowercase().as_str() {
-        "postgres" | "postgresql" => {
-            let pg = match PostgresBackend::open(backend_postgres::Config {
-                dsn,
-                ..backend_postgres::Config::default()
-            }) {
-                Ok(b) => b,
-                Err(err) => {
-                    eprintln!("devcloud-redshift: open postgres backend: {err}");
-                    std::process::exit(1);
-                }
-            };
-            (Some(Arc::new(pg)), Some(Arc::new(RedshiftToPostgres)))
+    let (sql_backend, translator) = match select_sql_backend(&backend_kind, dsn) {
+        Ok(pair) => pair,
+        Err(err) => {
+            eprintln!("devcloud-redshift: open postgres backend: {err}");
+            std::process::exit(1);
         }
-        _ => (None, None),
     };
 
     let object_store_root = env("DEVCLOUD_REDSHIFT_OBJECT_STORE");

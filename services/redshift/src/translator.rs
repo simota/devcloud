@@ -3747,7 +3747,7 @@ fn ensure_temporary_table_scope(clean_rest: String, temporary: bool) -> String {
 
 /// Mirrors `translateCreateTableLikeClause`.
 fn translate_create_table_like_clause(value: &str) -> Option<String> {
-    let tokens: Vec<&str> = value.trim().split_whitespace().collect();
+    let tokens: Vec<&str> = value.split_whitespace().collect();
     if tokens.len() != 2 && tokens.len() != 4 {
         return None;
     }
@@ -3781,7 +3781,7 @@ fn translate_column_definitions(
     let mut dist_key = String::new();
     let mut sort_keys: Vec<String> = Vec::new();
     for definition in &definitions {
-        let tokens: Vec<&str> = definition.trim().split_whitespace().collect();
+        let tokens: Vec<&str> = definition.split_whitespace().collect();
         if tokens.len() < 2 {
             return Err(SqlError::new(
                 "CREATE TABLE column definition requires name and type",
