@@ -114,8 +114,10 @@ fn req_q(method: &str, path: &str, query: &str, body: &[u8]) -> Request {
 async fn redis_command_forwards_to_control_exec() {
     let (base, record) =
         mock_upstream(200, r#"{"command":"GET","class":"read","rows":["v"]}"#).await;
-    let mut cfg = Config::default();
-    cfg.redis_base = base;
+    let cfg = Config {
+        redis_base: base,
+        ..Config::default()
+    };
 
     let body = br#"{"command":"GET","args":["k"]}"#;
     let resp = route(&cfg, &req("POST", "/api/redis/command", body)).await;
@@ -134,8 +136,10 @@ async fn redis_command_forwards_to_control_exec() {
 #[tokio::test]
 async fn redis_keys_get_forwards_to_introspect_keys() {
     let (base, record) = mock_upstream(200, r#"{"cursor":0,"nextCursor":0,"keys":[]}"#).await;
-    let mut cfg = Config::default();
-    cfg.redis_base = base;
+    let cfg = Config {
+        redis_base: base,
+        ..Config::default()
+    };
 
     let resp = route(
         &cfg,
@@ -153,8 +157,10 @@ async fn redis_keys_get_forwards_to_introspect_keys() {
 #[tokio::test]
 async fn redshift_query_forwards_to_control_query() {
     let (base, record) = mock_upstream(200, r#"{"result":{"statement":{"id":"s1"}}}"#).await;
-    let mut cfg = Config::default();
-    cfg.redshift_base = base;
+    let cfg = Config {
+        redshift_base: base,
+        ..Config::default()
+    };
 
     let body = br#"{"sql":"SELECT 1","maxRows":10}"#;
     let resp = route(&cfg, &req("POST", "/api/redshift/query", body)).await;
@@ -174,8 +180,10 @@ async fn redshift_clusters_rewraps_snapshot() {
         r#"{"status":"running","running":true,"clusters":[{"clusterIdentifier":"c1"}]}"#,
     )
     .await;
-    let mut cfg = Config::default();
-    cfg.redshift_base = base;
+    let cfg = Config {
+        redshift_base: base,
+        ..Config::default()
+    };
 
     let resp = route(&cfg, &req("GET", "/api/redshift/clusters", b"")).await;
     assert_eq!(resp.status, 200);
@@ -192,8 +200,10 @@ async fn redshift_clusters_rewraps_snapshot() {
 #[tokio::test]
 async fn dynamodb_create_table_forwards_provider_protocol() {
     let (base, record) = mock_upstream(200, r#"{"TableDescription":{"TableName":"t"}}"#).await;
-    let mut cfg = Config::default();
-    cfg.dynamodb_base = base;
+    let cfg = Config {
+        dynamodb_base: base,
+        ..Config::default()
+    };
 
     let body = br#"{"input":{"TableName":"t","KeySchema":[]}}"#;
     let resp = route(&cfg, &req("POST", "/api/dynamodb/tables", body)).await;
@@ -222,8 +232,10 @@ async fn dynamodb_tables_get_rewraps_snapshot() {
         r#"{"status":"running","running":true,"tables":[{"tableName":"t"}]}"#,
     )
     .await;
-    let mut cfg = Config::default();
-    cfg.dynamodb_base = base;
+    let cfg = Config {
+        dynamodb_base: base,
+        ..Config::default()
+    };
 
     let resp = route(&cfg, &req("GET", "/api/dynamodb/tables", b"")).await;
     assert_eq!(resp.status, 200);
@@ -239,8 +251,10 @@ async fn dynamodb_tables_get_rewraps_snapshot() {
 #[tokio::test]
 async fn mail_messages_get_forwards_to_introspect() {
     let (base, record) = mock_upstream(200, r#"{"messages":[]}"#).await;
-    let mut cfg = Config::default();
-    cfg.mail_base = base;
+    let cfg = Config {
+        mail_base: base,
+        ..Config::default()
+    };
 
     let resp = route(&cfg, &req("GET", "/api/messages", b"")).await;
     assert_eq!(resp.status, 200);
@@ -251,8 +265,10 @@ async fn mail_messages_get_forwards_to_introspect() {
 #[tokio::test]
 async fn mail_message_delete_forwards_to_control() {
     let (base, record) = mock_upstream(204, "").await;
-    let mut cfg = Config::default();
-    cfg.mail_base = base;
+    let cfg = Config {
+        mail_base: base,
+        ..Config::default()
+    };
 
     let resp = route(&cfg, &req("DELETE", "/api/messages/abc", b"")).await;
     assert_eq!(resp.status, 204);
@@ -266,8 +282,10 @@ async fn mail_message_delete_forwards_to_control() {
 #[tokio::test]
 async fn bigquery_query_forwards_rest_path() {
     let (base, record) = mock_upstream(200, r#"{"kind":"bigquery#queryResponse"}"#).await;
-    let mut cfg = Config::default();
-    cfg.bigquery_base = base;
+    let cfg = Config {
+        bigquery_base: base,
+        ..Config::default()
+    };
 
     let body = br#"{"query":"SELECT 1"}"#;
     let resp = route(
@@ -282,6 +300,168 @@ async fn bigquery_query_forwards_rest_path() {
     assert_eq!(rec.body, body);
 }
 
+#[tokio::test]
+async fn bigquery_dataset_delete_requires_confirmation() {
+    // A mismatched confirmation is rejected before any network call, so the
+    // upstream base can be a non-listening address.
+    let cfg = Config {
+        bigquery_base: "http://127.0.0.1:1".to_string(),
+        ..Config::default()
+    };
+
+    let resp = route(
+        &cfg,
+        &req(
+            "DELETE",
+            "/api/bigquery/projects/devcloud/datasets/analytics",
+            br#"{"confirmation":"wrong"}"#,
+        ),
+    )
+    .await;
+    assert_eq!(resp.status, 400);
+}
+
+#[tokio::test]
+async fn bigquery_dataset_delete_forwards_provider_204() {
+    let (base, record) = mock_upstream(204, "").await;
+    let cfg = Config {
+        bigquery_base: base,
+        ..Config::default()
+    };
+
+    let resp = route(
+        &cfg,
+        &req_q(
+            "DELETE",
+            "/api/bigquery/projects/devcloud/datasets/analytics",
+            "deleteContents=true",
+            br#"{"confirmation":"analytics"}"#,
+        ),
+    )
+    .await;
+    assert_eq!(resp.status, 204);
+    let rec = record.lock().unwrap().clone();
+    assert_eq!(rec.method, "DELETE");
+    assert_eq!(
+        rec.target,
+        "/bigquery/v2/projects/devcloud/datasets/analytics?deleteContents=true"
+    );
+}
+
+#[tokio::test]
+async fn bigquery_table_delete_forwards_provider_204() {
+    let (base, record) = mock_upstream(204, "").await;
+    let cfg = Config {
+        bigquery_base: base,
+        ..Config::default()
+    };
+
+    let resp = route(
+        &cfg,
+        &req(
+            "DELETE",
+            "/api/bigquery/projects/devcloud/datasets/analytics/tables/events",
+            br#"{"confirmation":"events"}"#,
+        ),
+    )
+    .await;
+    assert_eq!(resp.status, 204);
+    let rec = record.lock().unwrap().clone();
+    assert_eq!(rec.method, "DELETE");
+    assert_eq!(
+        rec.target,
+        "/bigquery/v2/projects/devcloud/datasets/analytics/tables/events"
+    );
+}
+
+// ── Application Auto Scaling: provider-protocol Describe forwarding ─────────
+
+#[tokio::test]
+async fn applicationautoscaling_status_reports_disabled_without_base() {
+    let cfg = Config::default();
+    let resp = route(&cfg, &req("GET", "/api/applicationautoscaling/status", b"")).await;
+    assert_eq!(resp.status, 200);
+    let v: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+    assert_eq!(v["status"], "disabled");
+}
+
+#[tokio::test]
+async fn applicationautoscaling_scalable_targets_forwards_describe_action() {
+    let (base, record) = mock_upstream(
+        200,
+        r#"{"ScalableTargets":[{"ServiceNamespace":"dynamodb","ResourceId":"table/t","ScalableDimension":"dynamodb:table:ReadCapacityUnits","MinCapacity":1,"MaxCapacity":10,"SuspendedState":{},"CreationTime":"2024-01-01T00:00:00Z"}]}"#,
+    )
+    .await;
+    let cfg = Config {
+        app_auto_scaling_base: base,
+        ..Config::default()
+    };
+
+    let resp = route(
+        &cfg,
+        &req("GET", "/api/applicationautoscaling/scalable-targets", b""),
+    )
+    .await;
+    assert_eq!(resp.status, 200);
+    let rec = record.lock().unwrap().clone();
+    assert_eq!(rec.method, "POST");
+    assert_eq!(rec.target, "/");
+    assert_eq!(
+        rec.headers.get("x-amz-target").map(String::as_str),
+        Some("AnyScaleFrontendService.DescribeScalableTargets")
+    );
+    let sent: serde_json::Value = serde_json::from_slice(&rec.body).unwrap();
+    assert_eq!(sent["ServiceNamespace"], "dynamodb");
+    let v: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+    assert_eq!(v["scalableTargets"][0]["ResourceId"], "table/t");
+}
+
+#[tokio::test]
+async fn applicationautoscaling_scaling_policies_forwards_describe_action() {
+    let (base, record) = mock_upstream(200, r#"{"ScalingPolicies":[]}"#).await;
+    let cfg = Config {
+        app_auto_scaling_base: base,
+        ..Config::default()
+    };
+
+    let resp = route(
+        &cfg,
+        &req("GET", "/api/applicationautoscaling/scaling-policies", b""),
+    )
+    .await;
+    assert_eq!(resp.status, 200);
+    let rec = record.lock().unwrap().clone();
+    assert_eq!(
+        rec.headers.get("x-amz-target").map(String::as_str),
+        Some("AnyScaleFrontendService.DescribeScalingPolicies")
+    );
+    let v: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+    assert_eq!(v["scalingPolicies"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn applicationautoscaling_scheduled_actions_forwards_describe_action() {
+    let (base, record) = mock_upstream(200, r#"{"ScheduledActions":[]}"#).await;
+    let cfg = Config {
+        app_auto_scaling_base: base,
+        ..Config::default()
+    };
+
+    let resp = route(
+        &cfg,
+        &req("GET", "/api/applicationautoscaling/scheduled-actions", b""),
+    )
+    .await;
+    assert_eq!(resp.status, 200);
+    let rec = record.lock().unwrap().clone();
+    assert_eq!(
+        rec.headers.get("x-amz-target").map(String::as_str),
+        Some("AnyScaleFrontendService.DescribeScheduledActions")
+    );
+    let v: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+    assert_eq!(v["scheduledActions"].as_array().unwrap().len(), 0);
+}
+
 // ── Pub/Sub: snapshot read re-wrap ──────────────────────────────────────────
 
 #[tokio::test]
@@ -291,8 +471,10 @@ async fn pubsub_topics_get_rewraps_snapshot() {
         r#"{"project":"devcloud","status":"running","running":true,"topics":[{"name":"projects/devcloud/topics/t"}]}"#,
     )
     .await;
-    let mut cfg = Config::default();
-    cfg.pubsub_base = base;
+    let cfg = Config {
+        pubsub_base: base,
+        ..Config::default()
+    };
 
     let resp = route(&cfg, &req("GET", "/api/pubsub/topics", b"")).await;
     assert_eq!(resp.status, 200);
@@ -308,8 +490,10 @@ async fn pubsub_topics_get_rewraps_snapshot() {
 #[tokio::test]
 async fn gcs_uploads_forwards_to_introspect() {
     let (base, record) = mock_upstream(200, r#"{"sessions":[]}"#).await;
-    let mut cfg = Config::default();
-    cfg.gcs_base = base;
+    let cfg = Config {
+        gcs_base: base,
+        ..Config::default()
+    };
 
     let resp = route(&cfg, &req("GET", "/api/gcs/uploads", b"")).await;
     assert_eq!(resp.status, 200);
@@ -321,8 +505,10 @@ async fn gcs_uploads_forwards_to_introspect() {
 async fn gcs_buckets_get_forwards_to_introspect() {
     let (base, record) =
         mock_upstream(200, r#"{"buckets":[{"name":"alpha","objectCount":2}]}"#).await;
-    let mut cfg = Config::default();
-    cfg.gcs_base = base;
+    let cfg = Config {
+        gcs_base: base,
+        ..Config::default()
+    };
 
     let resp = route(&cfg, &req("GET", "/api/gcs/buckets", b"")).await;
     assert_eq!(resp.status, 200);
@@ -341,8 +527,10 @@ async fn gcs_bucket_detail_forwards_to_introspect() {
         r#"{"name":"alpha","objectCount":1,"gcsUri":"gs://alpha"}"#,
     )
     .await;
-    let mut cfg = Config::default();
-    cfg.gcs_base = base;
+    let cfg = Config {
+        gcs_base: base,
+        ..Config::default()
+    };
 
     let resp = route(&cfg, &req("GET", "/api/gcs/buckets/alpha", b"")).await;
     assert_eq!(resp.status, 200);
@@ -356,8 +544,10 @@ async fn gcs_bucket_detail_forwards_to_introspect() {
 async fn gcs_objects_forwards_prefix_to_introspect() {
     let (base, record) =
         mock_upstream(200, r#"{"bucket":"alpha","prefix":"logs/","objects":[]}"#).await;
-    let mut cfg = Config::default();
-    cfg.gcs_base = base;
+    let cfg = Config {
+        gcs_base: base,
+        ..Config::default()
+    };
 
     let resp = route(
         &cfg,
@@ -381,8 +571,10 @@ async fn gcs_objects_forwards_prefix_to_introspect() {
 async fn gcs_object_detail_forwards_to_introspect() {
     let (base, record) =
         mock_upstream(200, r#"{"name":"a.txt","gcsUri":"gs://alpha/a.txt"}"#).await;
-    let mut cfg = Config::default();
-    cfg.gcs_base = base;
+    let cfg = Config {
+        gcs_base: base,
+        ..Config::default()
+    };
 
     let resp = route(
         &cfg,
@@ -401,8 +593,10 @@ async fn gcs_create_bucket_forwards_provider_and_rewraps_201() {
         r#"{"kind":"storage#bucket","name":"alpha","timeCreated":"2024-06-01T12:00:00Z"}"#,
     )
     .await;
-    let mut cfg = Config::default();
-    cfg.gcs_base = base;
+    let cfg = Config {
+        gcs_base: base,
+        ..Config::default()
+    };
 
     let body = br#"{"name":"alpha"}"#;
     let resp = route(&cfg, &req("POST", "/api/gcs/buckets", body)).await;
@@ -422,8 +616,10 @@ async fn gcs_create_bucket_forwards_provider_and_rewraps_201() {
 #[tokio::test]
 async fn gcs_create_bucket_conflict_maps_409() {
     let (base, _record) = mock_upstream(409, r#"{"error":{"code":409,"message":"exists"}}"#).await;
-    let mut cfg = Config::default();
-    cfg.gcs_base = base;
+    let cfg = Config {
+        gcs_base: base,
+        ..Config::default()
+    };
 
     let resp = route(&cfg, &req("POST", "/api/gcs/buckets", br#"{"name":"a"}"#)).await;
     assert_eq!(resp.status, 409);
@@ -432,8 +628,10 @@ async fn gcs_create_bucket_conflict_maps_409() {
 #[tokio::test]
 async fn gcs_delete_bucket_forwards_provider_204() {
     let (base, record) = mock_upstream(204, "").await;
-    let mut cfg = Config::default();
-    cfg.gcs_base = base;
+    let cfg = Config {
+        gcs_base: base,
+        ..Config::default()
+    };
 
     let resp = route(&cfg, &req("DELETE", "/api/gcs/buckets/alpha", b"")).await;
     assert_eq!(resp.status, 204);
@@ -445,8 +643,10 @@ async fn gcs_delete_bucket_forwards_provider_204() {
 #[tokio::test]
 async fn gcs_delete_object_forwards_provider_204() {
     let (base, record) = mock_upstream(204, "").await;
-    let mut cfg = Config::default();
-    cfg.gcs_base = base;
+    let cfg = Config {
+        gcs_base: base,
+        ..Config::default()
+    };
 
     let resp = route(
         &cfg,
@@ -462,8 +662,10 @@ async fn gcs_delete_object_forwards_provider_204() {
 #[tokio::test]
 async fn gcs_delete_upload_session_forwards_to_control() {
     let (base, record) = mock_upstream(204, "").await;
-    let mut cfg = Config::default();
-    cfg.gcs_base = base;
+    let cfg = Config {
+        gcs_base: base,
+        ..Config::default()
+    };
 
     let resp = route(&cfg, &req("DELETE", "/api/gcs/uploads/aaa111", b"")).await;
     assert_eq!(resp.status, 204);
@@ -481,8 +683,10 @@ async fn s3_buckets_get_forwards_to_introspect() {
         r#"{"buckets":[{"name":"demo","creationDate":"2020-01-01T00:00:00Z","objectCount":2}]}"#,
     )
     .await;
-    let mut cfg = Config::default();
-    cfg.s3_base = base;
+    let cfg = Config {
+        s3_base: base,
+        ..Config::default()
+    };
 
     let resp = route(&cfg, &req("GET", "/api/s3/buckets", b"")).await;
     assert_eq!(resp.status, 200);
@@ -502,8 +706,10 @@ async fn s3_objects_get_forwards_to_introspect_with_prefix() {
         r#"{"bucket":"demo","prefix":"docs/","objects":[{"key":"docs/a.txt","s3Uri":"s3://demo/docs/a.txt"}]}"#,
     )
     .await;
-    let mut cfg = Config::default();
-    cfg.s3_base = base;
+    let cfg = Config {
+        s3_base: base,
+        ..Config::default()
+    };
 
     let resp = route(
         &cfg,
@@ -523,8 +729,10 @@ async fn s3_objects_get_forwards_to_introspect_with_prefix() {
 #[tokio::test]
 async fn s3_multipart_get_forwards_to_introspect() {
     let (base, record) = mock_upstream(200, r#"{"bucket":"demo","uploads":[]}"#).await;
-    let mut cfg = Config::default();
-    cfg.s3_base = base;
+    let cfg = Config {
+        s3_base: base,
+        ..Config::default()
+    };
 
     let resp = route(&cfg, &req("GET", "/api/s3/buckets/demo/multipart", b"")).await;
     assert_eq!(resp.status, 200);
@@ -539,8 +747,10 @@ async fn s3_bucket_detail_get_forwards_to_introspect() {
         r#"{"name":"demo","creationDate":"2020-01-01T00:00:00Z","objectCount":0}"#,
     )
     .await;
-    let mut cfg = Config::default();
-    cfg.s3_base = base;
+    let cfg = Config {
+        s3_base: base,
+        ..Config::default()
+    };
 
     let resp = route(&cfg, &req("GET", "/api/s3/buckets/demo", b"")).await;
     assert_eq!(resp.status, 200);
@@ -551,8 +761,10 @@ async fn s3_bucket_detail_get_forwards_to_introspect() {
 #[tokio::test]
 async fn s3_bucket_delete_forwards_provider_protocol() {
     let (base, record) = mock_upstream(204, "").await;
-    let mut cfg = Config::default();
-    cfg.s3_base = base;
+    let cfg = Config {
+        s3_base: base,
+        ..Config::default()
+    };
 
     let resp = route(&cfg, &req("DELETE", "/api/s3/buckets/demo", b"")).await;
     assert_eq!(resp.status, 204);
@@ -568,8 +780,10 @@ async fn s3_object_put_provider_error_relays_code_and_message() {
         r#"<Error><Code>BucketNotEmpty</Code><Message>bucket has objects</Message></Error>"#,
     )
     .await;
-    let mut cfg = Config::default();
-    cfg.s3_base = base;
+    let cfg = Config {
+        s3_base: base,
+        ..Config::default()
+    };
 
     let resp = route(
         &cfg,
@@ -590,8 +804,10 @@ async fn s3_object_delete_forwards_to_control_endpoint() {
     // the idempotent provider DELETE), relaying its 204 verbatim. The key is
     // encoded as a single path segment so a literal "/" becomes "%2F".
     let (base, record) = mock_upstream(204, "").await;
-    let mut cfg = Config::default();
-    cfg.s3_base = base;
+    let cfg = Config {
+        s3_base: base,
+        ..Config::default()
+    };
 
     let resp = route(
         &cfg,
@@ -609,8 +825,10 @@ async fn s3_object_delete_absent_relays_control_404() {
     // The /_control/ endpoint returns 404 when the object was absent (unlike the
     // provider DELETE, which is idempotent). The dashboard relays that 404.
     let (base, _record) = mock_upstream(404, "{\"error\":\"object does not exist\"}").await;
-    let mut cfg = Config::default();
-    cfg.s3_base = base;
+    let cfg = Config {
+        s3_base: base,
+        ..Config::default()
+    };
 
     let resp = route(
         &cfg,
@@ -623,8 +841,10 @@ async fn s3_object_delete_absent_relays_control_404() {
 #[tokio::test]
 async fn s3_object_download_forwards_provider_get_and_defaults_disposition() {
     let (base, record) = mock_upstream(200, "hello body").await;
-    let mut cfg = Config::default();
-    cfg.s3_base = base;
+    let cfg = Config {
+        s3_base: base,
+        ..Config::default()
+    };
 
     let resp = route(
         &cfg,

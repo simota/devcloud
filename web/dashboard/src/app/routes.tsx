@@ -9,6 +9,7 @@ import { RedisDashboard } from './services/redis/RedisDashboard'
 import { SQSDashboard } from './services/sqs/SQSDashboard'
 import { PubSubDashboard } from './services/pubsub/PubSubDashboard'
 import { GCSDashboard } from './services/gcs/GCSDashboard'
+import { ApplicationAutoScalingDashboard } from './services/applicationautoscaling/ApplicationAutoScalingDashboard'
 
 type RouteProps = {
   services: DashboardService[]
@@ -42,6 +43,11 @@ export function renderRoute({ services, path }: RouteProps): JSX.Element {
   }
   if (path === '/pubsub') {
     return <PubSubDashboard service={services.find((service) => service.id === 'pubsub')} />
+  }
+  if (path === '/applicationautoscaling') {
+    return (
+      <ApplicationAutoScalingDashboard service={services.find((service) => service.id === 'applicationautoscaling')} />
+    )
   }
   return <ServiceIndex services={services} />
 }

@@ -17,6 +17,7 @@
 //!   - [`services`] the `/api/services` registry.
 //!   - [`sqs`]      the SQS `/api/sqs/*` handler — the reusable per-service template.
 
+pub mod applicationautoscaling;
 pub mod assets;
 pub mod bigquery;
 pub mod config;

@@ -87,6 +87,15 @@
         "path": "\u003cPATH\u003e",
         "status": "running",
         "storagePath": "\u003cPATH\u003e"
+      },
+      {
+        "description": "Inspect local Application Auto Scaling targets, policies, and scheduled actions.",
+        "endpoint": "http://\u003cADDR\u003e",
+        "id": "\u003cID\u003e",
+        "name": "Application Auto Scaling",
+        "path": "\u003cPATH\u003e",
+        "status": "running",
+        "storagePath": "\u003cPATH\u003e"
       }
     ]
   }

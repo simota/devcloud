@@ -1,7 +1,13 @@
 import { useEffect, useState } from 'react'
 import type { FormEvent } from 'react'
 import { Button } from '../../../ui/Button'
-import { createBigQueryDataset, createBigQueryTable, insertBigQueryRows } from './api'
+import {
+  createBigQueryDataset,
+  createBigQueryTable,
+  deleteBigQueryDataset,
+  deleteBigQueryTable,
+  insertBigQueryRows,
+} from './api'
 import { parseInsertRows, parseJSONRecord, parseSchemaFields, readNestedString } from './helpers'
 import type { OperationState } from './state'
 import type { BigQueryDatasetCreateRequest, BigQueryTableCreateRequest } from './types'
@@ -38,18 +44,29 @@ export function BigQueryManagementPanel({
   const [rowTableId, setRowTableId] = useState('')
   const [insertId, setInsertId] = useState('')
   const [rowJSON, setRowJSON] = useState('{\n  "event_id": "evt-1",\n  "payload": "local test"\n}')
+  const [deleteDatasetId, setDeleteDatasetId] = useState('')
+  const [deleteDatasetContents, setDeleteDatasetContents] = useState(false)
+  const [deleteDatasetAcknowledged, setDeleteDatasetAcknowledged] = useState(false)
+  const [deleteDatasetConfirmation, setDeleteDatasetConfirmation] = useState('')
+  const [deleteTableDatasetId, setDeleteTableDatasetId] = useState('')
+  const [deleteTableId, setDeleteTableId] = useState('')
+  const [deleteTableAcknowledged, setDeleteTableAcknowledged] = useState(false)
+  const [deleteTableConfirmation, setDeleteTableConfirmation] = useState('')
   const [operationState, setOperationState] = useState<OperationState>({ status: 'idle' })
 
   useEffect(() => {
     if (activeDatasetId) {
       setTableDatasetId((current) => current || activeDatasetId)
       setRowDatasetId((current) => current || activeDatasetId)
+      setDeleteDatasetId((current) => current || activeDatasetId)
+      setDeleteTableDatasetId((current) => current || activeDatasetId)
     }
   }, [activeDatasetId])
 
   useEffect(() => {
     if (activeTableId) {
       setRowTableId((current) => current || activeTableId)
+      setDeleteTableId((current) => current || activeTableId)
     }
   }, [activeTableId])
 
@@ -155,6 +172,65 @@ export function BigQueryManagementPanel({
           message: insertErrors?.length ? 'Insert completed with partial insert errors.' : 'Inserted row data.',
           insertErrors,
         })
+        onMutationSuccess()
+      })
+      .catch((error: Error) => {
+        setOperationState({ status: 'error', message: error.message })
+      })
+  }
+
+  function submitDeleteDataset(event: FormEvent<HTMLFormElement>): void {
+    event.preventDefault()
+    const targetDatasetId = deleteDatasetId.trim()
+    if (!targetDatasetId) {
+      setOperationState({ status: 'error', message: 'Choose a dataset to delete.' })
+      return
+    }
+    if (!deleteDatasetAcknowledged) {
+      setOperationState({ status: 'error', message: 'Acknowledge the delete-dataset destructive action before confirming the dataset ID.' })
+      return
+    }
+    if (deleteDatasetConfirmation !== targetDatasetId) {
+      setOperationState({ status: 'error', message: 'Delete-dataset confirmation must match the dataset ID.' })
+      return
+    }
+
+    setOperationState({ status: 'running', label: 'Deleting dataset' })
+    deleteBigQueryDataset(projectId, targetDatasetId, deleteDatasetConfirmation, deleteDatasetContents)
+      .then(() => {
+        setOperationState({ status: 'success', message: `Deleted dataset ${targetDatasetId}.` })
+        setDeleteDatasetConfirmation('')
+        setDeleteDatasetAcknowledged(false)
+        onMutationSuccess()
+      })
+      .catch((error: Error) => {
+        setOperationState({ status: 'error', message: error.message })
+      })
+  }
+
+  function submitDeleteTable(event: FormEvent<HTMLFormElement>): void {
+    event.preventDefault()
+    const targetDatasetId = deleteTableDatasetId.trim()
+    const targetTableId = deleteTableId.trim()
+    if (!targetDatasetId || !targetTableId) {
+      setOperationState({ status: 'error', message: 'Choose a dataset and table to delete.' })
+      return
+    }
+    if (!deleteTableAcknowledged) {
+      setOperationState({ status: 'error', message: 'Acknowledge the delete-table destructive action before confirming the table ID.' })
+      return
+    }
+    if (deleteTableConfirmation !== targetTableId) {
+      setOperationState({ status: 'error', message: 'Delete-table confirmation must match the table ID.' })
+      return
+    }
+
+    setOperationState({ status: 'running', label: 'Deleting table' })
+    deleteBigQueryTable(projectId, targetDatasetId, targetTableId, deleteTableConfirmation)
+      .then(() => {
+        setOperationState({ status: 'success', message: `Deleted table ${targetDatasetId}.${targetTableId}.` })
+        setDeleteTableConfirmation('')
+        setDeleteTableAcknowledged(false)
         onMutationSuccess()
       })
       .catch((error: Error) => {
@@ -381,6 +457,120 @@ export function BigQueryManagementPanel({
         <p className="inspector-muted">JSON validation runs locally before tabledata.insertAll. Row payloads are not written to logs.</p>
         <Button disabled={mutationDisabled} type="submit">
           Insert row
+        </Button>
+      </form>
+
+      <form className="dynamodb-operation-form" onSubmit={submitDeleteDataset}>
+        <span className="inspector-label">Delete dataset</span>
+        <div className="pubsub-action-row">
+          <label className="compact-filter">
+            <span>Dataset ID</span>
+            <input
+              aria-label="BigQuery delete dataset ID"
+              disabled={mutationDisabled}
+              onChange={(event) => setDeleteDatasetId(event.target.value)}
+              placeholder={activeDatasetId ?? 'dataset'}
+              value={deleteDatasetId}
+            />
+          </label>
+          <label className="compact-filter small">
+            <span>Delete contents</span>
+            <input
+              aria-label="Delete BigQuery dataset contents"
+              checked={deleteDatasetContents}
+              disabled={mutationDisabled}
+              onChange={(event) => setDeleteDatasetContents(event.target.checked)}
+              type="checkbox"
+            />
+          </label>
+        </div>
+        <label className="destructive-confirmation">
+          <input
+            aria-label="I understand this deletes the dataset and, if selected, its tables."
+            checked={deleteDatasetAcknowledged}
+            disabled={mutationDisabled}
+            onChange={(event) => setDeleteDatasetAcknowledged(event.target.checked)}
+            type="checkbox"
+          />
+          <span>Step 1: I understand this deletes the dataset{deleteDatasetContents ? ' and all of its tables' : ''}.</span>
+        </label>
+        <label className="compact-filter">
+          <span>Step 2: Type {deleteDatasetId || 'dataset id'} to delete dataset</span>
+          <input
+            aria-label="BigQuery delete dataset confirmation"
+            disabled={mutationDisabled}
+            onChange={(event) => setDeleteDatasetConfirmation(event.target.value)}
+            value={deleteDatasetConfirmation}
+          />
+        </label>
+        <Button
+          className="danger"
+          disabled={
+            mutationDisabled ||
+            !deleteDatasetAcknowledged ||
+            deleteDatasetConfirmation !== deleteDatasetId.trim() ||
+            deleteDatasetId.trim() === ''
+          }
+          type="submit"
+        >
+          Delete dataset
+        </Button>
+      </form>
+
+      <form className="dynamodb-operation-form" onSubmit={submitDeleteTable}>
+        <span className="inspector-label">Delete table</span>
+        <div className="pubsub-action-row">
+          <label className="compact-filter">
+            <span>Dataset ID</span>
+            <input
+              aria-label="BigQuery delete table dataset ID"
+              disabled={mutationDisabled}
+              onChange={(event) => setDeleteTableDatasetId(event.target.value)}
+              placeholder={activeDatasetId ?? 'dataset'}
+              value={deleteTableDatasetId}
+            />
+          </label>
+          <label className="compact-filter">
+            <span>Table ID</span>
+            <input
+              aria-label="BigQuery delete table ID"
+              disabled={mutationDisabled}
+              onChange={(event) => setDeleteTableId(event.target.value)}
+              placeholder={activeTableId ?? 'table'}
+              value={deleteTableId}
+            />
+          </label>
+        </div>
+        <label className="destructive-confirmation">
+          <input
+            aria-label="I understand this deletes the table and its local rows."
+            checked={deleteTableAcknowledged}
+            disabled={mutationDisabled}
+            onChange={(event) => setDeleteTableAcknowledged(event.target.checked)}
+            type="checkbox"
+          />
+          <span>Step 1: I understand this deletes the table and its local rows.</span>
+        </label>
+        <label className="compact-filter">
+          <span>Step 2: Type {deleteTableId || 'table id'} to delete table</span>
+          <input
+            aria-label="BigQuery delete table confirmation"
+            disabled={mutationDisabled}
+            onChange={(event) => setDeleteTableConfirmation(event.target.value)}
+            value={deleteTableConfirmation}
+          />
+        </label>
+        <Button
+          className="danger"
+          disabled={
+            mutationDisabled ||
+            !deleteTableAcknowledged ||
+            deleteTableConfirmation !== deleteTableId.trim() ||
+            deleteTableId.trim() === ''
+          }
+          type="submit"
+        >
+          Delete table
         </Button>
       </form>
     </section>

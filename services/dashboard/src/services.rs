@@ -147,6 +147,16 @@ fn build(c: &Config) -> Vec<DashboardService> {
             storage_path: c.pubsub_storage_path.clone(),
             description: "Inspect local Pub/Sub topics, subscriptions, backlog, and leases.",
         },
+        DashboardService {
+            id: "applicationautoscaling",
+            name: "Application Auto Scaling",
+            path: "/dashboard/applicationautoscaling",
+            status: status(!c.app_auto_scaling_base.is_empty()),
+            endpoint: c.app_auto_scaling_endpoint.clone(),
+            storage_path: c.app_auto_scaling_storage_path.clone(),
+            description:
+                "Inspect local Application Auto Scaling targets, policies, and scheduled actions.",
+        },
     ]
 }
 
@@ -177,7 +187,7 @@ mod tests {
     }
 
     #[test]
-    fn registry_lists_nine_services_in_order() {
+    fn registry_lists_ten_services_in_order() {
         let cfg = Config::default();
         let resp = handle(&cfg, &req());
         assert_eq!(resp.status, 200);
@@ -186,7 +196,18 @@ mod tests {
         let ids: Vec<&str> = services.iter().map(|s| s["id"].as_str().unwrap()).collect();
         assert_eq!(
             ids,
-            ["mail", "s3", "gcs", "dynamodb", "bigquery", "redshift", "redis", "sqs", "pubsub"]
+            [
+                "mail",
+                "s3",
+                "gcs",
+                "dynamodb",
+                "bigquery",
+                "redshift",
+                "redis",
+                "sqs",
+                "pubsub",
+                "applicationautoscaling"
+            ]
         );
     }
 

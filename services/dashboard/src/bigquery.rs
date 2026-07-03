@@ -182,6 +182,40 @@ pub async fn handle_project_resource(config: &Config, req: &Request) -> Response
         }
     }
 
+    // --- REST mutation routes (DELETE), forwarded to the provider protocol.
+    // The real BigQuery REST API takes no request body on DELETE, so — mirroring
+    // `dynamodb::forward_operation`'s confirmation guard — the dashboard requires a
+    // JSON `{confirmation}` envelope matching the resource id before forwarding.
+    if req.method == "DELETE" {
+        if parts.len() == 3 && parts[1] == "datasets" {
+            return forward_delete(
+                config,
+                req,
+                &format!(
+                    "/bigquery/v2/projects/{}/datasets/{}",
+                    enc(project),
+                    enc(&parts[2])
+                ),
+                &parts[2],
+            )
+            .await;
+        }
+        if parts.len() == 5 && parts[1] == "datasets" && parts[3] == "tables" {
+            return forward_delete(
+                config,
+                req,
+                &format!(
+                    "/bigquery/v2/projects/{}/datasets/{}/tables/{}",
+                    enc(project),
+                    enc(&parts[2]),
+                    enc(&parts[4])
+                ),
+                &parts[4],
+            )
+            .await;
+        }
+    }
+
     if req.method != "GET" {
         return Response::method_not_allowed("GET");
     }
@@ -340,6 +374,46 @@ async fn forward_rest(config: &Config, req: &Request, path: &str) -> Response {
         path: &full_path,
         headers,
         body: req.body.clone(),
+    })
+    .await
+    {
+        Ok(resp) => relay(resp),
+        Err(e) => forward_failure(e),
+    }
+}
+
+/// Forwards a dashboard DELETE to the BigQuery provider protocol. Requires the
+/// JSON body's `confirmation` field to equal `required_confirmation` (the
+/// dataset or table id being deleted) before forwarding a bodyless DELETE,
+/// passing the query string through (e.g. `deleteContents` for datasets).
+async fn forward_delete(
+    config: &Config,
+    req: &Request,
+    path: &str,
+    required_confirmation: &str,
+) -> Response {
+    let envelope: Value = match serde_json::from_slice(&req.body) {
+        Ok(v) => v,
+        Err(_) => return Response::text_error(400, "invalid json request"),
+    };
+    let confirmation = envelope
+        .get("confirmation")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if confirmation != required_confirmation {
+        return Response::text_error(400, "confirmation must match the resource id");
+    }
+    let full_path = if req.query.is_empty() {
+        path.to_string()
+    } else {
+        format!("{path}?{}", req.query)
+    };
+    match forward(ForwardRequest {
+        base: &config.bigquery_base,
+        method: "DELETE",
+        path: &full_path,
+        headers: Vec::new(),
+        body: Vec::new(),
     })
     .await
     {

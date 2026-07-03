@@ -1,4 +1,4 @@
-import { fetchJSON } from '../../api/client'
+import { fetchJSON, fetchNoContent } from '../../api/client'
 import type {
   BigQueryDatasetsResponse,
   BigQueryDatasetCreateRequest,
@@ -80,6 +80,37 @@ export async function createBigQueryTable(
     {
       method: 'POST',
       body: request,
+    },
+  )
+}
+
+export async function deleteBigQueryDataset(
+  projectId: string,
+  datasetId: string,
+  confirmation: string,
+  deleteContents: boolean,
+): Promise<void> {
+  const query = deleteContents ? '?deleteContents=true' : ''
+  return fetchNoContent(
+    `/api/bigquery/projects/${encodeURIComponent(projectId)}/datasets/${encodeURIComponent(datasetId)}${query}`,
+    {
+      method: 'DELETE',
+      body: { confirmation },
+    },
+  )
+}
+
+export async function deleteBigQueryTable(
+  projectId: string,
+  datasetId: string,
+  tableId: string,
+  confirmation: string,
+): Promise<void> {
+  return fetchNoContent(
+    `/api/bigquery/projects/${encodeURIComponent(projectId)}/datasets/${encodeURIComponent(datasetId)}/tables/${encodeURIComponent(tableId)}`,
+    {
+      method: 'DELETE',
+      body: { confirmation },
     },
   )
 }

@@ -67,6 +67,11 @@ pub struct Config {
     pub pubsub_base: String,
     pub pubsub_endpoint: String,
     pub pubsub_storage_path: String,
+
+    pub app_auto_scaling_base: String,
+    pub app_auto_scaling_endpoint: String,
+    pub app_auto_scaling_storage_path: String,
+    pub app_auto_scaling_region: String,
 }
 
 impl Config {
@@ -139,6 +144,20 @@ impl Config {
             pubsub_storage_path: env_or(
                 "DEVCLOUD_DASHBOARD_PUBSUB_STORAGE",
                 ".devcloud/data/pubsub",
+            ),
+
+            app_auto_scaling_base: env("DEVCLOUD_DASHBOARD_APPAUTOSCALING_BASE"),
+            app_auto_scaling_endpoint: env_or(
+                "DEVCLOUD_DASHBOARD_APPAUTOSCALING_ENDPOINT",
+                "http://127.0.0.1:18030",
+            ),
+            app_auto_scaling_storage_path: env_or(
+                "DEVCLOUD_DASHBOARD_APPAUTOSCALING_STORAGE",
+                ".devcloud/data/applicationautoscaling",
+            ),
+            app_auto_scaling_region: env_or(
+                "DEVCLOUD_DASHBOARD_APPAUTOSCALING_REGION",
+                "us-east-1",
             ),
         }
     }

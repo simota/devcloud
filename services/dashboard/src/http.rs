@@ -19,7 +19,8 @@ use tokio::net::{TcpListener, TcpStream};
 
 use crate::config::Config;
 use crate::{
-    assets, bigquery, dynamodb, events, gcs, mail, pubsub, redis, redshift, s3, services, sqs,
+    applicationautoscaling, assets, bigquery, dynamodb, events, gcs, mail, pubsub, redis, redshift,
+    s3, services, sqs,
 };
 
 const MAX_HEADER_BYTES: usize = 64 * 1024;
@@ -284,6 +285,20 @@ pub async fn route(config: &Config, req: &Request) -> Response {
     }
     if path.starts_with("/api/pubsub/messages/") {
         return pubsub::handle_message(config, req).await;
+    }
+
+    // Application Auto Scaling.
+    if path == "/api/applicationautoscaling/status" {
+        return applicationautoscaling::handle_status(config, req).await;
+    }
+    if path == "/api/applicationautoscaling/scalable-targets" {
+        return applicationautoscaling::handle_scalable_targets(config, req).await;
+    }
+    if path == "/api/applicationautoscaling/scaling-policies" {
+        return applicationautoscaling::handle_scaling_policies(config, req).await;
+    }
+    if path == "/api/applicationautoscaling/scheduled-actions" {
+        return applicationautoscaling::handle_scheduled_actions(config, req).await;
     }
 
     Response::text_error(404, "404 page not found")
