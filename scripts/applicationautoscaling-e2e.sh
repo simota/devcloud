@@ -355,9 +355,12 @@ main() {
   devcloud_build "${TMP_DIR}/devcloud"
 
   log "starting devcloud"
+  # `exec` keeps $! pointing at the devcloud process itself; without it,
+  # bash 3.2 leaves the binary running as an orphan after cleanup kills the
+  # subshell wrapper.
   (
     cd "${WORKSPACE}"
-    "${TMP_DIR}/devcloud" up
+    exec "${TMP_DIR}/devcloud" up
   ) >"${TMP_DIR}/devcloud-up.log" 2>&1 &
   DEV_PID="$!"
 
