@@ -126,6 +126,33 @@ fn versioning_marker_and_rebuild_match_oracle() {
 }
 
 #[test]
+fn rebuild_current_object_tie_breaks_deterministically_on_equal_timestamps() {
+    // Three versions sharing an identical last_modified (forced via
+    // `set_fixed_now`) must not let the current-object rebuild depend on
+    // `fs::read_dir` order: the tie-break must always prefer the
+    // lexicographically greatest version id among the equal-timestamp versions.
+    let mut store = FileBucketStore::new(tempdir());
+    store.create_bucket("vers").unwrap();
+    store.put_bucket_versioning("vers", "Enabled").unwrap();
+    store.set_fixed_now("2026-05-30T12:00:00Z");
+    store.push_version_ids(&["v1", "v2", "v3"]);
+
+    put(&store, "vers", "v.txt", "one");
+    put(&store, "vers", "v.txt", "two");
+    put(&store, "vers", "v.txt", "three");
+
+    // Deleting the newest version (v3) leaves v1/v2 tied on last_modified;
+    // v2 must win regardless of directory read order.
+    let (_, removed) = store
+        .delete_object_version("vers", "v.txt", "v3", false)
+        .unwrap();
+    assert!(removed);
+    let (current, body) = store.get_object("vers", "v.txt").unwrap().unwrap();
+    assert_eq!(current.version_id, "v2");
+    assert_eq!(body, b"two");
+}
+
+#[test]
 fn suspended_versioning_uses_null_version_id() {
     let store = FileBucketStore::new(tempdir());
     store.create_bucket("sus").unwrap();

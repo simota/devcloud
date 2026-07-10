@@ -424,7 +424,10 @@ impl FileBucketStore {
                 } else if time_after(&b.last_modified, &a.last_modified) {
                     Ordering::Greater
                 } else {
-                    Ordering::Equal
+                    // Equal timestamps: tie-break on version id (descending) so
+                    // the "latest" version matches `rebuild_current_object`
+                    // regardless of directory read order.
+                    b.version_id.cmp(&a.version_id)
                 }
             }
             other => other,
@@ -508,7 +511,14 @@ impl FileBucketStore {
             let object = read_object(&version_path.join("object.json"))?
                 .ok_or_else(|| missing("read object version metadata"))?;
             if let Some(ref l) = latest {
-                if !time_after(&object.last_modified, &l.last_modified) {
+                if time_after(&l.last_modified, &object.last_modified) {
+                    continue;
+                }
+                // On an exact timestamp tie, break deterministically on version id
+                // rather than `fs::read_dir` order (which is filesystem-dependent).
+                if !time_after(&object.last_modified, &l.last_modified)
+                    && object.version_id <= l.version_id
+                {
                     continue;
                 }
             }
