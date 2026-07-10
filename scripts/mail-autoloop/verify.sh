@@ -152,7 +152,7 @@ start_devcloud() {
 
   (
     cd "${TMP_DIR}"
-    "${TMP_DIR}/devcloud" up
+    exec "${TMP_DIR}/devcloud" up
   ) >"${TMP_DIR}/devcloud-up.log" 2>&1 &
   DEV_PID="$!"
 }

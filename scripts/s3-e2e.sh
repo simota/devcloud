@@ -301,7 +301,7 @@ write_config "${WORKSPACE}"
 log "starting devcloud up on s3=${S3_PORT}, dashboard=${DASHBOARD_PORT}, smtp=${SMTP_PORT}"
 (
   cd "${WORKSPACE}"
-  "${BIN}" up
+  exec "${BIN}" up
 ) > "${TMP_DIR}/devcloud-up.log" 2>&1 &
 DEV_PID="$!"
 

@@ -516,7 +516,7 @@ write_config "${WORKSPACE}"
 log "starting devcloud up on bigquery=${BIGQUERY_PORT}, gcs=${GCS_PORT}, dashboard=${DASHBOARD_PORT}, smtp=${SMTP_PORT}, s3=${S3_PORT}, dynamodb=${DYNAMODB_PORT}"
 (
   cd "${WORKSPACE}"
-  "${BIN}" up
+  exec "${BIN}" up
 ) > "${TMP_DIR}/devcloud-up.log" 2>&1 &
 DEV_PID="$!"
 

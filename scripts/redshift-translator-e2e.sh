@@ -164,7 +164,7 @@ log "building devcloud"
 devcloud_build "${TMP_DIR}/devcloud"
 
 log "starting devcloud in ${TMP_DIR}"
-( cd "${TMP_DIR}" && "${TMP_DIR}/devcloud" up ) >"${TMP_DIR}/devcloud.log" 2>&1 &
+( cd "${TMP_DIR}" && exec "${TMP_DIR}/devcloud" up ) >"${TMP_DIR}/devcloud.log" 2>&1 &
 DEV_PID="$!"
 
 # Wait for the Redshift SQL port to accept connections.
