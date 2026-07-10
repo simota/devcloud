@@ -45,9 +45,11 @@ pub async fn run(
         let _ = tx.send(true);
     });
 
-    // SMTP task (binds internally from SmtpConfig.addr; no shutdown arg — select
-    // it against the inner shutdown below).
-    let smtp_task = {
+    // SMTP task (binds internally from SmtpConfig.addr; no shutdown arg — its
+    // accept loop can only be stopped by aborting the JoinHandle on shutdown,
+    // since a dropped handle does not cancel the task and would leave the SMTP
+    // listener accepting connections forever).
+    let mut smtp_task = {
         let s = smtp.clone();
         tokio::spawn(async move { s.run().await.map_err(|e| format!("mail SMTP: {e}")) })
     };
@@ -67,8 +69,12 @@ pub async fn run(
     });
 
     tokio::select! {
-        _ = shutdown_future(rx.clone()) => Ok(()),
-        r = smtp_task => r.map_err(|e| e.to_string()).and_then(|x| x),
+        _ = shutdown_future(rx.clone()) => {
+            smtp_task.abort();
+            let _ = smtp_task.await;
+            Ok(())
+        }
+        r = &mut smtp_task => r.map_err(|e| e.to_string()).and_then(|x| x),
         r = http_task => r.map_err(|e| e.to_string()).and_then(|x| x),
     }
 }
