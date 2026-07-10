@@ -1,13 +1,11 @@
 //! state.json persistence.
 //!
-//! Parity: `internal/services/redshift/storage.rs`. The stored JSON shape
-//! (field names, omitempty behavior, RFC3339Nano timestamps, 2-space indent)
-//! matches legacy `json.MarshalIndent` output so legacy and Rust can read each
-//! other's state files. Clusters and cluster snapshots are control-plane
-//! models that arrive in part 4 of increment #10; until then they are carried
-//! through load/persist as opaque JSON so they are never dropped.
-//! TODO(agent): replace the opaque clusters/snapshots passthrough with real
-//! models in part 4 (including `normalizeClusterEndpoints`).
+//! The stored JSON shape (field names, omitempty behavior, RFC3339Nano
+//! timestamps, 2-space indent) matches `json.MarshalIndent` output, so state
+//! files remain a stable on-disk contract. Clusters and cluster snapshots are
+//! persisted as typed control-plane models (`ClusterSnapshot` /
+//! `ClusterSnapshotMetadata` from [`crate::cluster`]); on restore, cluster
+//! endpoints are rewritten to the current config via `normalize_cluster_endpoints`.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};

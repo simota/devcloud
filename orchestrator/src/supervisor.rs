@@ -202,9 +202,6 @@ pub async fn run(cfg: Config) -> Result<(), String> {
 }
 
 /// Minimal startup banner.
-//
-// TODO(agent): port `internal/app/banner.rs` for byte-parity stdout once the
-// full service set + dashboard are wired.
 fn print_banner(cfg: &Config) {
     println!(
         "devcloud up — dashboard: http://localhost:{}",
