@@ -257,6 +257,78 @@ fn delete_subscription() {
 }
 
 #[test]
+fn delete_subscription_then_recreate_does_not_redeliver_old_topics_messages() {
+    let dir = tempdir();
+    let mut s = server(&dir);
+    s.create_subscription(
+        "devcloud",
+        "sub1",
+        &sub_from(r#"{"topic":"projects/devcloud/topics/orders"}"#),
+    )
+    .expect("create sub1 on orders");
+    let old: Vec<serde_json::Value> = serde_json::from_str(r#"[{"data":"b2xk"}]"#).unwrap();
+    s.publish("devcloud", "orders", &old).expect("publish old");
+
+    s.delete_subscription("devcloud", "sub1").expect("delete");
+
+    // Recreate the same subscription name, now bound to a different topic.
+    s.create_subscription(
+        "devcloud",
+        "sub1",
+        &sub_from(r#"{"topic":"projects/devcloud/topics/dlq"}"#),
+    )
+    .expect("recreate sub1 on dlq");
+    let fresh: Vec<serde_json::Value> = serde_json::from_str(r#"[{"data":"bmV3"}]"#).unwrap();
+    s.publish("devcloud", "dlq", &fresh).expect("publish fresh");
+
+    let resp = s.pull("devcloud", "sub1", 10).expect("pull");
+    let body: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+    let received = body["receivedMessages"].as_array().expect("messages");
+    // Only the new topic's message should be delivered — the stale delivery
+    // record from the deleted subscription must not have survived.
+    assert_eq!(received.len(), 1);
+    assert_eq!(received[0]["message"]["data"], "bmV3");
+}
+
+#[test]
+fn grpc_delete_subscription_rolls_back_on_persist_failure() {
+    let dir = tempdir();
+    let mut s = server(&dir);
+    s.create_subscription(
+        "devcloud",
+        "sub1",
+        &sub_from(r#"{"topic":"projects/devcloud/topics/orders"}"#),
+    )
+    .expect("create sub1");
+    let messages: Vec<serde_json::Value> = serde_json::from_str(r#"[{"data":"aGk="}]"#).unwrap();
+    s.publish("devcloud", "orders", &messages).expect("publish");
+    // Ensure there is a delivery to be rolled back, not just the subscription.
+    s.pull("devcloud", "sub1", 10).expect("pull");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+    std::fs::write(&dir, b"not a directory").unwrap();
+
+    assert!(s
+        .grpc_delete_subscription("projects/devcloud/subscriptions/sub1")
+        .is_err());
+
+    std::fs::remove_file(&dir).unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // Subscription and its deliveries must both still be present — a partial
+    // rollback (subscription restored, deliveries lost) would silently drop
+    // the in-flight message's tracking.
+    assert!(s
+        .grpc_get_subscription("projects/devcloud/subscriptions/sub1")
+        .is_ok());
+    let snapshot = s.message_snapshot("1").expect("message still tracked");
+    assert!(snapshot
+        .subscriptions
+        .iter()
+        .any(|d| d.subscription == "projects/devcloud/subscriptions/sub1"));
+}
+
+#[test]
 fn grpc_detach_subscription_rolls_back_when_persist_fails() {
     let dir = tempdir();
     let mut s = server(&dir);

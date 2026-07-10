@@ -983,14 +983,24 @@ impl Server {
             .iter()
             .filter_map(|k| self.snapshots.remove(k).map(|v| (k.clone(), v)))
             .collect();
+        let removed_deliveries = self.deliveries.remove(&name);
+        // Dropping this subscription's deliveries/snapshots can leave messages
+        // unreferenced; `persist` prunes those unconditionally before it can
+        // fail, so `messages` needs a full snapshot to be restorable too.
+        let previous_messages = self.messages.clone();
         self.resource_dirty = true;
+        self.messages_dirty = true;
         if let Err(err) = self.persist() {
             if let Some(s) = removed {
-                self.subscriptions.insert(name, s);
+                self.subscriptions.insert(name.clone(), s);
             }
             for (k, v) in removed_snaps {
                 self.snapshots.insert(k, v);
             }
+            if let Some(d) = removed_deliveries {
+                self.deliveries.insert(name, d);
+            }
+            self.messages = previous_messages;
             return Err(err);
         }
         Ok(RestResponse::no_content())
@@ -1080,8 +1090,13 @@ impl Server {
             .iter()
             .filter_map(|k| self.snapshots.remove(k).map(|v| (k.clone(), v)))
             .collect();
+        // Dropping this subscription's snapshots can leave messages
+        // unreferenced; `persist` prunes those unconditionally before it can
+        // fail, so `messages` needs a full snapshot to be restorable too.
+        let previous_messages = self.messages.clone();
         let previous = self.subscriptions.insert(name.clone(), sub);
         self.resource_dirty = true;
+        self.messages_dirty = true;
         if let Err(err) = self.persist() {
             match previous {
                 Some(p) => {
@@ -1094,6 +1109,7 @@ impl Server {
             for (k, v) in backup {
                 self.snapshots.insert(k, v);
             }
+            self.messages = previous_messages;
             return Err(err);
         }
         Ok(RestResponse::ok_struct(&serde_json::Map::new()))
@@ -1186,11 +1202,17 @@ impl Server {
             return Err(ApiError::not_found("snapshot not found"));
         }
         let removed = self.snapshots.remove(&name);
+        // Dropping this snapshot can leave messages unreferenced; `persist`
+        // prunes those unconditionally before it can fail, so `messages`
+        // needs a full snapshot to be restorable too.
+        let previous_messages = self.messages.clone();
         self.resource_dirty = true;
+        self.messages_dirty = true;
         if let Err(err) = self.persist() {
             if let Some(s) = removed {
                 self.snapshots.insert(name, s);
             }
+            self.messages = previous_messages;
             return Err(err);
         }
         Ok(RestResponse::no_content())
@@ -2580,11 +2602,22 @@ impl Server {
         if !self.subscriptions.contains_key(subscription) {
             return Err(ApiError::not_found("subscription not found"));
         }
-        self.subscriptions.remove(subscription);
-        self.deliveries.remove(subscription);
+        let removed = self.subscriptions.remove(subscription);
+        let removed_deliveries = self.deliveries.remove(subscription);
+        // Dropping this subscription's deliveries can leave messages
+        // unreferenced; `persist` prunes those unconditionally before it can
+        // fail, so `messages` needs a full snapshot to be restorable too.
+        let previous_messages = self.messages.clone();
         self.resource_dirty = true;
         self.messages_dirty = true;
         if self.persist().is_err() {
+            if let Some(s) = removed {
+                self.subscriptions.insert(subscription.to_string(), s);
+            }
+            if let Some(d) = removed_deliveries {
+                self.deliveries.insert(subscription.to_string(), d);
+            }
+            self.messages = previous_messages;
             return Err(ApiError::internal("pubsub resource store unavailable"));
         }
         Ok(())
@@ -3209,9 +3242,18 @@ impl Server {
         if !self.snapshots.contains_key(snapshot) {
             return Err(ApiError::not_found("snapshot not found"));
         }
-        self.snapshots.remove(snapshot);
+        let removed = self.snapshots.remove(snapshot);
+        // Dropping this snapshot can leave messages unreferenced; `persist`
+        // prunes those unconditionally before it can fail, so `messages`
+        // needs a full snapshot to be restorable too.
+        let previous_messages = self.messages.clone();
         self.resource_dirty = true;
+        self.messages_dirty = true;
         if self.persist().is_err() {
+            if let Some(s) = removed {
+                self.snapshots.insert(snapshot.to_string(), s);
+            }
+            self.messages = previous_messages;
             return Err(ApiError::internal("pubsub resource store unavailable"));
         }
         Ok(())

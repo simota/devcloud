@@ -108,6 +108,42 @@ fn snapshot_delete() {
 }
 
 #[test]
+fn delete_snapshot_cleans_up_now_unreferenced_message() {
+    let dir = tempdir();
+    let mut s = server(&dir);
+    let messages: Vec<serde_json::Value> = serde_json::from_str(r#"[{"data":"aGk="}]"#).unwrap();
+    s.publish("devcloud", "orders", &messages).expect("publish");
+    // The gRPC create-snapshot path (unlike REST's) captures the
+    // subscription's currently-pending deliveries into the snapshot.
+    s.grpc_create_snapshot(
+        "projects/devcloud/snapshots/snap1",
+        "projects/devcloud/subscriptions/sub1",
+        &Default::default(),
+    )
+    .expect("snapshot");
+
+    // Acking sub1's own delivery drops it (retainAckedMessages defaults to
+    // false), leaving the snapshot as the message's only remaining reference.
+    let pulled: serde_json::Value =
+        serde_json::from_slice(&s.pull("devcloud", "sub1", 10).expect("pull").body).unwrap();
+    let ack_id = pulled["receivedMessages"][0]["ackId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    s.acknowledge("devcloud", "sub1", &[ack_id]).expect("ack");
+    assert!(
+        s.message_snapshot("1").is_some(),
+        "message must still be tracked while the snapshot references it"
+    );
+
+    s.delete_snapshot("devcloud", "snap1").expect("delete");
+    assert!(
+        s.message_snapshot("1").is_none(),
+        "deleting the last referencing snapshot must trigger unreferenced-message cleanup"
+    );
+}
+
+#[test]
 fn schema_create_get_list_matches_oracle() {
     let dir = tempdir();
     let mut s = server(&dir);
