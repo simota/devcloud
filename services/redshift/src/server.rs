@@ -104,6 +104,9 @@ pub(crate) struct ServerState {
     pub next_session_id: i64,
     /// Mirrors `Server.clientTokenIndex` (Data API idempotency).
     pub client_token_index: BTreeMap<String, String>,
+    /// Snapshot of `db` taken by a live BEGIN; restored by ROLLBACK and
+    /// discarded by COMMIT. `None` means no transaction is in progress.
+    pub tx_snapshot: Option<Database>,
 }
 
 /// Mirrors legacy `statement` struct (dataapi.rs).
@@ -200,6 +203,7 @@ impl Server {
                 next_statement_id,
                 next_session_id: 0,
                 client_token_index,
+                tx_snapshot: None,
             }),
         });
         let backend: Arc<dyn SqlBackend> = match cfg.sql_backend {
@@ -207,11 +211,15 @@ impl Server {
             None => {
                 let exec_shared = Arc::clone(&shared);
                 let catalog_shared = Arc::clone(&shared);
-                Arc::new(MemoryBackend::new(
+                let snapshot_shared = Arc::clone(&shared);
+                let restore_shared = Arc::clone(&shared);
+                Arc::new(MemoryBackend::with_transaction_hooks(
                     Some(Box::new(move |statement| {
                         exec_shared.execute_sql_memory_backend(statement)
                     })),
                     Some(Box::new(move || catalog_shared.memory_catalog_snapshot())),
+                    Some(Box::new(move || snapshot_shared.lock_state().db.clone())),
+                    Some(Box::new(move |db| restore_shared.restore_db(db))),
                 ))
             }
         };
@@ -407,6 +415,46 @@ impl ServerShared {
     /// legacy (empty path → no-op, which is what most tests use).
     pub(crate) fn persist_locked(&self, state: &ServerState) -> Result<(), SqlError> {
         storage::persist_state(&self.config.storage_path, state)
+    }
+
+    /// Overwrites `db` and persists, used by the memory backend's transaction
+    /// rollback hook (`MemoryTransaction::rollback`).
+    pub(crate) fn restore_db(&self, db: Database) {
+        let mut state = self.lock_state();
+        state.db = db;
+        let _ = self.persist_locked(&state);
+    }
+
+    /// Starts a memory-engine transaction: snapshots `db` so a later ROLLBACK
+    /// can restore it. BEGIN while already inside a transaction is a no-op
+    /// ack, matching Postgres's "there is already a transaction in progress"
+    /// warning-then-continue behavior.
+    pub(crate) fn begin_transaction(&self) -> Result<QueryResult, SqlError> {
+        let mut state = self.lock_state();
+        if state.tx_snapshot.is_none() {
+            state.tx_snapshot = Some(state.db.clone());
+        }
+        Ok(QueryResult::tag_only("BEGIN"))
+    }
+
+    /// Discards the transaction snapshot, keeping every statement applied
+    /// since BEGIN. COMMIT outside a transaction is a no-op ack, matching
+    /// Postgres.
+    pub(crate) fn commit_transaction(&self) -> Result<QueryResult, SqlError> {
+        self.lock_state().tx_snapshot = None;
+        Ok(QueryResult::tag_only("COMMIT"))
+    }
+
+    /// Restores `db` to the state captured by the most recent BEGIN, undoing
+    /// every statement applied since. ROLLBACK outside a transaction is a
+    /// no-op ack, matching Postgres.
+    pub(crate) fn rollback_transaction(&self) -> Result<QueryResult, SqlError> {
+        let mut state = self.lock_state();
+        if let Some(snapshot) = state.tx_snapshot.take() {
+            state.db = snapshot;
+            self.persist_locked(&state)?;
+        }
+        Ok(QueryResult::tag_only("ROLLBACK"))
     }
 
     /// Mirrors `nextStatementIDValue`. Like legacy, this takes the lock on its own

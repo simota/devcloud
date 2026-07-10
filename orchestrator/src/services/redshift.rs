@@ -142,16 +142,24 @@ pub async fn run(
     });
 
     let sql_server = Arc::clone(&server);
-    let sql_task = tokio::spawn(async move { sql_server.serve_sql(sql_listener).await });
+    let mut sql_task = tokio::spawn(async move { sql_server.serve_sql(sql_listener).await });
     let http_server = Arc::clone(&server);
     let http_sd = shutdown_future(rx.clone());
     let http_task = tokio::spawn(async move {
         devcloud_redshift::http::serve(api_listener, http_server, http_sd).await
     });
 
+    // `serve_sql`'s accept loop takes no shutdown future (unlike `http::serve`),
+    // so the only way to stop it on shutdown is to abort its JoinHandle
+    // directly rather than dropping it (a dropped handle does not cancel the
+    // task, which would leave the SQL listener accepting connections forever).
     let result = tokio::select! {
-        _ = shutdown_future(rx.clone()) => Ok(()),
-        r = sql_task => r
+        _ = shutdown_future(rx.clone()) => {
+            sql_task.abort();
+            let _ = sql_task.await;
+            Ok(())
+        }
+        r = &mut sql_task => r
             .map_err(|e| e.to_string())
             .and_then(|x| x.map_err(|e| format!("redshift sql serve error: {e}"))),
         r = http_task => r

@@ -497,6 +497,84 @@ fn sql_core_drop_schema_removes_tables_and_preserves_public() {
 }
 
 #[test]
+fn sql_core_rollback_undoes_statements_since_begin() {
+    let server = Server::new(Config::default());
+    execute_all(
+        &server,
+        &[
+            "create table public.tx_events(id integer, payload varchar(64))",
+            "insert into public.tx_events values (1, 'kept')",
+            "begin",
+            "delete from public.tx_events where id = 1",
+            "insert into public.tx_events values (2, 'undone')",
+            "rollback",
+        ],
+    );
+
+    let result = server
+        .execute_sql("select id, payload from public.tx_events order by id")
+        .expect("select");
+    assert_eq!(
+        result.rows,
+        vec![vec!["1".to_string(), "kept".to_string()]],
+        "ROLLBACK should undo every statement applied since BEGIN"
+    );
+}
+
+#[test]
+fn sql_core_commit_persists_statements_since_begin() {
+    let server = Server::new(Config::default());
+    execute_all(
+        &server,
+        &[
+            "create table public.tx_events(id integer, payload varchar(64))",
+            "begin",
+            "insert into public.tx_events values (1, 'kept')",
+            "commit",
+            "insert into public.tx_events values (2, 'also kept')",
+        ],
+    );
+
+    let result = server
+        .execute_sql("select id, payload from public.tx_events order by id")
+        .expect("select");
+    assert_eq!(
+        result.rows,
+        vec![
+            vec!["1".to_string(), "kept".to_string()],
+            vec!["2".to_string(), "also kept".to_string()],
+        ],
+        "COMMIT should keep every statement applied since BEGIN"
+    );
+}
+
+#[test]
+fn sql_core_rollback_and_commit_outside_transaction_are_no_ops() {
+    let server = Server::new(Config::default());
+    execute_all(
+        &server,
+        &["create table public.tx_events(id integer, payload varchar(64))"],
+    );
+
+    // No BEGIN precedes these: Postgres warns "there is no transaction in
+    // progress" and no-ops the ack; the memory engine should do the same
+    // rather than erroring or discarding unrelated state.
+    let rollback = server.execute_sql("rollback").expect("rollback");
+    assert_eq!(rollback.tag, "ROLLBACK");
+    let commit = server.execute_sql("commit").expect("commit");
+    assert_eq!(commit.tag, "COMMIT");
+
+    execute_all(
+        &server,
+        &["insert into public.tx_events values (1, 'kept')"],
+    );
+    let result = server
+        .execute_sql("select id, payload from public.tx_events")
+        .expect("select");
+    assert_eq!(result.rows, vec![vec!["1".to_string(), "kept".to_string()]]);
+}
+
+#[test]
 fn simple_query_records_redacted_query_history() {
     let server = Server::new(Config {
         cluster_identifier: "devcloud".to_string(),

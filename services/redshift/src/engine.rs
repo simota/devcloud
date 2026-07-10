@@ -102,13 +102,13 @@ impl ServerShared {
             return self.show_parameter(normalized);
         }
         if lower == "begin" || lower == "begin transaction" || lower == "start transaction" {
-            return Ok(QueryResult::tag_only("BEGIN"));
+            return self.begin_transaction();
         }
         if lower == "commit" || lower == "end" {
-            return Ok(QueryResult::tag_only("COMMIT"));
+            return self.commit_transaction();
         }
         if lower == "rollback" {
-            return Ok(QueryResult::tag_only("ROLLBACK"));
+            return self.rollback_transaction();
         }
         if lower.starts_with("create schema") {
             return self.create_schema(normalized);

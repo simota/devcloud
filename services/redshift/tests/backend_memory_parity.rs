@@ -1,9 +1,10 @@
 //! 1:1 port of `internal/services/redshift/backend/memory/memory_test.rs`.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use devcloud_redshift::backend::{CatalogSnapshot, ExecResult, Schema, SqlBackend};
+use devcloud_redshift::model::Database;
 use devcloud_redshift::{MemoryBackend, SqlError};
 
 #[test]
@@ -54,6 +55,57 @@ fn backend_exec_catalog_and_transaction() {
     assert_eq!(catalog.schemas.len(), 1, "catalog = {catalog:?}");
     assert_eq!(catalog.schemas[0].name, "public", "catalog = {catalog:?}");
     assert_eq!(exec_calls.load(Ordering::SeqCst), 2, "execCalls");
+}
+
+#[test]
+fn backend_with_transaction_hooks_rollback_restores_snapshot_and_commit_persists() {
+    let state: Arc<Mutex<Database>> = Arc::new(Mutex::new(Database::default()));
+
+    let snapshot_state = Arc::clone(&state);
+    let restore_state = Arc::clone(&state);
+    let backend = MemoryBackend::with_transaction_hooks(
+        None,
+        None,
+        Some(Box::new(move || snapshot_state.lock().unwrap().clone())),
+        Some(Box::new(move |db| *restore_state.lock().unwrap() = db)),
+    );
+
+    state
+        .lock()
+        .unwrap()
+        .schemas
+        .insert("before".to_string(), Default::default());
+
+    let mut tx = backend.begin().expect("begin");
+    state
+        .lock()
+        .unwrap()
+        .schemas
+        .insert("during".to_string(), Default::default());
+    tx.rollback().expect("rollback");
+    assert!(
+        state.lock().unwrap().schemas.contains_key("before"),
+        "rollback should not touch pre-transaction state"
+    );
+    assert!(
+        !state.lock().unwrap().schemas.contains_key("during"),
+        "rollback should undo state added since begin()"
+    );
+    // Idempotent: a second rollback on an already-closed transaction is a
+    // no-op success, matching MemoryTransaction's pass-through-only mode.
+    tx.rollback().expect("second rollback");
+
+    let mut tx = backend.begin().expect("second begin");
+    state
+        .lock()
+        .unwrap()
+        .schemas
+        .insert("committed".to_string(), Default::default());
+    tx.commit().expect("commit");
+    assert!(
+        state.lock().unwrap().schemas.contains_key("committed"),
+        "commit should keep state added since begin()"
+    );
 }
 
 #[test]
