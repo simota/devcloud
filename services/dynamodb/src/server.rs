@@ -1207,11 +1207,35 @@ impl Server {
             return Err(ApiError::validation("transaction items are required"));
         }
         let mut plan: Vec<PlannedWrite> = Vec::new();
+        let mut seen_keys: std::collections::HashSet<(String, String)> =
+            std::collections::HashSet::new();
         for transaction_item in &request.transact_items {
             if count_transact_write_operations(transaction_item) != 1 {
                 return Err(ApiError::validation(
                     "each transaction item must contain exactly one operation",
                 ));
+            }
+            let (table_name, key_values) = if let Some(put) = &transaction_item.put {
+                (&put.table_name, &put.item)
+            } else if let Some(update) = &transaction_item.update {
+                (&update.table_name, &update.key)
+            } else if let Some(delete) = &transaction_item.delete {
+                (&delete.table_name, &delete.key)
+            } else if let Some(check) = &transaction_item.condition_check {
+                (&check.table_name, &check.key)
+            } else {
+                unreachable!("count_transact_write_operations guarantees exactly one operation")
+            };
+            if !table_name.is_empty() {
+                if let Some(state) = self.tables.get(table_name) {
+                    if let Ok(key) = item_key(&state.description, key_values) {
+                        if !seen_keys.insert((table_name.clone(), key)) {
+                            return Err(ApiError::validation(
+                                "Transaction request cannot include multiple operations on one item",
+                            ));
+                        }
+                    }
+                }
             }
             if let Some(put) = &transaction_item.put {
                 plan.push(self.validate_transact_put(put)?);

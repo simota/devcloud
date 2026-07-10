@@ -305,6 +305,47 @@ fn transact_write_condition_failure_is_cancelled() {
 }
 
 #[test]
+fn transact_write_duplicate_item_operations_rejected() {
+    let dir = tempdir();
+    let mut s = seeded(&dir);
+    let err = s
+        .transact_write_items(&TransactWriteItemsRequest {
+            transact_items: vec![
+                TransactWriteItem {
+                    put: Some(TransactPut {
+                        table_name: "T".to_string(),
+                        item: item(&[("pk", json!({"S": "a"})), ("v", json!({"N": "9"}))]),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                TransactWriteItem {
+                    update: Some(TransactUpdate {
+                        table_name: "T".to_string(),
+                        key: item(&[("pk", json!({"S": "a"}))]),
+                        update_expression: "SET v = v + :one".to_string(),
+                        expression_attribute_values: vals(&[(":one", json!({"N": "1"}))]),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            ],
+        })
+        .expect_err("duplicate key rejected");
+    assert_eq!(err.status, 400);
+    assert_eq!(err.name, "ValidationException");
+    assert_eq!(
+        err.message,
+        "Transaction request cannot include multiple operations on one item"
+    );
+    // Nothing was applied: `a` still has its original value.
+    let on_disk = std::fs::read(dir.join("state.json")).expect("read state");
+    let text = String::from_utf8_lossy(&on_disk);
+    assert!(text.contains("\"1\""));
+    assert!(!text.contains("\"9\""));
+}
+
+#[test]
 fn batch_write_unknown_table_errors() {
     let dir = tempdir();
     let mut s = seeded(&dir);
