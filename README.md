@@ -35,7 +35,7 @@ Default local endpoints:
 | Redshift SQL | `127.0.0.1:15439` | `http://127.0.0.1:18025/dashboard/redshift` |
 | Redshift API | `http://127.0.0.1:19099` | `http://127.0.0.1:18025/dashboard/redshift` |
 | Redis | `redis://127.0.0.1:16379` | `http://127.0.0.1:18025/dashboard/redis` |
-| Application Auto Scaling | `http://127.0.0.1:18030` | _(no dashboard page yet)_ |
+| Application Auto Scaling | `http://127.0.0.1:18030` | `http://127.0.0.1:18025/dashboard/applicationautoscaling` |
 
 Useful commands:
 
@@ -254,16 +254,16 @@ Legend:
 
 ### Service Availability
 
-| Capability | Mail | S3 | GCS | DynamoDB | BigQuery | SQS | Pub/Sub | Redshift | Redis |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Local endpoint | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
-| Dashboard view | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
-| Dashboard mutation actions | Partial | Partial | Partial | Partial | Partial | Partial | Yes | Yes | Partial |
-| Persistent local storage | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
-| Configurable port | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
-| Enable/disable via config | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
-| Local relaxed auth mode | N/A | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
-| Strict cloud-grade auth/IAM | No | Partial | No | Partial | No | Partial | No | Partial | Partial |
+| Capability | Mail | S3 | GCS | DynamoDB | BigQuery | SQS | Pub/Sub | Redshift | Redis | App Auto Scaling |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Local endpoint | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
+| Dashboard view | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
+| Dashboard mutation actions | Partial | Partial | Partial | Partial | Partial | Partial | Yes | Yes | Partial | No |
+| Persistent local storage | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
+| Configurable port | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
+| Enable/disable via config | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
+| Local relaxed auth mode | N/A | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
+| Strict cloud-grade auth/IAM | No | Partial | No | Partial | No | Partial | No | Partial | Partial | Partial |
 
 ### Mail
 
@@ -469,6 +469,7 @@ Run before claiming a service MVP is complete or when investigating a service-le
 | SQS MVP | `VERIFY_STAGE=full bash scripts/sqs-autoloop/verify.sh` |
 | Pub/Sub MVP | `VERIFY_STAGE=full bash scripts/pubsub-autoloop/verify.sh` |
 | Redis MVP | `VERIFY_STAGE=full bash scripts/redis-autoloop/verify.sh` |
+| Application Auto Scaling MVP | `VERIFY_STAGE=full bash scripts/applicationautoscaling-autoloop/verify.sh` |
 | GCS SDK compat | `VERIFY_STAGE=full-sdk-compat bash scripts/gcs-sdk-compat-autoloop/verify.sh` |
 | BigQuery SDK compat | `VERIFY_STAGE=full-sdk-compat bash scripts/bigquery-sdk-compat-autoloop/verify.sh` |
 | Pub/Sub full compat | `VERIFY_STAGE=full-compat bash scripts/pubsub-full-compat-autoloop/verify.sh` |
@@ -489,6 +490,7 @@ Run before claiming a service MVP is complete or when investigating a service-le
 | Redshift managed PostgreSQL | `scripts/redshift-managed-postgres-e2e.sh` | `initdb`, `postgres`, `psql` on `PATH` |
 | Redshift SQL translator | `scripts/redshift-translator-e2e.sh` | `psql`, `aws`, and `postgres` server binary on `PATH` |
 | Redis | `scripts/redis-e2e.sh` | `redis-cli` |
+| Application Auto Scaling | `scripts/applicationautoscaling-e2e.sh` | none |
 
 Useful env vars:
 

@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-`devcloud` is a local cloud service emulator: a single Rust binary that runs compatible development endpoints for Mail (SMTP), S3, GCS, DynamoDB, BigQuery, SQS, Pub/Sub, Redshift, Redis, Application Auto Scaling, and a React dashboard. It targets deterministic local tests and manual inspection — not production parity. New provider behavior should be added deliberately, backed by tests in the relevant Rust crate and usually an acceptance gate under `scripts/*-autoloop/`. Application Auto Scaling (`services/applicationautoscaling`, port 18030) is fully wired into the supervisor and config but has no dashboard page and no acceptance gate under `scripts/` yet.
+`devcloud` is a local cloud service emulator: a single Rust binary that runs compatible development endpoints for Mail (SMTP), S3, GCS, DynamoDB, BigQuery, SQS, Pub/Sub, Redshift, Redis, Application Auto Scaling, and a React dashboard. It targets deterministic local tests and manual inspection — not production parity. New provider behavior should be added deliberately, backed by tests in the relevant Rust crate and usually an acceptance gate under `scripts/*-autoloop/`.
 
 ## Commands
 
@@ -25,7 +25,7 @@ The dashboard lives in `web/dashboard/` (Vite + React 18 + TS) and is embedded i
 
 ### Acceptance gates (per-service)
 Each service has a bounded autoloop folder under `scripts/<service>-autoloop/`. The relevant entry points are:
-- `VERIFY_STAGE=full bash scripts/<service>-autoloop/verify.sh` — final acceptance gate for that service (`mail`, `s3`, `gcs`, `dynamodb`, `bigquery`, `sqs`, `pubsub`). Stages such as `foundation`, `<svc>-core`, `dashboard-static`, `hardening` exist for faster partial checks.
+- `VERIFY_STAGE=full bash scripts/<service>-autoloop/verify.sh` — final acceptance gate for that service (`mail`, `s3`, `gcs`, `dynamodb`, `bigquery`, `sqs`, `pubsub`, `redis`, `applicationautoscaling`). Stages such as `foundation`, `<svc>-core`, `dashboard-static`, `hardening` exist for faster partial checks.
 - SDK / advanced gates: `scripts/gcs-sdk-compat-autoloop`, `scripts/bigquery-sdk-compat-autoloop`, `scripts/pubsub-full-compat-autoloop`, `scripts/redshift-advanced-compat-autoloop`.
 - The autoloop folders also contain runner state (`progress.md`, `state.env`, `runner.log`). Treat these as generated; do not mix them with source commits.
 
@@ -47,7 +47,7 @@ Each provider lives under `services/<svc>/` and exposes crate-local config/serve
 `services/dashboard` is the HTTP entry point users hit at `:18025`. It serves:
 - The React SPA from `assets/react` (embedded). `assets.rs` mounts `/dashboard/` and falls back to `index.html` for client-side routes.
 - A set of `/api/*` JSON endpoints that forward to each service's introspection/control or provider-protocol surface.
-- **Route convention:** every service page lives under `/dashboard/<svc>` (`mail`, `s3`, `gcs`, `dynamodb`, `bigquery`, `sqs`, `pubsub`, `redshift`, `redis`). The compatibility short paths `/mail`, `/s3`, `/gcs`, `/dynamodb`, `/bigquery`, `/redis` return 301 redirects to their `/dashboard/<svc>` counterpart — never add new functionality to the compatibility redirects.
+- **Route convention:** every service page lives under `/dashboard/<svc>` (`mail`, `s3`, `gcs`, `dynamodb`, `bigquery`, `sqs`, `pubsub`, `redshift`, `redis`, `applicationautoscaling`). The compatibility short paths `/mail`, `/s3`, `/gcs`, `/dynamodb`, `/bigquery`, `/redis` return 301 redirects to their `/dashboard/<svc>` counterpart — never add new functionality to the compatibility redirects.
 - **Safety rule:** dashboard mutations MUST go through the provider-protocol path (`/api/<svc>/*` forwarding into the in-process service) — never directly through storage. Never log credentials, Authorization headers, signatures, message bodies, or object payloads. See `AGENTS.md` and the per-service notes in `README.md`.
 
 ### Always-on auxiliary services
