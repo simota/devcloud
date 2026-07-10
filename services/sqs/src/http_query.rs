@@ -75,11 +75,7 @@ impl Server {
             return QueryOutcome::error(404, "InvalidAddress", "SQS endpoint path is invalid");
         }
 
-        // legacy ParseForm merges URL query and (for form bodies) the POST body.
-        let mut form = FormValues::parse(raw_query);
-        if method == "POST" {
-            form.extend(FormValues::parse(form_body));
-        }
+        let form = merged_form(method, raw_query, form_body);
 
         // Version validation, mirroring validateQueryAPIVersion. GET reads the
         // query; POST reads the merged form. Both resolve via the merged map.
@@ -424,26 +420,9 @@ impl Server {
     }
 
     fn query_receive_message(&mut self, ctx: &QueryCtx) -> QueryOutcome {
-        let input = ReceiveMessageRequest {
-            queue_url: ctx.queue_url(),
-            max_number_of_messages: ctx.form.optional_int("MaxNumberOfMessages"),
-            visibility_timeout: ctx.form.optional_int("VisibilityTimeout"),
-            wait_time_seconds: ctx.form.optional_int("WaitTimeSeconds"),
-            attribute_names: ctx.form.list_values("AttributeName"),
-            message_attribute_names: ctx.form.list_values("MessageAttributeName"),
-            message_system_attribute_names: ctx.form.list_values("MessageSystemAttributeName"),
-        };
+        let input = receive_message_input(ctx);
         match self.receive_messages(&input) {
-            Ok(messages) => {
-                let mut x = response_open("ReceiveMessageResponse");
-                x.open("ReceiveMessageResult");
-                for m in &messages {
-                    write_received_message(&mut x, m);
-                }
-                x.close("ReceiveMessageResult");
-                response_close(&mut x, "ReceiveMessageResponse");
-                QueryOutcome::xml(200, x.finish())
-            }
+            Ok(messages) => receive_message_success(&messages),
             Err(e) => mapped_error(&e),
         }
     }
@@ -539,9 +518,90 @@ impl Server {
 
 /// Maps a logic error to its AWS code (via the responses.rs substring rules) at
 /// HTTP 400, rendered as an XML error envelope — mirrors the per-operation
-/// `writeProtocolError(errorCode(err), …)` on the Query path.
-fn mapped_error(err: &str) -> QueryOutcome {
+/// `writeProtocolError(errorCode(err), …)` on the Query path. `pub(crate)`:
+/// also used by the async `ReceiveMessage` long-poll dispatcher in `http.rs`,
+/// which bypasses `dispatch_query` to avoid holding the server lock across
+/// the wait (see `Server::receive_messages_once`).
+pub(crate) fn mapped_error(err: &str) -> QueryOutcome {
     QueryOutcome::error(400, &error_code(err), err)
+}
+
+/// Merges the URL query with the POST form body exactly as `dispatch_query`
+/// does (legacy `ParseForm` semantics): the body is only merged in for POST
+/// requests.
+fn merged_form(method: &str, raw_query: &str, form_body: &str) -> FormValues {
+    let mut form = FormValues::parse(raw_query);
+    if method == "POST" {
+        form.extend(FormValues::parse(form_body));
+    }
+    form
+}
+
+/// Extracts the merged `Action` value exactly as `dispatch_query` would,
+/// without parsing/validating/dispatching the rest of the request.
+/// `pub(crate)`: used by `http.rs` to detect a Query-protocol `ReceiveMessage`
+/// request before handing it to the async long-poll dispatcher.
+pub(crate) fn query_action(method: &str, raw_query: &str, form_body: &str) -> String {
+    merged_form(method, raw_query, form_body)
+        .get("Action")
+        .to_string()
+}
+
+/// Builds the `ReceiveMessageRequest` DTO from a validated `QueryCtx`, shared
+/// by `query_receive_message` and `parse_query_receive_message`.
+fn receive_message_input(ctx: &QueryCtx) -> ReceiveMessageRequest {
+    ReceiveMessageRequest {
+        queue_url: ctx.queue_url(),
+        max_number_of_messages: ctx.form.optional_int("MaxNumberOfMessages"),
+        visibility_timeout: ctx.form.optional_int("VisibilityTimeout"),
+        wait_time_seconds: ctx.form.optional_int("WaitTimeSeconds"),
+        attribute_names: ctx.form.list_values("AttributeName"),
+        message_attribute_names: ctx.form.list_values("MessageAttributeName"),
+        message_system_attribute_names: ctx.form.list_values("MessageSystemAttributeName"),
+    }
+}
+
+/// Validates + parses a Query-protocol `ReceiveMessage` request exactly as
+/// `dispatch_query` would (path validation, Version validation, field
+/// extraction) without dispatching it. `pub(crate)`: used by the async
+/// long-poll dispatcher in `http.rs` so it can reject an invalid request (bad
+/// path, missing/wrong `Version`) before ever entering the poll loop —
+/// mirroring `long_poll_receive_message`'s upfront JSON parse on the JSON
+/// path.
+pub(crate) fn parse_query_receive_message(
+    method: &str,
+    path: &str,
+    raw_query: &str,
+    form_body: &str,
+) -> Result<ReceiveMessageRequest, QueryOutcome> {
+    let path = if path.is_empty() { "/" } else { path };
+    if !is_root_path(path) && queue_name_from_path(path).is_empty() {
+        return Err(QueryOutcome::error(
+            404,
+            "InvalidAddress",
+            "SQS endpoint path is invalid",
+        ));
+    }
+    let form = merged_form(method, raw_query, form_body);
+    if let Err((code, message)) = validate_query_api_version(form.get("Version")) {
+        return Err(QueryOutcome::error(400, code, &message));
+    }
+    let ctx = QueryCtx { path, form: &form };
+    Ok(receive_message_input(&ctx))
+}
+
+/// Renders a successful `ReceiveMessage` response, mirroring the XML
+/// `query_receive_message`'s success arm used to build inline. `pub(crate)`:
+/// shared with the async long-poll dispatcher in `http.rs`.
+pub(crate) fn receive_message_success(messages: &[ReceivedMessage]) -> QueryOutcome {
+    let mut x = response_open("ReceiveMessageResponse");
+    x.open("ReceiveMessageResult");
+    for m in messages {
+        write_received_message(&mut x, m);
+    }
+    x.close("ReceiveMessageResult");
+    response_close(&mut x, "ReceiveMessageResponse");
+    QueryOutcome::xml(200, x.finish())
 }
 
 /// Carries the parsed form + request path through the per-operation handlers,

@@ -144,3 +144,159 @@ async fn long_poll_on_one_queue_does_not_block_another_queue() {
         "QueueA's long poll returned too early: {elapsed_a:?}"
     );
 }
+
+fn query_form_request(body: &str) -> Vec<u8> {
+    format!(
+        "POST / HTTP/1.1\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    )
+    .into_bytes()
+}
+
+/// Regression test for the Query-protocol counterpart of PERF-1: a
+/// `ReceiveMessage` long poll issued via the legacy form-encoded/XML protocol
+/// must not serialize other queues' operations behind it either.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn query_long_poll_on_one_queue_does_not_block_another_queue() {
+    let mut server = Server::new(cfg());
+    let url_a = server
+        .create_queue("QueueA", &Default::default(), &Default::default())
+        .unwrap()
+        .url;
+    let url_b = server
+        .create_queue("QueueB", &Default::default(), &Default::default())
+        .unwrap()
+        .url;
+    let server = Arc::new(Mutex::new(server));
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(devcloud_sqs::http::serve(
+        listener,
+        Arc::clone(&server),
+        std::future::pending(),
+    ));
+
+    let t0 = Instant::now();
+
+    // Start a 1s long poll on QueueA (empty — no message is ever sent there)
+    // via the Query/XML protocol.
+    let mut stream_a = TcpStream::connect(addr).await.unwrap();
+    let body_a = format!(
+        "Action=ReceiveMessage&Version=2012-11-05&QueueUrl={url_a}&WaitTimeSeconds=1",
+        url_a = urlencoding_lite(&url_a)
+    );
+    stream_a
+        .write_all(&query_form_request(&body_a))
+        .await
+        .unwrap();
+
+    // Let the server accept the connection and get into the poll loop (first
+    // attempt + first 100ms sleep) before issuing the second request.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    // A SendMessage on the unrelated QueueB (also Query protocol) must
+    // complete quickly — it must not queue up behind QueueA's still-running
+    // long poll.
+    let mut stream_b = TcpStream::connect(addr).await.unwrap();
+    let body_b = format!(
+        "Action=SendMessage&Version=2012-11-05&QueueUrl={url_b}&MessageBody=hello",
+        url_b = urlencoding_lite(&url_b)
+    );
+    stream_b
+        .write_all(&query_form_request(&body_b))
+        .await
+        .unwrap();
+    let (status_b, resp_b) = read_http_response(&mut stream_b).await;
+    let elapsed_b = t0.elapsed();
+
+    let (status_a, resp_a) = read_http_response(&mut stream_a).await;
+    let elapsed_a = t0.elapsed();
+
+    let resp_b_str = String::from_utf8_lossy(&resp_b);
+    assert_eq!(status_b, 200, "{resp_b_str}");
+    assert!(resp_b_str.contains("<SendMessageResponse"), "{resp_b_str}");
+    assert!(
+        elapsed_b < Duration::from_millis(500),
+        "QueueB's SendMessage finished {elapsed_b:?} after the test began — \
+         appears blocked behind QueueA's long poll (expected well under \
+         QueueA's 1s WaitTimeSeconds)"
+    );
+
+    let resp_a_str = String::from_utf8_lossy(&resp_a);
+    assert_eq!(status_a, 200, "{resp_a_str}");
+    assert!(
+        resp_a_str.contains("<ReceiveMessageResponse"),
+        "{resp_a_str}"
+    );
+    assert!(
+        !resp_a_str.contains("<Message>"),
+        "expected no messages: {resp_a_str}"
+    );
+    // Sanity: QueueA's poll actually ran close to its full WaitTimeSeconds
+    // (i.e. this isn't passing merely because the poll was skipped/short).
+    assert!(
+        elapsed_a >= Duration::from_millis(900),
+        "QueueA's long poll returned too early: {elapsed_a:?}"
+    );
+}
+
+/// Regression test: a long-polling `ReceiveMessage` must not silently switch
+/// to a same-named queue that replaced the original mid-poll. If the queue is
+/// deleted and recreated while the poll is in flight, the in-flight request
+/// must fail as if the (original) queue no longer exists, rather than
+/// transparently continuing against the new one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn long_poll_does_not_follow_delete_and_recreate_of_same_queue_name() {
+    let mut server = Server::new(cfg());
+    let url = server
+        .create_queue("QueueA", &Default::default(), &Default::default())
+        .unwrap()
+        .url;
+    let server = Arc::new(Mutex::new(server));
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(devcloud_sqs::http::serve(
+        listener,
+        Arc::clone(&server),
+        std::future::pending(),
+    ));
+
+    // Start a 2s long poll (JSON protocol) on the queue — empty, so it will
+    // keep polling until the wait elapses or the queue identity check fails.
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let body = format!(r#"{{"QueueUrl":"{url}","WaitTimeSeconds":2}}"#);
+    stream
+        .write_all(&json_request("AmazonSQS.ReceiveMessage", &body))
+        .await
+        .unwrap();
+
+    // Let the poll get past its first attempt.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    // Delete and recreate the same-named queue directly against the shared
+    // server (out from under the in-flight poll).
+    {
+        let mut guard = server.lock().unwrap();
+        assert!(guard.delete_queue(&url));
+        let recreated = guard
+            .create_queue("QueueA", &Default::default(), &Default::default())
+            .unwrap();
+        assert_eq!(recreated.url, url, "recreated queue must reuse the URL");
+    }
+
+    let (status, resp) = read_http_response(&mut stream).await;
+    let resp_str = String::from_utf8_lossy(&resp);
+    assert_eq!(status, 400, "{resp_str}");
+    assert!(
+        resp_str.contains("QueueDoesNotExist"),
+        "expected a QueueDoesNotExist error once the queue was replaced mid-poll: {resp_str}"
+    );
+}
+
+/// Minimal `application/x-www-form-urlencoded` value encoder sufficient for
+/// the queue URLs used in these tests (only `:` and `/` need escaping).
+fn urlencoding_lite(s: &str) -> String {
+    s.replace(':', "%3A").replace('/', "%2F")
+}

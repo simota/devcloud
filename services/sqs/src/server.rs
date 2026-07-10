@@ -66,6 +66,18 @@ pub struct Server {
     load_err: Option<String>,
 }
 
+/// Identifies a specific queue *instance* (as opposed to just its name):
+/// queues carry no dedicated id, so `arn` (constant for a given name) plus
+/// `created_at` (fresh on every `create_queue`) together distinguish a queue
+/// from a same-named one that replaced it via delete+recreate. Used to pin a
+/// long-poll `ReceiveMessage` to the queue it started against — see
+/// `Server::receive_messages_once`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QueueIdentity {
+    arn: String,
+    created_at: String,
+}
+
 fn default_str<'a>(value: &'a str, fallback: &'a str) -> &'a str {
     if value.is_empty() {
         fallback
@@ -269,6 +281,15 @@ impl Server {
 
     pub fn queue_by_name(&self, name: &str) -> Option<QueueState> {
         self.queues.get(name).map(clone_queue)
+    }
+
+    /// The current identity of the queue named `name`, if it exists. See
+    /// `QueueIdentity`.
+    pub(crate) fn queue_identity(&self, name: &str) -> Option<QueueIdentity> {
+        self.queues.get(name).map(|q| QueueIdentity {
+            arn: q.arn.clone(),
+            created_at: q.created_at.clone(),
+        })
     }
 
     pub fn queue_by_url(&self, queue_url: &str) -> Option<QueueState> {

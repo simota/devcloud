@@ -77,6 +77,18 @@ async fn handle_conn(
         let outcome = long_poll_receive_message(&server, &request.body).await;
         return write_json_response(&mut stream, outcome).await;
     }
+    if is_async_query_receive_request(&request) {
+        let form_body = query_form_body(&request, request.header("content-type"));
+        let outcome = long_poll_query_receive_message(
+            &server,
+            &request.method,
+            &request.path,
+            &request.query,
+            &form_body,
+        )
+        .await;
+        return write_query_response(&mut stream, outcome).await;
+    }
     match process(&server, &request) {
         Outcome::Json(outcome) => write_json_response(&mut stream, outcome).await,
         Outcome::Introspect(outcome) => write_introspect_response(&mut stream, outcome).await,
@@ -98,6 +110,42 @@ fn is_async_receive_request(req: &Request) -> bool {
     req.header("x-amz-target") == "AmazonSQS.ReceiveMessage"
 }
 
+/// True when `req` is a Query-protocol `ReceiveMessage` request — the Query
+/// analogue of `is_async_receive_request`. Mirrors `process`'s gating exactly:
+/// introspection path takes priority, method must be GET/POST, and it must
+/// not match anything the JSON path would claim (an `AmazonSQS.`-prefixed
+/// `X-Amz-Target`, or a JSON-content-type POST with no target — both stay on
+/// the JSON fast path or its error branch, never reaching here).
+fn is_async_query_receive_request(req: &Request) -> bool {
+    if crate::introspect::is_introspect_path(&req.path) {
+        return false;
+    }
+    if req.method != "POST" && req.method != "GET" {
+        return false;
+    }
+    let target = req.header("x-amz-target");
+    let content_type = req.header("content-type");
+    if target.starts_with("AmazonSQS.") {
+        return false;
+    }
+    if content_type.contains("application/x-amz-json-1.0") && req.method == "POST" {
+        return false;
+    }
+    let form_body = query_form_body(req, content_type);
+    crate::http_query::query_action(&req.method, &req.query, &form_body) == "ReceiveMessage"
+}
+
+/// The Query-protocol POST form body, mirroring `process`'s own extraction:
+/// only present for a form-urlencoded POST, empty otherwise (GET reads the
+/// URL query instead).
+fn query_form_body(req: &Request, content_type: &str) -> String {
+    if req.method == "POST" && content_type.contains("application/x-www-form-urlencoded") {
+        String::from_utf8_lossy(&req.body).into_owned()
+    } else {
+        String::new()
+    }
+}
+
 /// Long-polls `ReceiveMessage` without holding the server lock across the
 /// wait. Each attempt takes the lock just long enough for one non-waiting
 /// scan (`Server::receive_messages_once`), releases it, then sleeps on the
@@ -105,7 +153,11 @@ fn is_async_receive_request(req: &Request) -> bool {
 /// `services/pubsub/src/grpc.rs`. Attempt count/cadence
 /// (`wait_seconds * 10 + 1` attempts, 100ms apart) matches
 /// `Server::receive_messages` exactly, so response timing is unchanged from
-/// the caller's point of view; only the server lock's hold time shrinks.
+/// the caller's point of view; only the server lock's hold time shrinks. The
+/// queue's `QueueIdentity` is pinned from the first attempt and checked on
+/// every later one, so a delete+recreate of the same queue name mid-poll
+/// surfaces as `QueueDoesNotExist` instead of silently continuing against the
+/// new queue.
 async fn long_poll_receive_message(server: &Mutex<Server>, body: &[u8]) -> JsonOutcome {
     let req: Value = if body.is_empty() {
         json!({})
@@ -121,9 +173,9 @@ async fn long_poll_receive_message(server: &Mutex<Server>, body: &[u8]) -> JsonO
 
     let attempt = {
         let mut guard = server.lock().unwrap();
-        guard.receive_messages_once(&input)
+        guard.receive_messages_once(&input, None)
     };
-    let (first, wait_seconds) = match attempt {
+    let (first, wait_seconds, identity) = match attempt {
         Ok(r) => r,
         Err(e) => return mapped_error(&e),
     };
@@ -135,9 +187,9 @@ async fn long_poll_receive_message(server: &Mutex<Server>, body: &[u8]) -> JsonO
         tokio::time::sleep(Duration::from_millis(100)).await;
         let attempt = {
             let mut guard = server.lock().unwrap();
-            guard.receive_messages_once(&input)
+            guard.receive_messages_once(&input, Some(&identity))
         };
-        let (messages, _) = match attempt {
+        let (messages, _, _) = match attempt {
             Ok(r) => r,
             Err(e) => return mapped_error(&e),
         };
@@ -146,6 +198,54 @@ async fn long_poll_receive_message(server: &Mutex<Server>, body: &[u8]) -> JsonO
         }
     }
     receive_message_success(&[])
+}
+
+/// Long-polls a Query-protocol `ReceiveMessage` without holding the server
+/// lock across the wait — the Query-protocol counterpart of
+/// `long_poll_receive_message`. Validates the request up front exactly as
+/// `dispatch_query` would (path + Version), then drives the same
+/// `Server::receive_messages_once` attempt loop, rendering the XML response
+/// exactly as `dispatch_query`'s `ReceiveMessage` arm would.
+async fn long_poll_query_receive_message(
+    server: &Mutex<Server>,
+    method: &str,
+    path: &str,
+    raw_query: &str,
+    form_body: &str,
+) -> QueryOutcome {
+    let input =
+        match crate::http_query::parse_query_receive_message(method, path, raw_query, form_body) {
+            Ok(input) => input,
+            Err(outcome) => return outcome,
+        };
+
+    let attempt = {
+        let mut guard = server.lock().unwrap();
+        guard.receive_messages_once(&input, None)
+    };
+    let (first, wait_seconds, identity) = match attempt {
+        Ok(r) => r,
+        Err(e) => return crate::http_query::mapped_error(&e),
+    };
+    let attempts = (wait_seconds * 10 + 1).max(1);
+    if !first.is_empty() || attempts == 1 {
+        return crate::http_query::receive_message_success(&first);
+    }
+    for attempt_n in 1..attempts {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let attempt = {
+            let mut guard = server.lock().unwrap();
+            guard.receive_messages_once(&input, Some(&identity))
+        };
+        let (messages, _, _) = match attempt {
+            Ok(r) => r,
+            Err(e) => return crate::http_query::mapped_error(&e),
+        };
+        if !messages.is_empty() || attempt_n == attempts - 1 {
+            return crate::http_query::receive_message_success(&messages);
+        }
+    }
+    crate::http_query::receive_message_success(&[])
 }
 
 /// A rendered response in either protocol — JSON (modern), the read-only
@@ -266,12 +366,7 @@ fn process(server: &Mutex<Server>, req: &Request) -> Outcome {
 
     // Query/XML protocol. dispatch_query mirrors the rest of detectOperation
     // (path + Version validation) plus the per-action handlers.
-    let form_body =
-        if req.method == "POST" && content_type.contains("application/x-www-form-urlencoded") {
-            String::from_utf8_lossy(&req.body).into_owned()
-        } else {
-            String::new()
-        };
+    let form_body = query_form_body(req, content_type);
     let mut guard = server.lock().unwrap();
     Outcome::Query(guard.dispatch_query(&req.method, &req.path, &req.query, &form_body))
 }

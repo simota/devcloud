@@ -6,13 +6,17 @@
 //!
 //! `receive_messages_once` performs a single non-waiting attempt (validate +
 //! scan); `receive_messages` layers a bounded `std::thread::sleep` retry loop
-//! on top for synchronous callers (tests, the Query protocol path).
+//! on top for synchronous callers (tests, and `dispatch_json`/`dispatch_query`
+//! when called directly rather than through the socket server).
 //! `wait_time_seconds == 0` returns immediately, matching the legacy fast
-//! path. The async JSON HTTP server (`http.rs`) instead drives
+//! path. The async JSON and Query HTTP servers (`http.rs`) instead drive
 //! `receive_messages_once` from a tokio loop so the server lock is released
 //! between attempts rather than held across the whole wait; the legacy
 //! wait-channel is purely an early-wake optimization and is not behaviorally
-//! required either way.
+//! required either way. Both loops pin the queue's `QueueIdentity` from the
+//! first attempt and pass it back in on every later attempt, so a
+//! delete+recreate of the same queue name mid-poll surfaces as
+//! `QueueDoesNotExist` instead of silently continuing against the new queue.
 
 use std::collections::{BTreeMap, HashSet};
 use std::time::Duration;
@@ -22,7 +26,7 @@ use sha2::{Digest, Sha256};
 use crate::hashing::{md5_hex, md5_of_message_attributes, MessageAttributeValue};
 use crate::model::{DeduplicationState, MessageState};
 use crate::server::{
-    is_fifo_queue, queue_name_from_url, QueueState, Server, MAX_DELAY_SECONDS,
+    is_fifo_queue, queue_name_from_url, QueueIdentity, QueueState, Server, MAX_DELAY_SECONDS,
     MAX_VISIBILITY_TIMEOUT_SECONDS,
 };
 use crate::time_fmt::{add_seconds, before, is_zero, now_rfc3339, unix_millis_from_rfc3339};
@@ -273,21 +277,39 @@ impl Server {
     // --- receive (mirror message_core.rs) ---
 
     /// Single non-waiting attempt: validates the request, then performs one
-    /// scan for available messages. Returns the scan result alongside the
-    /// effective (clamped) `WaitTimeSeconds`, so a caller driving its own
-    /// poll loop knows how many ~100ms slices to keep polling for. Safe to
-    /// call repeatedly — the validation only reads immutable `Config` fields
-    /// and `input`, never mutable queue state.
+    /// scan for available messages. Returns the scan result, the effective
+    /// (clamped) `WaitTimeSeconds` (so a caller driving its own poll loop
+    /// knows how many ~100ms slices to keep polling for), and the queue's
+    /// current `QueueIdentity`.
+    ///
+    /// `pinned`: on the first attempt, pass `None` and keep the returned
+    /// identity; on every later attempt of the same poll, pass it back in as
+    /// `Some(&identity)`. If the queue was deleted and a same-named queue
+    /// recreated in between, the identity no longer matches and this returns
+    /// the same error a deleted queue would (`"queue does not exist"`),
+    /// rather than silently resuming the scan against the new queue.
+    ///
+    /// Safe to call repeatedly — the validation only reads immutable
+    /// `Config` fields and `input`, never mutable queue state.
     pub fn receive_messages_once(
         &mut self,
         input: &ReceiveMessageRequest,
-    ) -> Result<(Vec<ReceivedMessage>, i64), String> {
+        pinned: Option<&QueueIdentity>,
+    ) -> Result<(Vec<ReceivedMessage>, i64, QueueIdentity), String> {
         if input.queue_url.is_empty() {
             return Err("QueueUrl is required".into());
         }
         let name = queue_name_from_url(&input.queue_url);
         if name.is_empty() {
             return Err("queue does not exist".into());
+        }
+        let identity = self
+            .queue_identity(&name)
+            .ok_or_else(|| "queue does not exist".to_string())?;
+        if let Some(pinned) = pinned {
+            if pinned != &identity {
+                return Err("queue does not exist".into());
+            }
         }
         let mut max_messages = input.max_number_of_messages.unwrap_or(1);
         if max_messages < 1 {
@@ -313,26 +335,28 @@ impl Server {
             &input.message_attribute_names,
             &requested_system_attribute_names(input),
         )?;
-        Ok((messages, wait_seconds))
+        Ok((messages, wait_seconds, identity))
     }
 
     /// Long-poll receive. `wait_time_seconds == 0` returns immediately.
     /// Blocks the calling thread for the wait via `std::thread::sleep` — used
-    /// directly by tests and the Query protocol path. The JSON HTTP path
-    /// instead drives `receive_messages_once` from an async loop in
-    /// `http.rs` so the server lock isn't held across the sleeps.
+    /// directly by tests and by `dispatch_json`/`dispatch_query` when called
+    /// directly rather than through the socket server. The socket server's
+    /// JSON and Query paths instead drive `receive_messages_once` from an
+    /// async loop in `http.rs` so the server lock isn't held across the
+    /// sleeps.
     pub fn receive_messages(
         &mut self,
         input: &ReceiveMessageRequest,
     ) -> Result<Vec<ReceivedMessage>, String> {
-        let (first, wait_seconds) = self.receive_messages_once(input)?;
+        let (first, wait_seconds, identity) = self.receive_messages_once(input, None)?;
         let attempts = (wait_seconds * 10 + 1).max(1); // ~100ms slices, mirroring the legacy loop
         if !first.is_empty() || attempts == 1 {
             return Ok(first);
         }
         for attempt in 1..attempts {
             std::thread::sleep(Duration::from_millis(100));
-            let (messages, _) = self.receive_messages_once(input)?;
+            let (messages, _, _) = self.receive_messages_once(input, Some(&identity))?;
             if !messages.is_empty() || attempt == attempts - 1 {
                 return Ok(messages);
             }
