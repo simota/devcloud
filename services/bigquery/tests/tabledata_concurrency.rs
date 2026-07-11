@@ -9,6 +9,7 @@
 //! `Barrier` to line the requests up on the same instant, so the race window
 //! is exercised on every run rather than left to scheduler luck.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
 use std::thread;
 
@@ -16,14 +17,21 @@ use devcloud_bigquery::model::{InsertAllResponse, TableResource};
 use devcloud_bigquery::server::{Config, Server};
 
 fn tempdir() -> std::path::PathBuf {
+    // A per-process counter guarantees uniqueness across the concurrently
+    // running test functions: `SystemTime::now().as_nanos()` has coarse
+    // resolution on some platforms (macOS routinely returns the same value for
+    // back-to-back reads), so pid+nanos alone can collide and hand two tests
+    // the same storage dir, corrupting each other's row counts.
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
     let mut dir = std::env::temp_dir();
     dir.push(format!(
-        "devcloud-bigquery-tabledata-concurrency-{}-{}",
+        "devcloud-bigquery-tabledata-concurrency-{}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-            .as_nanos()
+            .as_nanos(),
+        COUNTER.fetch_add(1, Ordering::Relaxed),
     ));
     std::fs::create_dir_all(&dir).expect("create temp dir");
     dir
