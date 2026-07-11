@@ -132,27 +132,35 @@ assert_goal_contract() {
 # --- config / service / dashboard shape assertions (run when files exist) ---
 
 assert_redis_config_shape() {
-  if [[ ! -f orchestrator/config.rs ]]; then
+  if [[ ! -f orchestrator/src/config.rs ]]; then
     return 1
   fi
-  env -u RIPGREP_CONFIG_PATH rg -q 'RedisServiceConfig|RedisPort|Redis +RedisAuthConfig' orchestrator/config.rs
+  env -u RIPGREP_CONFIG_PATH rg -q 'struct RedisServiceConfig' orchestrator/src/config.rs &&
+    env -u RIPGREP_CONFIG_PATH rg -q 'redis_port' orchestrator/src/config.rs
 }
 
 assert_redis_service_pkg_shape() {
-  test -d services/redis &&
-    test -f services/redis/server.rs &&
-    env -u RIPGREP_CONFIG_PATH rg -q 'func NewServer' services/redis/server.rs
+  test -d services/redis-control &&
+    test -f services/redis-control/src/server.rs &&
+    env -u RIPGREP_CONFIG_PATH rg -q 'pub struct Server' services/redis-control/src/server.rs &&
+    env -u RIPGREP_CONFIG_PATH rg -q 'pub fn new' services/redis-control/src/server.rs &&
+    env -u RIPGREP_CONFIG_PATH rg -q 'command_allowed|CommandClass' services/redis-control/src/command_allowlist.rs
 }
 
 assert_managed_redis_shape() {
-  test -f orchestrator/managed_redis.rs &&
-    env -u RIPGREP_CONFIG_PATH rg -q 'redis-server|SIGTERM|--requirepass|--port' orchestrator/managed_redis.rs
+  test -f orchestrator/src/services/redis.rs &&
+    env -u RIPGREP_CONFIG_PATH rg -q 'Command::new' orchestrator/src/services/redis.rs &&
+    env -u RIPGREP_CONFIG_PATH rg -q 'start_kill' orchestrator/src/services/redis.rs &&
+    env -u RIPGREP_CONFIG_PATH rg -q 'fn redis_mode' orchestrator/src/services/redis.rs &&
+    env -u RIPGREP_CONFIG_PATH rg -q -- '--requirepass' services/redis/src/lib.rs &&
+    env -u RIPGREP_CONFIG_PATH rg -q -- '--port' services/redis/src/lib.rs
 }
 
 assert_dashboard_redis_shape() {
-  test -f services/dashboard/redis_handlers.rs &&
-    env -u RIPGREP_CONFIG_PATH rg -q '/api/redis/status|/api/redis/keys|allowlist|Allowlist|allowedCommands' services/dashboard/redis_handlers.rs &&
-    env -u RIPGREP_CONFIG_PATH rg -q 'redis' services/dashboard/services.rs
+  test -f services/dashboard/src/redis.rs &&
+    env -u RIPGREP_CONFIG_PATH rg -q '/api/redis/status|/api/redis/keys' services/dashboard/src/http.rs &&
+    env -u RIPGREP_CONFIG_PATH rg -q 'handle_status|handle_keys|handle_command' services/dashboard/src/redis.rs &&
+    env -u RIPGREP_CONFIG_PATH rg -q 'redis' services/dashboard/src/services.rs
 }
 
 assert_dashboard_redis_ui_shape() {

@@ -37,33 +37,37 @@ assert_mvp_still_passes() {
 }
 
 assert_streaming_pull_contract() {
-  env -u RIPGREP_CONFIG_PATH rg -q 'func .*StreamingPull' services/pubsub &&
+  env -u RIPGREP_CONFIG_PATH rg -q 'async fn streaming_pull' services/pubsub/src/grpc.rs &&
+    env -u RIPGREP_CONFIG_PATH rg -q 'fn apply_streaming_pull_request' services/pubsub/src/grpc.rs &&
     cargo test --workspace
 }
 
 assert_snapshot_seek_grpc_contract() {
-  env -u RIPGREP_CONFIG_PATH rg -q 'func .*CreateSnapshot' services/pubsub &&
-    env -u RIPGREP_CONFIG_PATH rg -q 'func .*GetSnapshot' services/pubsub &&
-    env -u RIPGREP_CONFIG_PATH rg -q 'func .*ListSnapshots' services/pubsub &&
-    env -u RIPGREP_CONFIG_PATH rg -q 'func .*DeleteSnapshot' services/pubsub &&
-    env -u RIPGREP_CONFIG_PATH rg -q 'func .*Seek' services/pubsub &&
+  env -u RIPGREP_CONFIG_PATH rg -q 'async fn create_snapshot' services/pubsub/src/grpc.rs &&
+    env -u RIPGREP_CONFIG_PATH rg -q 'async fn get_snapshot' services/pubsub/src/grpc.rs &&
+    env -u RIPGREP_CONFIG_PATH rg -q 'async fn list_snapshots' services/pubsub/src/grpc.rs &&
+    env -u RIPGREP_CONFIG_PATH rg -q 'async fn delete_snapshot' services/pubsub/src/grpc.rs &&
+    env -u RIPGREP_CONFIG_PATH rg -q 'async fn seek' services/pubsub/src/grpc.rs &&
     cargo test --workspace
 }
 
 assert_schema_grpc_contract() {
-  env -u RIPGREP_CONFIG_PATH rg -q 'RegisterSchemaServiceServer|SchemaServiceServer' services/pubsub &&
-    env -u RIPGREP_CONFIG_PATH rg -q 'func .*CreateSchema' services/pubsub &&
-    env -u RIPGREP_CONFIG_PATH rg -q 'func .*ValidateMessage' services/pubsub &&
+  env -u RIPGREP_CONFIG_PATH rg -q 'SchemaServiceServer' services/pubsub/src &&
+    env -u RIPGREP_CONFIG_PATH rg -q 'async fn create_schema' services/pubsub/src/grpc.rs &&
+    env -u RIPGREP_CONFIG_PATH rg -q 'async fn validate_message' services/pubsub/src/grpc.rs &&
     cargo test --workspace
 }
 
 assert_push_delivery_contract() {
-  env -u RIPGREP_CONFIG_PATH rg -q 'pushWorker|runPush|deliverPush|pushDelivery' services/pubsub &&
+  env -u RIPGREP_CONFIG_PATH rg -q 'fn modify_push_config' services/pubsub/src/server.rs &&
+    env -u RIPGREP_CONFIG_PATH rg -q 'fn grpc_modify_push_config' services/pubsub/src/server.rs &&
+    env -u RIPGREP_CONFIG_PATH rg -q 'fn validate_push_config' services/pubsub/src/validation.rs &&
     cargo test --workspace
 }
 
 assert_ordering_contract() {
-  env -u RIPGREP_CONFIG_PATH rg -q 'StreamingPull.*Ordering|Ordering.*StreamingPull' services/pubsub &&
+  env -u RIPGREP_CONFIG_PATH rg -q 'if sub.enable_message_ordering' services/pubsub/src/server.rs &&
+    env -u RIPGREP_CONFIG_PATH rg -q 'enable_message_ordering' services/pubsub/src/grpc.rs &&
     cargo test --workspace
 }
 

@@ -38,7 +38,8 @@ assert_existing_gates() {
 }
 
 assert_default_backend_contract() {
-  env -u RIPGREP_CONFIG_PATH rg -q 'backend_kind: "postgres"|backend_mode: "managed"' orchestrator/src/config.rs &&
+  env -u RIPGREP_CONFIG_PATH rg -q 'default_string\(&b\.kind, "postgres"\)' orchestrator/src/config.rs &&
+    env -u RIPGREP_CONFIG_PATH rg -q '"managed"\.to_string\(\)' orchestrator/src/config.rs &&
     env -u RIPGREP_CONFIG_PATH rg -q 'kind: memory|backend_kind.*memory|memory fallback' orchestrator docs scripts &&
     cargo test --workspace
 }
