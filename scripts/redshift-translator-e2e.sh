@@ -36,6 +36,7 @@ REDSHIFT_SQL_PORT="${REDSHIFT_SQL_PORT:-$(free_port)}"
 REDSHIFT_API_PORT="${REDSHIFT_API_PORT:-$(free_port)}"
 DASHBOARD_PORT="${DASHBOARD_PORT:-$(free_port)}"
 SMTP_PORT="${SMTP_PORT:-$(free_port)}"
+MAIL_HTTP_PORT="${MAIL_HTTP_PORT:-$(free_port)}"
 S3_PORT="${S3_PORT:-$(free_port)}"
 GCS_PORT="${GCS_PORT:-$(free_port)}"
 DYNAMODB_PORT="${DYNAMODB_PORT:-$(free_port)}"
@@ -68,6 +69,7 @@ project: redshift-translator-e2e
 
 server:
   smtpPort: ${SMTP_PORT}
+  mailHttpPort: ${MAIL_HTTP_PORT}
   dashboardPort: ${DASHBOARD_PORT}
   s3Port: ${S3_PORT}
   gcsPort: ${GCS_PORT}

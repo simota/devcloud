@@ -17,6 +17,7 @@ PY
 
 REDIS_PORT="${E2E_REDIS_PORT:-$(free_port)}"
 DASHBOARD_PORT="${E2E_DASHBOARD_PORT:-$(free_port)}"
+APP_AUTOSCALING_PORT="${E2E_APP_AUTOSCALING_PORT:-$(free_port)}"
 KEEP_WORKDIR="${E2E_KEEP_WORKDIR:-false}"
 INTERACTIVE="${E2E_INTERACTIVE:-false}"
 
@@ -107,6 +108,7 @@ project: redis-e2e
 
 server:
   dashboardPort: ${DASHBOARD_PORT}
+  appAutoScalingPort: ${APP_AUTOSCALING_PORT}
   redisPort: ${REDIS_PORT}
 
 auth:

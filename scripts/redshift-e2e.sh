@@ -50,6 +50,7 @@ EVENT_RELAY_PORT="${EVENT_RELAY_PORT:-$(free_port)}"
 APP_AUTOSCALING_PORT="${APP_AUTOSCALING_PORT:-$(free_port)}"
 REDIS_HTTP_PORT="${REDIS_HTTP_PORT:-$(free_port)}"
 SMTP_PORT="${SMTP_PORT:-$(free_port)}"
+MAIL_HTTP_PORT="${MAIL_HTTP_PORT:-$(free_port)}"
 S3_PORT="${S3_PORT:-$(free_port)}"
 GCS_PORT="${GCS_PORT:-$(free_port)}"
 DYNAMODB_PORT="${DYNAMODB_PORT:-$(free_port)}"
@@ -223,6 +224,7 @@ project: redshift-e2e
 
 server:
   smtpPort: ${SMTP_PORT}
+  mailHttpPort: ${MAIL_HTTP_PORT}
   dashboardPort: ${DASHBOARD_PORT}
   eventRelayPort: ${EVENT_RELAY_PORT}
   appAutoScalingPort: ${APP_AUTOSCALING_PORT}

@@ -9,6 +9,8 @@ SQS_PORT="${E2E_SQS_PORT:-}"
 GCS_PORT="${E2E_GCS_PORT:-}"
 S3_PORT="${E2E_S3_PORT:-}"
 SMTP_PORT="${E2E_SMTP_PORT:-}"
+MAIL_HTTP_PORT="${E2E_MAIL_HTTP_PORT:-}"
+APP_AUTOSCALING_PORT="${E2E_APP_AUTOSCALING_PORT:-}"
 DYNAMODB_PORT="${E2E_DYNAMODB_PORT:-}"
 BIGQUERY_PORT="${E2E_BIGQUERY_PORT:-}"
 DASHBOARD_PORT="${E2E_DASHBOARD_PORT:-}"
@@ -126,6 +128,12 @@ assign_ports() {
   if [[ -z "${SMTP_PORT}" ]]; then
     SMTP_PORT="$(find_free_port)"
   fi
+  if [[ -z "${MAIL_HTTP_PORT}" ]]; then
+    MAIL_HTTP_PORT="$(find_free_port)"
+  fi
+  if [[ -z "${APP_AUTOSCALING_PORT}" ]]; then
+    APP_AUTOSCALING_PORT="$(find_free_port)"
+  fi
   if [[ -z "${DYNAMODB_PORT}" ]]; then
     DYNAMODB_PORT="$(find_free_port)"
   fi
@@ -218,8 +226,10 @@ project: sqs-e2e
 
 server:
   smtpPort: ${SMTP_PORT}
+  mailHttpPort: ${MAIL_HTTP_PORT}
   dashboardPort: ${DASHBOARD_PORT}
   eventRelayPort: ${EVENT_RELAY_PORT}
+  appAutoScalingPort: ${APP_AUTOSCALING_PORT}
   s3Port: ${S3_PORT}
   gcsPort: ${GCS_PORT}
   dynamodbPort: ${DYNAMODB_PORT}

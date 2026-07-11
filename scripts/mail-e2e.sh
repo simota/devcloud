@@ -6,6 +6,8 @@ source "${ROOT_DIR}/scripts/lib/devcloud-engine.sh"
 cd "${ROOT_DIR}"
 
 SMTP_PORT="${E2E_SMTP_PORT:-12026}"
+MAIL_HTTP_PORT="${E2E_MAIL_HTTP_PORT:-11080}"
+APP_AUTOSCALING_PORT="${E2E_APP_AUTOSCALING_PORT:-18030}"
 DASHBOARD_PORT="${E2E_DASHBOARD_PORT:-18026}"
 KEEP_WORKDIR="${E2E_KEEP_WORKDIR:-false}"
 INTERACTIVE="${E2E_INTERACTIVE:-false}"
@@ -78,7 +80,9 @@ project: e2e
 
 server:
   smtpPort: ${SMTP_PORT}
+  mailHttpPort: ${MAIL_HTTP_PORT}
   dashboardPort: ${DASHBOARD_PORT}
+  appAutoScalingPort: ${APP_AUTOSCALING_PORT}
 
 auth:
   smtp:
