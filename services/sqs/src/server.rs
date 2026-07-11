@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use crate::model::{DeduplicationState, MessageState};
-use crate::persistence::{PersistedQueue, PersistedState};
+use crate::persistence::{PersistedQueueRef, PersistedState, PersistedStateRef};
 use crate::policy::{
     normalized_permission_actions, parse_redrive_allow_policy, parse_redrive_policy, QueuePolicy,
     QueuePolicyPrincipal, QueuePolicyStatement,
@@ -626,25 +626,34 @@ impl Server {
             return Ok(());
         }
         std::fs::create_dir_all(&self.config.storage_path).map_err(|e| e.to_string())?;
-        let mut persisted = PersistedState::default();
+        // Serialize straight off `&self.queues`/`&self.move_tasks` via the
+        // borrowing `Ref` types (see persistence.rs) instead of cloning every
+        // message/attribute/dedup entry into an owned `PersistedState` first —
+        // persist() runs on every mutating call, so that clone's cost would
+        // grow with total queue size rather than with the size of this call's
+        // actual change.
+        let mut queues = BTreeMap::new();
         for (name, q) in &self.queues {
-            persisted.queues.insert(
-                name.clone(),
-                PersistedQueue {
-                    name: q.name.clone(),
-                    url: q.url.clone(),
-                    arn: q.arn.clone(),
-                    attributes: q.attributes.clone(),
-                    tags: q.tags.clone(),
-                    created_at: q.created_at.clone(),
+            queues.insert(
+                name.as_str(),
+                PersistedQueueRef {
+                    name: &q.name,
+                    url: &q.url,
+                    arn: &q.arn,
+                    attributes: &q.attributes,
+                    tags: &q.tags,
+                    created_at: &q.created_at,
                     modified_at: queue_last_modified_at(q),
-                    messages: q.messages.clone(),
+                    messages: &q.messages,
                     sequence: q.sequence,
-                    dedup: q.dedup.clone(),
+                    dedup: &q.dedup,
                 },
             );
         }
-        persisted.move_tasks = self.move_tasks.clone();
+        let persisted = PersistedStateRef {
+            queues,
+            move_tasks: &self.move_tasks,
+        };
         let data = persisted.to_json_bytes();
         let path = self.state_path();
         let tmp = path.with_extension("json.tmp");

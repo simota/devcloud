@@ -5,7 +5,8 @@ use std::collections::BTreeMap;
 
 use devcloud_sqs::{
     normalized_permission_actions, parse_redrive_allow_policy, parse_redrive_policy,
-    queue_name_from_url, Config, Server,
+    queue_name_from_url, Config, MessageAttributeValue, PersistedQueue, PersistedState,
+    ReceiveMessageRequest, SendMessageRequest, Server,
 };
 
 fn cfg() -> Config {
@@ -597,4 +598,118 @@ fn persisted_state_survives_reload() {
     let q = s2.queue_by_name("Orders").expect("reloaded");
     assert_eq!(q.attributes["VisibilityTimeout"], "45");
     assert_eq!(q.tags["env"], "prod");
+}
+
+#[test]
+fn persist_matches_owned_clone_writer_for_a_fully_populated_queue() {
+    // Regression guard for the `Server::persist()` optimization that now
+    // serializes straight off `&self.queues` via `PersistedStateRef`/
+    // `PersistedQueueRef` (persistence.rs) instead of first deep-cloning into
+    // an owned `PersistedState`. Populates every persisted field at once
+    // (message attributes, a delayed message, FIFO dedup, sequence, tags)
+    // and confirms the new borrowing writer's on-disk bytes are identical to
+    // what the old owned-clone `PersistedState` writer would produce for the
+    // same data.
+    let dir = std::env::temp_dir().join(format!(
+        "devcloud-sqs-persist-parity-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut c = cfg();
+    c.storage_path = dir.to_string_lossy().into_owned();
+    let mut s = Server::new(c);
+
+    s.create_queue(
+        "Orders.fifo",
+        &map(&[("FifoQueue", "true"), ("VisibilityTimeout", "30")]),
+        &map(&[("env", "prod"), ("team", "payments")]),
+    )
+    .unwrap();
+    let furl = "http://127.0.0.1:9324/000000000000/Orders.fifo";
+
+    let mut attrs = BTreeMap::new();
+    attrs.insert(
+        "priority".to_string(),
+        MessageAttributeValue {
+            data_type: "String".to_string(),
+            string_value: "high".to_string(),
+            ..Default::default()
+        },
+    );
+    s.send_message(&SendMessageRequest {
+        queue_url: furl.to_string(),
+        message_body: "first".to_string(),
+        message_group_id: "g1".to_string(),
+        message_deduplication_id: "d1".to_string(),
+        message_attributes: attrs,
+        ..Default::default()
+    })
+    .unwrap();
+    s.send_message(&SendMessageRequest {
+        queue_url: furl.to_string(),
+        message_body: "second".to_string(),
+        message_group_id: "g1".to_string(),
+        message_deduplication_id: "d2".to_string(),
+        ..Default::default()
+    })
+    .unwrap();
+    // Receiving with a visibility timeout exercises `invisible_until` and
+    // `receive_count` diverging from the legacy zero-time/zero defaults.
+    s.receive_messages(&ReceiveMessageRequest {
+        queue_url: furl.to_string(),
+        max_number_of_messages: Some(1),
+        visibility_timeout: Some(30),
+        wait_time_seconds: Some(0),
+        ..Default::default()
+    })
+    .unwrap();
+
+    let q = s.queue_by_name("Orders.fifo").expect("queue present");
+    assert!(!q.messages.is_empty(), "messages must be populated");
+    assert!(!q.dedup.is_empty(), "FIFO dedup must be populated");
+    assert!(!q.tags.is_empty(), "tags must be populated");
+    assert!(q.sequence > 0, "FIFO sequence must be populated");
+    assert!(
+        q.messages.iter().any(|m| !m.attributes.is_empty()),
+        "message attributes must be populated"
+    );
+    assert!(
+        q.messages.iter().any(|m| m.receive_count > 0),
+        "receive_count must be populated"
+    );
+    assert!(
+        q.messages
+            .iter()
+            .any(|m| m.invisible_until != devcloud_sqs::ZERO_TIME),
+        "invisible_until must diverge from the zero-time default"
+    );
+
+    let bytes_from_new_writer = std::fs::read(dir.join("state.json")).expect("state.json written");
+
+    let mut old = PersistedState::default();
+    old.queues.insert(
+        q.name.clone(),
+        PersistedQueue {
+            name: q.name.clone(),
+            url: q.url.clone(),
+            arn: q.arn.clone(),
+            attributes: q.attributes.clone(),
+            tags: q.tags.clone(),
+            created_at: q.created_at.clone(),
+            modified_at: q.modified_at.clone(),
+            messages: q.messages.clone(),
+            sequence: q.sequence,
+            dedup: q.dedup.clone(),
+        },
+    );
+    let bytes_from_old_writer = old.to_json_bytes();
+
+    assert_eq!(
+        bytes_from_new_writer, bytes_from_old_writer,
+        "Server::persist()'s borrowing writer must stay byte-identical to \
+         the old owned-clone PersistedState writer"
+    );
 }

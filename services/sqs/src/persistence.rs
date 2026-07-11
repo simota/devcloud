@@ -75,3 +75,55 @@ impl PersistedState {
         out
     }
 }
+
+fn map_ref_is_empty<K, V>(m: &&BTreeMap<K, V>) -> bool {
+    m.is_empty()
+}
+
+fn slice_ref_is_empty<T>(s: &&[T]) -> bool {
+    s.is_empty()
+}
+
+/// Borrowing mirror of [`PersistedState`] / [`PersistedQueue`] used by
+/// `Server::persist` to serialize `state.json` straight from the live queue
+/// map. `persist()` runs on every mutating call, so cloning every message,
+/// attribute, and dedup entry into an owned `PersistedState` first (as the
+/// naive path would) makes each op's cost grow with total queue size; these
+/// `Ref` types serialize directly off `&QueueState`/`&Server` fields instead,
+/// producing byte-identical output without the intermediate deep clone.
+#[derive(Serialize)]
+pub struct PersistedStateRef<'a> {
+    pub queues: BTreeMap<&'a str, PersistedQueueRef<'a>>,
+    #[serde(rename = "moveTasks", skip_serializing_if = "map_ref_is_empty")]
+    pub move_tasks: &'a BTreeMap<String, MoveTaskState>,
+}
+
+#[derive(Serialize)]
+pub struct PersistedQueueRef<'a> {
+    pub name: &'a str,
+    pub url: &'a str,
+    pub arn: &'a str,
+    pub attributes: &'a BTreeMap<String, String>,
+    #[serde(skip_serializing_if = "map_ref_is_empty")]
+    pub tags: &'a BTreeMap<String, String>,
+    #[serde(rename = "createdAt")]
+    pub created_at: &'a str,
+    #[serde(rename = "modifiedAt", skip_serializing_if = "String::is_empty")]
+    pub modified_at: String,
+    #[serde(skip_serializing_if = "slice_ref_is_empty")]
+    pub messages: &'a [MessageState],
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub sequence: u64,
+    #[serde(skip_serializing_if = "map_ref_is_empty")]
+    pub dedup: &'a BTreeMap<String, DeduplicationState>,
+}
+
+impl<'a> PersistedStateRef<'a> {
+    /// Same byte layout as [`PersistedState::to_json_bytes`]: compact JSON +
+    /// trailing newline.
+    pub fn to_json_bytes(&self) -> Vec<u8> {
+        let mut out = serde_json::to_vec(self).expect("serialize persisted state");
+        out.push(b'\n');
+        out
+    }
+}
