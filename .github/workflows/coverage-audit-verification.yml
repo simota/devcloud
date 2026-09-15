@@ -65,7 +65,7 @@ jobs:
               end = text.index('\nrun_foundation_checks()', start)
               replacement = f'''# Measure real Rust source-line coverage; see docs/testing-coverage.md.
           assert_coverage_thresholds() {{
-            python3 "${{ROOT_DIR}}/scripts/lib/rust-coverage.py" "${{ROOT_DIR}}" \\
+            python3 "$ROOT_DIR/scripts/lib/rust-coverage.py" "$ROOT_DIR" \\
               ./services/{service}:72.0 ./services/dashboard:{dashboard}
           }}
           '''
@@ -147,7 +147,6 @@ jobs:
           all_paths = []
           for message, paths in groups:
               entries = [{'path': path, 'mode': '100644', 'type': 'blob', 'content': pathlib.Path(path).read_text()} for path in paths]
-              # Preserve executable flags on the existing shell scripts.
               for entry in entries:
                   if entry['path'].endswith('/verify.sh'):
                       entry['mode'] = '100755'
