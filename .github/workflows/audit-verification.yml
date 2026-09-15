@@ -41,10 +41,12 @@ jobs:
           path: repo
           fetch-depth: 0
           clean: false
-      - name: Install compiler prerequisite
+      - name: Install compiler prerequisite and reproducible npm
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y protobuf-compiler
+          npm install --global npm@10.9.2
+          npm --version
       - name: Restore and verify audited source changes
         working-directory: repo
         run: |
@@ -71,11 +73,16 @@ jobs:
           rustc --version | tee "$RUNNER_TEMP/audit-core/versions.log"
           cargo --version | tee -a "$RUNNER_TEMP/audit-core/versions.log"
           protoc --version | tee -a "$RUNNER_TEMP/audit-core/versions.log"
+          node --version | tee -a "$RUNNER_TEMP/audit-core/versions.log"
+          npm --version | tee -a "$RUNNER_TEMP/audit-core/versions.log"
           cargo fmt --all -- --check 2>&1 | tee "$RUNNER_TEMP/audit-core/fmt.log"
           cargo check --workspace 2>&1 | tee "$RUNNER_TEMP/audit-core/check.log"
           cargo test --workspace 2>&1 | tee "$RUNNER_TEMP/audit-core/tests.log"
           cargo clippy --workspace --all-targets 2>&1 | tee "$RUNNER_TEMP/audit-core/clippy.log"
           (cd web/dashboard && npm install && npm run typecheck && npm run build) 2>&1 | tee "$RUNNER_TEMP/audit-core/dashboard.log"
+          git status --short | tee "$RUNNER_TEMP/audit-core/final-status.txt"
+          git diff --stat | tee "$RUNNER_TEMP/audit-core/final-diff-stat.txt"
+          git diff > "$RUNNER_TEMP/audit-core/final-worktree.diff"
           git diff --check
           test -z "$(git status --porcelain)"
       - name: Publish only the isolated fix branch
@@ -132,6 +139,7 @@ jobs:
           if [[ "$GROUP" = redshift ]]; then packages+=(postgresql postgresql-client); fi
           sudo apt-get update -qq
           sudo apt-get install -y "${packages[@]}"
+          npm install --global npm@10.9.2
           if [[ "$GROUP" = redshift ]]; then pg_config --bindir >> "$GITHUB_PATH"; fi
           case "$GROUP" in
             s3|sqs|dynamodb|applicationautoscaling)
