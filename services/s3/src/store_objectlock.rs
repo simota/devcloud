@@ -37,7 +37,7 @@ impl FileBucketStore {
             body = Vec::new();
         }
         if !version_id.is_empty() {
-            let version_path = self.object_versions_path(bucket, key).join(version_id);
+            let version_path = Self::version_path(&self.object_path(bucket, key), version_id)?;
             Self::write_json(&version_path.join("object.json"), &object)?;
             return Ok(true);
         }
@@ -145,7 +145,7 @@ impl FileBucketStore {
             body = Vec::new();
         }
         if !version_id.is_empty() {
-            let version_path = self.object_versions_path(bucket, key).join(version_id);
+            let version_path = Self::version_path(&self.object_path(bucket, key), version_id)?;
             Self::write_json(&version_path.join("object.json"), &object)?;
         } else {
             Self::write_json(&self.object_path(bucket, key).join("object.json"), &object)?;

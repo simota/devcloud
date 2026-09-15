@@ -613,11 +613,11 @@ fn cut(s: &str, sep: char) -> (&str, &str, bool) {
 // applyConfigValue (legacy config.rs lines ~818-1464) — per-key dispatch
 // ---------------------------------------------------------------------------
 
-/// Replicate legacy strconv.Atoi: signed 64→truncated to int; here legacy `int` is
-/// 64-bit on the target platforms but field types are i32/i64 per struct. We
-/// parse as i64 then narrow; an out-of-range value mirrors legacy ParseInt error.
-fn parse_int(field: &str, value: &str) -> io::Result<i64> {
-    value.parse::<i64>().map_err(|_| {
+/// Parse directly into the destination integer type so bounds are checked before
+/// validation or assignment. In particular, i32 fields must not wrap via `as`,
+/// while i64 byte/capacity limits retain their full supported range.
+fn parse_int<T: std::str::FromStr>(field: &str, value: &str) -> io::Result<T> {
+    value.parse::<T>().map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidData,
             format!("parse {field}: invalid integer {value:?}"),
@@ -661,43 +661,43 @@ pub fn apply_config_value(cfg: &mut Config, path: &[String], value: &str) -> io:
     let key = path.join(".");
     match key.as_str() {
         "project" => cfg.project = value.to_string(),
-        "server.smtpPort" => cfg.server.smtp_port = parse_int("server.smtpPort", value)? as i32,
+        "server.smtpPort" => cfg.server.smtp_port = parse_int("server.smtpPort", value)?,
         "server.mailHttpPort" | "server.mailHTTPPort" => {
-            cfg.server.mail_http_port = parse_int("server.mailHttpPort", value)? as i32
+            cfg.server.mail_http_port = parse_int("server.mailHttpPort", value)?
         }
         "server.dashboardPort" => {
-            cfg.server.dashboard_port = parse_int("server.dashboardPort", value)? as i32
+            cfg.server.dashboard_port = parse_int("server.dashboardPort", value)?
         }
         "server.eventRelayPort" => {
-            cfg.server.event_relay_port = parse_int("server.eventRelayPort", value)? as i32
+            cfg.server.event_relay_port = parse_int("server.eventRelayPort", value)?
         }
-        "server.s3Port" => cfg.server.s3_port = parse_int("server.s3Port", value)? as i32,
-        "server.gcsPort" => cfg.server.gcs_port = parse_int("server.gcsPort", value)? as i32,
+        "server.s3Port" => cfg.server.s3_port = parse_int("server.s3Port", value)?,
+        "server.gcsPort" => cfg.server.gcs_port = parse_int("server.gcsPort", value)?,
         "server.dynamodbPort" => {
-            cfg.server.dynamodb_port = parse_int("server.dynamodbPort", value)? as i32
+            cfg.server.dynamodb_port = parse_int("server.dynamodbPort", value)?
         }
         "server.bigqueryPort" | "server.bigQueryPort" => {
-            cfg.server.bigquery_port = parse_int("server.bigQueryPort", value)? as i32
+            cfg.server.bigquery_port = parse_int("server.bigQueryPort", value)?
         }
         "server.redshiftPort" => {
-            cfg.server.redshift_port = parse_int("server.redshiftPort", value)? as i32
+            cfg.server.redshift_port = parse_int("server.redshiftPort", value)?
         }
         "server.redshiftAPIPort" | "server.redshiftApiPort" => {
-            cfg.server.redshift_api_port = parse_int("server.redshiftAPIPort", value)? as i32
+            cfg.server.redshift_api_port = parse_int("server.redshiftAPIPort", value)?
         }
-        "server.redisPort" => cfg.server.redis_port = parse_int("server.redisPort", value)? as i32,
+        "server.redisPort" => cfg.server.redis_port = parse_int("server.redisPort", value)?,
         "server.redisHttpPort" | "server.redisHTTPPort" => {
-            cfg.server.redis_http_port = parse_int("server.redisHttpPort", value)? as i32
+            cfg.server.redis_http_port = parse_int("server.redisHttpPort", value)?
         }
-        "server.sqsPort" => cfg.server.sqs_port = parse_int("server.sqsPort", value)? as i32,
+        "server.sqsPort" => cfg.server.sqs_port = parse_int("server.sqsPort", value)?,
         "server.pubsubGrpcPort" => {
-            cfg.server.pubsub_grpc_port = parse_int("server.pubsubGrpcPort", value)? as i32
+            cfg.server.pubsub_grpc_port = parse_int("server.pubsubGrpcPort", value)?
         }
         "server.pubsubRestPort" => {
-            cfg.server.pubsub_rest_port = parse_int("server.pubsubRestPort", value)? as i32
+            cfg.server.pubsub_rest_port = parse_int("server.pubsubRestPort", value)?
         }
         "server.appAutoScalingPort" => {
-            cfg.server.app_auto_scaling_port = parse_int("server.appAutoScalingPort", value)? as i32
+            cfg.server.app_auto_scaling_port = parse_int("server.appAutoScalingPort", value)?
         }
         "auth.smtp.mode" => cfg.auth.smtp.mode = value.to_string(),
         "auth.smtp.user" => cfg.auth.smtp.username = value.to_string(),
@@ -798,7 +798,7 @@ pub fn apply_config_value(cfg: &mut Config, path: &[String], value: &str) -> io:
             if n <= 0 {
                 return Err(err_positive("services.dynamodb.maxTables"));
             }
-            cfg.services.dynamodb.max_tables = n as i32;
+            cfg.services.dynamodb.max_tables = n;
         }
         "services.dynamodb.streams.enabled" => {
             cfg.services.dynamodb.streams.enabled =
@@ -811,7 +811,7 @@ pub fn apply_config_value(cfg: &mut Config, path: &[String], value: &str) -> io:
                     "services.dynamodb.ttl.schedulerIntervalSeconds",
                 ));
             }
-            cfg.services.dynamodb.ttl.scheduler_interval_seconds = n as i32;
+            cfg.services.dynamodb.ttl.scheduler_interval_seconds = n;
         }
         "services.bigquery.enabled" => {
             cfg.services.bigquery.enabled = parse_bool("services.bigquery.enabled", value)?
@@ -837,14 +837,14 @@ pub fn apply_config_value(cfg: &mut Config, path: &[String], value: &str) -> io:
             if n <= 0 {
                 return Err(err_positive("services.bigquery.query.maxResultRows"));
             }
-            cfg.services.bigquery.query.max_result_rows = n as i32;
+            cfg.services.bigquery.query.max_result_rows = n;
         }
         "services.bigquery.query.maxExecutionSeconds" => {
             let n = parse_int("services.bigquery.query.maxExecutionSeconds", value)?;
             if n <= 0 {
                 return Err(err_positive("services.bigquery.query.maxExecutionSeconds"));
             }
-            cfg.services.bigquery.query.max_execution_seconds = n as i32;
+            cfg.services.bigquery.query.max_execution_seconds = n;
         }
         "services.bigquery.query.defaultUseLegacySql" => {
             cfg.services.bigquery.query.default_use_legacy_sql =
@@ -865,7 +865,7 @@ pub fn apply_config_value(cfg: &mut Config, path: &[String], value: &str) -> io:
             if n <= 0 {
                 return Err(err_positive("services.redshift.numberOfNodes"));
             }
-            cfg.services.redshift.number_of_nodes = n as i32;
+            cfg.services.redshift.number_of_nodes = n;
         }
         "services.redshift.maxStatementBytes" => {
             let n = parse_int("services.redshift.maxStatementBytes", value)?;
@@ -902,7 +902,7 @@ pub fn apply_config_value(cfg: &mut Config, path: &[String], value: &str) -> io:
             if n <= 0 {
                 return Err(err_positive("services.redshift.dataApi.maxResultRows"));
             }
-            cfg.services.redshift.data_api.max_result_rows = n as i32;
+            cfg.services.redshift.data_api.max_result_rows = n;
         }
         "services.redshift.dataApi.statementRetentionSeconds"
         | "services.redshift.dataAPI.statementRetentionSeconds" => {
@@ -912,7 +912,7 @@ pub fn apply_config_value(cfg: &mut Config, path: &[String], value: &str) -> io:
                     "services.redshift.dataApi.statementRetentionSeconds",
                 ));
             }
-            cfg.services.redshift.data_api.statement_retention_seconds = n as i32;
+            cfg.services.redshift.data_api.statement_retention_seconds = n;
         }
         "services.redshift.dataApi.sessionRetentionSeconds"
         | "services.redshift.dataAPI.sessionRetentionSeconds" => {
@@ -922,7 +922,7 @@ pub fn apply_config_value(cfg: &mut Config, path: &[String], value: &str) -> io:
                     "services.redshift.dataApi.sessionRetentionSeconds",
                 ));
             }
-            cfg.services.redshift.data_api.session_retention_seconds = n as i32;
+            cfg.services.redshift.data_api.session_retention_seconds = n;
         }
         "services.redshift.sql.enableExtendedProtocol" => {
             cfg.services.redshift.sql.enable_extended_protocol =
@@ -933,7 +933,7 @@ pub fn apply_config_value(cfg: &mut Config, path: &[String], value: &str) -> io:
             if n <= 0 {
                 return Err(err_positive("services.redshift.sql.maxResultRows"));
             }
-            cfg.services.redshift.sql.max_result_rows = n as i32;
+            cfg.services.redshift.sql.max_result_rows = n;
         }
         "services.redshift.sql.defaultSearchPath" => {
             cfg.services.redshift.sql.default_search_path = value.to_string()
@@ -965,7 +965,7 @@ pub fn apply_config_value(cfg: &mut Config, path: &[String], value: &str) -> io:
             if n <= 0 {
                 return Err(err_positive("services.redis.maxMemoryMB"));
             }
-            cfg.services.redis.max_memory_mb = n as i32;
+            cfg.services.redis.max_memory_mb = n;
         }
         "services.redis.appendOnly" => {
             cfg.services.redis.append_only = parse_bool("services.redis.appendOnly", value)?
@@ -980,7 +980,7 @@ pub fn apply_config_value(cfg: &mut Config, path: &[String], value: &str) -> io:
             if n <= 0 {
                 return Err(err_positive("services.sqs.maxQueues"));
             }
-            cfg.services.sqs.max_queues = n as i32;
+            cfg.services.sqs.max_queues = n;
         }
         "services.sqs.maxMessageBytes" => {
             let n = parse_int("services.sqs.maxMessageBytes", value)?;
@@ -994,7 +994,7 @@ pub fn apply_config_value(cfg: &mut Config, path: &[String], value: &str) -> io:
             if n <= 0 {
                 return Err(err_positive("services.sqs.maxReceiveBatchSize"));
             }
-            cfg.services.sqs.max_receive_batch_size = n as i32;
+            cfg.services.sqs.max_receive_batch_size = n;
         }
         "services.sqs.defaultVisibilityTimeoutSeconds" => {
             let n = parse_int("services.sqs.defaultVisibilityTimeoutSeconds", value)?;
@@ -1003,21 +1003,21 @@ pub fn apply_config_value(cfg: &mut Config, path: &[String], value: &str) -> io:
                     "services.sqs.defaultVisibilityTimeoutSeconds",
                 ));
             }
-            cfg.services.sqs.default_visibility_timeout_seconds = n as i32;
+            cfg.services.sqs.default_visibility_timeout_seconds = n;
         }
         "services.sqs.defaultDelaySeconds" => {
             let n = parse_int("services.sqs.defaultDelaySeconds", value)?;
             if n < 0 {
                 return Err(err_non_negative("services.sqs.defaultDelaySeconds"));
             }
-            cfg.services.sqs.default_delay_seconds = n as i32;
+            cfg.services.sqs.default_delay_seconds = n;
         }
         "services.sqs.defaultMessageRetentionSeconds" => {
             let n = parse_int("services.sqs.defaultMessageRetentionSeconds", value)?;
             if n <= 0 {
                 return Err(err_positive("services.sqs.defaultMessageRetentionSeconds"));
             }
-            cfg.services.sqs.default_message_retention_seconds = n as i32;
+            cfg.services.sqs.default_message_retention_seconds = n;
         }
         "services.sqs.defaultReceiveWaitTimeSeconds" => {
             let n = parse_int("services.sqs.defaultReceiveWaitTimeSeconds", value)?;
@@ -1026,14 +1026,14 @@ pub fn apply_config_value(cfg: &mut Config, path: &[String], value: &str) -> io:
                     "services.sqs.defaultReceiveWaitTimeSeconds",
                 ));
             }
-            cfg.services.sqs.default_receive_wait_time_seconds = n as i32;
+            cfg.services.sqs.default_receive_wait_time_seconds = n;
         }
         "services.sqs.schedulerIntervalSeconds" => {
             let n = parse_int("services.sqs.schedulerIntervalSeconds", value)?;
             if n <= 0 {
                 return Err(err_positive("services.sqs.schedulerIntervalSeconds"));
             }
-            cfg.services.sqs.scheduler_interval_seconds = n as i32;
+            cfg.services.sqs.scheduler_interval_seconds = n;
         }
         "services.pubsub.enabled" => {
             cfg.services.pubsub.enabled = parse_bool("services.pubsub.enabled", value)?
@@ -1048,35 +1048,35 @@ pub fn apply_config_value(cfg: &mut Config, path: &[String], value: &str) -> io:
             if n <= 0 {
                 return Err(err_positive("services.pubsub.defaultAckDeadlineSeconds"));
             }
-            cfg.services.pubsub.default_ack_deadline_seconds = n as i32;
+            cfg.services.pubsub.default_ack_deadline_seconds = n;
         }
         "services.pubsub.messageRetentionSeconds" => {
             let n = parse_int("services.pubsub.messageRetentionSeconds", value)?;
             if n <= 0 {
                 return Err(err_positive("services.pubsub.messageRetentionSeconds"));
             }
-            cfg.services.pubsub.message_retention_seconds = n as i32;
+            cfg.services.pubsub.message_retention_seconds = n;
         }
         "services.pubsub.maxAckDeadlineSeconds" => {
             let n = parse_int("services.pubsub.maxAckDeadlineSeconds", value)?;
             if n <= 0 {
                 return Err(err_positive("services.pubsub.maxAckDeadlineSeconds"));
             }
-            cfg.services.pubsub.max_ack_deadline_seconds = n as i32;
+            cfg.services.pubsub.max_ack_deadline_seconds = n;
         }
         "services.pubsub.maxPullMessages" => {
             let n = parse_int("services.pubsub.maxPullMessages", value)?;
             if n <= 0 {
                 return Err(err_positive("services.pubsub.maxPullMessages"));
             }
-            cfg.services.pubsub.max_pull_messages = n as i32;
+            cfg.services.pubsub.max_pull_messages = n;
         }
         "services.pubsub.pullWaitTimeoutSeconds" => {
             let n = parse_int("services.pubsub.pullWaitTimeoutSeconds", value)?;
             if n < 0 {
                 return Err(err_non_negative("services.pubsub.pullWaitTimeoutSeconds"));
             }
-            cfg.services.pubsub.pull_wait_timeout_seconds = n as i32;
+            cfg.services.pubsub.pull_wait_timeout_seconds = n;
         }
         "services.pubsub.enableREST" => {
             cfg.services.pubsub.enable_rest = parse_bool("services.pubsub.enableREST", value)?
@@ -1796,6 +1796,107 @@ pub fn apply_service_selection(cfg: &Config, selected: &[String]) -> io::Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Include aliases: each spelling must preserve the destination type's bounds.
+    const I32_CONFIG_KEYS: &[&str] = &[
+        "server.smtpPort",
+        "server.mailHttpPort",
+        "server.mailHTTPPort",
+        "server.dashboardPort",
+        "server.eventRelayPort",
+        "server.s3Port",
+        "server.gcsPort",
+        "server.dynamodbPort",
+        "server.bigqueryPort",
+        "server.bigQueryPort",
+        "server.redshiftPort",
+        "server.redshiftAPIPort",
+        "server.redshiftApiPort",
+        "server.redisPort",
+        "server.redisHttpPort",
+        "server.redisHTTPPort",
+        "server.sqsPort",
+        "server.pubsubGrpcPort",
+        "server.pubsubRestPort",
+        "server.appAutoScalingPort",
+        "services.dynamodb.maxTables",
+        "services.dynamodb.ttl.schedulerIntervalSeconds",
+        "services.bigquery.query.maxResultRows",
+        "services.bigquery.query.maxExecutionSeconds",
+        "services.redshift.numberOfNodes",
+        "services.redshift.dataApi.maxResultRows",
+        "services.redshift.dataAPI.maxResultRows",
+        "services.redshift.dataApi.statementRetentionSeconds",
+        "services.redshift.dataAPI.statementRetentionSeconds",
+        "services.redshift.dataApi.sessionRetentionSeconds",
+        "services.redshift.dataAPI.sessionRetentionSeconds",
+        "services.redshift.sql.maxResultRows",
+        "services.redis.maxMemoryMB",
+        "services.sqs.maxQueues",
+        "services.sqs.maxReceiveBatchSize",
+        "services.sqs.defaultVisibilityTimeoutSeconds",
+        "services.sqs.defaultDelaySeconds",
+        "services.sqs.defaultMessageRetentionSeconds",
+        "services.sqs.defaultReceiveWaitTimeSeconds",
+        "services.sqs.schedulerIntervalSeconds",
+        "services.pubsub.defaultAckDeadlineSeconds",
+        "services.pubsub.messageRetentionSeconds",
+        "services.pubsub.maxAckDeadlineSeconds",
+        "services.pubsub.maxPullMessages",
+        "services.pubsub.pullWaitTimeoutSeconds",
+    ];
+
+    #[test]
+    fn numeric_config_rejects_i32_overflow_without_mutating_config() {
+        for &key in I32_CONFIG_KEYS {
+            let path: Vec<String> = key.split('.').map(str::to_string).collect();
+            for value in [
+                "2147483648",
+                "4294967296",
+                "4294978321", // 2^32 + the default SMTP port: used to wrap to 11025.
+                "9223372036854775807",
+                "-2147483649",
+                "-9223372036854775808",
+            ] {
+                let mut cfg = default_config();
+                let before = cfg.clone();
+                let err = apply_config_value(&mut cfg, &path, value)
+                    .expect_err("out-of-range integers must not wrap");
+                assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{key}: {value}");
+                assert_eq!(cfg, before, "invalid {key} must not mutate configuration");
+            }
+        }
+    }
+
+    #[test]
+    fn numeric_config_preserves_valid_i32_and_i64_values() {
+        for &key in I32_CONFIG_KEYS {
+            let path: Vec<String> = key.split('.').map(str::to_string).collect();
+            let mut cfg = default_config();
+            apply_config_value(&mut cfg, &path, "1").expect(key);
+        }
+        let mut cfg = default_config();
+        apply_config_value(&mut cfg, &["server".into(), "smtpPort".into()], "65535").unwrap();
+        assert_eq!(cfg.server.smtp_port, 65535);
+        apply_config_value(
+            &mut cfg,
+            &["services".into(), "s3".into(), "maxObjectBytes".into()],
+            "5368709120",
+        )
+        .unwrap();
+        assert_eq!(cfg.services.s3.max_object_bytes, 5_368_709_120);
+        apply_config_value(
+            &mut cfg,
+            &[
+                "services".into(),
+                "sqs".into(),
+                "defaultDelaySeconds".into(),
+            ],
+            "0",
+        )
+        .unwrap();
+        assert_eq!(cfg.services.sqs.default_delay_seconds, 0);
+    }
 
     #[test]
     fn default_yaml_round_trips_through_parser() {

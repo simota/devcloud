@@ -46,6 +46,7 @@ pub enum StoreError {
     ContentMd5Mismatch,
     ObjectLocked,
     VersionIdRequired,
+    InvalidVersionId,
     InvalidUploadId,
     InvalidPartNumber,
     MultipartUploadNotExist,
@@ -142,6 +143,15 @@ impl FileBucketStore {
 
     pub fn object_versions_path(&self, bucket: &str, key: &str) -> PathBuf {
         self.object_path(bucket, key).join("versions")
+    }
+
+    /// All version-specific reads/writes go through this boundary. Object paths
+    /// are derived from validated bucket names and encoded object keys.
+    pub(crate) fn version_path(object_path: &Path, version_id: &str) -> Result<PathBuf> {
+        if !crate::validation::valid_version_id(version_id) {
+            return Err(StoreError::InvalidVersionId);
+        }
+        Ok(object_path.join("versions").join(version_id))
     }
 
     pub fn multipart_path(&self, bucket: &str) -> PathBuf {

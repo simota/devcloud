@@ -521,6 +521,9 @@ fn handle_object(store: &FileBucketStore, req: &Request, bucket: &str, key: &str
                 Err(StoreError::ObjectLocked) => {
                     xml_error(403, "AccessDenied", "object is protected by Object Lock")
                 }
+                Err(StoreError::InvalidVersionId) => {
+                    xml_error(400, "InvalidArgument", "invalid version id")
+                }
                 Err(StoreError::InvalidBucketName) | Err(StoreError::InvalidObjectKey) => {
                     xml_error(400, "InvalidArgument", "invalid object key")
                 }
@@ -564,6 +567,9 @@ fn delete_object_version(
             xml_error(403, "AccessDenied", "object is protected by Object Lock")
         }
         Err(StoreError::BucketNotExist) => xml_error(404, "NoSuchBucket", "bucket does not exist"),
+        Err(StoreError::InvalidVersionId) => {
+            xml_error(400, "InvalidArgument", "invalid version id")
+        }
         Err(StoreError::InvalidBucketName) | Err(StoreError::InvalidObjectKey) => {
             xml_error(400, "InvalidArgument", "invalid object key")
         }
@@ -1045,6 +1051,9 @@ fn put_object_acl(store: &FileBucketStore, req: &Request, bucket: &str, key: &st
         Ok(true) => Response::empty(200),
         Ok(false) => xml_error(404, "NoSuchKey", "object does not exist"),
         Err(StoreError::BucketNotExist) => xml_error(404, "NoSuchBucket", "bucket does not exist"),
+        Err(StoreError::InvalidVersionId) => {
+            xml_error(400, "InvalidArgument", "invalid version id")
+        }
         Err(StoreError::InvalidBucketName) | Err(StoreError::InvalidObjectKey) => {
             xml_error(400, "InvalidArgument", "invalid object key")
         }
@@ -1058,6 +1067,9 @@ fn get_object_acl(store: &FileBucketStore, req: &Request, bucket: &str, key: &st
         Ok(Some(acl)) => Response::xml(200, access_control_policy(&acl)),
         Ok(None) => xml_error(404, "NoSuchKey", "object does not exist"),
         Err(StoreError::BucketNotExist) => xml_error(404, "NoSuchBucket", "bucket does not exist"),
+        Err(StoreError::InvalidVersionId) => {
+            xml_error(400, "InvalidArgument", "invalid version id")
+        }
         Err(StoreError::InvalidBucketName) | Err(StoreError::InvalidObjectKey) => {
             xml_error(400, "InvalidArgument", "invalid object key")
         }
@@ -1080,6 +1092,9 @@ fn put_object_retention(
         Ok(Some(_)) => Response::empty(200),
         Ok(None) => xml_error(404, "NoSuchKey", "object does not exist"),
         Err(StoreError::BucketNotExist) => xml_error(404, "NoSuchBucket", "bucket does not exist"),
+        Err(StoreError::InvalidVersionId) => {
+            xml_error(400, "InvalidArgument", "invalid version id")
+        }
         Err(StoreError::InvalidBucketName) | Err(StoreError::InvalidObjectKey) => {
             xml_error(400, "InvalidArgument", "invalid object key")
         }
@@ -1105,6 +1120,9 @@ fn get_object_retention(
         ),
         Ok(None) => xml_error(404, "NoSuchKey", "object does not exist"),
         Err(StoreError::BucketNotExist) => xml_error(404, "NoSuchBucket", "bucket does not exist"),
+        Err(StoreError::InvalidVersionId) => {
+            xml_error(400, "InvalidArgument", "invalid version id")
+        }
         Err(StoreError::InvalidBucketName) | Err(StoreError::InvalidObjectKey) => {
             xml_error(400, "InvalidArgument", "invalid object key")
         }
@@ -1127,6 +1145,9 @@ fn put_object_legal_hold(
         Ok(Some(_)) => Response::empty(200),
         Ok(None) => xml_error(404, "NoSuchKey", "object does not exist"),
         Err(StoreError::BucketNotExist) => xml_error(404, "NoSuchBucket", "bucket does not exist"),
+        Err(StoreError::InvalidVersionId) => {
+            xml_error(400, "InvalidArgument", "invalid version id")
+        }
         Err(StoreError::InvalidBucketName) | Err(StoreError::InvalidObjectKey) => {
             xml_error(400, "InvalidArgument", "invalid object key")
         }
@@ -1152,6 +1173,9 @@ fn get_object_legal_hold(
         ),
         Ok(None) => xml_error(404, "NoSuchKey", "object does not exist"),
         Err(StoreError::BucketNotExist) => xml_error(404, "NoSuchBucket", "bucket does not exist"),
+        Err(StoreError::InvalidVersionId) => {
+            xml_error(400, "InvalidArgument", "invalid version id")
+        }
         Err(StoreError::InvalidBucketName) | Err(StoreError::InvalidObjectKey) => {
             xml_error(400, "InvalidArgument", "invalid object key")
         }
@@ -1443,6 +1467,9 @@ fn put_object(store: &FileBucketStore, req: &Request, bucket: &str, key: &str) -
             "the Content-MD5 you specified did not match what was received",
         ),
         Err(StoreError::BucketNotExist) => xml_error(404, "NoSuchBucket", "bucket does not exist"),
+        Err(StoreError::InvalidVersionId) => {
+            xml_error(400, "InvalidArgument", "invalid version id")
+        }
         Err(StoreError::InvalidBucketName) | Err(StoreError::InvalidObjectKey) => {
             xml_error(400, "InvalidArgument", "invalid object key")
         }
@@ -1462,6 +1489,9 @@ fn copy_object(store: &FileBucketStore, req: &Request, bucket: &str, key: &str) 
             Ok(None) => return xml_error(404, "NoSuchKey", "source object does not exist"),
             Err(StoreError::BucketNotExist) => {
                 return xml_error(404, "NoSuchBucket", "source bucket does not exist");
+            }
+            Err(StoreError::InvalidVersionId) => {
+                return xml_error(400, "InvalidArgument", "invalid version id");
             }
             Err(StoreError::InvalidBucketName) | Err(StoreError::InvalidObjectKey) => {
                 return xml_error(400, "InvalidArgument", "invalid copy source");
@@ -1533,6 +1563,9 @@ fn copy_object(store: &FileBucketStore, req: &Request, bucket: &str, key: &str) 
             r
         }
         Err(StoreError::BucketNotExist) => xml_error(404, "NoSuchBucket", "bucket does not exist"),
+        Err(StoreError::InvalidVersionId) => {
+            xml_error(400, "InvalidArgument", "invalid version id")
+        }
         Err(StoreError::InvalidBucketName) | Err(StoreError::InvalidObjectKey) => {
             xml_error(400, "InvalidArgument", "invalid object key")
         }
@@ -1572,6 +1605,9 @@ fn select_object_content(
         Ok(None) => return xml_error(404, "NoSuchKey", "object does not exist"),
         Err(StoreError::BucketNotExist) => {
             return xml_error(404, "NoSuchBucket", "bucket does not exist");
+        }
+        Err(StoreError::InvalidVersionId) => {
+            return xml_error(400, "InvalidArgument", "invalid version id");
         }
         Err(StoreError::InvalidBucketName) | Err(StoreError::InvalidObjectKey) => {
             return xml_error(400, "InvalidArgument", "invalid object key");
@@ -2196,6 +2232,9 @@ fn get_object(
         Ok(Some((object, body))) => object_response(req, object, body, head_only),
         Ok(None) => xml_error(404, "NoSuchKey", "object does not exist"),
         Err(StoreError::BucketNotExist) => xml_error(404, "NoSuchBucket", "bucket does not exist"),
+        Err(StoreError::InvalidVersionId) => {
+            xml_error(400, "InvalidArgument", "invalid version id")
+        }
         Err(StoreError::InvalidBucketName) | Err(StoreError::InvalidObjectKey) => {
             xml_error(400, "InvalidArgument", "invalid object key")
         }

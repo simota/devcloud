@@ -179,3 +179,56 @@ fn update_object_metadata_bumps_metageneration() {
     assert_eq!(updated.content_type, "text/plain");
     assert_eq!(updated.metageneration, 2);
 }
+
+fn outside_version_fixture() -> (std::path::PathBuf, FileBucketStore, std::path::PathBuf) {
+    // All destructive probes are confined to a fresh test directory. `outside`
+    // represents host data outside the emulator's configured object-store root.
+    let root = tempdir();
+    let store = FileBucketStore::new(root.join("buckets"));
+    store.create_bucket("data").unwrap();
+    put(&store, "data", "key", "kept");
+    let outside = root.join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    std::fs::write(outside.join("object.json"), b"{}").unwrap();
+    std::fs::write(outside.join("body"), b"outside sentinel").unwrap();
+    (root, store, outside)
+}
+
+#[test]
+fn version_id_cannot_read_outside_store() {
+    let (root, store, outside) = outside_version_fixture();
+    let result = store.get_object_version("data", "key", outside.to_str().unwrap());
+    assert!(
+        result.is_err(),
+        "absolute version IDs must not read host files"
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn version_id_cannot_update_outside_store() {
+    let (root, store, outside) = outside_version_fixture();
+    let result = store.put_object_acl("data", "key", outside.to_str().unwrap(), "public-read");
+    assert!(
+        result.is_err(),
+        "absolute version IDs must not overwrite host files"
+    );
+    assert_eq!(std::fs::read(outside.join("object.json")).unwrap(), b"{}");
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn version_id_cannot_delete_outside_store() {
+    let (root, store, outside) = outside_version_fixture();
+    let result = store.delete_object_version("data", "key", outside.to_str().unwrap(), false);
+    assert!(
+        result.is_err(),
+        "absolute version IDs must not delete host directories"
+    );
+    assert_eq!(
+        std::fs::read(outside.join("body")).unwrap(),
+        b"outside sentinel"
+    );
+    assert_eq!(store.get_object("data", "key").unwrap().unwrap().1, b"kept");
+    std::fs::remove_dir_all(root).unwrap();
+}

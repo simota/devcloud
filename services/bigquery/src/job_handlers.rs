@@ -89,10 +89,12 @@ impl Server {
         );
     }
 
-    /// `GET /bigquery/v2/projects/{p}/jobs/{j}` — the inline handler in legacy
-    /// `handleJobs` (routes.rs). Note: legacy does not `validateResourceID` the
-    /// job id on this path; parity kept.
+    /// `GET /bigquery/v2/projects/{p}/jobs/{j}`. Validate the decoded job ID
+    /// before it can be used as a storage path, just like cancel/delete/results.
     pub fn get_job(&self, project_id: &str, job_id: &str) -> ApiResponse {
+        if let Err(message) = validate_resource_id(job_id, "job") {
+            return ApiResponse::error(400, "invalid", &message);
+        }
         match self.read_query_job(project_id, job_id) {
             Err(_) => ApiResponse::error(500, "backendError", "internal error"),
             Ok(None) => ApiResponse::error(
