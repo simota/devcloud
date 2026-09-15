@@ -53,7 +53,12 @@ pub fn parse_rfc3339(value: &str) -> Option<(i64, u32)> {
         return None;
     }
     let (hms, frac) = match time.split_once('.') {
-        Some((hms, frac)) => (hms, frac),
+        Some((hms, frac)) => {
+            if frac.is_empty() || !frac.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            (hms, frac)
+        }
         None => (time, ""),
     };
     let mut t = hms.split(':');
@@ -65,12 +70,13 @@ pub fn parse_rfc3339(value: &str) -> Option<(i64, u32)> {
     }
     let days = days_from_civil(year, month, day);
     let secs = days * 86_400 + hour * 3600 + minute * 60 + second;
-    let nanos = if frac.is_empty() {
-        0
-    } else {
-        let padded = format!("{frac:0<9}");
-        padded[..9].parse().ok()?
-    };
+    // RFC3339Nano truncates sub-nanosecond precision. Validate all digits above,
+    // but avoid allocating or indexing UTF-8 while accumulating the first nine.
+    let nanos = frac
+        .bytes()
+        .take(9)
+        .fold(0_u32, |n, digit| n * 10 + u32::from(digit - b'0'))
+        * 10_u32.pow((9 - frac.len().min(9)) as u32);
     Some((secs, nanos))
 }
 
