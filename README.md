@@ -76,6 +76,8 @@ the React app instead.
 
 Configuration lives at `.devcloud/config.yaml`. Runtime data is stored under `.devcloud/data` by default.
 
+Configured server ports must be between `1` and `65535`; port `0` (ephemeral binding) is not supported. Integer settings are checked against their destination type before assignment, while each setting retains its documented positive or non-negative constraint.
+
 ```yaml
 project: dev
 
