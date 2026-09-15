@@ -1,0 +1,73 @@
+name: Parser audit verification
+
+on:
+  push:
+    branches:
+      - audit/parser-boundary-fixes-20260915
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          clean: false
+          persist-credentials: false
+      - name: Record source and baseline environment
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/audit"
+          git archive --format=tar.gz --output="$RUNNER_TEMP/audit/source.tar.gz" HEAD
+          {
+            git status
+            git diff
+            git rev-parse HEAD
+            rustc --version
+            cargo --version
+            node --version
+            npm --version
+            find scripts -maxdepth 2 -name verify.sh -print | sort
+            find scripts -maxdepth 1 -name '*-e2e.sh' -print | sort
+          } > "$RUNNER_TEMP/audit/environment.log" 2>&1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: source-${{ github.sha }}
+          path: ${{ runner.temp }}/audit/source.tar.gz
+          retention-days: 7
+      - name: Baseline and regression gates
+        shell: bash
+        run: |
+          set +e
+          result=0
+          run_gate() {
+            name="$1"
+            shift
+            "$@" > "$RUNNER_TEMP/audit/$name.log" 2>&1
+            code=$?
+            if [ "$code" -eq 0 ]; then state=PASS; else state=FAIL; result=1; fi
+            printf '%s\t%s\texit=%s\n' "$state" "$name" "$code" | tee -a "$RUNNER_TEMP/audit/results.tsv"
+          }
+          run_gate cargo-fmt cargo fmt --all -- --check
+          run_gate cargo-check cargo check --workspace
+          run_gate cargo-test cargo test --workspace
+          run_gate cargo-clippy cargo clippy --workspace --all-targets
+          run_gate dashboard-install bash -c 'cd web/dashboard && npm install'
+          run_gate dashboard-typecheck bash -c 'cd web/dashboard && npm run typecheck'
+          run_gate dashboard-build bash -c 'cd web/dashboard && npm run build'
+          run_gate shell-syntax bash -c "bash -n scripts/*-e2e.sh scripts/*-autoloop/verify.sh scripts/lib/devcloud-engine.sh"
+          git status --short > "$RUNNER_TEMP/audit/final-status.log"
+          git diff --check > "$RUNNER_TEMP/audit/diff-check.log" 2>&1
+          exit "$result"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: verification-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/audit/*.log
+            ${{ runner.temp }}/audit/results.tsv
+          retention-days: 7
+          if-no-files-found: error
