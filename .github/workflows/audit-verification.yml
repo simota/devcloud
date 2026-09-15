@@ -45,8 +45,8 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y protobuf-compiler
-          npm install --global npm@10.9.2
-          npm --version
+          npm install --global --prefix "$RUNNER_TEMP/npm10" npm@10.9.2
+          echo "$RUNNER_TEMP/npm10/bin" >> "$GITHUB_PATH"
       - name: Restore and verify audited source changes
         working-directory: repo
         run: |
@@ -139,7 +139,9 @@ jobs:
           if [[ "$GROUP" = redshift ]]; then packages+=(postgresql postgresql-client); fi
           sudo apt-get update -qq
           sudo apt-get install -y "${packages[@]}"
-          npm install --global npm@10.9.2
+          npm install --global --prefix "$RUNNER_TEMP/npm10" npm@10.9.2
+          export PATH="$RUNNER_TEMP/npm10/bin:$PATH"
+          echo "$RUNNER_TEMP/npm10/bin" >> "$GITHUB_PATH"
           if [[ "$GROUP" = redshift ]]; then pg_config --bindir >> "$GITHUB_PATH"; fi
           case "$GROUP" in
             s3|sqs|dynamodb|applicationautoscaling)
