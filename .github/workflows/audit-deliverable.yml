@@ -1,0 +1,120 @@
+name: Audit deliverable
+on:
+  push:
+    branches: [audit/coverage-gates-20260915]
+    paths: [.github/workflows/audit-deliverable.yml]
+permissions:
+  contents: write
+jobs:
+  deliver:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          clean: false
+          persist-credentials: false
+      - name: Materialize reviewed fixes
+        run: |
+          mkdir -p "$RUNNER_TEMP/audit"
+          git status > "$RUNNER_TEMP/audit/initial-status.log"
+          python3 scripts/parser-audit-regressions.py .
+          python3 scripts/parser-audit-cross-protocol.py .
+          python3 scripts/parser-audit-fixes.py .
+          rustfmt --edition 2021 orchestrator/src/config.rs services/s3/src/time_fmt.rs services/pubsub/src/time_fmt.rs services/s3/tests/http_parity.rs services/pubsub/tests/http_parity.rs services/pubsub/tests/grpc_conformance.rs
+          python3 - <<'PY'
+          from pathlib import Path
+          for service, dashboard in [('s3', '68.5'), ('gcs', '70.0')]:
+              path = Path(f'scripts/{service}-test-coverage-autoloop/verify.sh')
+              text = path.read_text()
+              start = text.index('coverage_value() {')
+              end = text.index('\nrun_foundation_checks()', start)
+              replacement = '\n'.join([
+                  '# Measure real Rust source-line coverage; see docs/testing-coverage.md.',
+                  'assert_coverage_thresholds() {',
+                  '  python3 "${ROOT_DIR}/scripts/lib/rust-coverage.py" "${ROOT_DIR}" \\',
+                  f'    ./services/{service}:72.0 ./services/dashboard:{dashboard}',
+                  '}', '',
+              ])
+              path.write_text(text[:start] + replacement + text[end:])
+          PY
+          python3 -m unittest discover -s scripts/tests -p test_coverage_gate.py -v > "$RUNNER_TEMP/audit/coverage-tests.log" 2>&1
+          cargo fmt --all -- --check
+          git diff --check
+      - name: Verify byte identity and publish source-only commits
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, tarfile, urllib.request
+          expected = {
+              'README.md': '9a8ee3649324cb6940778e59604468a37be11dd9cd26c82c7ade93ff7d4086e5',
+              'orchestrator/src/config.rs': 'b3d2e1c1382f9d835cb34daf1e0f3984cb57c378c0c1266bc1a96ac3076960f0',
+              'services/s3/src/time_fmt.rs': '794d21ab20aa225d66391c6b4fa280ce8da10ad0321add154d2d5b1884dc1abc',
+              'services/pubsub/src/time_fmt.rs': '61eef38054f8862d0a35c528692a254b85b89fe88bdfbc1e99adce78a026cfad',
+              'services/s3/tests/http_parity.rs': '53c3283639bb75399ce575dcc057c439cd8ae15e9801b053604c69de0970a47b',
+              'services/pubsub/tests/http_parity.rs': 'cce7ac2c1313b3b0968da72bc918aab27b9d018e2c52ca2b1354c2641ba94468',
+              'services/pubsub/tests/grpc_conformance.rs': '815c3f72ebe6dea307a23a88145a779af46c1212f2272dffad19c91111c43744',
+              'scripts/s3-test-coverage-autoloop/verify.sh': '555938cf0c8af567baf5f600da1e3535921bdbcbfa2c48472bbe9f5cbdc97c9a',
+              'scripts/gcs-test-coverage-autoloop/verify.sh': 'b723b4832e73bacb00585c70e5f67b3bdaa2e43ee360faeb2f5efb69b17f80a4',
+              'scripts/lib/rust-coverage.py': 'c57085f7efa72d39e7ed955542a78fc0017102753dbb21269acdb5ca36d1b0b9',
+              'scripts/tests/test_coverage_gate.py': 'a9ab93f38ca785fc03ade59d8b1c9f762ee61fb0733aa94265f8612e1a4e58a5',
+              'docs/testing-coverage.md': '781a827e842f558b1c1d2dfe850cd4b1d3567748ed9af6d916755d3c5e651f79',
+          }
+          for path, digest in expected.items():
+              assert hashlib.sha256(pathlib.Path(path).read_bytes()).hexdigest() == digest, path
+          base = '0d031df3a5417a24855e44e2c25de2f88f0f1129'
+          branch = 'fix/parser-and-coverage-regressions-20260915'
+          def api(path, payload=None):
+              data = None if payload is None else json.dumps(payload).encode()
+              req = urllib.request.Request('https://api.github.com/repos/simota/devcloud/' + path, data=data, headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json', 'Content-Type': 'application/json'})
+              with urllib.request.urlopen(req) as response:
+                  return json.load(response)
+          parent = base
+          tree = api('git/commits/' + base)['tree']['sha']
+          groups = [
+              ('fix(config): reject out-of-range integers and TCP ports', ['README.md', 'orchestrator/src/config.rs']),
+              ('fix(time): validate timestamp fractions before truncation', ['services/s3/src/time_fmt.rs', 'services/pubsub/src/time_fmt.rs', 'services/s3/tests/http_parity.rs', 'services/pubsub/tests/http_parity.rs']),
+              ('test(pubsub): verify bidirectional REST and gRPC shared state', ['services/pubsub/tests/grpc_conformance.rs']),
+              ('fix(test): measure S3 and GCS coverage instead of constant 100 percent', ['scripts/s3-test-coverage-autoloop/verify.sh', 'scripts/gcs-test-coverage-autoloop/verify.sh', 'scripts/lib/rust-coverage.py', 'scripts/tests/test_coverage_gate.py', 'docs/testing-coverage.md']),
+          ]
+          commits = []
+          for message, paths in groups:
+              entries = [{'path': path, 'mode': '100755' if path.endswith('/verify.sh') else '100644', 'type': 'blob', 'content': pathlib.Path(path).read_text()} for path in paths]
+              tree = api('git/trees', {'base_tree': tree, 'tree': entries})['sha']
+              parent = api('git/commits', {'message': message, 'tree': tree, 'parents': [parent]})['sha']
+              commits.append({'message': message, 'sha': parent, 'paths': paths})
+          api('git/refs', {'ref': 'refs/heads/' + branch, 'sha': parent})
+          out = pathlib.Path(os.environ['RUNNER_TEMP']) / 'audit'
+          (out / 'published.json').write_text(json.dumps({'base': base, 'branch': branch, 'head': parent, 'commits': commits}, indent=2) + '\n')
+          (out / 'source-sha256.json').write_text(json.dumps(expected, indent=2) + '\n')
+          with tarfile.open(out / 'changed-sources.tar.gz', 'w:gz') as archive:
+              for path in expected:
+                  archive.add(path, arcname=path)
+          print('Source-only branch:', branch, parent)
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: reviewed-deliverable-${{ github.sha }}
+          path: ${{ runner.temp }}/audit/
+          retention-days: 7
+      - name: Measure coverage independently of nested acceptance scripts
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y protobuf-compiler
+          rustup component add llvm-tools-preview
+          cargo install cargo-llvm-cov --version 0.9.0 --locked
+          set +e
+          python3 scripts/lib/rust-coverage.py "$PWD" ./services/s3:72 ./services/gcs:72 ./services/dashboard:70 > "$RUNNER_TEMP/audit/measured-coverage.log" 2>&1
+          code=$?
+          printf 'measurement\texit=%s\n' "$code" > "$RUNNER_TEMP/audit/measurement-result.tsv"
+          cargo llvm-cov report --json --summary-only --output-path "$RUNNER_TEMP/audit/measured-coverage.json" > "$RUNNER_TEMP/audit/coverage-report.log" 2>&1
+          report_code=$?
+          printf 'report\texit=%s\n' "$report_code" >> "$RUNNER_TEMP/audit/measurement-result.tsv"
+          if [ "$code" -ne 0 ] || [ "$report_code" -ne 0 ]; then exit 1; fi
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: measured-deliverable-${{ github.sha }}
+          path: ${{ runner.temp }}/audit/
+          retention-days: 7
