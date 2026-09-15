@@ -53,7 +53,14 @@ pub fn parse_rfc3339(value: &str) -> Option<(i64, u32)> {
         return None;
     }
     let (hms, frac) = match time.split_once('.') {
-        Some((hms, frac)) => (hms, frac),
+        Some((hms, frac)) => {
+            // Validate the entire fraction, including digits beyond nanosecond
+            // precision, before truncating. Never slice arbitrary UTF-8 bytes.
+            if frac.is_empty() || !frac.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            (hms, frac)
+        }
         None => (time, ""),
     };
     let mut t = hms.split(':');
@@ -65,12 +72,12 @@ pub fn parse_rfc3339(value: &str) -> Option<(i64, u32)> {
     }
     let days = days_from_civil(year, month, day);
     let secs = days * 86_400 + hour * 3600 + minute * 60 + second;
-    let nanos = if frac.is_empty() {
-        0
-    } else {
-        let padded = format!("{frac:0<9}");
-        padded[..9].parse().ok()?
-    };
+    // Keep the existing nanosecond truncation for valid higher precision,
+    // padding shorter fractions without allocating a copy of the input.
+    let mut nanos = 0;
+    for digit in frac.bytes().chain(std::iter::repeat(b'0')).take(9) {
+        nanos = nanos * 10 + u32::from(digit - b'0');
+    }
     Some((secs, nanos))
 }
 
@@ -150,6 +157,48 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn regression_fraction_rejects_non_ascii_at_every_precision_boundary() {
+        for prefix_len in 0..=12 {
+            for character in ['é', 'あ', '🙂'] {
+                let value = format!("1970-01-01T00:00:00.{}{character}Z", "1".repeat(prefix_len));
+                assert_eq!(parse_rfc3339(&value), None);
+            }
+        }
+    }
+
+    #[test]
+    fn regression_fraction_rejects_empty_and_non_decimal_suffixes() {
+        for fraction in [
+            "",
+            "+1",
+            "-1",
+            "123456789x",
+            "1234567890 ",
+            "1234567890\n",
+            "1234567890\0",
+        ] {
+            let value = format!("1970-01-01T00:00:00.{fraction}Z");
+            assert_eq!(parse_rfc3339(&value), None);
+        }
+    }
+
+    #[test]
+    fn regression_fraction_preserves_valid_nanosecond_precision() {
+        assert_eq!(parse_rfc3339("1970-01-01T00:00:00Z"), Some((0, 0)));
+        for (fraction, nanos) in [
+            ("0", 0),
+            ("1", 100_000_000),
+            ("001", 1_000_000),
+            ("12345678", 123_456_780),
+            ("123456789", 123_456_789),
+            ("123456789123456789", 123_456_789),
+        ] {
+            let value = format!("1970-01-01T00:00:00.{fraction}Z");
+            assert_eq!(parse_rfc3339(&value), Some((0, nanos)));
+        }
+    }
 
     #[test]
     fn whole_second_has_no_fraction() {
