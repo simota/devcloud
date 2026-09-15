@@ -1,16 +1,12 @@
 name: Isolated audit verification
-
 on:
   push:
     branches: [audit/verification-20260915]
-
 permissions:
   contents: read
-
 defaults:
   run:
     shell: bash
-
 env:
   AUDIT_BASE: 0d031df3a5417a24855e44e2c25de2f88f0f1129
   AUDIT_TREE: 50c90a10c124baf5c4c2e024f5cee123c5b9473c
@@ -20,7 +16,6 @@ env:
   AWS_ACCESS_KEY_ID: dev
   AWS_SECRET_ACCESS_KEY: dev
   AWS_DEFAULT_REGION: us-east-1
-
 jobs:
   validate-and-publish:
     runs-on: ubuntu-24.04
@@ -41,7 +36,7 @@ jobs:
           path: repo
           fetch-depth: 0
           clean: false
-      - name: Install compiler prerequisite and reproducible npm
+      - name: Install build tools
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y protobuf-compiler
@@ -79,7 +74,10 @@ jobs:
           cargo check --workspace 2>&1 | tee "$RUNNER_TEMP/audit-core/check.log"
           cargo test --workspace 2>&1 | tee "$RUNNER_TEMP/audit-core/tests.log"
           cargo clippy --workspace --all-targets 2>&1 | tee "$RUNNER_TEMP/audit-core/clippy.log"
-          (cd web/dashboard && npm install && npm run typecheck && npm run build) 2>&1 | tee "$RUNNER_TEMP/audit-core/dashboard.log"
+          # npm install was run on the original baseline and the fixed tree.
+          # Both rewrite the same libc metadata in package-lock.json. Final
+          # reproducibility uses npm ci, which preserves the existing lockfile.
+          (cd web/dashboard && npm ci && npm run typecheck && npm run build) 2>&1 | tee "$RUNNER_TEMP/audit-core/dashboard.log"
           git status --short | tee "$RUNNER_TEMP/audit-core/final-status.txt"
           git diff --stat | tee "$RUNNER_TEMP/audit-core/final-diff-stat.txt"
           git diff > "$RUNNER_TEMP/audit-core/final-worktree.diff"
@@ -151,7 +149,7 @@ jobs:
               ;;
           esac
           cd web/dashboard
-          npm install
+          npm ci
       - name: Run all discovered final stages and standalone E2Es
         working-directory: repo
         env:
