@@ -1,0 +1,102 @@
+name: Isolated audit verification
+
+on:
+  push:
+    branches: [audit/verification-20260915]
+
+permissions:
+  contents: read
+
+env:
+  AUDIT_REF: 0d031df3a5417a24855e44e2c25de2f88f0f1129
+  CARGO_TERM_COLOR: never
+
+jobs:
+  source-snapshot:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ env.AUDIT_REF }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Capture immutable source and initial status
+        shell: bash
+        run: |
+          set -euo pipefail
+          git status --porcelain=v1 > "$RUNNER_TEMP/initial-status.txt"
+          git diff --check
+          git rev-parse HEAD > "$RUNNER_TEMP/source-commit.txt"
+          git bundle create "$RUNNER_TEMP/devcloud-source.bundle" --all
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: audit-source
+          path: |
+            ${{ runner.temp }}/devcloud-source.bundle
+            ${{ runner.temp }}/source-commit.txt
+            ${{ runner.temp }}/initial-status.txt
+          retention-days: 7
+          if-no-files-found: error
+  baseline:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ env.AUDIT_REF }}
+          persist-credentials: false
+      - name: Environment and gate discovery
+        run: |
+          git status
+          git diff
+          rustc --version
+          cargo --version
+          node --version
+          npm --version
+          find scripts -maxdepth 2 -name verify.sh -print
+          find scripts -maxdepth 1 -name '*-e2e.sh' -print
+      - name: Rust format baseline
+        id: fmt
+        run: cargo fmt --all -- --check
+      - name: Rust check baseline
+        id: check
+        if: always()
+        run: cargo check --workspace
+      - name: Rust tests baseline
+        id: tests
+        if: always()
+        run: cargo test --workspace
+      - name: Rust clippy baseline
+        id: clippy
+        if: always()
+        run: cargo clippy --workspace --all-targets
+      - name: Dashboard install baseline
+        id: npm_install
+        if: always()
+        working-directory: web/dashboard
+        run: npm install
+      - name: Dashboard typecheck baseline
+        id: typecheck
+        if: always()
+        working-directory: web/dashboard
+        run: npm run typecheck
+      - name: Dashboard build baseline
+        id: build
+        if: always()
+        working-directory: web/dashboard
+        run: npm run build
+      - name: Record baseline outcomes
+        if: always()
+        run: |
+          mkdir -p "$RUNNER_TEMP/audit-results"
+          printf '%s\n' 'fmt=${{ steps.fmt.outcome }}' 'check=${{ steps.check.outcome }}' 'tests=${{ steps.tests.outcome }}' 'clippy=${{ steps.clippy.outcome }}' 'npm_install=${{ steps.npm_install.outcome }}' 'typecheck=${{ steps.typecheck.outcome }}' 'build=${{ steps.build.outcome }}' > "$RUNNER_TEMP/audit-results/outcomes.txt"
+          git diff --stat > "$RUNNER_TEMP/audit-results/generated-diff-stat.txt"
+          git status --short > "$RUNNER_TEMP/audit-results/final-status.txt"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: audit-baseline-outcomes
+          path: ${{ runner.temp }}/audit-results
+          retention-days: 7
+          if-no-files-found: error
