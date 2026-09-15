@@ -12,31 +12,41 @@ env:
   CARGO_TERM_COLOR: never
 
 jobs:
-  source-snapshot:
+  offline-tooling:
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           ref: ${{ env.AUDIT_REF }}
-          fetch-depth: 0
           persist-credentials: false
-      - name: Capture immutable source and initial status
+          clean: false
+      - name: Prepare compiler and locked dependencies
         shell: bash
         run: |
           set -euo pipefail
-          git status --porcelain=v1 > "$RUNNER_TEMP/initial-status.txt"
-          git diff --check
-          git rev-parse HEAD > "$RUNNER_TEMP/source-commit.txt"
-          git bundle create "$RUNNER_TEMP/devcloud-source.bundle" --all
+          sudo apt-get update -qq
+          sudo apt-get install -y protobuf-compiler
+          root="$RUNNER_TEMP/offline-tooling"
+          mkdir -p "$root/rust" "$root/protoc/bin" "$root/protoc/lib" "$root/protoc/include"
+          sysroot=$(rustc --print sysroot)
+          cp -a "$sysroot/bin" "$sysroot/lib" "$root/rust/"
+          cp /usr/bin/protoc "$root/protoc/bin/"
+          cp -L /usr/lib/x86_64-linux-gnu/libprotobuf.so.32 /usr/lib/x86_64-linux-gnu/libprotoc.so.32 "$root/protoc/lib/"
+          cp -a /usr/include/google "$root/protoc/include/"
+          cargo vendor --locked "$root/vendor" > "$root/vendor-config.toml"
+          (cd web/dashboard && npm install)
+          tar -czf "$root/dashboard-node-modules.tar.gz" -C web/dashboard node_modules
+          tar -czf "$RUNNER_TEMP/offline-tooling.tar.gz" -C "$root" .
+          sha256sum "$RUNNER_TEMP/offline-tooling.tar.gz" > "$RUNNER_TEMP/offline-tooling.sha256"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: audit-source
+          name: audit-offline-tooling
           path: |
-            ${{ runner.temp }}/devcloud-source.bundle
-            ${{ runner.temp }}/source-commit.txt
-            ${{ runner.temp }}/initial-status.txt
-          retention-days: 7
+            ${{ runner.temp }}/offline-tooling.tar.gz
+            ${{ runner.temp }}/offline-tooling.sha256
+          compression-level: 0
+          retention-days: 2
           if-no-files-found: error
   baseline:
     runs-on: ubuntu-24.04
@@ -46,46 +56,53 @@ jobs:
         with:
           ref: ${{ env.AUDIT_REF }}
           persist-credentials: false
+          clean: false
+      - name: Install build prerequisite
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y protobuf-compiler
       - name: Environment and gate discovery
         run: |
+          mkdir -p "$RUNNER_TEMP/audit-results"
           git status
           git diff
           rustc --version
           cargo --version
+          protoc --version
           node --version
           npm --version
           find scripts -maxdepth 2 -name verify.sh -print
           find scripts -maxdepth 1 -name '*-e2e.sh' -print
       - name: Rust format baseline
         id: fmt
-        run: cargo fmt --all -- --check
+        run: cargo fmt --all -- --check 2>&1 | tee "$RUNNER_TEMP/audit-results/fmt.log"
       - name: Rust check baseline
         id: check
         if: always()
-        run: cargo check --workspace
+        run: cargo check --workspace 2>&1 | tee "$RUNNER_TEMP/audit-results/check.log"
       - name: Rust tests baseline
         id: tests
         if: always()
-        run: cargo test --workspace
+        run: cargo test --workspace 2>&1 | tee "$RUNNER_TEMP/audit-results/tests.log"
       - name: Rust clippy baseline
         id: clippy
         if: always()
-        run: cargo clippy --workspace --all-targets
+        run: cargo clippy --workspace --all-targets 2>&1 | tee "$RUNNER_TEMP/audit-results/clippy.log"
       - name: Dashboard install baseline
         id: npm_install
         if: always()
         working-directory: web/dashboard
-        run: npm install
+        run: npm install 2>&1 | tee "$RUNNER_TEMP/audit-results/npm-install.log"
       - name: Dashboard typecheck baseline
         id: typecheck
         if: always()
         working-directory: web/dashboard
-        run: npm run typecheck
+        run: npm run typecheck 2>&1 | tee "$RUNNER_TEMP/audit-results/typecheck.log"
       - name: Dashboard build baseline
         id: build
         if: always()
         working-directory: web/dashboard
-        run: npm run build
+        run: npm run build 2>&1 | tee "$RUNNER_TEMP/audit-results/build.log"
       - name: Record baseline outcomes
         if: always()
         run: |
