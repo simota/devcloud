@@ -1405,3 +1405,40 @@ fn multipart_abort_removes_upload() {
     );
     assert_eq!(missing.status, 404);
 }
+
+#[test]
+fn regression_invalid_retention_fraction_does_not_change_persisted_retention() {
+    let root = tempdir();
+    let store = FileBucketStore::new(&root);
+    assert_eq!(route(&store, &req("PUT", "/data")).status, 200);
+    assert_eq!(route(&store, &req("PUT", "/data/locked.txt")).status, 200);
+    let valid = br#"<Retention><Mode>GOVERNANCE</Mode><RetainUntilDate>2099-01-01T00:00:00Z</RetainUntilDate></Retention>"#;
+    assert_eq!(
+        route(
+            &store,
+            &Request::new("PUT", "/data/locked.txt?retention", valid.to_vec())
+        )
+        .status,
+        200
+    );
+    let before = route(&store, &req("GET", "/data/locked.txt?retention"));
+    assert_eq!(before.status, 200);
+    for time in ["2099-01-01T00:00:00.Z", "2099-01-01T00:00:00.123456789xZ"] {
+        let body = format!(
+            "<Retention><Mode>GOVERNANCE</Mode><RetainUntilDate>{time}</RetainUntilDate></Retention>"
+        );
+        let response = route(
+            &store,
+            &Request::new("PUT", "/data/locked.txt?retention", body.into_bytes()),
+        );
+        assert_eq!(response.status, 400);
+        assert!(String::from_utf8(response.body)
+            .unwrap()
+            .contains("<Code>InvalidArgument</Code>"));
+        let reopened = FileBucketStore::new(&root);
+        let after = route(&reopened, &req("GET", "/data/locked.txt?retention"));
+        assert_eq!(after.status, 200);
+        assert_eq!(after.body, before.body);
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}

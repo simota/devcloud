@@ -328,3 +328,36 @@ fn tempdir() -> std::path::PathBuf {
     std::fs::create_dir_all(&dir).expect("create tempdir");
     dir
 }
+
+#[test]
+fn regression_invalid_seek_fraction_preserves_inflight_delivery() {
+    let (dir, md) = (tempdir(), tempdir());
+    let mut s = server(&dir, &md);
+    let messages = vec![serde_json::json!({"data": "aGk="})];
+    s.publish("devcloud", "orders", &messages).unwrap();
+    let pulled: serde_json::Value =
+        serde_json::from_slice(&s.pull("devcloud", "sub1", 1).unwrap().body).unwrap();
+    let ack_id = pulled["receivedMessages"][0]["ackId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    for time in ["2026-05-30T11:00:00.Z", "2026-05-30T11:00:00.123456789xZ"] {
+        let response = route(
+            &mut s,
+            &req(
+                "POST",
+                "/v1/projects/devcloud/subscriptions/sub1:seek",
+                &serde_json::json!({"time": time}).to_string(),
+            ),
+        );
+        assert_eq!(response.status, 400);
+        let error: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(error["error"]["code"], 400);
+        assert_eq!(error["error"]["status"], "INVALID_ARGUMENT");
+        assert_eq!(error["error"]["message"], "invalid seek time");
+        assert_eq!(s.pull("devcloud", "sub1", 1).unwrap().body, b"{}\n");
+    }
+    s.acknowledge("devcloud", "sub1", &[ack_id]).unwrap();
+    std::fs::remove_dir_all(dir).unwrap();
+    std::fs::remove_dir_all(md).unwrap();
+}
