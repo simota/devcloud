@@ -7,113 +7,149 @@ on:
 permissions:
   contents: read
 
+defaults:
+  run:
+    shell: bash
+
 env:
-  AUDIT_REF: 0d031df3a5417a24855e44e2c25de2f88f0f1129
+  AUDIT_BASE: 0d031df3a5417a24855e44e2c25de2f88f0f1129
+  AUDIT_TREE: 50c90a10c124baf5c4c2e024f5cee123c5b9473c
   CARGO_TERM_COLOR: never
+  RUST_BACKTRACE: '0'
+  AWS_EC2_METADATA_DISABLED: 'true'
+  AWS_ACCESS_KEY_ID: dev
+  AWS_SECRET_ACCESS_KEY: dev
+  AWS_DEFAULT_REGION: us-east-1
 
 jobs:
-  offline-tooling:
+  validate-and-publish:
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 25
+    permissions:
+      contents: write
+    outputs:
+      fix_sha: ${{ steps.publish.outputs.fix_sha }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: ${{ env.AUDIT_REF }}
+          path: audit-input
           persist-credentials: false
           clean: false
-      - name: Prepare compiler and locked dependencies
-        shell: bash
-        run: |
-          set -euo pipefail
-          sudo apt-get update -qq
-          sudo apt-get install -y protobuf-compiler
-          root="$RUNNER_TEMP/offline-tooling"
-          mkdir -p "$root/rust" "$root/protoc/bin" "$root/protoc/lib" "$root/protoc/include"
-          sysroot=$(rustc --print sysroot)
-          cp -a "$sysroot/bin" "$sysroot/lib" "$root/rust/"
-          cp /usr/bin/protoc "$root/protoc/bin/"
-          cp -L /usr/lib/x86_64-linux-gnu/libprotobuf.so.32 /usr/lib/x86_64-linux-gnu/libprotoc.so.32 "$root/protoc/lib/"
-          cp -a /usr/include/google "$root/protoc/include/"
-          cargo vendor --locked "$root/vendor" > "$root/vendor-config.toml"
-          (cd web/dashboard && npm install)
-          tar -czf "$root/dashboard-node-modules.tar.gz" -C web/dashboard node_modules
-          tar -czf "$RUNNER_TEMP/offline-tooling.tar.gz" -C "$root" .
-          sha256sum "$RUNNER_TEMP/offline-tooling.tar.gz" > "$RUNNER_TEMP/offline-tooling.sha256"
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: audit-offline-tooling
-          path: |
-            ${{ runner.temp }}/offline-tooling.tar.gz
-            ${{ runner.temp }}/offline-tooling.sha256
-          compression-level: 0
-          retention-days: 2
-          if-no-files-found: error
-  baseline:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 35
-    steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: ${{ env.AUDIT_REF }}
-          persist-credentials: false
+          ref: ${{ env.AUDIT_BASE }}
+          path: repo
+          fetch-depth: 0
           clean: false
-      - name: Install build prerequisite
+      - name: Install compiler prerequisite
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y protobuf-compiler
-      - name: Environment and gate discovery
+      - name: Restore and verify audited source changes
+        working-directory: repo
         run: |
-          mkdir -p "$RUNNER_TEMP/audit-results"
-          git status
-          git diff
-          rustc --version
-          cargo --version
-          protoc --version
-          node --version
-          npm --version
-          find scripts -maxdepth 2 -name verify.sh -print
-          find scripts -maxdepth 1 -name '*-e2e.sh' -print
-      - name: Rust format baseline
-        id: fmt
-        run: cargo fmt --all -- --check 2>&1 | tee "$RUNNER_TEMP/audit-results/fmt.log"
-      - name: Rust check baseline
-        id: check
-        if: always()
-        run: cargo check --workspace 2>&1 | tee "$RUNNER_TEMP/audit-results/check.log"
-      - name: Rust tests baseline
-        id: tests
-        if: always()
-        run: cargo test --workspace 2>&1 | tee "$RUNNER_TEMP/audit-results/tests.log"
-      - name: Rust clippy baseline
-        id: clippy
-        if: always()
-        run: cargo clippy --workspace --all-targets 2>&1 | tee "$RUNNER_TEMP/audit-results/clippy.log"
-      - name: Dashboard install baseline
-        id: npm_install
-        if: always()
-        working-directory: web/dashboard
-        run: npm install 2>&1 | tee "$RUNNER_TEMP/audit-results/npm-install.log"
-      - name: Dashboard typecheck baseline
-        id: typecheck
-        if: always()
-        working-directory: web/dashboard
-        run: npm run typecheck 2>&1 | tee "$RUNNER_TEMP/audit-results/typecheck.log"
-      - name: Dashboard build baseline
-        id: build
-        if: always()
-        working-directory: web/dashboard
-        run: npm run build 2>&1 | tee "$RUNNER_TEMP/audit-results/build.log"
-      - name: Record baseline outcomes
-        if: always()
+          python3 - <<'PY'
+          import base64, gzip, hashlib, pathlib, os
+          parts = sorted(pathlib.Path('../audit-input/.audit/patch').glob('*.b64'))
+          assert len(parts) == 6
+          compressed = base64.b64decode(''.join(p.read_text().strip() for p in parts), validate=True)
+          assert hashlib.sha256(compressed).hexdigest() == '13a303b5cbf9e8e39d0f230753580ae6bac6491ec45c99cdd78a6d45fcbbc3fc'
+          pathlib.Path(os.environ['RUNNER_TEMP'], 'audit-fixes.mbox').write_bytes(gzip.decompress(compressed))
+          PY
+          git status --short
+          test -z "$(git status --porcelain)"
+          git config user.name 'Devcloud Audit'
+          git config user.email 'devcloud-audit@users.noreply.github.com'
+          git am "$RUNNER_TEMP/audit-fixes.mbox"
+          test "$(git rev-parse HEAD^{tree})" = "$AUDIT_TREE"
+          git diff --check "$AUDIT_BASE" HEAD
+          git diff --name-only "$AUDIT_BASE" HEAD
+      - name: Full build and regression verification
+        working-directory: repo
         run: |
-          mkdir -p "$RUNNER_TEMP/audit-results"
-          printf '%s\n' 'fmt=${{ steps.fmt.outcome }}' 'check=${{ steps.check.outcome }}' 'tests=${{ steps.tests.outcome }}' 'clippy=${{ steps.clippy.outcome }}' 'npm_install=${{ steps.npm_install.outcome }}' 'typecheck=${{ steps.typecheck.outcome }}' 'build=${{ steps.build.outcome }}' > "$RUNNER_TEMP/audit-results/outcomes.txt"
-          git diff --stat > "$RUNNER_TEMP/audit-results/generated-diff-stat.txt"
-          git status --short > "$RUNNER_TEMP/audit-results/final-status.txt"
+          mkdir -p "$RUNNER_TEMP/audit-core"
+          rustc --version | tee "$RUNNER_TEMP/audit-core/versions.log"
+          cargo --version | tee -a "$RUNNER_TEMP/audit-core/versions.log"
+          protoc --version | tee -a "$RUNNER_TEMP/audit-core/versions.log"
+          cargo fmt --all -- --check 2>&1 | tee "$RUNNER_TEMP/audit-core/fmt.log"
+          cargo check --workspace 2>&1 | tee "$RUNNER_TEMP/audit-core/check.log"
+          cargo test --workspace 2>&1 | tee "$RUNNER_TEMP/audit-core/tests.log"
+          cargo clippy --workspace --all-targets 2>&1 | tee "$RUNNER_TEMP/audit-core/clippy.log"
+          (cd web/dashboard && npm install && npm run typecheck && npm run build) 2>&1 | tee "$RUNNER_TEMP/audit-core/dashboard.log"
+          git diff --check
+          test -z "$(git status --porcelain)"
+      - name: Publish only the isolated fix branch
+        id: publish
+        working-directory: repo
+        run: |
+          branch=audit/config-time-boundaries-20260915
+          git fetch origin "refs/heads/$branch"
+          existing=$(git rev-parse FETCH_HEAD)
+          if [[ "$existing" = "$AUDIT_BASE" ]]; then
+            git push origin "HEAD:refs/heads/$branch"
+            fix_sha=$(git rev-parse HEAD)
+          elif [[ "$(git rev-parse FETCH_HEAD^{tree})" = "$AUDIT_TREE" ]]; then
+            fix_sha=$existing
+          else
+            echo 'Refusing to overwrite concurrent branch changes' >&2
+            exit 1
+          fi
+          echo "fix_sha=$fix_sha" >> "$GITHUB_OUTPUT"
+          printf '%s\n' "$fix_sha" > "$RUNNER_TEMP/audit-core/fix-commit.txt"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
-          name: audit-baseline-outcomes
-          path: ${{ runner.temp }}/audit-results
+          name: audit-fixed-core
+          path: ${{ runner.temp }}/audit-core
           retention-days: 7
-          if-no-files-found: error
+  acceptance:
+    needs: validate-and-publish
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        group: [s3, gcs, bigquery, pubsub, dynamodb, redshift, sqs, mail, redis, applicationautoscaling, misc]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          path: audit-input
+          persist-credentials: false
+          clean: false
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ needs.validate-and-publish.outputs.fix_sha }}
+          path: repo
+          persist-credentials: false
+          clean: false
+      - name: Install local-only test dependencies
+        working-directory: repo
+        env:
+          GROUP: ${{ matrix.group }}
+        run: |
+          packages=(protobuf-compiler ripgrep netcat-openbsd)
+          if [[ "$GROUP" = redis ]]; then packages+=(redis-server); fi
+          if [[ "$GROUP" = redshift ]]; then packages+=(postgresql postgresql-client); fi
+          sudo apt-get update -qq
+          sudo apt-get install -y "${packages[@]}"
+          if [[ "$GROUP" = redshift ]]; then pg_config --bindir >> "$GITHUB_PATH"; fi
+          case "$GROUP" in
+            s3|sqs|dynamodb|applicationautoscaling)
+              python3 -m venv "$RUNNER_TEMP/aws-cli"
+              "$RUNNER_TEMP/aws-cli/bin/pip" install awscli awscli-local
+              echo "$RUNNER_TEMP/aws-cli/bin" >> "$GITHUB_PATH"
+              ;;
+          esac
+          cd web/dashboard
+          npm install
+      - name: Run all discovered final stages and standalone E2Es
+        working-directory: repo
+        env:
+          GROUP: ${{ matrix.group }}
+        run: python3 ../audit-input/.audit/run-gates.py "$GROUP"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: audit-gates-${{ matrix.group }}
+          path: ${{ runner.temp }}/audit-${{ matrix.group }}
+          retention-days: 7
