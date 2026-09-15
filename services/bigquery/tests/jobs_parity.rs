@@ -622,3 +622,50 @@ fn tempdir() -> std::path::PathBuf {
     std::fs::create_dir_all(&dir).expect("create tempdir");
     dir
 }
+
+fn assert_job_get_rejects_host_path(absolute: bool) {
+    use devcloud_bigquery::routes::{handle, Request};
+
+    let dir = tempdir();
+    let server = new_server(&dir.join("store"));
+    // A synthetic persisted record outside the configured BigQuery storage root.
+    let outside = dir.join("outside.json");
+    let payload = br#"{"job":{"id":"outside-job-sentinel"}}"#;
+    std::fs::write(&outside, payload).unwrap();
+    let ordinary = server.query_job_path("local-project", "ordinary_job");
+    std::fs::create_dir_all(ordinary.parent().unwrap()).unwrap();
+    std::fs::write(&ordinary, br#"{"job":{"id":"ordinary_job"}}"#).unwrap();
+    let id = if absolute {
+        outside.with_extension("").to_string_lossy().into_owned()
+    } else {
+        "../../../../outside".to_string()
+    };
+    let escaped = id.replace('/', "%2F");
+    let response = handle(
+        &server,
+        &Request::new(
+            "GET",
+            &format!("/bigquery/v2/projects/local-project/jobs/{escaped}"),
+            b"",
+        ),
+    );
+    assert_eq!(response.status, 400, "host path must not be read as a job");
+    let error: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+    assert_eq!(error["error"]["code"], 400);
+    assert_eq!(error["error"]["errors"][0]["reason"], "invalid");
+    assert!(!response.body_str().contains("outside-job-sentinel"));
+    assert_eq!(std::fs::read(&outside).unwrap(), payload);
+    assert_eq!(server.get_job("local-project", "ordinary_job").status, 200);
+    assert_eq!(server.get_job("local-project", "missing_job").status, 404);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn job_get_rejects_percent_encoded_absolute_path() {
+    assert_job_get_rejects_host_path(true);
+}
+
+#[test]
+fn job_get_rejects_percent_encoded_parent_traversal() {
+    assert_job_get_rejects_host_path(false);
+}
