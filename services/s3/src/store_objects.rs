@@ -212,7 +212,7 @@ impl FileBucketStore {
                 return Ok(Some(found));
             }
         }
-        let path = self.object_versions_path(bucket, key).join(version_id);
+        let path = Self::version_path(&self.object_path(bucket, key), version_id)?;
         let object = match read_object(&path.join("object.json"))? {
             Some(o) => o,
             None => return Ok(None),
@@ -317,7 +317,7 @@ impl FileBucketStore {
         {
             return Err(StoreError::ObjectLocked);
         }
-        let version_dir = self.object_versions_path(bucket, key).join(version_id);
+        let version_dir = Self::version_path(&self.object_path(bucket, key), version_id)?;
         remove_dir_all_ignoring_missing(&version_dir)?;
         self.rebuild_current_object(bucket, key)?;
         Ok((object, true))
@@ -450,7 +450,7 @@ impl FileBucketStore {
         if object.version_id.is_empty() {
             return Ok(());
         }
-        let version_path = object_path.join("versions").join(&object.version_id);
+        let version_path = Self::version_path(object_path, &object.version_id)?;
         fs::create_dir_all(&version_path)?;
         Self::write_json(&version_path.join("object.json"), object)?;
         if object.delete_marker {

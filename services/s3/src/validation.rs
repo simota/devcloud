@@ -40,6 +40,12 @@ pub fn valid_object_key(key: &str) -> bool {
     !key.is_empty() && !key.contains('\0')
 }
 
+/// Version IDs are opaque single path components, including legacy IDs and `null`.
+/// Never interpret a version ID as a host path (on Unix or Windows).
+pub fn valid_version_id(version_id: &str) -> bool {
+    !matches!(version_id, "" | "." | "..") && !version_id.contains(['/', '\\', '\0', ':'])
+}
+
 /// Reports whether `upload_id` is a valid multipart upload ID (32 lowercase hex).
 pub fn valid_upload_id(upload_id: &str) -> bool {
     upload_id.len() == 32
@@ -75,6 +81,28 @@ mod tests {
         assert!(valid_object_key("path/to/object"));
         assert!(!valid_object_key(""));
         assert!(!valid_object_key("has\0null"));
+    }
+
+    #[test]
+    fn version_ids_are_opaque_single_path_components() {
+        for id in ["null", "v1", "legacy-id_2", "日本語", "a.b"] {
+            assert!(valid_version_id(id), "valid version ID rejected");
+        }
+        for id in [
+            "",
+            ".",
+            "..",
+            "../v1",
+            "v1/..",
+            "/tmp/version",
+            "a/b",
+            "a\\b",
+            "C:version",
+            "C:\\version",
+            "has\0nul",
+        ] {
+            assert!(!valid_version_id(id), "host path accepted as a version ID");
+        }
     }
 
     #[test]
