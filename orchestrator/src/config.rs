@@ -1797,6 +1797,107 @@ pub fn apply_service_selection(cfg: &Config, selected: &[String]) -> io::Result<
 mod tests {
     use super::*;
 
+    // Include aliases: each spelling must preserve the destination type's bounds.
+    const I32_CONFIG_KEYS: &[&str] = &[
+        "server.smtpPort",
+        "server.mailHttpPort",
+        "server.mailHTTPPort",
+        "server.dashboardPort",
+        "server.eventRelayPort",
+        "server.s3Port",
+        "server.gcsPort",
+        "server.dynamodbPort",
+        "server.bigqueryPort",
+        "server.bigQueryPort",
+        "server.redshiftPort",
+        "server.redshiftAPIPort",
+        "server.redshiftApiPort",
+        "server.redisPort",
+        "server.redisHttpPort",
+        "server.redisHTTPPort",
+        "server.sqsPort",
+        "server.pubsubGrpcPort",
+        "server.pubsubRestPort",
+        "server.appAutoScalingPort",
+        "services.dynamodb.maxTables",
+        "services.dynamodb.ttl.schedulerIntervalSeconds",
+        "services.bigquery.query.maxResultRows",
+        "services.bigquery.query.maxExecutionSeconds",
+        "services.redshift.numberOfNodes",
+        "services.redshift.dataApi.maxResultRows",
+        "services.redshift.dataAPI.maxResultRows",
+        "services.redshift.dataApi.statementRetentionSeconds",
+        "services.redshift.dataAPI.statementRetentionSeconds",
+        "services.redshift.dataApi.sessionRetentionSeconds",
+        "services.redshift.dataAPI.sessionRetentionSeconds",
+        "services.redshift.sql.maxResultRows",
+        "services.redis.maxMemoryMB",
+        "services.sqs.maxQueues",
+        "services.sqs.maxReceiveBatchSize",
+        "services.sqs.defaultVisibilityTimeoutSeconds",
+        "services.sqs.defaultDelaySeconds",
+        "services.sqs.defaultMessageRetentionSeconds",
+        "services.sqs.defaultReceiveWaitTimeSeconds",
+        "services.sqs.schedulerIntervalSeconds",
+        "services.pubsub.defaultAckDeadlineSeconds",
+        "services.pubsub.messageRetentionSeconds",
+        "services.pubsub.maxAckDeadlineSeconds",
+        "services.pubsub.maxPullMessages",
+        "services.pubsub.pullWaitTimeoutSeconds",
+    ];
+
+    #[test]
+    fn numeric_config_rejects_i32_overflow_without_mutating_config() {
+        for &key in I32_CONFIG_KEYS {
+            let path: Vec<String> = key.split('.').map(str::to_string).collect();
+            for value in [
+                "2147483648",
+                "4294967296",
+                "4294978321", // 2^32 + the default SMTP port: used to wrap to 11025.
+                "9223372036854775807",
+                "-2147483649",
+                "-9223372036854775808",
+            ] {
+                let mut cfg = default_config();
+                let before = cfg.clone();
+                let err = apply_config_value(&mut cfg, &path, value)
+                    .expect_err("out-of-range integers must not wrap");
+                assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{key}: {value}");
+                assert_eq!(cfg, before, "invalid {key} must not mutate configuration");
+            }
+        }
+    }
+
+    #[test]
+    fn numeric_config_preserves_valid_i32_and_i64_values() {
+        for &key in I32_CONFIG_KEYS {
+            let path: Vec<String> = key.split('.').map(str::to_string).collect();
+            let mut cfg = default_config();
+            apply_config_value(&mut cfg, &path, "1").expect(key);
+        }
+        let mut cfg = default_config();
+        apply_config_value(&mut cfg, &["server".into(), "smtpPort".into()], "65535").unwrap();
+        assert_eq!(cfg.server.smtp_port, 65535);
+        apply_config_value(
+            &mut cfg,
+            &["services".into(), "s3".into(), "maxObjectBytes".into()],
+            "5368709120",
+        )
+        .unwrap();
+        assert_eq!(cfg.services.s3.max_object_bytes, 5_368_709_120);
+        apply_config_value(
+            &mut cfg,
+            &[
+                "services".into(),
+                "sqs".into(),
+                "defaultDelaySeconds".into(),
+            ],
+            "0",
+        )
+        .unwrap();
+        assert_eq!(cfg.services.sqs.default_delay_seconds, 0);
+    }
+
     #[test]
     fn default_yaml_round_trips_through_parser() {
         // The YAML emitted from default config must parse back to the default

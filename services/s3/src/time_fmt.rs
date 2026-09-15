@@ -152,6 +152,45 @@ mod tests {
     use super::*;
 
     #[test]
+    fn timestamp_fraction_rejects_unicode_without_panicking() {
+        // Test both sides of the old nine-byte slicing boundary.
+        for width in 0..=10 {
+            for invalid in ["あ", "é", "🦀", "\0"] {
+                let value = format!("2026-05-30T12:00:00.{}{invalid}Z", "1".repeat(width));
+                assert_eq!(parse_rfc3339(&value), None, "{value:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn timestamp_fraction_validates_digits_beyond_nanosecond_precision() {
+        for fraction in ["", "+1", "-1", "1 ", "123456789x", "123456789.0"] {
+            let value = format!("2026-05-30T12:00:00.{fraction}Z");
+            assert_eq!(parse_rfc3339(&value), None, "{value:?}");
+        }
+    }
+
+    #[test]
+    fn timestamp_fraction_preserves_supported_precision() {
+        for (fraction, nanos) in [
+            ("0", 0),
+            ("1", 100_000_000),
+            ("000000001", 1),
+            ("123456789", 123_456_789),
+            ("123456789123456789", 123_456_789),
+        ] {
+            let value = format!("2026-05-30T12:00:00.{fraction}Z");
+            assert_eq!(parse_rfc3339(&value), Some((1_780_142_400, nanos)));
+        }
+        for secs in [-62_135_596_800, -1, 0, 1_780_142_400] {
+            for nanos in [0, 1, 100_000_000, 999_999_999] {
+                let value = rfc3339nano_from_unix(secs, nanos);
+                assert_eq!(parse_rfc3339(&value), Some((secs, nanos)), "{value}");
+            }
+        }
+    }
+
+    #[test]
     fn whole_second_has_no_fraction() {
         // 1780142400 = 2026-05-30T12:00:00Z
         assert_eq!(

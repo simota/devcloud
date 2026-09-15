@@ -533,6 +533,52 @@ fn object_lock_configuration_retention_and_legal_hold_subresources() {
 }
 
 #[test]
+fn invalid_retention_fraction_returns_xml_error_without_changing_object() {
+    let root = tempdir();
+    let store = FileBucketStore::new(&root);
+    assert_eq!(route(&store, &req("PUT", "/data")).status, 200);
+    assert_eq!(
+        route(
+            &store,
+            &Request::new("PUT", "/data/kept", b"original".to_vec())
+        )
+        .status,
+        200
+    );
+    for timestamp in [
+        "2031-01-01T00:00:00.12345678あZ",
+        "2031-01-01T00:00:00.123456789xZ",
+        "2031-01-01T00:00:00.Z",
+    ] {
+        let body = format!(
+            "<Retention><Mode>GOVERNANCE</Mode><RetainUntilDate>{timestamp}</RetainUntilDate></Retention>"
+        );
+        let response = route(
+            &store,
+            &Request::new("PUT", "/data/kept?retention", body.into_bytes()),
+        );
+        assert_eq!(response.status, 400);
+        assert!(String::from_utf8(response.body)
+            .unwrap()
+            .contains("<Code>InvalidArgument</Code>"));
+        assert_eq!(
+            response.headers.get("Content-Type").map(String::as_str),
+            Some("application/xml")
+        );
+        assert_eq!(route(&store, &req("GET", "/data/kept")).body, b"original");
+    }
+    drop(store);
+    let reopened = FileBucketStore::new(&root);
+    assert_eq!(
+        route(&reopened, &req("GET", "/data/kept")).body,
+        b"original"
+    );
+    // No rejected retention value should have been persisted.
+    assert_eq!(route(&reopened, &req("DELETE", "/data/kept")).status, 204);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn object_retention_blocks_delete_until_expired() {
     let root = tempdir();
     let mut store = FileBucketStore::new(&root);
@@ -1404,4 +1450,36 @@ fn multipart_abort_removes_upload() {
         ),
     );
     assert_eq!(missing.status, 404);
+}
+
+#[test]
+fn version_id_dotdot_cannot_delete_all_versions_over_http() {
+    let root = tempdir();
+    let store = FileBucketStore::new(&root);
+    store.create_bucket("data").unwrap();
+    store.put_bucket_versioning("data", "Enabled").unwrap();
+    for body in [b"first".as_slice(), b"second".as_slice()] {
+        assert_eq!(
+            route(&store, &Request::new("PUT", "/data/key", body.to_vec())).status,
+            200
+        );
+    }
+    let response = route(&store, &req("DELETE", "/data/key?versionId=%2E%2E"));
+    assert_eq!(
+        response.status, 400,
+        "dot-dot must not delete every version"
+    );
+    assert!(String::from_utf8(response.body)
+        .unwrap()
+        .contains("<Code>InvalidArgument</Code>"));
+    assert_eq!(
+        store
+            .list_object_versions("data", "")
+            .unwrap()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(route(&store, &req("GET", "/data/key")).body, b"second");
+    std::fs::remove_dir_all(root).unwrap();
 }

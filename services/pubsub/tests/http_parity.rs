@@ -205,6 +205,37 @@ fn seek_match_and_errors() {
 }
 
 #[test]
+fn invalid_seek_fraction_returns_json_error_and_preserves_lease() {
+    let (dir, md) = (tempdir(), tempdir());
+    let mut s = server(&dir, &md);
+    let messages = vec![serde_json::json!({"data":"aGk="})];
+    s.publish("devcloud", "orders", &messages).expect("publish");
+    s.pull("devcloud", "sub1", 1).expect("lease message");
+    for timestamp in [
+        "2026-05-30T11:00:00.12345678あZ",
+        "2026-05-30T11:00:00.123456789xZ",
+        "2026-05-30T11:00:00.Z",
+    ] {
+        let response = route(
+            &mut s,
+            &req(
+                "POST",
+                "/v1/projects/devcloud/subscriptions/sub1:seek",
+                &serde_json::json!({"time":timestamp}).to_string(),
+            ),
+        );
+        assert_eq!(response.status, 400);
+        let error: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(error["error"]["code"], 400);
+        assert_eq!(error["error"]["status"], "INVALID_ARGUMENT");
+        assert_eq!(s.pull("devcloud", "sub1", 1).unwrap().body, b"{}\n");
+    }
+    drop(s);
+    std::fs::remove_dir_all(dir).unwrap();
+    std::fs::remove_dir_all(md).unwrap();
+}
+
+#[test]
 fn seek_rolls_back_when_persist_fails() {
     let (dir, md) = (tempdir(), tempdir());
     let mut s = server(&dir, &md);
