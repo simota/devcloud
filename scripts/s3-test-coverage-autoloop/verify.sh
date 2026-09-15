@@ -75,23 +75,10 @@ assert_e2e_docs_contract() {
     cargo test --workspace
 }
 
-coverage_value() {
-  local package="$1"
-  cargo test --workspace >/dev/null
-  printf '100\n'
-}
-
-assert_min_coverage() {
-  local package="$1"
-  local minimum="$2"
-  local actual
-  actual="$(coverage_value "${package}")"
-  awk -v actual="${actual}" -v minimum="${minimum}" 'BEGIN { exit !(actual + 0 >= minimum + 0) }'
-}
-
+# Measure real Rust source-line coverage; see docs/testing-coverage.md.
 assert_coverage_thresholds() {
-  assert_min_coverage ./services/s3 72.0 &&
-    assert_min_coverage ./services/dashboard 68.5
+  python3 "${ROOT_DIR}/scripts/lib/rust-coverage.py" "${ROOT_DIR}" \
+    ./services/s3:72.0 ./services/dashboard:68.5
 }
 
 run_foundation_checks() {
