@@ -1,0 +1,173 @@
+name: Coverage audit verification
+
+on:
+  push:
+    branches:
+      - audit/coverage-gates-20260915
+    paths:
+      - .github/workflows/coverage-audit-verification.yml
+
+permissions:
+  contents: write
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      AWS_ACCESS_KEY_ID: dev
+      AWS_SECRET_ACCESS_KEY: dev
+      AWS_DEFAULT_REGION: us-east-1
+      AWS_EC2_METADATA_DISABLED: 'true'
+      E2E_INTERACTIVE: 'false'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          clean: false
+          persist-credentials: false
+      - name: Install verification prerequisites
+        run: |
+          mkdir -p "$RUNNER_TEMP/audit"
+          sudo apt-get update -qq
+          sudo apt-get install -y protobuf-compiler redis-server postgresql ripgrep
+          python3 -m venv "$RUNNER_TEMP/cli"
+          "$RUNNER_TEMP/cli/bin/pip" install awscli awscli-local
+          echo "$RUNNER_TEMP/cli/bin" >> "$GITHUB_PATH"
+          rustup component add llvm-tools-preview
+          cargo install cargo-llvm-cov --version 0.9.0 --locked
+      - name: Apply previously verified parser changes
+        run: |
+          git status > "$RUNNER_TEMP/audit/initial-status.log"
+          git diff >> "$RUNNER_TEMP/audit/initial-status.log"
+          python3 scripts/parser-audit-regressions.py .
+          python3 scripts/parser-audit-cross-protocol.py .
+          python3 scripts/parser-audit-fixes.py .
+          rustfmt --edition 2021 orchestrator/src/config.rs services/s3/src/time_fmt.rs services/pubsub/src/time_fmt.rs services/s3/tests/http_parity.rs services/pubsub/tests/http_parity.rs services/pubsub/tests/grpc_conformance.rs
+      - name: Prove original coverage gate false positives
+        run: |
+          set +e
+          python3 -m unittest discover -s scripts/tests -p test_coverage_gate.py -v > "$RUNNER_TEMP/audit/coverage-red.log" 2>&1
+          code=$?
+          if [ "$code" -eq 1 ] && grep -q '^FAILED (failures=16)' "$RUNNER_TEMP/audit/coverage-red.log"; then
+            printf 'EXPECTED_FAIL\tcoverage-red\texit=%s\n' "$code" > "$RUNNER_TEMP/audit/results.tsv"
+          else
+            echo 'UNPROVEN coverage regression'
+            exit 1
+          fi
+      - name: Replace constant coverage with real measurement
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          for service, dashboard in [('s3', '68.5'), ('gcs', '70.0')]:
+              path = Path(f'scripts/{service}-test-coverage-autoloop/verify.sh')
+              text = path.read_text()
+              start = text.index('coverage_value() {')
+              end = text.index('\nrun_foundation_checks()', start)
+              replacement = f'''# Measure real Rust source-line coverage; see docs/testing-coverage.md.
+          assert_coverage_thresholds() {{
+            python3 "${{ROOT_DIR}}/scripts/lib/rust-coverage.py" "${{ROOT_DIR}}" \\
+              ./services/{service}:72.0 ./services/dashboard:{dashboard}
+          }}
+          '''
+              path.write_text(text[:start] + replacement + text[end:])
+          PY
+          git diff --check
+      - name: Gate regression and formatting checks
+        id: core
+        run: |
+          python3 -m unittest discover -s scripts/tests -p test_coverage_gate.py -v > "$RUNNER_TEMP/audit/coverage-green.log" 2>&1
+          cargo fmt --all -- --check > "$RUNNER_TEMP/audit/cargo-fmt.log" 2>&1
+          bash -n scripts/s3-test-coverage-autoloop/verify.sh
+          bash -n scripts/gcs-test-coverage-autoloop/verify.sh
+          printf 'PASS\tcoverage-green\nPASS\tcargo-fmt\nPASS\tshell-syntax\n' >> "$RUNNER_TEMP/audit/results.tsv"
+          echo 'ready=true' >> "$GITHUB_OUTPUT"
+      - name: Run both full coverage gates and retain actual reports
+        if: steps.core.outputs.ready == 'true'
+        shell: bash
+        run: |
+          set +e
+          result=0
+          for service in s3 gcs; do
+            VERIFY_STAGE=full-test-coverage bash "scripts/$service-test-coverage-autoloop/verify.sh" > "$RUNNER_TEMP/audit/gate-$service-coverage.log" 2>&1
+            code=$?
+            if [ "$code" -eq 0 ]; then state=PASS; else state=FAIL; result=1; fi
+            printf '%s\tgate-%s-coverage\texit=%s\n' "$state" "$service" "$code" | tee -a "$RUNNER_TEMP/audit/results.tsv"
+            cargo llvm-cov report --json --summary-only --output-path "$RUNNER_TEMP/audit/coverage-$service.json" > "$RUNNER_TEMP/audit/report-$service.log" 2>&1
+            report_code=$?
+            printf 'REPORT\t%s\texit=%s\n' "$service" "$report_code" | tee -a "$RUNNER_TEMP/audit/results.tsv"
+            if [ "$report_code" -ne 0 ]; then result=1; fi
+          done
+          exit "$result"
+      - name: Final combined source verification
+        if: always() && steps.core.outputs.ready == 'true'
+        shell: bash
+        run: |
+          set +e
+          result=0
+          run_gate() {
+            name="$1"; shift
+            "$@" > "$RUNNER_TEMP/audit/$name.log" 2>&1
+            code=$?
+            if [ "$code" -eq 0 ]; then state=PASS; else state=FAIL; result=1; fi
+            printf '%s\t%s\texit=%s\n' "$state" "$name" "$code" | tee -a "$RUNNER_TEMP/audit/results.tsv"
+          }
+          run_gate cargo-check cargo check --workspace
+          run_gate cargo-test cargo test --workspace
+          run_gate cargo-clippy cargo clippy --workspace --all-targets
+          run_gate dashboard-install bash -c 'cd web/dashboard && npm install'
+          run_gate dashboard-typecheck bash -c 'cd web/dashboard && npm run typecheck'
+          run_gate dashboard-build bash -c 'cd web/dashboard && npm run build'
+          run_gate diff-check git diff --check
+          git status --short > "$RUNNER_TEMP/audit/final-status.log"
+          exit "$result"
+      - name: Publish combined source-only fixes without changing main
+        if: always() && steps.core.outputs.ready == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'PY'
+          import json, os, pathlib, tarfile, urllib.request
+          base = '0d031df3a5417a24855e44e2c25de2f88f0f1129'
+          repo = 'simota/devcloud'
+          branch = 'fix/audit-boundaries-and-coverage-20260915'
+          def api(path, payload=None):
+              data = None if payload is None else json.dumps(payload).encode()
+              req = urllib.request.Request('https://api.github.com/repos/' + repo + '/' + path, data=data, headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json', 'Content-Type': 'application/json'})
+              with urllib.request.urlopen(req) as response:
+                  return json.load(response)
+          parent = base
+          tree = api('git/commits/' + base)['tree']['sha']
+          groups = [
+              ('fix(config): reject out-of-range integers and TCP ports', ['README.md', 'orchestrator/src/config.rs']),
+              ('fix(time): validate timestamp fractions before truncation', ['services/s3/src/time_fmt.rs', 'services/pubsub/src/time_fmt.rs', 'services/s3/tests/http_parity.rs', 'services/pubsub/tests/http_parity.rs']),
+              ('test(pubsub): verify bidirectional REST and gRPC shared state', ['services/pubsub/tests/grpc_conformance.rs']),
+              ('fix(test): measure S3 and GCS coverage instead of reporting constant 100 percent', ['scripts/s3-test-coverage-autoloop/verify.sh', 'scripts/gcs-test-coverage-autoloop/verify.sh', 'scripts/lib/rust-coverage.py', 'scripts/tests/test_coverage_gate.py', 'docs/testing-coverage.md']),
+          ]
+          commits = []
+          all_paths = []
+          for message, paths in groups:
+              entries = [{'path': path, 'mode': '100644', 'type': 'blob', 'content': pathlib.Path(path).read_text()} for path in paths]
+              # Preserve executable flags on the existing shell scripts.
+              for entry in entries:
+                  if entry['path'].endswith('/verify.sh'):
+                      entry['mode'] = '100755'
+              tree = api('git/trees', {'base_tree': tree, 'tree': entries})['sha']
+              parent = api('git/commits', {'message': message, 'tree': tree, 'parents': [parent]})['sha']
+              commits.append({'message': message, 'sha': parent, 'paths': paths})
+              all_paths.extend(paths)
+          api('git/refs', {'ref': 'refs/heads/' + branch, 'sha': parent})
+          result = {'base': base, 'branch': branch, 'head': parent, 'commits': commits}
+          out = pathlib.Path(os.environ['RUNNER_TEMP']) / 'audit'
+          (out / 'published.json').write_text(json.dumps(result, indent=2) + '\n')
+          with tarfile.open(out / 'changed-sources.tar.gz', 'w:gz') as archive:
+              for path in all_paths:
+                  archive.add(path, arcname=path)
+          print('Published source-only branch:', branch, parent)
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: coverage-verification-${{ github.sha }}
+          path: ${{ runner.temp }}/audit/
+          retention-days: 7
+          if-no-files-found: error
