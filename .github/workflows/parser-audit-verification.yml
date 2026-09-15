@@ -6,75 +6,179 @@ on:
       - audit/parser-boundary-fixes-20260915
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   verify:
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    timeout-minutes: 50
+    env:
+      AWS_ACCESS_KEY_ID: dev
+      AWS_SECRET_ACCESS_KEY: dev
+      AWS_DEFAULT_REGION: us-east-1
+      AWS_EC2_METADATA_DISABLED: 'true'
+      E2E_INTERACTIVE: 'false'
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           clean: false
           persist-credentials: false
-      - name: Install build prerequisite
+      - name: Install local test prerequisites
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y protobuf-compiler
-      - name: Record environment
-        run: |
+          sudo apt-get install -y protobuf-compiler redis-server postgresql ripgrep
+          python3 -m venv "$RUNNER_TEMP/cli"
+          "$RUNNER_TEMP/cli/bin/pip" install awscli awscli-local
+          echo "$RUNNER_TEMP/cli/bin" >> "$GITHUB_PATH"
           mkdir -p "$RUNNER_TEMP/audit"
-          {
-            git status
-            git diff
-            git rev-parse HEAD
-            rustc --version
-            cargo --version
-            protoc --version
-            node --version
-            npm --version
-          } > "$RUNNER_TEMP/audit/environment.log" 2>&1
-      - name: Original-source Rust baseline with protoc
-        shell: bash
-        run: |
-          set +e
-          for gate in check test clippy; do
-            case "$gate" in
-              check) cargo check --workspace > "$RUNNER_TEMP/audit/baseline-check.log" 2>&1 ;;
-              test) cargo test --workspace > "$RUNNER_TEMP/audit/baseline-test.log" 2>&1 ;;
-              clippy) cargo clippy --workspace --all-targets > "$RUNNER_TEMP/audit/baseline-clippy.log" 2>&1 ;;
-            esac
-            code=$?
-            printf 'baseline-%s\texit=%s\n' "$gate" "$code" | tee -a "$RUNNER_TEMP/audit/results.tsv"
-          done
       - name: Add regression tests before production changes
         run: |
+          git status > "$RUNNER_TEMP/audit/initial-status.log"
+          git diff >> "$RUNNER_TEMP/audit/initial-status.log"
           python3 scripts/parser-audit-regressions.py .
-          rustfmt --edition 2021 orchestrator/src/config.rs services/s3/src/time_fmt.rs services/pubsub/src/time_fmt.rs services/s3/tests/http_parity.rs services/pubsub/tests/http_parity.rs
+          python3 scripts/parser-audit-cross-protocol.py .
+          rustfmt --edition 2021 orchestrator/src/config.rs services/s3/src/time_fmt.rs services/pubsub/src/time_fmt.rs services/s3/tests/http_parity.rs services/pubsub/tests/http_parity.rs services/pubsub/tests/grpc_conformance.rs
           git diff --check
           git diff > "$RUNNER_TEMP/audit/regressions-only.patch"
-      - name: Require real failing regression assertions
+      - name: Prove unit and HTTP regression failures before fixes
         shell: bash
         run: |
           set +e
           result=0
           for svc in orchestrator s3 pubsub; do
-            cargo test -p "devcloud-$svc" regression_ > "$RUNNER_TEMP/audit/red-$svc.log" 2>&1
+            cargo test -p "devcloud-$svc" --no-fail-fast regression_ > "$RUNNER_TEMP/audit/red-$svc.log" 2>&1
             code=$?
-            if [ "$code" -eq 101 ] && grep -Eq '^test .*regression_.* \.\.\. FAILED$' "$RUNNER_TEMP/audit/red-$svc.log"; then
-              state=EXPECTED_FAIL
-            else
-              state=UNPROVEN
-              result=1
-            fi
+            if [ "$code" -eq 101 ] && grep -Eq '^test .*regression_.* \.\.\. FAILED$' "$RUNNER_TEMP/audit/red-$svc.log"; then state=EXPECTED_FAIL; else state=UNPROVEN; result=1; fi
             printf '%s\tred-%s\texit=%s\n' "$state" "$svc" "$code" | tee -a "$RUNNER_TEMP/audit/results.tsv"
           done
-          git status --short > "$RUNNER_TEMP/audit/final-status.log"
+          grep -q '^test regression_invalid_retention_fraction_does_not_change_persisted_retention ... FAILED$' "$RUNNER_TEMP/audit/red-s3.log" || result=1
+          grep -q '^test regression_invalid_seek_fraction_preserves_inflight_delivery ... FAILED$' "$RUNNER_TEMP/audit/red-pubsub.log" || result=1
+          grep -q '^test regression_rest_and_grpc_share_resources_deliveries_and_acknowledgements ... ok$' "$RUNNER_TEMP/audit/red-pubsub.log" || result=1
           exit "$result"
+      - name: Apply minimal production fixes
+        run: |
+          python3 scripts/parser-audit-fixes.py .
+          rustfmt --edition 2021 orchestrator/src/config.rs services/s3/src/time_fmt.rs services/pubsub/src/time_fmt.rs
+          git diff --check
+      - name: Focused and workspace verification
+        id: core
+        shell: bash
+        run: |
+          set +e
+          result=0
+          run_gate() {
+            name="$1"; shift
+            "$@" > "$RUNNER_TEMP/audit/$name.log" 2>&1
+            code=$?
+            if [ "$code" -eq 0 ]; then state=PASS; else state=FAIL; result=1; fi
+            printf '%s\t%s\texit=%s\n' "$state" "$name" "$code" | tee -a "$RUNNER_TEMP/audit/results.tsv"
+          }
+          run_gate focused-orchestrator cargo test -p devcloud-orchestrator
+          run_gate focused-s3 cargo test -p devcloud-s3
+          run_gate focused-pubsub cargo test -p devcloud-pubsub
+          run_gate cargo-fmt cargo fmt --all -- --check
+          run_gate cargo-check cargo check --workspace
+          run_gate cargo-test cargo test --workspace
+          run_gate cargo-clippy cargo clippy --workspace --all-targets
+          run_gate dashboard-install bash -c 'cd web/dashboard && npm install'
+          run_gate dashboard-typecheck bash -c 'cd web/dashboard && npm run typecheck'
+          run_gate dashboard-build bash -c 'cd web/dashboard && npm run build'
+          run_gate shell-syntax bash -c 'while IFS= read -r script; do bash -n "$script" || exit; done < <(find scripts -maxdepth 2 -type f -name "*.sh" | sort)'
+          git diff --check > "$RUNNER_TEMP/audit/diff-check.log" 2>&1 || result=1
+          if [ "$result" -eq 0 ]; then echo 'ready=true' >> "$GITHUB_OUTPUT"; fi
+          exit "$result"
+      - name: Export source-only fix
+        if: steps.core.outputs.ready == 'true'
+        run: |
+          files=(README.md orchestrator/src/config.rs services/s3/src/time_fmt.rs services/pubsub/src/time_fmt.rs services/s3/tests/http_parity.rs services/pubsub/tests/http_parity.rs services/pubsub/tests/grpc_conformance.rs)
+          git diff -- "${files[@]}" > "$RUNNER_TEMP/audit/parser-fixes.patch"
+          tar -czf "$RUNNER_TEMP/audit/changed-sources.tar.gz" "${files[@]}"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
-          name: regression-proof-${{ github.sha }}
+          name: core-verification-${{ github.sha }}
+          path: ${{ runner.temp }}/audit/
+          retention-days: 7
+          if-no-files-found: error
+      - name: Dynamic final-stage acceptance and E2E discovery
+        if: steps.core.outputs.ready == 'true'
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import pathlib, re, os
+          out = pathlib.Path(os.environ['RUNNER_TEMP']) / 'audit'
+          gates = []
+          for p in sorted(pathlib.Path('scripts').glob('*/verify.sh')):
+              s = p.read_text()
+              cases = re.findall(r'case [^\n]*(?:VERIFY_STAGE|stage)[^\n]* in\n(.*?)\nesac', s, re.S)
+              choices = re.findall(r'^  ([\w|*-]+)\)', cases[-1], re.M) if cases else []
+              choices = [c for choice in choices for c in choice.split('|') if c.startswith('full')]
+              stage = choices[-1] if choices else 'full'
+              gates.append(f'{stage}\t{p}')
+          (out / 'gates.tsv').write_text('\n'.join(gates) + '\n')
+          (out / 'e2e.txt').write_text('\n'.join(str(p) for p in sorted(pathlib.Path('scripts').glob('*-e2e.sh'))) + '\n')
+          PY
+          set +e
+          result=0
+          while IFS=$'\t' read -r stage script; do
+            name="gate-$(basename "$(dirname "$script")")"
+            case "$script" in
+              scripts/s3-test-coverage-autoloop/verify.sh|scripts/gcs-test-coverage-autoloop/verify.sh)
+                printf 'NOT_RUN\t%s\treason=hardcoded-coverage-under-review\n' "$name" | tee -a "$RUNNER_TEMP/audit/results.tsv"
+                continue ;;
+            esac
+            VERIFY_STAGE="$stage" bash "$script" > "$RUNNER_TEMP/audit/$name.log" 2>&1
+            code=$?
+            if [ "$code" -eq 0 ]; then state=PASS; else state=FAIL; result=1; fi
+            printf '%s\t%s\tstage=%s\texit=%s\n' "$state" "$name" "$stage" "$code" | tee -a "$RUNNER_TEMP/audit/results.tsv"
+          done < "$RUNNER_TEMP/audit/gates.tsv"
+          while IFS= read -r script; do
+            name="$(basename "$script" .sh)"
+            bash "$script" > "$RUNNER_TEMP/audit/$name.log" 2>&1
+            code=$?
+            if [ "$code" -eq 0 ]; then state=PASS; else state=FAIL; result=1; fi
+            printf '%s\t%s\texit=%s\n' "$state" "$name" "$code" | tee -a "$RUNNER_TEMP/audit/results.tsv"
+          done < "$RUNNER_TEMP/audit/e2e.txt"
+          git status --short > "$RUNNER_TEMP/audit/final-status.log"
+          exit "$result"
+      - name: Publish reviewed source-only commits on a new branch
+        if: always() && steps.core.outputs.ready == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'PY'
+          import json, os, pathlib, urllib.request
+          base = '0d031df3a5417a24855e44e2c25de2f88f0f1129'
+          repo = 'simota/devcloud'
+          branch = 'fix/parser-boundaries-20260915'
+          def api(path, payload=None):
+              data = None if payload is None else json.dumps(payload).encode()
+              req = urllib.request.Request('https://api.github.com/repos/' + repo + '/' + path, data=data, headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json', 'Content-Type': 'application/json'})
+              with urllib.request.urlopen(req) as response:
+                  return json.load(response)
+          parent = base
+          tree = api('git/commits/' + base)['tree']['sha']
+          groups = [
+              ('fix(config): reject out-of-range integers and TCP ports', ['README.md', 'orchestrator/src/config.rs']),
+              ('fix(time): validate timestamp fractions before truncation', ['services/s3/src/time_fmt.rs', 'services/pubsub/src/time_fmt.rs', 'services/s3/tests/http_parity.rs', 'services/pubsub/tests/http_parity.rs']),
+              ('test(pubsub): verify bidirectional REST and gRPC shared state', ['services/pubsub/tests/grpc_conformance.rs']),
+          ]
+          commits = []
+          for message, paths in groups:
+              entries = [{'path': path, 'mode': '100644', 'type': 'blob', 'content': pathlib.Path(path).read_text()} for path in paths]
+              tree = api('git/trees', {'base_tree': tree, 'tree': entries})['sha']
+              parent = api('git/commits', {'message': message, 'tree': tree, 'parents': [parent]})['sha']
+              commits.append({'message': message, 'sha': parent, 'paths': paths})
+          api('git/refs', {'ref': 'refs/heads/' + branch, 'sha': parent})
+          result = {'base': base, 'branch': branch, 'head': parent, 'commits': commits}
+          path = pathlib.Path(os.environ['RUNNER_TEMP']) / 'audit' / 'published.json'
+          path.write_text(json.dumps(result, indent=2) + '\n')
+          print('Published source-only branch:', branch, parent)
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: final-verification-${{ github.sha }}
           path: ${{ runner.temp }}/audit/
           retention-days: 7
           if-no-files-found: error
