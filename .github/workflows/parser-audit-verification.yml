@@ -13,61 +13,68 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 35
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           clean: false
           persist-credentials: false
-      - name: Record source and baseline environment
-        shell: bash
+      - name: Install build prerequisite
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y protobuf-compiler
+      - name: Record environment
         run: |
           mkdir -p "$RUNNER_TEMP/audit"
-          git archive --format=tar.gz --output="$RUNNER_TEMP/audit/source.tar.gz" HEAD
           {
             git status
             git diff
             git rev-parse HEAD
             rustc --version
             cargo --version
+            protoc --version
             node --version
             npm --version
-            find scripts -maxdepth 2 -name verify.sh -print | sort
-            find scripts -maxdepth 1 -name '*-e2e.sh' -print | sort
           } > "$RUNNER_TEMP/audit/environment.log" 2>&1
-      - uses: actions/upload-artifact@v4
-        with:
-          name: source-${{ github.sha }}
-          path: ${{ runner.temp }}/audit/source.tar.gz
-          retention-days: 7
-      - name: Baseline and regression gates
+      - name: Original-source Rust baseline with protoc
+        shell: bash
+        run: |
+          set +e
+          for gate in check test clippy; do
+            case "$gate" in
+              check) cargo check --workspace > "$RUNNER_TEMP/audit/baseline-check.log" 2>&1 ;;
+              test) cargo test --workspace > "$RUNNER_TEMP/audit/baseline-test.log" 2>&1 ;;
+              clippy) cargo clippy --workspace --all-targets > "$RUNNER_TEMP/audit/baseline-clippy.log" 2>&1 ;;
+            esac
+            code=$?
+            printf 'baseline-%s\texit=%s\n' "$gate" "$code" | tee -a "$RUNNER_TEMP/audit/results.tsv"
+          done
+      - name: Add regression tests before production changes
+        run: |
+          python3 scripts/parser-audit-regressions.py .
+          rustfmt --edition 2021 orchestrator/src/config.rs services/s3/src/time_fmt.rs services/pubsub/src/time_fmt.rs services/s3/tests/http_parity.rs services/pubsub/tests/http_parity.rs
+          git diff --check
+          git diff > "$RUNNER_TEMP/audit/regressions-only.patch"
+      - name: Require real failing regression assertions
         shell: bash
         run: |
           set +e
           result=0
-          run_gate() {
-            name="$1"
-            shift
-            "$@" > "$RUNNER_TEMP/audit/$name.log" 2>&1
+          for svc in orchestrator s3 pubsub; do
+            cargo test -p "devcloud-$svc" regression_ > "$RUNNER_TEMP/audit/red-$svc.log" 2>&1
             code=$?
-            if [ "$code" -eq 0 ]; then state=PASS; else state=FAIL; result=1; fi
-            printf '%s\t%s\texit=%s\n' "$state" "$name" "$code" | tee -a "$RUNNER_TEMP/audit/results.tsv"
-          }
-          run_gate cargo-fmt cargo fmt --all -- --check
-          run_gate cargo-check cargo check --workspace
-          run_gate cargo-test cargo test --workspace
-          run_gate cargo-clippy cargo clippy --workspace --all-targets
-          run_gate dashboard-install bash -c 'cd web/dashboard && npm install'
-          run_gate dashboard-typecheck bash -c 'cd web/dashboard && npm run typecheck'
-          run_gate dashboard-build bash -c 'cd web/dashboard && npm run build'
-          run_gate shell-syntax bash -c "bash -n scripts/*-e2e.sh scripts/*-autoloop/verify.sh scripts/lib/devcloud-engine.sh"
+            if [ "$code" -eq 101 ] && grep -Eq '^test .*regression_.* \.\.\. FAILED$' "$RUNNER_TEMP/audit/red-$svc.log"; then
+              state=EXPECTED_FAIL
+            else
+              state=UNPROVEN
+              result=1
+            fi
+            printf '%s\tred-%s\texit=%s\n' "$state" "$svc" "$code" | tee -a "$RUNNER_TEMP/audit/results.tsv"
+          done
           git status --short > "$RUNNER_TEMP/audit/final-status.log"
-          git diff --check > "$RUNNER_TEMP/audit/diff-check.log" 2>&1
           exit "$result"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
-          name: verification-${{ github.sha }}
-          path: |
-            ${{ runner.temp }}/audit/*.log
-            ${{ runner.temp }}/audit/results.tsv
+          name: regression-proof-${{ github.sha }}
+          path: ${{ runner.temp }}/audit/
           retention-days: 7
           if-no-files-found: error
