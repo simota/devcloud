@@ -59,7 +59,7 @@ impl HttpAuth {
         }
     }
 
-    fn is_strict(&self) -> bool {
+    pub fn is_strict(&self) -> bool {
         self.mode() == SMTP_AUTH_STRICT
     }
 }
@@ -303,15 +303,8 @@ fn parse_message_rest(rest: &str) -> Option<(String, bool)> {
 /// Basic credentials whose user AND password equal the configured ones
 /// (constant-time compare). Returns `Some(401)` to reject, `None` to proceed.
 fn verify_http(auth: &HttpAuth, req: &Request) -> Option<Response> {
-    if !auth.is_strict() {
+    if check_basic_auth(auth, req.header("authorization")) {
         return None;
-    }
-    if let Some((user, pass)) = basic_auth(req.header("authorization")) {
-        if constant_time_eq(user.as_bytes(), auth.username.as_bytes())
-            && constant_time_eq(pass.as_bytes(), auth.password.as_bytes())
-        {
-            return None;
-        }
     }
     let mut resp = Response::text(401, "unauthorized");
     resp.headers.push((
@@ -321,11 +314,25 @@ fn verify_http(auth: &HttpAuth, req: &Request) -> Option<Response> {
     Some(resp)
 }
 
+/// Validate HTTP Basic credentials; relaxed/off modes require no credentials.
+pub fn check_basic_auth(auth: &HttpAuth, authorization: &str) -> bool {
+    if !auth.is_strict() {
+        return true;
+    }
+    basic_auth(authorization).is_some_and(|(user, pass)| {
+        constant_time_eq(user.as_bytes(), auth.username.as_bytes())
+            & constant_time_eq(pass.as_bytes(), auth.password.as_bytes())
+    })
+}
+
 /// Mirrors legacy `basicAuth`: parse `Authorization: Basic <base64(user:pass)>`.
 /// Never logs the header or its contents.
 fn basic_auth(header: &str) -> Option<(String, String)> {
     const PREFIX: &str = "Basic ";
-    if header.len() < PREFIX.len() || !header[..PREFIX.len()].eq_ignore_ascii_case(PREFIX) {
+    if !header
+        .get(..PREFIX.len())
+        .is_some_and(|p| p.eq_ignore_ascii_case(PREFIX))
+    {
         return None;
     }
     let decoded = base64_decode(&header[PREFIX.len()..])?;

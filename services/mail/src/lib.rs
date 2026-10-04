@@ -40,8 +40,12 @@ pub mod time_fmt;
 
 pub use blob::{BlobId, BlobStore, FileBlobStore};
 pub use http::serve_http;
-pub use model::{Attachment, Envelope, ListMessagesInput, ListMessagesResult, Message};
+pub use model::{
+    Attachment, Envelope, ListMessagesInput, ListMessagesResult, Message, MessageEntry,
+};
 pub use parser::parse_message;
 pub use service::Service;
-pub use smtp::{SmtpConfig, SmtpServer, SMTP_AUTH_OFF, SMTP_AUTH_RELAXED, SMTP_AUTH_STRICT};
+pub use smtp::{
+    SmtpConfig, SmtpLimits, SmtpServer, SMTP_AUTH_OFF, SMTP_AUTH_RELAXED, SMTP_AUTH_STRICT,
+};
 pub use store::{FileStore, RecordingStore, Store};

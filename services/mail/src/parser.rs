@@ -140,7 +140,7 @@ fn fill_message_body(msg: &mut Message, content_type: &str, body: &[u8]) {
     if let Some((media_type, params)) = parse_media_type(content_type) {
         if media_type.starts_with("multipart/") {
             if let Some(boundary) = params_get(&params, "boundary") {
-                read_multipart_body(msg, &boundary, body);
+                read_multipart_body(msg, &boundary, body, 0);
             }
             return;
         }
@@ -156,7 +156,11 @@ fn fill_message_body(msg: &mut Message, content_type: &str, body: &[u8]) {
     msg.text_body = String::from_utf8_lossy(body).to_string();
 }
 
-fn fill_message_body_part(msg: &mut Message, part: &[u8]) {
+fn fill_message_body_part(msg: &mut Message, part: &[u8], depth: usize) {
+    if depth > 64 {
+        msg.parse_error = "MIME nesting exceeds 64".to_string();
+        return;
+    }
     let (headers, body) = match parse_headers(part) {
         Ok(parsed) => parsed,
         Err(_) => return,
@@ -165,7 +169,7 @@ fn fill_message_body_part(msg: &mut Message, part: &[u8]) {
     if let Some((media_type, params)) = parse_media_type(&content_type) {
         if media_type.starts_with("multipart/") {
             if let Some(boundary) = params_get(&params, "boundary") {
-                read_multipart_body(msg, &boundary, body);
+                read_multipart_body(msg, &boundary, body, depth);
             }
             return;
         }
@@ -192,7 +196,7 @@ fn fill_message_body_part(msg: &mut Message, part: &[u8]) {
     }
 }
 
-fn read_multipart_body(msg: &mut Message, boundary: &str, body: &[u8]) {
+fn read_multipart_body(msg: &mut Message, boundary: &str, body: &[u8], depth: usize) {
     if boundary.is_empty() {
         return;
     }
@@ -210,7 +214,7 @@ fn read_multipart_body(msg: &mut Message, boundary: &str, body: &[u8]) {
         if trimmed == dash || trimmed == close {
             if in_part {
                 let part = std::mem::take(&mut part_buf);
-                fill_message_body_part(msg, &part);
+                fill_message_body_part(msg, &part, depth + 1);
             }
             if trimmed == close {
                 return;

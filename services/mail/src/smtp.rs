@@ -6,6 +6,7 @@
 //! (dot-unstuffing + cumulative size limit), same AUTH PLAIN/LOGIN flows.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
@@ -46,11 +47,36 @@ impl SmtpConfig {
 pub struct SmtpServer {
     config: SmtpConfig,
     service: Arc<Service>,
+    envelope_capture: bool,
+    limits: SmtpLimits,
+}
+
+/// Zero/None limits retain the existing unlimited session behavior.
+#[derive(Clone, Debug, Default)]
+pub struct SmtpLimits {
+    pub max_line_bytes: usize,
+    pub idle_timeout: Option<Duration>,
+    pub max_recipients: usize,
 }
 
 impl SmtpServer {
     pub fn new(config: SmtpConfig, service: Arc<Service>) -> Self {
-        Self { config, service }
+        Self {
+            config,
+            service,
+            envelope_capture: false,
+            limits: SmtpLimits::default(),
+        }
+    }
+
+    pub fn with_envelope_capture(mut self) -> Self {
+        self.envelope_capture = true;
+        self
+    }
+
+    pub fn with_limits(mut self, limits: SmtpLimits) -> Self {
+        self.limits = limits;
+        self
     }
 
     /// Mirrors `SMTPServer.Run`: accept loop on the configured address. A fresh
@@ -63,6 +89,8 @@ impl SmtpServer {
             let server = SmtpServer {
                 config: self.config.clone(),
                 service: Arc::clone(&self.service),
+                envelope_capture: self.envelope_capture,
+                limits: self.limits.clone(),
             };
             tokio::spawn(async move {
                 server.handle_conn(sock).await;
@@ -87,6 +115,9 @@ impl SmtpServer {
             has_mail_from: false,
             authenticated: false,
             envelope: Envelope::default(),
+            helo: String::new(),
+            envelope_capture: self.envelope_capture,
+            limits: self.limits,
         };
 
         if !session.reply(220, "devcloud ESMTP ready").await {
@@ -117,6 +148,9 @@ where
     has_mail_from: bool,
     authenticated: bool,
     envelope: Envelope,
+    helo: String,
+    envelope_capture: bool,
+    limits: SmtpLimits,
 }
 
 impl<S> Session<S>
@@ -127,7 +161,43 @@ where
     /// '\r\n' or '\n'. `None` on EOF/error.
     async fn read_line_bytes(&mut self) -> Option<Vec<u8>> {
         let mut buf = Vec::new();
-        let n = self.reader.read_until(b'\n', &mut buf).await.ok()?;
+        let limit = self.limits.max_line_bytes;
+        let idle = self.limits.idle_timeout;
+        let n = if limit == 0 && idle.is_none() {
+            self.reader.read_until(b'\n', &mut buf).await.ok()?
+        } else {
+            loop {
+                let available = if let Some(timeout) = idle {
+                    match tokio::time::timeout(timeout, self.reader.fill_buf()).await {
+                        Ok(Ok(bytes)) => bytes,
+                        Ok(Err(_)) => return None,
+                        Err(_) => {
+                            self.reply(421, "idle timeout").await;
+                            return None;
+                        }
+                    }
+                } else {
+                    self.reader.fill_buf().await.ok()?
+                };
+                if available.is_empty() {
+                    break buf.len();
+                }
+                let take = available
+                    .iter()
+                    .position(|&b| b == b'\n')
+                    .map_or(available.len(), |i| i + 1);
+                if limit > 0 && buf.len().saturating_add(take) > limit {
+                    self.reply(500, "line exceeds limit").await;
+                    return None;
+                }
+                let finished = available[take - 1] == b'\n';
+                buf.extend_from_slice(&available[..take]);
+                self.reader.consume(take);
+                if finished {
+                    break buf.len();
+                }
+            }
+        };
         if n == 0 {
             return None;
         }
@@ -163,6 +233,7 @@ where
                     return self.reply(500, "syntax error").await;
                 }
                 self.greeted = true;
+                self.helo = crate::service::sanitize_helo(&arg);
                 self.reset_envelope();
                 if command == "EHLO" {
                     self.reply_ehlo().await
@@ -198,6 +269,11 @@ where
                 match parse_address_arg(&arg, "TO:") {
                     None => self.reply(500, "syntax error").await,
                     Some(to) => {
+                        if self.limits.max_recipients > 0
+                            && self.envelope.to.len() >= self.limits.max_recipients
+                        {
+                            return self.reply(452, "too many recipients").await;
+                        }
                         self.envelope.to.push(to);
                         self.reply(250, "OK").await
                     }
@@ -277,7 +353,13 @@ where
         }
 
         let envelope = self.envelope.clone();
-        match self.service.receive(envelope, &raw) {
+        let received = if self.envelope_capture {
+            self.service
+                .receive_from_session(envelope, &self.helo, &raw)
+        } else {
+            self.service.receive(envelope, &raw)
+        };
+        match received {
             Err(_) => {
                 self.reply(451, "requested action aborted: local error in processing")
                     .await
@@ -444,7 +526,10 @@ fn parse_address_arg(arg: &str, prefix: &str) -> Option<String> {
 /// Mirrors `parsePathArg`. Returns `(address, rest)`.
 fn parse_path_arg(arg: &str, prefix: &str, allow_empty: bool) -> Option<(String, String)> {
     let arg = arg.trim();
-    if arg.len() < prefix.len() || !arg[..prefix.len()].eq_ignore_ascii_case(prefix) {
+    if !arg
+        .get(..prefix.len())
+        .is_some_and(|p| p.eq_ignore_ascii_case(prefix))
+    {
         return None;
     }
     let rest = arg[prefix.len()..].trim();

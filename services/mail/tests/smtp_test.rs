@@ -685,3 +685,128 @@ async fn smtp_auth_login_challenge_response_flow() {
     c.close().await;
     let _ = done.await;
 }
+fn start_bounded_session(
+    store: Arc<RecordingStore>,
+    capture: bool,
+    limits: devcloud_mail::SmtpLimits,
+) -> (TestClient, JoinHandle<()>) {
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+    let service = Arc::new(Service::new(store));
+    let mut server = SmtpServer::new(relaxed_cfg(0), service).with_limits(limits);
+    if capture {
+        server = server.with_envelope_capture();
+    }
+    let done = tokio::spawn(server.handle_conn(server_io));
+    (
+        TestClient {
+            stream: client_io,
+            buf: Vec::new(),
+        },
+        done,
+    )
+}
+
+#[tokio::test]
+async fn envelope_capture_survives_data_and_rset_and_caps_helo() {
+    let store = Arc::new(RecordingStore::new());
+    let (mut c, done) =
+        start_bounded_session(store.clone(), true, devcloud_mail::SmtpLimits::default());
+    c.expect_reply("220").await;
+    c.send_line(&format!("EHLO {}\u{7}", "x".repeat(300))).await;
+    c.expect_reply("250").await;
+    for sender in ["env@a", ""] {
+        c.send_line("RSET").await;
+        c.expect_reply("250").await;
+        c.send_line(&format!("MAIL FROM:<{sender}> SIZE=100")).await;
+        c.expect_reply("250").await;
+        c.send_line("RCPT TO:<r1@b>").await;
+        c.expect_reply("250").await;
+        c.send_line("RCPT TO:<r2@b>").await;
+        c.expect_reply("250").await;
+        c.send_line("DATA").await;
+        c.expect_reply("354").await;
+        for line in ["From: Header <hdr@a>", "", "body", "."] {
+            c.send_line(line).await;
+        }
+        c.expect_reply("250").await;
+    }
+    c.send_line("HELO new.example").await;
+    c.expect_reply("250").await;
+    c.send_line("QUIT").await;
+    c.expect_reply("221").await;
+    done.await.unwrap();
+    let (messages, _) = store.snapshot();
+    assert_eq!(messages[0].envelope_from.as_deref(), Some("env@a"));
+    assert_eq!(messages[1].envelope_from.as_deref(), Some(""));
+    assert!(messages
+        .iter()
+        .all(|m| m.helo == "x".repeat(255) && m.to.len() == 2));
+}
+
+#[tokio::test]
+async fn default_capture_is_off_and_unicode_paths_do_not_panic() {
+    let store = Arc::new(RecordingStore::new());
+    let (mut c, done) =
+        start_bounded_session(store.clone(), false, devcloud_mail::SmtpLimits::default());
+    c.expect_reply("220").await;
+    for (command, reply) in [
+        ("HELO client", "250"),
+        ("MAIL ééé", "500"),
+        ("MAIL FROM:<a>", "250"),
+        ("RCPT TO:<b>", "250"),
+        ("DATA", "354"),
+    ] {
+        c.send_line(command).await;
+        c.expect_reply(reply).await;
+    }
+    for line in ["Subject: s", "", "body", "."] {
+        c.send_line(line).await;
+    }
+    c.expect_reply("250").await;
+    c.send_line("QUIT").await;
+    c.expect_reply("221").await;
+    done.await.unwrap();
+    let (messages, _) = store.snapshot();
+    assert_eq!(messages[0].envelope_from, None);
+    assert!(messages[0].helo.is_empty());
+}
+
+#[tokio::test]
+async fn smtp_limits_bound_lines_recipients_and_idle() {
+    let (mut c, done) = start_bounded_session(
+        Arc::new(RecordingStore::new()),
+        true,
+        devcloud_mail::SmtpLimits {
+            max_line_bytes: 64,
+            max_recipients: 1,
+            idle_timeout: Some(std::time::Duration::from_secs(1)),
+        },
+    );
+    c.expect_reply("220").await;
+    for (command, reply) in [
+        ("HELO client", "250"),
+        ("MAIL FROM:<a>", "250"),
+        ("RCPT TO:<b>", "250"),
+        ("RCPT TO:<c>", "452"),
+    ] {
+        c.send_line(command).await;
+        c.expect_reply(reply).await;
+    }
+    c.send_line(&"x".repeat(65)).await;
+    c.expect_reply("500").await;
+    tokio::time::timeout(std::time::Duration::from_secs(1), done)
+        .await
+        .unwrap()
+        .unwrap();
+    let (mut c, done) = start_bounded_session(
+        Arc::new(RecordingStore::new()),
+        true,
+        devcloud_mail::SmtpLimits {
+            idle_timeout: Some(std::time::Duration::from_millis(10)),
+            ..Default::default()
+        },
+    );
+    c.expect_reply("220").await;
+    c.expect_reply("421").await;
+    done.await.unwrap();
+}
