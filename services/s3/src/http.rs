@@ -1,8 +1,8 @@
 //! Minimal HTTP/1.1 socket server for the S3 Rust increment.
 //!
 //! Scope: service listing, bucket CRUD, current-object PUT/GET/HEAD/DELETE,
-//! object listing, selected bucket/object sub-resources, and multipart upload.
-//! Copy, select, and SigV4 are later increments.
+//! object listing, selected bucket/object sub-resources, multipart upload, and
+//! `If-None-Match` (GET/HEAD 304, conditional PUT/Copy/CompleteMultipartUpload).
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -1319,6 +1319,10 @@ fn complete_multipart_upload(
     key: &str,
     upload_id: &str,
 ) -> Response {
+    let if_none_match = match if_none_match_write(req) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
     let Some(part_numbers) = parse_complete_multipart_parts(&req.body) else {
         return xml_error(400, "MalformedXML", "request body is malformed");
     };
@@ -1339,7 +1343,12 @@ fn complete_multipart_upload(
         }
         previous = *part_number;
     }
-    match store.complete_multipart_upload(bucket, key, upload_id, &part_numbers) {
+    let completed = if if_none_match {
+        store.complete_multipart_upload_if_absent(bucket, key, upload_id, &part_numbers)
+    } else {
+        store.complete_multipart_upload(bucket, key, upload_id, &part_numbers)
+    };
+    match completed {
         Ok(Some(object)) => {
             let mut r = Response::xml(
                 200,
@@ -1376,6 +1385,7 @@ fn complete_multipart_upload(
             r
         }
         Ok(None) => xml_error(404, "NoSuchUpload", "multipart upload does not exist"),
+        Err(StoreError::PreconditionFailed) => precondition_failed(),
         Err(StoreError::InvalidPart(_)) => {
             xml_error(400, "InvalidPart", "multipart part is missing")
         }
@@ -1416,6 +1426,10 @@ fn list_multipart_uploads(store: &FileBucketStore, bucket: &str) -> Response {
 }
 
 fn put_object(store: &FileBucketStore, req: &Request, bucket: &str, key: &str) -> Response {
+    let if_none_match = match if_none_match_write(req) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
     let encryption = match server_side_encryption_from_headers(req) {
         Ok(encryption) => encryption,
         Err(err) => return server_side_encryption_error(err),
@@ -1438,7 +1452,12 @@ fn put_object(store: &FileBucketStore, req: &Request, bucket: &str, key: &str) -
         legal_hold,
         ..Default::default()
     };
-    match store.put_object(input) {
+    let stored = if if_none_match {
+        store.put_object_if_absent(input)
+    } else {
+        store.put_object(input)
+    };
+    match stored {
         Ok(object) => {
             let mut r = Response::empty(200);
             write_object_lock_headers(&mut r, &object);
@@ -1466,6 +1485,7 @@ fn put_object(store: &FileBucketStore, req: &Request, bucket: &str, key: &str) -
             "BadDigest",
             "the Content-MD5 you specified did not match what was received",
         ),
+        Err(StoreError::PreconditionFailed) => precondition_failed(),
         Err(StoreError::BucketNotExist) => xml_error(404, "NoSuchBucket", "bucket does not exist"),
         Err(StoreError::InvalidVersionId) => {
             xml_error(400, "InvalidArgument", "invalid version id")
@@ -1478,6 +1498,10 @@ fn put_object(store: &FileBucketStore, req: &Request, bucket: &str, key: &str) -
 }
 
 fn copy_object(store: &FileBucketStore, req: &Request, bucket: &str, key: &str) -> Response {
+    let if_none_match = match if_none_match_write(req) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
     let Some((source_bucket, source_key, source_version_id)) =
         parse_copy_source(req.header("x-amz-copy-source"))
     else {
@@ -1498,6 +1522,12 @@ fn copy_object(store: &FileBucketStore, req: &Request, bucket: &str, key: &str) 
             }
             Err(_) => return xml_error(500, "InternalError", "internal error"),
         };
+    if etag_list_matches(
+        req.header("x-amz-copy-source-if-none-match"),
+        &source_object.etag,
+    ) {
+        return precondition_failed();
+    }
 
     let mut input = PutObjectInput {
         bucket: bucket.to_string(),
@@ -1541,7 +1571,12 @@ fn copy_object(store: &FileBucketStore, req: &Request, bucket: &str, key: &str) 
         }
     }
 
-    match store.put_object(input) {
+    let stored = if if_none_match {
+        store.put_object_if_absent(input)
+    } else {
+        store.put_object(input)
+    };
+    match stored {
         Ok(object) => {
             let mut r = Response::xml(
                 200,
@@ -1562,6 +1597,7 @@ fn copy_object(store: &FileBucketStore, req: &Request, bucket: &str, key: &str) 
             }
             r
         }
+        Err(StoreError::PreconditionFailed) => precondition_failed(),
         Err(StoreError::BucketNotExist) => xml_error(404, "NoSuchBucket", "bucket does not exist"),
         Err(StoreError::InvalidVersionId) => {
             xml_error(400, "InvalidArgument", "invalid version id")
@@ -2243,6 +2279,10 @@ fn get_object(
 }
 
 fn object_response(req: &Request, object: Object, body: Vec<u8>, head_only: bool) -> Response {
+    // Preconditions are evaluated before Range (RFC 7232 section 6).
+    if etag_list_matches(req.header("if-none-match"), &object.etag) {
+        return not_modified(object);
+    }
     let (start, end, partial) = match parse_range(req.header("range"), body.len()) {
         Ok(v) => v,
         Err(_) => return xml_error(416, "InvalidRange", "requested range is not satisfiable"),
@@ -2302,6 +2342,42 @@ fn object_response(req: &Request, object: Object, body: Vec<u8>, head_only: bool
         r.headers.insert(format!("x-amz-meta-{key}"), value);
     }
     r
+}
+
+/// `304 Not Modified` for a GET/HEAD whose `If-None-Match` names the object's
+/// ETag: validator headers only, no body.
+fn not_modified(object: Object) -> Response {
+    let mut r = Response::empty(304);
+    r.headers.insert("ETag".to_string(), object.etag);
+    r.headers.insert(
+        "Last-Modified".to_string(),
+        http_date_from_rfc3339(&object.last_modified),
+    );
+    if !object.version_id.is_empty() {
+        r.headers
+            .insert("x-amz-version-id".to_string(), object.version_id);
+    }
+    if !object.cache_control.is_empty() {
+        r.headers
+            .insert("Cache-Control".to_string(), object.cache_control);
+    }
+    r
+}
+
+/// Whether an `If-None-Match`-style header (`*`, or a comma-separated list of
+/// quoted, unquoted, or weak `W/` ETags) names `etag`. An empty header names
+/// nothing. Uses weak comparison, as RFC 7232 prescribes for `If-None-Match`.
+fn etag_list_matches(header: &str, etag: &str) -> bool {
+    let target = etag.trim_matches('"');
+    header.split(',').map(str::trim).any(|candidate| {
+        candidate == "*"
+            || (!candidate.is_empty()
+                && candidate
+                    .strip_prefix("W/")
+                    .unwrap_or(candidate)
+                    .trim_matches('"')
+                    == target)
+    })
 }
 
 fn list_objects(store: &FileBucketStore, req: &Request, bucket: &str) -> Response {
@@ -2468,6 +2544,29 @@ fn user_metadata(headers: &BTreeMap<String, String>) -> BTreeMap<String, String>
                 .map(|name| (name.to_string(), v.clone()))
         })
         .collect()
+}
+
+/// Reads `If-None-Match` on PutObject/CopyObject/CompleteMultipartUpload. S3
+/// accepts only `*` there; `Ok(true)` means the write must not replace a
+/// current object.
+fn if_none_match_write(req: &Request) -> Result<bool, Response> {
+    match req.header("if-none-match").trim() {
+        "" => Ok(false),
+        "*" => Ok(true),
+        _ => Err(xml_error(
+            501,
+            "NotImplemented",
+            "A header you provided implies functionality that is not implemented",
+        )),
+    }
+}
+
+fn precondition_failed() -> Response {
+    xml_error(
+        412,
+        "PreconditionFailed",
+        "At least one of the pre-conditions you specified did not hold",
+    )
 }
 
 fn parse_copy_source(source: &str) -> Option<(String, String, String)> {
@@ -3537,9 +3636,13 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 async fn write_response(stream: &mut TcpStream, response: Response) -> std::io::Result<()> {
     let mut headers = response.headers;
     headers.insert("Server".to_string(), "AmazonS3".to_string());
-    headers
-        .entry("Content-Length".to_string())
-        .or_insert_with(|| response.body.len().to_string());
+    // A 304 carries no body, so it must not advertise a zero Content-Length
+    // for the representation it stands in for.
+    if response.status != 304 {
+        headers
+            .entry("Content-Length".to_string())
+            .or_insert_with(|| response.body.len().to_string());
+    }
     headers.insert("Connection".to_string(), "close".to_string());
 
     let mut head = format!(
@@ -3564,11 +3667,13 @@ fn reason_phrase(status: u16) -> &'static str {
         200 => "OK",
         204 => "No Content",
         206 => "Partial Content",
+        304 => "Not Modified",
         400 => "Bad Request",
         403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
         409 => "Conflict",
+        412 => "Precondition Failed",
         416 => "Requested Range Not Satisfiable",
         500 => "Internal Server Error",
         501 => "Not Implemented",

@@ -122,6 +122,17 @@ impl FileBucketStore {
         upload_id: &str,
         part_numbers: &[i64],
     ) -> Result<Option<Object>> {
+        let _guard = self.lock_object_writes();
+        self.complete_multipart_upload_locked(bucket, key, upload_id, part_numbers)
+    }
+
+    fn complete_multipart_upload_locked(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+        part_numbers: &[i64],
+    ) -> Result<Option<Object>> {
         let upload = match self.get_multipart_upload(bucket, key, upload_id)? {
             Some(u) => u,
             None => return Ok(None),
@@ -145,7 +156,7 @@ impl FileBucketStore {
             combined.extend_from_slice(&body);
             part_etags.push(part.etag);
         }
-        let mut object = self.put_object(PutObjectInput {
+        let mut object = self.put_object_locked(PutObjectInput {
             bucket: upload.bucket.clone(),
             key: upload.key.clone(),
             body: combined.clone(),
@@ -166,6 +177,26 @@ impl FileBucketStore {
         remove_dir_all_ignoring_missing(&self.multipart_upload_path(bucket, upload_id))?;
         let _ = fs::remove_dir(self.multipart_path(bucket));
         Ok(Some(object))
+    }
+
+    /// `complete_multipart_upload` guarded by `If-None-Match: *`: fails with
+    /// `PreconditionFailed` (leaving the upload in place) when a current object
+    /// exists at the key.
+    pub fn complete_multipart_upload_if_absent(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+        part_numbers: &[i64],
+    ) -> Result<Option<Object>> {
+        let _guard = self.lock_object_writes();
+        if self.get_multipart_upload(bucket, key, upload_id)?.is_none() {
+            return Ok(None);
+        }
+        if self.current_object_exists(bucket, key)? {
+            return Err(StoreError::PreconditionFailed);
+        }
+        self.complete_multipart_upload_locked(bucket, key, upload_id, part_numbers)
     }
 
     /// Aborts an upload, discarding its parts. `true` if it existed.

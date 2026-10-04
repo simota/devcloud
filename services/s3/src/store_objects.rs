@@ -66,6 +66,12 @@ impl FileBucketStore {
     /// Stores an object (body + `object.json`, plus a version snapshot when the
     /// bucket has versioning). Returns the stored object.
     pub fn put_object(&self, input: PutObjectInput) -> Result<Object> {
+        let _guard = self.lock_object_writes();
+        self.put_object_locked(input)
+    }
+
+    /// `put_object` for a caller already holding `lock_object_writes`.
+    pub(crate) fn put_object_locked(&self, input: PutObjectInput) -> Result<Object> {
         if !valid_bucket_name(&input.bucket) {
             return Err(StoreError::InvalidBucketName);
         }
@@ -124,12 +130,31 @@ impl FileBucketStore {
         Ok(object)
     }
 
+    /// `put_object` guarded by `If-None-Match: *`: fails with
+    /// `PreconditionFailed` when a current object (not a delete marker) exists.
+    pub fn put_object_if_absent(&self, input: PutObjectInput) -> Result<Object> {
+        let _guard = self.lock_object_writes();
+        self.require_bucket_and_key(&input.bucket, &input.key)?;
+        if self.current_object_exists(&input.bucket, &input.key)? {
+            return Err(StoreError::PreconditionFailed);
+        }
+        self.put_object_locked(input)
+    }
+
+    /// Whether `key` has a current object that is not a delete marker. Callers
+    /// validate the bucket and key first.
+    pub(crate) fn current_object_exists(&self, bucket: &str, key: &str) -> Result<bool> {
+        let path = self.object_path(bucket, key).join("object.json");
+        Ok(read_object(&path)?.is_some_and(|object| !object.delete_marker))
+    }
+
     /// Updates an existing object's metadata fields (content-type/encoding/cache/
     /// disposition/user metadata), bumping the metageneration. `None` if absent.
     pub fn update_object_metadata(
         &self,
         input: UpdateObjectMetadataInput,
     ) -> Result<Option<Object>> {
+        let _guard = self.lock_object_writes();
         if !valid_bucket_name(&input.bucket) {
             return Err(StoreError::InvalidBucketName);
         }
@@ -238,6 +263,7 @@ impl FileBucketStore {
         key: &str,
         bypass_governance: bool,
     ) -> Result<(Object, bool)> {
+        let _guard = self.lock_object_writes();
         if !valid_bucket_name(bucket) {
             return Err(StoreError::InvalidBucketName);
         }
@@ -308,6 +334,7 @@ impl FileBucketStore {
         if version_id.is_empty() {
             return Err(StoreError::VersionIdRequired);
         }
+        let _guard = self.lock_object_writes();
         let object = match self.get_object_version(bucket, key, version_id)? {
             Some((o, _)) => o,
             None => return Ok((Object::default(), false)),
