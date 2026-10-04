@@ -747,6 +747,7 @@ pub struct ListBucketResult {
     pub name: String,
     pub prefix: String,
     pub delimiter: String,
+    pub encoding_type: String,
     pub marker: String,
     pub next_marker: String,
     pub continuation_token: String,
@@ -778,6 +779,9 @@ impl ListBucketResult {
             .text_child("Prefix", &self.prefix);
         if !self.delimiter.is_empty() {
             el = el.text_child("Delimiter", &self.delimiter);
+        }
+        if !self.encoding_type.is_empty() {
+            el = el.text_child("EncodingType", &self.encoding_type);
         }
         if !self.marker.is_empty() {
             el = el.text_child("Marker", &self.marker);

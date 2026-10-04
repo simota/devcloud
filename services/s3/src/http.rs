@@ -2345,6 +2345,12 @@ fn list_objects(store: &FileBucketStore, req: &Request, bucket: &str) -> Respons
         name: bucket.to_string(),
         prefix: encode_list_value(prefix, encoding_type),
         delimiter: encode_list_value(delimiter, encoding_type),
+        // Echoed so SDKs know to URL-decode keys; only "url" encodes anything.
+        encoding_type: if encoding_type == "url" {
+            encoding_type.to_string()
+        } else {
+            String::new()
+        },
         marker: encode_list_value(
             req.query.get("marker").map(String::as_str).unwrap_or(""),
             encoding_type,
