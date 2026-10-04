@@ -124,6 +124,24 @@ impl FileBucketStore {
         Ok(object)
     }
 
+    /// `put_object` guarded by `If-None-Match: *`: fails with
+    /// `PreconditionFailed` when a current object (not a delete marker) exists.
+    pub fn put_object_if_absent(&self, input: PutObjectInput) -> Result<Object> {
+        let _guard = self.conditional_write_lock.lock().unwrap();
+        self.require_bucket_and_key(&input.bucket, &input.key)?;
+        if self.current_object_exists(&input.bucket, &input.key)? {
+            return Err(StoreError::PreconditionFailed);
+        }
+        self.put_object(input)
+    }
+
+    /// Whether `key` has a current object that is not a delete marker. Callers
+    /// validate the bucket and key first.
+    pub(crate) fn current_object_exists(&self, bucket: &str, key: &str) -> Result<bool> {
+        let path = self.object_path(bucket, key).join("object.json");
+        Ok(read_object(&path)?.is_some_and(|object| !object.delete_marker))
+    }
+
     /// Updates an existing object's metadata fields (content-type/encoding/cache/
     /// disposition/user metadata), bumping the metageneration. `None` if absent.
     pub fn update_object_metadata(

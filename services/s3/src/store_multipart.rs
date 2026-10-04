@@ -168,6 +168,26 @@ impl FileBucketStore {
         Ok(Some(object))
     }
 
+    /// `complete_multipart_upload` guarded by `If-None-Match: *`: fails with
+    /// `PreconditionFailed` (leaving the upload in place) when a current object
+    /// exists at the key.
+    pub fn complete_multipart_upload_if_absent(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+        part_numbers: &[i64],
+    ) -> Result<Option<Object>> {
+        let _guard = self.conditional_write_lock.lock().unwrap();
+        if self.get_multipart_upload(bucket, key, upload_id)?.is_none() {
+            return Ok(None);
+        }
+        if self.current_object_exists(bucket, key)? {
+            return Err(StoreError::PreconditionFailed);
+        }
+        self.complete_multipart_upload(bucket, key, upload_id, part_numbers)
+    }
+
     /// Aborts an upload, discarding its parts. `true` if it existed.
     pub fn abort_multipart_upload(&self, bucket: &str, key: &str, upload_id: &str) -> Result<bool> {
         if self.get_multipart_upload(bucket, key, upload_id)?.is_none() {

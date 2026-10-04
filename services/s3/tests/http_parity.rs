@@ -1511,3 +1511,343 @@ fn version_id_dotdot_cannot_delete_all_versions_over_http() {
     assert_eq!(route(&store, &req("GET", "/data/key")).body, b"second");
     std::fs::remove_dir_all(root).unwrap();
 }
+
+fn if_none_match_put(target: &str, body: &[u8], value: &str) -> Request {
+    let mut put = Request::new("PUT", target, body.to_vec());
+    put.headers
+        .insert("if-none-match".to_string(), value.to_string());
+    put
+}
+
+#[test]
+fn put_object_if_none_match_rejects_existing_current_object() {
+    let root = tempdir();
+    let store = FileBucketStore::new(&root);
+    assert_eq!(route(&store, &req("PUT", "/data")).status, 200);
+
+    let created = route(&store, &if_none_match_put("/data/lock", b"first", "*"));
+    assert_eq!(created.status, 200);
+
+    let conflict = route(&store, &if_none_match_put("/data/lock", b"second", "*"));
+    assert_eq!(conflict.status, 412);
+    let body = String::from_utf8(conflict.body).unwrap();
+    assert!(body.contains("<Code>PreconditionFailed</Code>"));
+    assert_eq!(route(&store, &req("GET", "/data/lock")).body, b"first");
+
+    let unsupported = route(&store, &if_none_match_put("/data/other", b"x", "\"etag\""));
+    assert_eq!(unsupported.status, 501);
+    assert!(String::from_utf8(unsupported.body)
+        .unwrap()
+        .contains("<Code>NotImplemented</Code>"));
+    assert_eq!(route(&store, &req("GET", "/data/other")).status, 404);
+
+    assert_eq!(route(&store, &req("DELETE", "/data/lock")).status, 204);
+    let recreated = route(&store, &if_none_match_put("/data/lock", b"third", "*"));
+    assert_eq!(recreated.status, 200);
+    assert_eq!(route(&store, &req("GET", "/data/lock")).body, b"third");
+
+    let missing_bucket = route(&store, &if_none_match_put("/nope/lock", b"x", "*"));
+    assert_eq!(missing_bucket.status, 404);
+}
+
+#[test]
+fn put_object_if_none_match_treats_delete_marker_as_absent() {
+    let root = tempdir();
+    let store = FileBucketStore::new(&root);
+    assert_eq!(route(&store, &req("PUT", "/data")).status, 200);
+    let versioning = Request::new(
+        "PUT",
+        "/data?versioning",
+        br#"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>"#.to_vec(),
+    );
+    assert_eq!(route(&store, &versioning).status, 200);
+
+    assert_eq!(
+        route(&store, &if_none_match_put("/data/lock", b"v1", "*")).status,
+        200
+    );
+    let deleted = route(&store, &req("DELETE", "/data/lock"));
+    assert_eq!(deleted.headers.get("x-amz-delete-marker").unwrap(), "true");
+
+    assert_eq!(
+        route(&store, &if_none_match_put("/data/lock", b"v2", "*")).status,
+        200
+    );
+    assert_eq!(
+        route(&store, &if_none_match_put("/data/lock", b"v3", "*")).status,
+        412
+    );
+    assert_eq!(route(&store, &req("GET", "/data/lock")).body, b"v2");
+}
+
+#[test]
+fn put_object_if_none_match_admits_one_concurrent_writer() {
+    let root = tempdir();
+    let store = FileBucketStore::new(&root);
+    assert_eq!(route(&store, &req("PUT", "/data")).status, 200);
+
+    let statuses: Vec<u16> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..16)
+            .map(|i| {
+                let store = &store;
+                scope.spawn(move || {
+                    let body = format!("writer-{i}");
+                    route(
+                        store,
+                        &if_none_match_put("/data/lock", body.as_bytes(), "*"),
+                    )
+                    .status
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    assert_eq!(statuses.iter().filter(|s| **s == 200).count(), 1);
+    assert_eq!(statuses.iter().filter(|s| **s == 412).count(), 15);
+}
+
+#[test]
+fn complete_multipart_upload_if_none_match_keeps_upload_on_conflict() {
+    let root = tempdir();
+    let store = FileBucketStore::new(&root);
+    store.create_bucket("data").unwrap();
+    store.push_version_ids(&["0123456789abcdef0123456789abcdef"]);
+    let upload_id = "0123456789abcdef0123456789abcdef";
+
+    assert_eq!(
+        route(&store, &req("POST", "/data/big.bin?uploads")).status,
+        200
+    );
+    let part = Request::new(
+        "PUT",
+        &format!("/data/big.bin?uploadId={upload_id}&partNumber=1"),
+        b"hello".to_vec(),
+    );
+    assert_eq!(route(&store, &part).status, 200);
+    assert_eq!(
+        route(
+            &store,
+            &Request::new("PUT", "/data/big.bin", b"existing".to_vec())
+        )
+        .status,
+        200
+    );
+
+    let complete_body = br#"<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>"x"</ETag></Part></CompleteMultipartUpload>"#;
+    let mut complete = Request::new(
+        "POST",
+        &format!("/data/big.bin?uploadId={upload_id}"),
+        complete_body.to_vec(),
+    );
+    complete
+        .headers
+        .insert("if-none-match".to_string(), "*".to_string());
+
+    let conflict = route(&store, &complete);
+    assert_eq!(conflict.status, 412);
+    assert!(String::from_utf8(conflict.body)
+        .unwrap()
+        .contains("<Code>PreconditionFailed</Code>"));
+    assert_eq!(
+        route(&store, &req("GET", "/data/big.bin")).body,
+        b"existing"
+    );
+    let uploads = String::from_utf8(route(&store, &req("GET", "/data?uploads")).body).unwrap();
+    assert!(uploads.contains(&format!("<UploadId>{upload_id}</UploadId>")));
+
+    assert_eq!(route(&store, &req("DELETE", "/data/big.bin")).status, 204);
+    let completed = route(&store, &complete);
+    assert_eq!(completed.status, 200);
+    assert_eq!(route(&store, &req("GET", "/data/big.bin")).body, b"hello");
+
+    let missing = route(&store, &complete);
+    assert_eq!(missing.status, 404);
+}
+
+fn with_header(mut request: Request, name: &str, value: &str) -> Request {
+    request.headers.insert(name.to_string(), value.to_string());
+    request
+}
+
+#[test]
+fn get_and_head_if_none_match_return_not_modified_for_matching_etag() {
+    let root = tempdir();
+    let store = FileBucketStore::new(&root);
+    assert_eq!(route(&store, &req("PUT", "/data")).status, 200);
+    let mut put = Request::new("PUT", "/data/file.txt", b"hello".to_vec());
+    put.headers
+        .insert("cache-control".to_string(), "max-age=60".to_string());
+    let etag = route(&store, &put).headers.get("ETag").unwrap().clone();
+    assert_eq!(etag, "\"5d41402abc4b2a76b9719d911017c592\"");
+    let bare = etag.trim_matches('"');
+
+    for value in [
+        etag.clone(),
+        bare.to_string(),
+        format!("W/{etag}"),
+        format!("\"other\", {etag}"),
+        "*".to_string(),
+    ] {
+        for method in ["GET", "HEAD"] {
+            let r = route(
+                &store,
+                &with_header(req(method, "/data/file.txt"), "if-none-match", &value),
+            );
+            assert_eq!(r.status, 304, "{method} If-None-Match: {value}");
+            assert!(r.body.is_empty());
+            assert_eq!(r.headers.get("ETag"), Some(&etag));
+            assert!(r.headers.contains_key("Last-Modified"));
+            assert_eq!(r.headers.get("Cache-Control").unwrap(), "max-age=60");
+            assert!(!r.headers.contains_key("Content-Length"));
+        }
+    }
+
+    let changed = route(
+        &store,
+        &with_header(req("GET", "/data/file.txt"), "if-none-match", "\"other\""),
+    );
+    assert_eq!(changed.status, 200);
+    assert_eq!(changed.body, b"hello");
+
+    // The precondition wins over an unsatisfiable Range.
+    let ranged = with_header(
+        with_header(req("GET", "/data/file.txt"), "if-none-match", &etag),
+        "range",
+        "bytes=100-200",
+    );
+    assert_eq!(route(&store, &ranged).status, 304);
+
+    let missing = route(
+        &store,
+        &with_header(req("GET", "/data/absent.txt"), "if-none-match", "*"),
+    );
+    assert_eq!(missing.status, 404);
+}
+
+#[test]
+fn get_if_none_match_evaluates_against_requested_version() {
+    let root = tempdir();
+    let store = FileBucketStore::new(&root);
+    assert_eq!(route(&store, &req("PUT", "/data")).status, 200);
+    let versioning = Request::new(
+        "PUT",
+        "/data?versioning",
+        br#"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>"#.to_vec(),
+    );
+    assert_eq!(route(&store, &versioning).status, 200);
+    store.push_version_ids(&[
+        "11111111111111111111111111111111",
+        "22222222222222222222222222222222",
+    ]);
+    let v1 = route(
+        &store,
+        &Request::new("PUT", "/data/file.txt", b"one".to_vec()),
+    );
+    let v1_etag = v1.headers.get("ETag").unwrap().clone();
+    assert_eq!(
+        route(
+            &store,
+            &Request::new("PUT", "/data/file.txt", b"two".to_vec())
+        )
+        .status,
+        200
+    );
+
+    let old = route(
+        &store,
+        &with_header(
+            req(
+                "GET",
+                "/data/file.txt?versionId=11111111111111111111111111111111",
+            ),
+            "if-none-match",
+            &v1_etag,
+        ),
+    );
+    assert_eq!(old.status, 304);
+    assert_eq!(
+        old.headers.get("x-amz-version-id").unwrap(),
+        "11111111111111111111111111111111"
+    );
+
+    let current = route(
+        &store,
+        &with_header(req("GET", "/data/file.txt"), "if-none-match", &v1_etag),
+    );
+    assert_eq!(current.status, 200);
+    assert_eq!(current.body, b"two");
+}
+
+#[test]
+fn copy_object_if_none_match_guards_destination_and_source() {
+    let root = tempdir();
+    let store = FileBucketStore::new(&root);
+    assert_eq!(route(&store, &req("PUT", "/data")).status, 200);
+    let source_etag = route(
+        &store,
+        &Request::new("PUT", "/data/src", b"source".to_vec()),
+    )
+    .headers
+    .get("ETag")
+    .unwrap()
+    .clone();
+    let copy = |target: &str| with_header(req("PUT", target), "x-amz-copy-source", "/data/src");
+
+    let created = route(
+        &store,
+        &with_header(copy("/data/dst"), "if-none-match", "*"),
+    );
+    assert_eq!(created.status, 200);
+    assert_eq!(route(&store, &req("GET", "/data/dst")).body, b"source");
+
+    assert_eq!(
+        route(
+            &store,
+            &Request::new("PUT", "/data/src", b"changed".to_vec())
+        )
+        .status,
+        200
+    );
+    let exists = route(
+        &store,
+        &with_header(copy("/data/dst"), "if-none-match", "*"),
+    );
+    assert_eq!(exists.status, 412);
+    assert!(String::from_utf8(exists.body)
+        .unwrap()
+        .contains("<Code>PreconditionFailed</Code>"));
+    assert_eq!(route(&store, &req("GET", "/data/dst")).body, b"source");
+
+    let unsupported = route(
+        &store,
+        &with_header(copy("/data/dst2"), "if-none-match", &source_etag),
+    );
+    assert_eq!(unsupported.status, 501);
+
+    let current_etag = route(&store, &req("HEAD", "/data/src"))
+        .headers
+        .get("ETag")
+        .unwrap()
+        .clone();
+    let source_unchanged = route(
+        &store,
+        &with_header(
+            copy("/data/dst3"),
+            "x-amz-copy-source-if-none-match",
+            &current_etag,
+        ),
+    );
+    assert_eq!(source_unchanged.status, 412);
+    assert_eq!(route(&store, &req("GET", "/data/dst3")).status, 404);
+
+    let source_changed = route(
+        &store,
+        &with_header(
+            copy("/data/dst3"),
+            "x-amz-copy-source-if-none-match",
+            &source_etag,
+        ),
+    );
+    assert_eq!(source_changed.status, 200);
+    assert_eq!(route(&store, &req("GET", "/data/dst3")).body, b"changed");
+}

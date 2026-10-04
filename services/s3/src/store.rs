@@ -51,6 +51,8 @@ pub enum StoreError {
     InvalidPartNumber,
     MultipartUploadNotExist,
     InvalidPart(i64),
+    /// An `If-None-Match: *` write found a current object at the key.
+    PreconditionFailed,
     Io(io::Error),
 }
 
@@ -72,6 +74,9 @@ pub struct FileBucketStore {
     fixed_version_ids: Mutex<VecDeque<String>>,
     /// Monotonic counter mixed into random version-ID generation.
     id_counter: AtomicU64,
+    /// Serializes the existence check and write of conditional
+    /// (`If-None-Match: *`) writes so concurrent creators cannot both succeed.
+    pub(crate) conditional_write_lock: Mutex<()>,
 }
 
 impl FileBucketStore {
@@ -81,6 +86,7 @@ impl FileBucketStore {
             fixed_now: None,
             fixed_version_ids: Mutex::new(VecDeque::new()),
             id_counter: AtomicU64::new(0),
+            conditional_write_lock: Mutex::new(()),
         }
     }
 
