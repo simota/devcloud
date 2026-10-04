@@ -1,0 +1,10 @@
+# Docker build context allowlist. Images build Rust binaries from the
+# workspace, so they need the root manifest/lockfile and every member crate
+# (cargo resolves the whole workspace even for `-p <crate>`), nothing else.
+*
+!Cargo.toml
+!Cargo.lock
+!orchestrator/
+!services/
+**/target/
+**/node_modules/
