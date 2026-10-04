@@ -122,6 +122,17 @@ impl FileBucketStore {
         upload_id: &str,
         part_numbers: &[i64],
     ) -> Result<Option<Object>> {
+        let _guard = self.lock_object_writes();
+        self.complete_multipart_upload_locked(bucket, key, upload_id, part_numbers)
+    }
+
+    fn complete_multipart_upload_locked(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+        part_numbers: &[i64],
+    ) -> Result<Option<Object>> {
         let upload = match self.get_multipart_upload(bucket, key, upload_id)? {
             Some(u) => u,
             None => return Ok(None),
@@ -145,7 +156,7 @@ impl FileBucketStore {
             combined.extend_from_slice(&body);
             part_etags.push(part.etag);
         }
-        let mut object = self.put_object(PutObjectInput {
+        let mut object = self.put_object_locked(PutObjectInput {
             bucket: upload.bucket.clone(),
             key: upload.key.clone(),
             body: combined.clone(),
@@ -178,14 +189,14 @@ impl FileBucketStore {
         upload_id: &str,
         part_numbers: &[i64],
     ) -> Result<Option<Object>> {
-        let _guard = self.conditional_write_lock.lock().unwrap();
+        let _guard = self.lock_object_writes();
         if self.get_multipart_upload(bucket, key, upload_id)?.is_none() {
             return Ok(None);
         }
         if self.current_object_exists(bucket, key)? {
             return Err(StoreError::PreconditionFailed);
         }
-        self.complete_multipart_upload(bucket, key, upload_id, part_numbers)
+        self.complete_multipart_upload_locked(bucket, key, upload_id, part_numbers)
     }
 
     /// Aborts an upload, discarding its parts. `true` if it existed.

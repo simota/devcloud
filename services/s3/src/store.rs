@@ -9,12 +9,12 @@ use crate::model::Bucket;
 use crate::time_fmt::now_rfc3339nano;
 use crate::validation::valid_bucket_name;
 use crate::wire_json;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// The metadata sidecar files (and `inventory`/`analytics` directories) that do
@@ -74,19 +74,22 @@ pub struct FileBucketStore {
     fixed_version_ids: Mutex<VecDeque<String>>,
     /// Monotonic counter mixed into random version-ID generation.
     id_counter: AtomicU64,
-    /// Serializes the existence check and write of conditional
-    /// (`If-None-Match: *`) writes so concurrent creators cannot both succeed.
-    pub(crate) conditional_write_lock: Mutex<()>,
+    /// Serializes every write that creates, replaces, or removes an object's
+    /// current state. Shared by all instances over the same root (S3, GCS,
+    /// BigQuery, and Redshift each own one), so conditional writes can check
+    /// existence and write atomically against any of them.
+    object_write_lock: Arc<Mutex<()>>,
 }
 
 impl FileBucketStore {
     pub fn new(root: impl Into<PathBuf>) -> Self {
+        let root = root.into();
         FileBucketStore {
-            root: root.into(),
+            object_write_lock: shared_object_write_lock(&root),
+            root,
             fixed_now: None,
             fixed_version_ids: Mutex::new(VecDeque::new()),
             id_counter: AtomicU64::new(0),
-            conditional_write_lock: Mutex::new(()),
         }
     }
 
@@ -102,6 +105,14 @@ impl FileBucketStore {
         for id in ids {
             q.push_back((*id).to_string());
         }
+    }
+
+    /// Holds the root-wide object write lock. A panicked writer leaves only
+    /// `()` behind, so poisoning is ignored rather than wedging every service.
+    pub(crate) fn lock_object_writes(&self) -> MutexGuard<'_, ()> {
+        self.object_write_lock
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     pub(crate) fn now(&self) -> String {
@@ -308,6 +319,42 @@ impl FileBucketStore {
     }
 }
 
+/// The process-wide object write lock for `root`, keyed by its resolved path
+/// so different spellings of one directory share a lock.
+fn shared_object_write_lock(root: &Path) -> Arc<Mutex<()>> {
+    static LOCKS: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
+    LOCKS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .entry(resolve_root(root))
+        .or_default()
+        .clone()
+}
+
+/// Canonicalizes the nearest existing ancestor of `root` and re-appends the
+/// missing tail, so the key is stable whether or not the root exists yet.
+fn resolve_root(root: &Path) -> PathBuf {
+    let absolute = std::path::absolute(root).unwrap_or_else(|_| root.to_path_buf());
+    let mut existing = absolute.as_path();
+    let mut missing = Vec::new();
+    loop {
+        if let Ok(resolved) = fs::canonicalize(existing) {
+            return missing
+                .iter()
+                .rev()
+                .fold(resolved, |path, name| path.join(name));
+        }
+        match (existing.parent(), existing.file_name()) {
+            (Some(parent), Some(name)) => {
+                missing.push(name.to_os_string());
+                existing = parent;
+            }
+            _ => return absolute,
+        }
+    }
+}
+
 /// Writes `data` to `path` via a temp file in the same directory + rename, so a
 /// crash mid-write cannot leave a truncated file at `path` while metadata (or a
 /// concurrent read) claims it is complete. Callers already serialize access to
@@ -372,4 +419,39 @@ fn splitmix64(state: &mut u64) -> u64 {
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
     z ^ (z >> 31)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn instances_over_one_root_share_the_object_write_lock() {
+        let base = std::env::temp_dir().join(format!("devcloud-s3-lock-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        // Created before the root exists, then compared after it does.
+        let early = FileBucketStore::new(base.join("root"));
+        fs::create_dir_all(base.join("root")).unwrap();
+        fs::create_dir_all(base.join("other")).unwrap();
+        std::os::unix::fs::symlink(base.join("root"), base.join("link")).unwrap();
+
+        for spelling in [
+            base.join("root"),
+            base.join("root").join("."),
+            base.join("other").join("..").join("root"),
+            base.join("link"),
+        ] {
+            let store = FileBucketStore::new(&spelling);
+            assert!(
+                Arc::ptr_eq(&early.object_write_lock, &store.object_write_lock),
+                "{spelling:?} must share the lock"
+            );
+        }
+        let elsewhere = FileBucketStore::new(base.join("elsewhere"));
+        assert!(!Arc::ptr_eq(
+            &early.object_write_lock,
+            &elsewhere.object_write_lock
+        ));
+        fs::remove_dir_all(&base).unwrap();
+    }
 }

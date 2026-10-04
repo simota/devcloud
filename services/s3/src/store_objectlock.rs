@@ -28,6 +28,7 @@ impl FileBucketStore {
         version_id: &str,
         acl: &str,
     ) -> Result<bool> {
+        let _guard = self.lock_object_writes();
         let (mut object, mut body) = match self.get_object_version(bucket, key, version_id)? {
             Some(v) => v,
             None => return Ok(false),
@@ -136,6 +137,7 @@ impl FileBucketStore {
         version_id: &str,
         update: impl FnOnce(&mut Object),
     ) -> Result<Option<Object>> {
+        let _guard = self.lock_object_writes();
         let (mut object, mut body) = match self.get_object_version(bucket, key, version_id)? {
             Some(v) => v,
             None => return Ok(None),
