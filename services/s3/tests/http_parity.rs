@@ -274,6 +274,34 @@ fn list_objects_v1_and_v2() {
 }
 
 #[test]
+fn list_objects_url_encoding_declares_encoding_type() {
+    let root = tempdir();
+    let mut store = FileBucketStore::new(&root);
+    store.set_fixed_now("2026-05-30T12:00:00Z");
+    assert_eq!(route(&store, &req("PUT", "/data")).status, 200);
+    let put = Request::new("PUT", "/data/dir/a b.txt", b"x".to_vec());
+    assert_eq!(route(&store, &put).status, 200);
+
+    // SDKs only URL-decode keys when the response echoes EncodingType.
+    for target in [
+        "/data?encoding-type=url",
+        "/data?list-type=2&encoding-type=url",
+    ] {
+        let body = String::from_utf8(route(&store, &req("GET", target)).body).unwrap();
+        assert!(
+            body.contains("<EncodingType>url</EncodingType>"),
+            "{target}"
+        );
+        assert!(body.contains("<Key>dir%2Fa%20b.txt</Key>"), "{target}");
+    }
+
+    let plain = route(&store, &req("GET", "/data?list-type=2"));
+    let body = String::from_utf8(plain.body).unwrap();
+    assert!(!body.contains("<EncodingType>"));
+    assert!(body.contains("<Key>dir/a b.txt</Key>"));
+}
+
+#[test]
 fn list_object_versions_paginates_versions_and_delete_markers() {
     let root = tempdir();
     let store = FileBucketStore::new(&root);
