@@ -13,6 +13,7 @@ members = [
   "services/event-relay",
   "services/gcs",
   "services/mail",
+  "services/mailbox",
   "services/pubsub",
   "services/redis",
   "services/redis-control",
