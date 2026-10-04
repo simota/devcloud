@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::model::{Envelope, ListMessagesInput, ListMessagesResult, Message};
+use crate::model::{Envelope, ListMessagesInput, ListMessagesResult, Message, MessageEntry};
 use crate::parser::parse_message;
 use crate::store::Store;
 use crate::time_fmt::now_rfc3339;
@@ -29,7 +29,41 @@ impl Service {
     /// Mirrors `Service.Receive`: parse the raw body under the envelope, stamp
     /// id + received time, persist, then emit `mail.received`.
     pub fn receive(&self, envelope: Envelope, raw: &[u8]) -> Result<Message, String> {
+        self.receive_inner(envelope, "", raw, false)
+    }
+
+    /// Capture the SMTP reverse path separately from the display From header.
+    pub fn receive_from(
+        &self,
+        envelope: Envelope,
+        helo: &str,
+        raw: &[u8],
+    ) -> Result<Message, String> {
+        self.receive_inner(envelope, &sanitize_helo(helo), raw, true)
+    }
+
+    /// SMTP sessions retain a sanitized HELO across transactions.
+    pub(crate) fn receive_from_session(
+        &self,
+        envelope: Envelope,
+        helo: &str,
+        raw: &[u8],
+    ) -> Result<Message, String> {
+        self.receive_inner(envelope, helo, raw, true)
+    }
+
+    fn receive_inner(
+        &self,
+        envelope: Envelope,
+        helo: &str,
+        raw: &[u8],
+        capture: bool,
+    ) -> Result<Message, String> {
         let mut msg = parse_message(raw, &envelope);
+        if capture {
+            msg.envelope_from = Some(envelope.from.clone());
+            msg.helo = helo.to_string();
+        }
         msg.id = new_message_id();
         msg.received_at = Some(now_rfc3339());
         let stored = self.store.append(msg, raw)?;
@@ -48,6 +82,10 @@ impl Service {
     /// Mirrors `Service.List`: read-only passthrough to the store.
     pub fn list(&self, input: ListMessagesInput) -> Result<ListMessagesResult, String> {
         self.store.list(input)
+    }
+
+    pub fn list_all(&self) -> Result<Vec<MessageEntry>, String> {
+        self.store.list_all()
     }
 
     /// Mirrors `Service.Get`: read-only passthrough to the store.
@@ -74,6 +112,10 @@ impl Service {
         emit_event_no_payload("mail.cleared");
         Ok(())
     }
+}
+
+pub(crate) fn sanitize_helo(helo: &str) -> String {
+    helo.chars().filter(|c| !c.is_control()).take(255).collect()
 }
 
 /// Emits a dashboard event with a payload to the in-process sink, if installed.

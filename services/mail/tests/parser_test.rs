@@ -117,3 +117,18 @@ fn parse_message_extracts_multipart_text_and_html_bodies() {
     assert_eq!(message.text_body, "plain body");
     assert_eq!(message.html_body, "<p>html body</p>");
 }
+#[test]
+fn parse_message_stops_at_nesting_limit() {
+    let mut raw = Vec::new();
+    for n in 0..80 {
+        raw.extend_from_slice(
+            format!("Content-Type: multipart/mixed; boundary=b{n}\r\n\r\n--b{n}\r\n").as_bytes(),
+        );
+    }
+    raw.extend_from_slice(b"Content-Type: text/plain\r\n\r\nbody\r\n");
+    for n in (0..80).rev() {
+        raw.extend_from_slice(format!("--b{n}--\r\n").as_bytes());
+    }
+    let message = devcloud_mail::parse_message(&raw, &devcloud_mail::Envelope::default());
+    assert!(message.parse_error.contains("64"));
+}

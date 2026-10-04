@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use crate::blob::BlobStore;
-use crate::model::{ListMessagesInput, ListMessagesResult, Message};
+use crate::model::{ListMessagesInput, ListMessagesResult, Message, MessageEntry};
 use crate::time_fmt::{now_rfc3339, unix_from_rfc3339};
 
 /// Storage backend for received messages. Mirrors legacy `mail.Store`.
@@ -23,6 +23,9 @@ use crate::time_fmt::{now_rfc3339, unix_from_rfc3339};
 pub trait Store: Send + Sync {
     fn append(&self, message: Message, raw: &[u8]) -> Result<Message, String>;
     fn list(&self, input: ListMessagesInput) -> Result<ListMessagesResult, String>;
+    fn list_all(&self) -> Result<Vec<MessageEntry>, String> {
+        Err("list_all unsupported".to_string())
+    }
     fn get(&self, id: &str) -> Result<Option<Message>, String>;
     fn get_raw(&self, id: &str) -> Result<Option<Vec<u8>>, String>;
     fn delete(&self, id: &str) -> Result<(), String>;
@@ -193,15 +196,15 @@ impl Store for FileStore {
         }
 
         let mut guard = self.index.lock().unwrap();
-        let line =
+        let mut line =
             serde_json::to_vec(&message).map_err(|e| format!("append message metadata: {e}"))?;
+        line.push(b'\n');
         let mut f = fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(self.messages_path())
             .map_err(|e| format!("open messages log: {e}"))?;
         f.write_all(&line)
-            .and_then(|_| f.write_all(b"\n"))
             .map_err(|e| format!("append message metadata: {e}"))?;
         // Only keep the index in sync if it is already loaded — do not force a
         // load here, since a load failure (e.g. a pre-existing corrupt line)
@@ -245,6 +248,24 @@ impl Store for FileStore {
             .iter()
             .find(|m| m.deleted_at.is_none() && m.id == id)
             .cloned())
+    }
+
+    fn list_all(&self) -> Result<Vec<MessageEntry>, String> {
+        let mut guard = self.index.lock().unwrap();
+        let mut messages: Vec<_> = self
+            .ensure_loaded(&mut guard)?
+            .iter()
+            .filter(|m| m.deleted_at.is_none())
+            .map(|m| MessageEntry {
+                id: m.id.clone(),
+                received_at: m.received_at.clone(),
+            })
+            .collect();
+        drop(guard);
+        messages.reverse();
+        messages
+            .sort_by_key(|m| std::cmp::Reverse(m.received_at.as_deref().map(unix_from_rfc3339)));
+        Ok(messages)
     }
 
     fn get_raw(&self, id: &str) -> Result<Option<Vec<u8>>, String> {

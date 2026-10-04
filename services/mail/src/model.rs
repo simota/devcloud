@@ -68,6 +68,14 @@ pub struct Message {
         skip_serializing_if = "String::is_empty"
     )]
     pub parse_error: String,
+    #[serde(
+        rename = "envelopeFrom",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub envelope_from: Option<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub helo: String,
 }
 
 /// SMTP envelope (reverse-path + forward-paths). Mirrors legacy `Envelope`.
@@ -82,6 +90,13 @@ pub struct Envelope {
 pub struct ListMessagesInput {
     pub limit: i32,
     pub cursor: String,
+}
+
+/// Lightweight listing snapshot; retrieve message contents separately by id.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MessageEntry {
+    pub id: String,
+    pub received_at: Option<String>,
 }
 
 /// Result of listing messages. Mirrors legacy `ListMessagesResult`; `messages`

@@ -249,3 +249,59 @@ fn file_store_jsonl_matches_legacy_byte_for_byte() {
         b"Subject: Hello\r\n\r\nBody"
     );
 }
+#[test]
+fn list_all_is_uncapped_newest_first_and_excludes_tombstones() {
+    let (store, _) = new_store("list-all");
+    for n in 0..105 {
+        store
+            .append(
+                fixed_msg(&format!("m{n}"), "b", "s", "2026-04-30T10:00:00Z"),
+                b"raw",
+            )
+            .unwrap();
+    }
+    let service = devcloud_mail::Service::new(Arc::new(store));
+    service.delete("m103").unwrap();
+    let all = service.list_all().unwrap();
+    assert_eq!(all.len(), 104);
+    assert_eq!(all[0].id, "m104");
+    assert_eq!(all[1].id, "m102");
+    assert_eq!(
+        service
+            .list(ListMessagesInput::default())
+            .unwrap()
+            .messages
+            .len(),
+        100
+    );
+    assert_eq!(
+        devcloud_mail::RecordingStore::new().list_all().unwrap_err(),
+        "list_all unsupported"
+    );
+}
+
+#[test]
+fn receive_from_persists_optional_fields_without_changing_receive_serialization() {
+    let store = Arc::new(devcloud_mail::RecordingStore::new());
+    let service = devcloud_mail::Service::new(store.clone());
+    let envelope = devcloud_mail::Envelope {
+        from: String::new(),
+        to: vec!["rcpt@b".into()],
+    };
+    let raw = b"From: Header <header@a>\r\nSubject: s\r\n\r\nbody";
+    let plain = service.receive(envelope.clone(), raw).unwrap();
+    let encoded = serde_json::to_string(&plain).unwrap();
+    assert!(!encoded.contains("envelopeFrom"));
+    assert!(!encoded.contains("helo"));
+    let captured = service
+        .receive_from(envelope, "client\u{7}.example", raw)
+        .unwrap();
+    assert_eq!(captured.from, "Header <header@a>");
+    assert_eq!(captured.envelope_from.as_deref(), Some(""));
+    assert_eq!(captured.helo, "client.example");
+    let encoded = serde_json::to_string(&captured).unwrap();
+    assert!(encoded.ends_with("\"envelopeFrom\":\"\",\"helo\":\"client.example\"}"));
+    let old: Message = serde_json::from_str("{\"id\":\"old\",\"from\":\"header@a\"}").unwrap();
+    assert_eq!(old.envelope_from, None);
+    assert!(old.helo.is_empty());
+}
