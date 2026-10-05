@@ -10,6 +10,8 @@
 #
 # Auth defaults to relaxed. Strict auth: pass DEVCLOUD_S3_AUTH_MODE=strict together with
 # DEVCLOUD_S3_ACCESS_KEY_ID / DEVCLOUD_S3_SECRET_ACCESS_KEY / DEVCLOUD_S3_REGION.
+# Create buckets at startup with a comma-separated list (existing buckets are kept):
+#   docker run --rm -p 9000:9000 -e DEVCLOUD_S3_BUCKETS=uploads,backups devcloud-s3
 
 FROM --platform=$BUILDPLATFORM rust:1-slim-bookworm AS build
 ARG TARGETARCH
