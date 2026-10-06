@@ -157,6 +157,26 @@ fn build(c: &Config) -> Vec<DashboardService> {
             description:
                 "Inspect local Application Auto Scaling targets, policies, and scheduled actions.",
         },
+        DashboardService {
+            id: "lambda",
+            name: "Lambda",
+            path: "/dashboard/lambda",
+            status: status(!c.lambda_base.is_empty()),
+            endpoint: c.lambda_endpoint.clone(),
+            storage_path: c.lambda_storage_path.clone(),
+            description:
+                "Inspect local Lambda functions, invoke them, and read recent invocation logs.",
+        },
+        DashboardService {
+            id: "cloudrun",
+            name: "Cloud Run",
+            path: "/dashboard/cloudrun",
+            status: status(!c.cloudrun_base.is_empty()),
+            endpoint: c.cloudrun_endpoint.clone(),
+            storage_path: c.cloudrun_storage_path.clone(),
+            description:
+                "Inspect local Cloud Run services, revisions, running instances, and logs.",
+        },
     ]
 }
 
@@ -187,7 +207,7 @@ mod tests {
     }
 
     #[test]
-    fn registry_lists_ten_services_in_order() {
+    fn registry_lists_services_in_order() {
         let cfg = Config::default();
         let resp = handle(&cfg, &req());
         assert_eq!(resp.status, 200);
@@ -206,7 +226,9 @@ mod tests {
                 "redis",
                 "sqs",
                 "pubsub",
-                "applicationautoscaling"
+                "applicationautoscaling",
+                "lambda",
+                "cloudrun"
             ]
         );
     }

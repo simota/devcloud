@@ -314,6 +314,12 @@ services:
       mode: ${REDSHIFT_BACKEND_MODE}
       externalDsn: ${REDSHIFT_BACKEND_EXTERNAL_DSN}
       managed: ${REDSHIFT_BACKEND_MANAGED}
+# Lambda / Cloud Run are not exercised here; keep them off their default ports.
+services:
+  lambda:
+    enabled: false
+  cloudRun:
+    enabled: false
 EOF
 
 log "building devcloud"

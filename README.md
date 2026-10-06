@@ -2,7 +2,7 @@
 
 Local cloud service emulator for development and E2E inspection.
 
-`devcloud` runs a local dashboard plus compatible development endpoints for Mail, S3, GCS, DynamoDB, BigQuery, SQS, Google Cloud Pub/Sub, Redshift, and Redis. It is designed for deterministic local tests and manual inspection, not for production workloads or full cloud-provider parity.
+`devcloud` runs a local dashboard plus compatible development endpoints for Mail, S3, GCS, DynamoDB, BigQuery, SQS, Google Cloud Pub/Sub, Redshift, Redis, Application Auto Scaling, AWS Lambda, and Cloud Run. It is designed for deterministic local tests and manual inspection, not for production workloads or full cloud-provider parity.
 
 ## Quick Start
 
@@ -36,6 +36,8 @@ Default local endpoints:
 | Redshift API | `http://127.0.0.1:19099` | `http://127.0.0.1:18025/dashboard/redshift` |
 | Redis | `redis://127.0.0.1:16379` | `http://127.0.0.1:18025/dashboard/redis` |
 | Application Auto Scaling | `http://127.0.0.1:18030` | `http://127.0.0.1:18025/dashboard/applicationautoscaling` |
+| Lambda | `http://127.0.0.1:19010` | `http://127.0.0.1:18025/dashboard/lambda` |
+| Cloud Run | `http://127.0.0.1:18095` (services: `http://<svc>.<region>.<project>.run.localhost:18095`) | `http://127.0.0.1:18025/dashboard/cloudrun` |
 
 Useful commands:
 
@@ -96,6 +98,8 @@ server:
   redisPort: 16379
   redisHttpPort: 16380
   appAutoScalingPort: 18030
+  lambdaPort: 19010
+  cloudRunPort: 18095
 
 auth:
   smtp:
@@ -141,6 +145,14 @@ auth:
     accessKeyId: dev
     secretAccessKey: dev
     accountId: "000000000000"
+  lambda:
+    mode: relaxed
+    accessKeyId: dev
+    secretAccessKey: dev
+    accountId: "000000000000"
+  cloudRun:
+    mode: relaxed
+    bearerToken: dev
 
 storage:
   path: .devcloud/data
@@ -240,6 +252,14 @@ services:
   appAutoScaling:
     enabled: true
     region: us-east-1
+  lambda:
+    enabled: true
+    region: us-east-1
+  cloudRun:
+    enabled: true
+    project: devcloud
+    region: us-central1
+    docker: false
 ```
 
 ## Support Matrix
@@ -254,16 +274,16 @@ Legend:
 
 ### Service Availability
 
-| Capability | Mail | S3 | GCS | DynamoDB | BigQuery | SQS | Pub/Sub | Redshift | Redis | App Auto Scaling |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Local endpoint | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
-| Dashboard view | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
-| Dashboard mutation actions | Partial | Partial | Partial | Partial | Partial | Partial | Yes | Yes | Partial | No |
-| Persistent local storage | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
-| Configurable port | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
-| Enable/disable via config | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
-| Local relaxed auth mode | N/A | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
-| Strict cloud-grade auth/IAM | No | Partial | No | Partial | No | Partial | No | Partial | Partial | Partial |
+| Capability | Mail | S3 | GCS | DynamoDB | BigQuery | SQS | Pub/Sub | Redshift | Redis | App Auto Scaling | Lambda | Cloud Run |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Local endpoint | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
+| Dashboard view | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
+| Dashboard mutation actions | Partial | Partial | Partial | Partial | Partial | Partial | Yes | Yes | Partial | No | Partial | No |
+| Persistent local storage | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
+| Configurable port | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
+| Enable/disable via config | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
+| Local relaxed auth mode | N/A | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
+| Strict cloud-grade auth/IAM | No | Partial | No | Partial | No | Partial | No | Partial | Partial | Partial | Partial | Partial |
 
 ### Mail
 
@@ -429,6 +449,33 @@ Pub/Sub dashboard actions are available under `/dashboard/pubsub`:
 | Redis AUTH | Partial | Relaxed mode does not set `requirepass`; strict mode passes the configured password to managed Redis. |
 | Cluster, Sentinel, modules, RedisJSON, RediSearch | No | Out of local compatibility scope. |
 
+### AWS Lambda-Compatible API
+
+| Feature | Status | Notes |
+| --- | --- | --- |
+| Function CRUD | Yes | `CreateFunction`, `GetFunction`, `GetFunctionConfiguration`, `ListFunctions` (Marker/MaxItems), `UpdateFunctionConfiguration` (RevisionId precondition), `UpdateFunctionCode`, `DeleteFunction` on the `/2015-03-31/functions` REST API. Name, partial ARN, and full ARN identifiers are accepted. |
+| Deployment packages | Partial | Zip only (`ZipFile` base64, or `S3Bucket`/`S3Key` from the local S3 store when S3 is enabled). Stored + DEFLATE entries; zip64, container images, and layers are not supported. |
+| Invoke | Partial | `RequestResponse`, `Event` (async, 202), and `DryRun`; `X-Amz-Function-Error: Unhandled` on handler errors; `X-Amz-Log-Type: Tail` returns the last 4 KB of the START/END/REPORT-framed log; per-function `Timeout` is enforced. |
+| Runtimes | Partial | `python3.x` and `nodejs*` handlers run as local `python3` / `node` processes (CommonJS, ESM `.mjs`, async and callback handlers). Other runtimes (`java*`, `dotnet*`, `ruby*`, `provided*`) can be deployed but invoking them returns `InvalidRuntimeException`. |
+| Handler environment | Partial | Cleared environment: `PATH`, Lambda's reserved variables (`AWS_LAMBDA_FUNCTION_NAME`, `AWS_REGION`, `LAMBDA_TASK_ROOT`, ...), and the function's `Environment.Variables`. No credentials are injected. |
+| Tags / account settings | Yes | `/2017-03-31/tags/{arn}` list/tag/untag and `GetAccountSettings`. |
+| Versions, aliases, layers, function URLs, event source mappings, concurrency | No | Only `$LATEST` exists. |
+| Auth | Partial | `relaxed`, `signed-relaxed`, and `strict` SigV4 (service `lambda`), like Application Auto Scaling. |
+| Browser (CSRF) guard | Yes | Non-GET requests carrying a non-loopback `Origin` (or `Sec-Fetch-Site: cross-site`) are rejected with 403, so a web page cannot create or invoke functions; SDKs/CLIs (no `Origin`) and loopback front-ends are unaffected. The dashboard's test invoke applies the same rule. |
+
+### Cloud Run-Compatible API
+
+| Feature | Status | Notes |
+| --- | --- | --- |
+| Admin API v2 services | Yes | Create (`serviceId`, `validateOnly`), get, list (including location `-`), patch (`updateMask`, `allowMissing`, etag check), delete under `/v2/projects/{p}/locations/{l}/services`. |
+| Revisions | Yes | A template change creates a `<svc>-<generation>-<suffix>` revision; list/get/delete (the latest revision cannot be deleted). |
+| Long-running operations | Partial | Every mutation completes synchronously and returns a `done: true` Operation; operations are kept in memory (get/list/delete/`:wait`). |
+| IAM policy | Partial | `getIamPolicy`, `setIamPolicy`, `testIamPermissions` per service. Strict mode enforces a bearer token on the Admin API and on service requests unless the service grants `allUsers` `roles/run.invoker` or sets `invokerIamDisabled`. |
+| Serving requests | Partial | Requests with `Host: <svc>.<location>.<project>.run.localhost[:port]` (the service `uri`) or under `/_run/<project>/<location>/<svc>/` (in `urls`) are reverse-proxied to the latest revision. Traffic splitting is not emulated: the latest revision always serves. |
+| Container execution | Partial | `containers[0].command` + `args` run as a local process with `PORT` set to a free loopback port plus `K_SERVICE`/`K_REVISION`/`K_CONFIGURATION` and the container `env` values (`valueSource` secrets are not resolved). Image-only containers run with `docker run` when `services.cloudRun.docker: true`, otherwise requests return 503. One instance per service, started on first request, replaced on a new revision, stopped on delete/shutdown. |
+| Browser (CSRF) guard | Yes | Non-GET Admin API requests with a non-loopback `Origin` (or `Sec-Fetch-Site: cross-site`) are rejected with 403; service (data-plane) requests are not restricted. |
+| Jobs, domain mappings, v1 (Knative) API | No | Out of local compatibility scope. |
+
 ### Dashboard API
 
 | Feature | Status | Notes |
@@ -442,6 +489,8 @@ Pub/Sub dashboard actions are available under `/dashboard/pubsub`:
 | Pub/Sub dashboard API | Yes | Status, topics, subscriptions, publish, pull, ack, and message metadata. |
 | Redshift dashboard API | Yes | Status, clusters, catalog, table detail, query runner, and statement history. |
 | Redis dashboard API | Yes | Status, SCAN-based keys, key inspector, allowlisted command runner, delete, expire, and guarded `FLUSHDB`. |
+| Lambda dashboard API | Yes | Status, functions, recent invocations with log tails, and test invoke through the Invoke API. |
+| Cloud Run dashboard API | Yes | Status, services, revisions, running instances, and instance logs. |
 | Common React dashboard shell | Yes | All service pages are served under `/dashboard/<svc>` from the shared React shell; compatibility `/mail`, `/s3`, `/gcs`, `/dynamodb`, `/bigquery`, `/redis` paths return 301 redirects. |
 
 ## Verification
@@ -470,6 +519,8 @@ Run before claiming a service MVP is complete or when investigating a service-le
 | Pub/Sub MVP | `VERIFY_STAGE=full bash scripts/pubsub-autoloop/verify.sh` |
 | Redis MVP | `VERIFY_STAGE=full bash scripts/redis-autoloop/verify.sh` |
 | Application Auto Scaling MVP | `VERIFY_STAGE=full bash scripts/applicationautoscaling-autoloop/verify.sh` |
+| Lambda MVP | `VERIFY_STAGE=full bash scripts/lambda-autoloop/verify.sh` |
+| Cloud Run MVP | `VERIFY_STAGE=full bash scripts/cloudrun-autoloop/verify.sh` |
 | GCS SDK compat | `VERIFY_STAGE=full-sdk-compat bash scripts/gcs-sdk-compat-autoloop/verify.sh` |
 | BigQuery SDK compat | `VERIFY_STAGE=full-sdk-compat bash scripts/bigquery-sdk-compat-autoloop/verify.sh` |
 | Pub/Sub full compat | `VERIFY_STAGE=full-compat bash scripts/pubsub-full-compat-autoloop/verify.sh` |
@@ -491,6 +542,8 @@ Run before claiming a service MVP is complete or when investigating a service-le
 | Redshift SQL translator | `scripts/redshift-translator-e2e.sh` | `psql`, `aws`, and `postgres` server binary on `PATH` |
 | Redis | `scripts/redis-e2e.sh` | `redis-cli` |
 | Application Auto Scaling | `scripts/applicationautoscaling-e2e.sh` | none |
+| Lambda | `scripts/lambda-e2e.sh` | `python3` (handler runtime) |
+| Cloud Run | `scripts/cloudrun-e2e.sh` | `python3` (sample service) |
 
 Useful env vars:
 
@@ -512,6 +565,9 @@ Useful env vars:
 | `services/sqs` | SQS-compatible JSON and Query API service. |
 | `services/pubsub` | Google Cloud Pub/Sub-compatible REST and gRPC service. |
 | `services/redshift` | Redshift SQL, Data API, and management API service. |
+| `services/applicationautoscaling` | Application Auto Scaling-compatible JSON API service. |
+| `services/lambda` | AWS Lambda-compatible REST API with local python/node handler execution. |
+| `services/cloudrun` | Cloud Run Admin API v2 plus a reverse proxy to locally run service processes. |
 | `services/dashboard` | Local Web UI, embedded React assets, and dashboard APIs. |
 | `docs/` | Product and compatibility designs. |
 | `mock/` | UI design mocks. |

@@ -3,6 +3,12 @@
 version = 4
 
 [[package]]
+name = "adler2"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
+
+[[package]]
 name = "aho-corasick"
 version = "1.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -202,13 +208,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "devcloud-cloudrun"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+]
+
+[[package]]
 name = "devcloud-dashboard"
 version = "0.1.0"
 dependencies = [
+ "base64",
+ "devcloud-cloudrun",
+ "devcloud-lambda",
  "futures-util",
+ "hex",
+ "hmac",
  "include_dir",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
  "tokio-tungstenite",
  "tungstenite",
@@ -249,6 +273,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "devcloud-lambda"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "devcloud-s3",
+ "hex",
+ "hmac",
+ "libc",
+ "miniz_oxide",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+]
+
+[[package]]
 name = "devcloud-mail"
 version = "0.1.0"
 dependencies = [
@@ -278,10 +318,12 @@ version = "0.1.0"
 dependencies = [
  "devcloud-applicationautoscaling",
  "devcloud-bigquery",
+ "devcloud-cloudrun",
  "devcloud-dashboard",
  "devcloud-dynamodb",
  "devcloud-event-relay",
  "devcloud-gcs",
+ "devcloud-lambda",
  "devcloud-mail",
  "devcloud-pubsub",
  "devcloud-redis",
@@ -798,6 +840,15 @@ name = "mime"
 version = "0.3.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6877bb514081ee2a7ff5ef9de3281f14a4dd4bceac4c09388074a6b5df8a139a"
+
+[[package]]
+name = "miniz_oxide"
+version = "0.8.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1fa76a2c86f704bdb222d66965fb3d63269ce38518b83cb0575fca855ebb6316"
+dependencies = [
+ "adler2",
+]
 
 [[package]]
 name = "mio"

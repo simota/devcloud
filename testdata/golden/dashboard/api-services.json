@@ -96,6 +96,24 @@
         "path": "\u003cPATH\u003e",
         "status": "running",
         "storagePath": "\u003cPATH\u003e"
+      },
+      {
+        "description": "Inspect local Lambda functions, invoke them, and read recent invocation logs.",
+        "endpoint": "http://\u003cADDR\u003e",
+        "id": "\u003cID\u003e",
+        "name": "Lambda",
+        "path": "\u003cPATH\u003e",
+        "status": "running",
+        "storagePath": "\u003cPATH\u003e"
+      },
+      {
+        "description": "Inspect local Cloud Run services, revisions, running instances, and logs.",
+        "endpoint": "http://\u003cADDR\u003e",
+        "id": "\u003cID\u003e",
+        "name": "Cloud Run",
+        "path": "\u003cPATH\u003e",
+        "status": "running",
+        "storagePath": "\u003cPATH\u003e"
       }
     ]
   }

@@ -59,6 +59,8 @@ pub async fn run(cfg: Config) -> Result<(), String> {
     devcloud_gcs::set_event_sink(event_tx.clone());
     devcloud_bigquery::set_event_sink(event_tx.clone());
     devcloud_redshift::set_event_sink(event_tx.clone());
+    devcloud_lambda::set_event_sink(event_tx.clone());
+    devcloud_cloudrun::set_event_sink(event_tx.clone());
     {
         let addr = format!("127.0.0.1:{}", cfg.server.event_relay_port);
         let sd = shutdown_future(rx.clone());
@@ -100,6 +102,16 @@ pub async fn run(cfg: Config) -> Result<(), String> {
         let c = cfg.clone();
         let sd = shutdown_future(rx.clone());
         set.spawn(async move { services::applicationautoscaling::run(&c, sd).await });
+    }
+    if cfg.services.lambda.enabled {
+        let c = cfg.clone();
+        let sd = shutdown_future(rx.clone());
+        set.spawn(async move { services::lambda::run(&c, sd).await });
+    }
+    if cfg.services.cloud_run.enabled {
+        let c = cfg.clone();
+        let sd = shutdown_future(rx.clone());
+        set.spawn(async move { services::cloudrun::run(&c, sd).await });
     }
     if cfg.services.pubsub.enabled {
         let c = cfg.clone();
