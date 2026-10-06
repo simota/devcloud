@@ -297,6 +297,12 @@ services:
     defaultMessageRetentionSeconds: 345600
     defaultReceiveWaitTimeSeconds: 0
     schedulerIntervalSeconds: 1
+# Lambda / Cloud Run are not exercised here; keep them off their default ports.
+services:
+  lambda:
+    enabled: false
+  cloudRun:
+    enabled: false
 EOF
 }
 
