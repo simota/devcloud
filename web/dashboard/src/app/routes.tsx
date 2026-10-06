@@ -10,6 +10,8 @@ import { SQSDashboard } from './services/sqs/SQSDashboard'
 import { PubSubDashboard } from './services/pubsub/PubSubDashboard'
 import { GCSDashboard } from './services/gcs/GCSDashboard'
 import { ApplicationAutoScalingDashboard } from './services/applicationautoscaling/ApplicationAutoScalingDashboard'
+import { LambdaDashboard } from './services/lambda/LambdaDashboard'
+import { CloudRunDashboard } from './services/cloudrun/CloudRunDashboard'
 
 type RouteProps = {
   services: DashboardService[]
@@ -48,6 +50,12 @@ export function renderRoute({ services, path }: RouteProps): JSX.Element {
     return (
       <ApplicationAutoScalingDashboard service={services.find((service) => service.id === 'applicationautoscaling')} />
     )
+  }
+  if (path === '/lambda') {
+    return <LambdaDashboard service={services.find((service) => service.id === 'lambda')} />
+  }
+  if (path === '/cloudrun') {
+    return <CloudRunDashboard service={services.find((service) => service.id === 'cloudrun')} />
   }
   return <ServiceIndex services={services} />
 }

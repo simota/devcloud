@@ -53,10 +53,11 @@
 //! and the shipped product, so it is masked symmetrically. Every other service's
 //! status is asserted unmasked.
 //!
-//! One deliberate post-legacy addition: the `applicationautoscaling` entry in the
-//! two registry goldens. The legacy dashboard never had that service; the entry
-//! was appended when the Rust dashboard gained its page, so the goldens track
-//! intended current behavior, not a byte-frozen legacy capture, for that row.
+//! Deliberate post-legacy additions: the `applicationautoscaling`, `lambda`, and
+//! `cloudrun` entries in the two registry goldens. The legacy dashboard never had
+//! those services; the entries were appended when the Rust dashboard gained their
+//! pages, so the goldens track intended current behavior, not a byte-frozen
+//! legacy capture, for those rows.
 //!
 //! ── ROUTE SET ─────────────────────────────────────────────────────────────────
 //!
@@ -731,7 +732,9 @@ fn spawn_devcloud_up(workspace: &Path) -> Child {
 \u{20}\u{20}sqsPort: 29324\n\
 \u{20}\u{20}pubsubGrpcPort: 28085\n\
 \u{20}\u{20}pubsubRestPort: 28086\n\
-\u{20}\u{20}appAutoScalingPort: 28030\n",
+\u{20}\u{20}appAutoScalingPort: 28030\n\
+\u{20}\u{20}lambdaPort: 29010\n\
+\u{20}\u{20}cloudRunPort: 28095\n",
     );
     std::fs::write(&cfg_path, cfg).expect("write config.yaml override");
 

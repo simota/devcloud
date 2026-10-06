@@ -18,6 +18,14 @@ fn http_ep(port: i32) -> String {
     format!("http://127.0.0.1:{port}")
 }
 
+fn enabled_ep(enabled: bool, port: i32) -> String {
+    if enabled {
+        http_ep(port)
+    } else {
+        String::new()
+    }
+}
+
 fn join(path: &str, sub: &str) -> String {
     Path::new(path).join(sub).to_string_lossy().into_owned()
 }
@@ -89,6 +97,24 @@ fn build_config(cfg: &AppConfig) -> Config {
         app_auto_scaling_endpoint: http_ep(cfg.server.app_auto_scaling_port),
         app_auto_scaling_storage_path: join(s, "applicationautoscaling"),
         app_auto_scaling_region: cfg.services.app_auto_scaling.region.clone(),
+
+        // Empty base == disabled: the registry/status handlers report the
+        // service off instead of forwarding to a port nothing listens on.
+        lambda_base: enabled_ep(cfg.services.lambda.enabled, cfg.server.lambda_port),
+        lambda_endpoint: http_ep(cfg.server.lambda_port),
+        lambda_storage_path: join(s, "lambda"),
+        lambda_region: cfg.services.lambda.region.clone(),
+        lambda_auth_mode: cfg.auth.lambda.mode.clone(),
+        lambda_access_key_id: cfg.auth.lambda.access_key_id.clone(),
+        lambda_secret_access_key: cfg.auth.lambda.secret_access_key.clone(),
+
+        cloudrun_base: enabled_ep(cfg.services.cloud_run.enabled, cfg.server.cloud_run_port),
+        cloudrun_endpoint: http_ep(cfg.server.cloud_run_port),
+        cloudrun_storage_path: join(s, "cloudrun"),
+        cloudrun_project: cfg.services.cloud_run.project.clone(),
+        cloudrun_region: cfg.services.cloud_run.region.clone(),
+        cloudrun_auth_mode: cfg.auth.cloud_run.mode.clone(),
+        cloudrun_bearer_token: cfg.auth.cloud_run.bearer_token.clone(),
     }
 }
 
@@ -115,5 +141,22 @@ mod tests {
 
         assert_eq!(dashboard.s3_storage_path, ".devcloud/data/s3");
         assert_eq!(dashboard.gcs_storage_path, ".devcloud/data/gcs");
+    }
+
+    #[test]
+    fn disabled_lambda_and_cloudrun_have_no_forward_base() {
+        let mut cfg = AppConfig::default();
+        let on = build_config(&cfg);
+        assert_eq!(on.lambda_base, "http://127.0.0.1:19010");
+        assert_eq!(on.cloudrun_base, "http://127.0.0.1:18095");
+        cfg.services.lambda.enabled = false;
+        cfg.services.cloud_run.enabled = false;
+        let off = build_config(&cfg);
+        assert!(off.lambda_base.is_empty());
+        assert!(off.cloudrun_base.is_empty());
+        assert_eq!(
+            off.lambda_endpoint, "http://127.0.0.1:19010",
+            "display endpoint stays"
+        );
     }
 }

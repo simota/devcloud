@@ -20,18 +20,21 @@
 pub mod applicationautoscaling;
 pub mod assets;
 pub mod bigquery;
+pub mod cloudrun;
 pub mod config;
 pub mod dynamodb;
 pub mod events;
 pub mod forward;
 pub mod gcs;
 pub mod http;
+pub mod lambda;
 pub mod mail;
 pub mod pubsub;
 pub mod redis;
 pub mod redshift;
 pub mod s3;
 pub mod services;
+pub mod sigv4;
 pub mod sqs;
 
 pub use config::Config;

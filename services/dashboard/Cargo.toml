@@ -33,5 +33,15 @@ tungstenite = "0.24"
 # Re-exported by tokio-tungstenite; declared explicitly for the Sink/Stream
 # combinators (split/send/next) the bidirectional pump uses.
 futures-util = { version = "0.3", default-features = false }
+# Decodes the Lambda X-Amz-Log-Result header for the test-invoke view.
+base64 = "0.22"
+# SigV4-signs Lambda forwarding when the service runs strict/signed-relaxed.
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
 
 [dev-dependencies]
+# strict_auth_forwarding.rs drives real strict-mode Lambda / Cloud Run servers
+# to prove the dashboard's signed / bearer forwarding is accepted.
+devcloud-lambda = { path = "../lambda" }
+devcloud-cloudrun = { path = "../cloudrun" }

@@ -223,10 +223,16 @@ dependencies = [
 name = "devcloud-dashboard"
 version = "0.1.0"
 dependencies = [
+ "base64",
+ "devcloud-cloudrun",
+ "devcloud-lambda",
  "futures-util",
+ "hex",
+ "hmac",
  "include_dir",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
  "tokio-tungstenite",
  "tungstenite",
@@ -312,10 +318,12 @@ version = "0.1.0"
 dependencies = [
  "devcloud-applicationautoscaling",
  "devcloud-bigquery",
+ "devcloud-cloudrun",
  "devcloud-dashboard",
  "devcloud-dynamodb",
  "devcloud-event-relay",
  "devcloud-gcs",
+ "devcloud-lambda",
  "devcloud-mail",
  "devcloud-pubsub",
  "devcloud-redis",

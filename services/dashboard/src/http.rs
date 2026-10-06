@@ -19,8 +19,8 @@ use tokio::net::{TcpListener, TcpStream};
 
 use crate::config::Config;
 use crate::{
-    applicationautoscaling, assets, bigquery, dynamodb, events, gcs, mail, pubsub, redis, redshift,
-    s3, services, sqs,
+    applicationautoscaling, assets, bigquery, cloudrun, dynamodb, events, gcs, lambda, mail,
+    pubsub, redis, redshift, s3, services, sqs,
 };
 
 const MAX_HEADER_BYTES: usize = 64 * 1024;
@@ -301,6 +301,34 @@ pub async fn route(config: &Config, req: &Request) -> Response {
         return applicationautoscaling::handle_scheduled_actions(config, req).await;
     }
 
+    // Lambda.
+    if path == "/api/lambda/status" {
+        return lambda::handle_status(config, req).await;
+    }
+    if path == "/api/lambda/functions" {
+        return lambda::handle_functions(config, req).await;
+    }
+    if path == "/api/lambda/invocations" {
+        return lambda::handle_invocations(config, req).await;
+    }
+    if path.starts_with("/api/lambda/functions/") && path.ends_with("/invoke") {
+        return lambda::handle_invoke(config, req).await;
+    }
+
+    // Cloud Run.
+    if path == "/api/cloudrun/status" {
+        return cloudrun::handle_status(config, req).await;
+    }
+    if path == "/api/cloudrun/services" {
+        return cloudrun::handle_services(config, req).await;
+    }
+    if path == "/api/cloudrun/instances" {
+        return cloudrun::handle_instances(config, req).await;
+    }
+    if path.starts_with("/api/cloudrun/services/") {
+        return cloudrun::handle_service(config, req).await;
+    }
+
     Response::text_error(404, "404 page not found")
 }
 
@@ -467,6 +495,36 @@ pub fn path_segment_decode(raw: &str) -> Option<String> {
         return None;
     }
     Some(decoded)
+}
+
+/// CSRF guard for state-changing / code-executing requests. AWS SDKs, CLIs and
+/// other non-browser clients send no `Origin`; a browser always does on a
+/// cross-origin POST — including "simple" `text/plain` ones that CORS never
+/// blocks from being sent. Only loopback origins (local front-ends, the
+/// devcloud dashboard) are trusted; a DNS-rebinding page keeps its own
+/// non-loopback origin and is refused too.
+pub fn trusted_origin(origin: &str, sec_fetch_site: &str) -> bool {
+    if origin.is_empty() {
+        return !sec_fetch_site.eq_ignore_ascii_case("cross-site");
+    }
+    let Some((scheme, rest)) = origin.split_once("://") else {
+        return false; // includes the opaque `null` origin
+    };
+    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+        return false;
+    }
+    let host = if let Some(v6) = rest.strip_prefix('[') {
+        match v6.split_once(']') {
+            Some((h, _)) => h.to_string(),
+            None => return false,
+        }
+    } else {
+        rest.rsplit_once(':')
+            .map(|(h, _)| h)
+            .unwrap_or(rest)
+            .to_ascii_lowercase()
+    };
+    host == "localhost" || host == "127.0.0.1" || host == "::1" || host.ends_with(".localhost")
 }
 
 fn hex_val(b: u8) -> Option<u8> {

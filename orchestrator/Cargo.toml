@@ -21,6 +21,8 @@ devcloud-dynamodb = { path = "../services/dynamodb" }
 devcloud-bigquery = { path = "../services/bigquery" }
 devcloud-sqs = { path = "../services/sqs" }
 devcloud-applicationautoscaling = { path = "../services/applicationautoscaling" }
+devcloud-lambda = { path = "../services/lambda" }
+devcloud-cloudrun = { path = "../services/cloudrun" }
 devcloud-pubsub = { path = "../services/pubsub" }
 devcloud-redshift = { path = "../services/redshift" }
 devcloud-redis = { path = "../services/redis" }

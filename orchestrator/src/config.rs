@@ -53,6 +53,8 @@ pub struct ServerConfig {
     pub pubsub_grpc_port: i32,
     pub pubsub_rest_port: i32,
     pub app_auto_scaling_port: i32,
+    pub lambda_port: i32,
+    pub cloud_run_port: i32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -67,6 +69,8 @@ pub struct AuthConfig {
     pub sqs: SqsAuthConfig,
     pub pubsub: PubSubAuthConfig,
     pub app_auto_scaling: AppAutoScalingAuthConfig,
+    pub lambda: LambdaAuthConfig,
+    pub cloud_run: CloudRunAuthConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -144,6 +148,20 @@ pub struct AppAutoScalingAuthConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct LambdaAuthConfig {
+    pub mode: String,
+    pub access_key_id: String,
+    pub secret_access_key: String,
+    pub account_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CloudRunAuthConfig {
+    pub mode: String,
+    pub bearer_token: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct StorageConfig {
     pub path: String,
 }
@@ -160,6 +178,8 @@ pub struct ServicesConfig {
     pub sqs: SqsServiceConfig,
     pub pubsub: PubSubServiceConfig,
     pub app_auto_scaling: AppAutoScalingServiceConfig,
+    pub lambda: LambdaServiceConfig,
+    pub cloud_run: CloudRunServiceConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -302,6 +322,21 @@ pub struct AppAutoScalingServiceConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct LambdaServiceConfig {
+    pub enabled: bool,
+    pub region: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CloudRunServiceConfig {
+    pub enabled: bool,
+    pub project: String,
+    pub region: String,
+    /// Run image-only containers (no `command`) with `docker run`.
+    pub docker: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct PubSubServiceConfig {
     pub enabled: bool,
     pub project: String,
@@ -346,6 +381,8 @@ pub fn default_config() -> Config {
             pubsub_grpc_port: 18085,
             pubsub_rest_port: 18086,
             app_auto_scaling_port: 18030,
+            lambda_port: 19010,
+            cloud_run_port: 18095,
         },
         auth: AuthConfig {
             smtp: SmtpAuthConfig {
@@ -401,6 +438,16 @@ pub fn default_config() -> Config {
                 access_key_id: "dev".to_string(),
                 secret_access_key: "dev".to_string(),
                 account_id: "000000000000".to_string(),
+            },
+            lambda: LambdaAuthConfig {
+                mode: "relaxed".to_string(),
+                access_key_id: "dev".to_string(),
+                secret_access_key: "dev".to_string(),
+                account_id: "000000000000".to_string(),
+            },
+            cloud_run: CloudRunAuthConfig {
+                mode: "relaxed".to_string(),
+                bearer_token: "dev".to_string(),
             },
         },
         storage: StorageConfig {
@@ -520,6 +567,16 @@ pub fn default_config() -> Config {
             app_auto_scaling: AppAutoScalingServiceConfig {
                 enabled: true,
                 region: "us-east-1".to_string(),
+            },
+            lambda: LambdaServiceConfig {
+                enabled: true,
+                region: "us-east-1".to_string(),
+            },
+            cloud_run: CloudRunServiceConfig {
+                enabled: true,
+                project: "devcloud".to_string(),
+                region: "us-central1".to_string(),
+                docker: false,
             },
         },
     }
@@ -699,6 +756,10 @@ pub fn apply_config_value(cfg: &mut Config, path: &[String], value: &str) -> io:
         "server.appAutoScalingPort" => {
             cfg.server.app_auto_scaling_port = parse_int("server.appAutoScalingPort", value)?
         }
+        "server.lambdaPort" => cfg.server.lambda_port = parse_int("server.lambdaPort", value)?,
+        "server.cloudRunPort" => {
+            cfg.server.cloud_run_port = parse_int("server.cloudRunPort", value)?
+        }
         "auth.smtp.mode" => cfg.auth.smtp.mode = value.to_string(),
         "auth.smtp.user" => cfg.auth.smtp.username = value.to_string(),
         "auth.smtp.password" => cfg.auth.smtp.password = value.to_string(),
@@ -741,6 +802,12 @@ pub fn apply_config_value(cfg: &mut Config, path: &[String], value: &str) -> io:
         "auth.appAutoScaling.accountId" => {
             cfg.auth.app_auto_scaling.account_id = trim_quotes(value)
         }
+        "auth.lambda.mode" => cfg.auth.lambda.mode = value.to_string(),
+        "auth.lambda.accessKeyId" => cfg.auth.lambda.access_key_id = value.to_string(),
+        "auth.lambda.secretAccessKey" => cfg.auth.lambda.secret_access_key = value.to_string(),
+        "auth.lambda.accountId" => cfg.auth.lambda.account_id = trim_quotes(value),
+        "auth.cloudRun.mode" => cfg.auth.cloud_run.mode = value.to_string(),
+        "auth.cloudRun.bearerToken" => cfg.auth.cloud_run.bearer_token = value.to_string(),
         "storage.path" => cfg.storage.path = value.to_string(),
         "services.mail.enabled" => {
             cfg.services.mail.enabled = parse_bool("services.mail.enabled", value)?
@@ -1095,6 +1162,18 @@ pub fn apply_config_value(cfg: &mut Config, path: &[String], value: &str) -> io:
         "services.appAutoScaling.region" => {
             cfg.services.app_auto_scaling.region = value.to_string()
         }
+        "services.lambda.enabled" => {
+            cfg.services.lambda.enabled = parse_bool("services.lambda.enabled", value)?
+        }
+        "services.lambda.region" => cfg.services.lambda.region = value.to_string(),
+        "services.cloudRun.enabled" => {
+            cfg.services.cloud_run.enabled = parse_bool("services.cloudRun.enabled", value)?
+        }
+        "services.cloudRun.project" => cfg.services.cloud_run.project = value.to_string(),
+        "services.cloudRun.region" => cfg.services.cloud_run.region = value.to_string(),
+        "services.cloudRun.docker" => {
+            cfg.services.cloud_run.docker = parse_bool("services.cloudRun.docker", value)?
+        }
         // legacy default: unknown key → silently ignored (return nil).
         _ => {}
     }
@@ -1251,6 +1330,8 @@ pub fn default_config_yaml(cfg: &Config) -> String {
             "  pubsubGrpcPort: {pubsub_grpc_port}\n",
             "  pubsubRestPort: {pubsub_rest_port}\n",
             "  appAutoScalingPort: {app_auto_scaling_port}\n",
+            "  lambdaPort: {lambda_port}\n",
+            "  cloudRunPort: {cloud_run_port}\n",
             "\n",
             "auth:\n",
             "  smtp:\n",
@@ -1296,6 +1377,14 @@ pub fn default_config_yaml(cfg: &Config) -> String {
             "    accessKeyId: {aas_access_key_id}\n",
             "    secretAccessKey: {aas_secret_access_key}\n",
             "    accountId: \"{aas_account_id}\"\n",
+            "  lambda:\n",
+            "    mode: {lambda_auth_mode}\n",
+            "    accessKeyId: {lambda_access_key_id}\n",
+            "    secretAccessKey: {lambda_secret_access_key}\n",
+            "    accountId: \"{lambda_account_id}\"\n",
+            "  cloudRun:\n",
+            "    mode: {cloud_run_auth_mode}\n",
+            "    bearerToken: {cloud_run_bearer_token}\n",
             "\n",
             "storage:\n",
             "  path: {storage_path}\n",
@@ -1399,6 +1488,14 @@ pub fn default_config_yaml(cfg: &Config) -> String {
             "  appAutoScaling:\n",
             "    enabled: {aas_enabled}\n",
             "    region: {aas_region}\n",
+            "  lambda:\n",
+            "    enabled: {lambda_enabled}\n",
+            "    region: {lambda_region}\n",
+            "  cloudRun:\n",
+            "    enabled: {cloud_run_enabled}\n",
+            "    project: {cloud_run_project}\n",
+            "    region: {cloud_run_region}\n",
+            "    docker: {cloud_run_docker}\n",
         ),
         project = cfg.project,
         smtp_port = s.smtp_port,
@@ -1417,6 +1514,8 @@ pub fn default_config_yaml(cfg: &Config) -> String {
         pubsub_grpc_port = s.pubsub_grpc_port,
         pubsub_rest_port = s.pubsub_rest_port,
         app_auto_scaling_port = s.app_auto_scaling_port,
+        lambda_port = s.lambda_port,
+        cloud_run_port = s.cloud_run_port,
         smtp_mode = a.smtp.mode,
         smtp_user = a.smtp.username,
         smtp_password = a.smtp.password,
@@ -1450,6 +1549,12 @@ pub fn default_config_yaml(cfg: &Config) -> String {
         aas_access_key_id = a.app_auto_scaling.access_key_id,
         aas_secret_access_key = a.app_auto_scaling.secret_access_key,
         aas_account_id = a.app_auto_scaling.account_id,
+        lambda_auth_mode = a.lambda.mode,
+        lambda_access_key_id = a.lambda.access_key_id,
+        lambda_secret_access_key = a.lambda.secret_access_key,
+        lambda_account_id = a.lambda.account_id,
+        cloud_run_auth_mode = a.cloud_run.mode,
+        cloud_run_bearer_token = a.cloud_run.bearer_token,
         storage_path = cfg.storage.path,
         mail_enabled = fmt_bool(sv.mail.enabled),
         mail_max_message_bytes = sv.mail.max_message_bytes,
@@ -1535,6 +1640,12 @@ pub fn default_config_yaml(cfg: &Config) -> String {
         pubsub_enable_push = fmt_bool(sv.pubsub.enable_push),
         aas_enabled = fmt_bool(sv.app_auto_scaling.enabled),
         aas_region = sv.app_auto_scaling.region,
+        lambda_enabled = fmt_bool(sv.lambda.enabled),
+        lambda_region = sv.lambda.region,
+        cloud_run_enabled = fmt_bool(sv.cloud_run.enabled),
+        cloud_run_project = sv.cloud_run.project,
+        cloud_run_region = sv.cloud_run.region,
+        cloud_run_docker = fmt_bool(sv.cloud_run.docker),
     )
 }
 
@@ -1623,6 +1734,14 @@ pub fn init_workspace(cfg: &Config) -> io::Result<()> {
         &path_join(&cfg.storage.path, "applicationautoscaling"),
         "create applicationautoscaling storage",
     )?;
+    mkdir_all(
+        &path_join(&cfg.storage.path, "lambda"),
+        "create lambda storage",
+    )?;
+    mkdir_all(
+        &path_join(&cfg.storage.path, "cloudrun"),
+        "create cloudrun storage",
+    )?;
     mkdir_all(&pubsub_data_dir(cfg), "create pubsub storage")?;
     mkdir_all(&pubsub_message_data_dir(cfg), "create message storage")?;
     mkdir_all(&path_join(&cfg.storage.path, "kv"), "create kv storage")?;
@@ -1693,6 +1812,8 @@ const SERVICE_TOGGLES: &[&str] = &[
     "sqs",
     "pubsub",
     "appautoscaling",
+    "lambda",
+    "cloudrun",
 ];
 
 /// legacy `ServiceNames`: canonical service identifiers, alphabetically sorted.
@@ -1715,6 +1836,8 @@ fn set_service_enabled(cfg: &mut Config, name: &str, v: bool) {
         "sqs" => cfg.services.sqs.enabled = v,
         "pubsub" => cfg.services.pubsub.enabled = v,
         "appautoscaling" => cfg.services.app_auto_scaling.enabled = v,
+        "lambda" => cfg.services.lambda.enabled = v,
+        "cloudrun" => cfg.services.cloud_run.enabled = v,
         _ => {}
     }
 }
@@ -1740,6 +1863,11 @@ fn service_aliases() -> HashMap<&'static str, &'static str> {
         ("app-autoscaling", "appautoscaling"),
         ("app_autoscaling", "appautoscaling"),
         ("applicationautoscaling", "appautoscaling"),
+        ("lambda", "lambda"),
+        ("cloudrun", "cloudrun"),
+        ("cloud-run", "cloudrun"),
+        ("cloud_run", "cloudrun"),
+        ("run", "cloudrun"),
     ])
 }
 
@@ -1819,6 +1947,8 @@ mod tests {
         "server.pubsubGrpcPort",
         "server.pubsubRestPort",
         "server.appAutoScalingPort",
+        "server.lambdaPort",
+        "server.cloudRunPort",
         "services.dynamodb.maxTables",
         "services.dynamodb.ttl.schedulerIntervalSeconds",
         "services.bigquery.query.maxResultRows",
@@ -1923,7 +2053,9 @@ mod tests {
     fn default_yaml_first_and_last_lines() {
         let yaml = default_config_yaml(&default_config());
         assert!(yaml.starts_with("project: dev\n\nserver:\n"));
-        assert!(yaml.ends_with("  appAutoScaling:\n    enabled: true\n    region: us-east-1\n"));
+        assert!(yaml.ends_with(
+            "  cloudRun:\n    enabled: true\n    project: devcloud\n    region: us-central1\n    docker: false\n"
+        ));
     }
 
     #[test]
@@ -1939,8 +2071,10 @@ mod tests {
             vec![
                 "appautoscaling",
                 "bigquery",
+                "cloudrun",
                 "dynamodb",
                 "gcs",
+                "lambda",
                 "mail",
                 "pubsub",
                 "redis",

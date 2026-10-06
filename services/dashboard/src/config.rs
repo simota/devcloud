@@ -72,6 +72,22 @@ pub struct Config {
     pub app_auto_scaling_endpoint: String,
     pub app_auto_scaling_storage_path: String,
     pub app_auto_scaling_region: String,
+
+    pub lambda_base: String,
+    pub lambda_endpoint: String,
+    pub lambda_storage_path: String,
+    pub lambda_region: String,
+    pub lambda_auth_mode: String,
+    pub lambda_access_key_id: String,
+    pub lambda_secret_access_key: String,
+
+    pub cloudrun_base: String,
+    pub cloudrun_endpoint: String,
+    pub cloudrun_storage_path: String,
+    pub cloudrun_project: String,
+    pub cloudrun_region: String,
+    pub cloudrun_auth_mode: String,
+    pub cloudrun_bearer_token: String,
 }
 
 impl Config {
@@ -159,6 +175,34 @@ impl Config {
                 "DEVCLOUD_DASHBOARD_APPAUTOSCALING_REGION",
                 "us-east-1",
             ),
+
+            lambda_base: env("DEVCLOUD_DASHBOARD_LAMBDA_BASE"),
+            lambda_endpoint: env_or(
+                "DEVCLOUD_DASHBOARD_LAMBDA_ENDPOINT",
+                "http://127.0.0.1:19010",
+            ),
+            lambda_storage_path: env_or(
+                "DEVCLOUD_DASHBOARD_LAMBDA_STORAGE",
+                ".devcloud/data/lambda",
+            ),
+            lambda_region: env_or("DEVCLOUD_DASHBOARD_LAMBDA_REGION", "us-east-1"),
+            lambda_auth_mode: env_or("DEVCLOUD_DASHBOARD_LAMBDA_AUTH_MODE", "relaxed"),
+            lambda_access_key_id: env("DEVCLOUD_DASHBOARD_LAMBDA_ACCESS_KEY"),
+            lambda_secret_access_key: env("DEVCLOUD_DASHBOARD_LAMBDA_SECRET_KEY"),
+
+            cloudrun_base: env("DEVCLOUD_DASHBOARD_CLOUDRUN_BASE"),
+            cloudrun_endpoint: env_or(
+                "DEVCLOUD_DASHBOARD_CLOUDRUN_ENDPOINT",
+                "http://127.0.0.1:18095",
+            ),
+            cloudrun_storage_path: env_or(
+                "DEVCLOUD_DASHBOARD_CLOUDRUN_STORAGE",
+                ".devcloud/data/cloudrun",
+            ),
+            cloudrun_project: env_or("DEVCLOUD_DASHBOARD_CLOUDRUN_PROJECT", "devcloud"),
+            cloudrun_region: env_or("DEVCLOUD_DASHBOARD_CLOUDRUN_REGION", "us-central1"),
+            cloudrun_auth_mode: env_or("DEVCLOUD_DASHBOARD_CLOUDRUN_AUTH_MODE", "relaxed"),
+            cloudrun_bearer_token: env("DEVCLOUD_DASHBOARD_CLOUDRUN_BEARER_TOKEN"),
         }
     }
 }
