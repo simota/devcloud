@@ -1,0 +1,93 @@
+//! `devcloud-lambda` binary: serves the Lambda REST API without the orchestrator.
+//!
+//! Configuration comes from environment variables:
+//!
+//!   DEVCLOUD_LAMBDA_ADDR       listen address (host:port), default 127.0.0.1:0
+//!   DEVCLOUD_LAMBDA_STORAGE    function state + package root, required
+//!   DEVCLOUD_LAMBDA_ENDPOINT   public base URL for `Code.Location`, default http://<addr>
+//!   DEVCLOUD_LAMBDA_REGION     default us-east-1
+//!   DEVCLOUD_LAMBDA_ACCOUNT_ID default 000000000000
+//!   DEVCLOUD_LAMBDA_AUTH_MODE  relaxed (default), signed-relaxed, or strict
+//!   DEVCLOUD_LAMBDA_ACCESS_KEY_ID / DEVCLOUD_LAMBDA_SECRET_ACCESS_KEY strict-mode creds
+//!   DEVCLOUD_LAMBDA_S3_STORAGE devcloud-s3 storage root, enabling Code.S3Bucket/S3Key (optional)
+
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use devcloud_lambda::{Config, Server};
+
+fn env(name: &str) -> String {
+    std::env::var(name).unwrap_or_default()
+}
+
+fn env_or(name: &str, default: &str) -> String {
+    std::env::var(name)
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| default.to_string())
+}
+
+fn main() {
+    let addr = env_or("DEVCLOUD_LAMBDA_ADDR", "127.0.0.1:0");
+    let storage = env("DEVCLOUD_LAMBDA_STORAGE");
+    if storage.is_empty() {
+        eprintln!("devcloud-lambda: DEVCLOUD_LAMBDA_STORAGE is required");
+        std::process::exit(2);
+    }
+    let s3_storage = env("DEVCLOUD_LAMBDA_S3_STORAGE");
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("build tokio runtime");
+
+    runtime.block_on(async move {
+        let listener = match tokio::net::TcpListener::bind(&addr).await {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("devcloud-lambda: bind {addr}: {e}");
+                std::process::exit(1);
+            }
+        };
+        // Resolved after bind so port 0 reports the real port.
+        let bound = listener.local_addr().map(|a| a.to_string()).unwrap_or(addr);
+        let config = Config {
+            endpoint: env_or("DEVCLOUD_LAMBDA_ENDPOINT", &format!("http://{bound}")),
+            addr: bound,
+            region: env_or("DEVCLOUD_LAMBDA_REGION", "us-east-1"),
+            account_id: env_or("DEVCLOUD_LAMBDA_ACCOUNT_ID", "000000000000"),
+            auth_mode: env("DEVCLOUD_LAMBDA_AUTH_MODE"),
+            access_key_id: env("DEVCLOUD_LAMBDA_ACCESS_KEY_ID"),
+            secret_access_key: env("DEVCLOUD_LAMBDA_SECRET_ACCESS_KEY"),
+            storage_path: storage,
+            object_store_root: (!s3_storage.is_empty()).then(|| PathBuf::from(s3_storage)),
+            interpreters: Default::default(),
+        };
+        let server = Arc::new(Server::new(config));
+        if let Some(err) = server.load_err() {
+            eprintln!("devcloud-lambda: failed to load state: {err}");
+            std::process::exit(1);
+        }
+        if let Err(e) = devcloud_lambda::http::serve(listener, server, shutdown_signal()).await {
+            eprintln!("devcloud-lambda: serve error: {e}");
+            std::process::exit(1);
+        }
+    });
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut sigint = signal(SignalKind::interrupt()).expect("install SIGINT handler");
+        let mut sigterm = signal(SignalKind::terminate()).expect("install SIGTERM handler");
+        tokio::select! {
+            _ = sigint.recv() => {}
+            _ = sigterm.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}

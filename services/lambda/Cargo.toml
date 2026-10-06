@@ -8,9 +8,13 @@ description = "Local AWS Lambda emulator for devcloud: Lambda REST API (function
 name = "devcloud_lambda"
 path = "src/lib.rs"
 
+[[bin]]
+name = "devcloud-lambda"
+path = "src/main.rs"
+
 [dependencies]
 # Same hand-rolled HTTP/1.1-on-tokio approach as the other AWS-protocol crates.
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "io-util", "process", "time", "sync", "fs"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "io-util", "process", "time", "sync", "fs", "signal"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 hmac = "0.12"
