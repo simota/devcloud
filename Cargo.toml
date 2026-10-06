@@ -12,6 +12,7 @@ members = [
   "services/dynamodb",
   "services/event-relay",
   "services/gcs",
+  "services/lambda",
   "services/mail",
   "services/mailbox",
   "services/pubsub",
