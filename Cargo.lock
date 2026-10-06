@@ -208,6 +208,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "devcloud-cloudrun"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+]
+
+[[package]]
 name = "devcloud-dashboard"
 version = "0.1.0"
 dependencies = [

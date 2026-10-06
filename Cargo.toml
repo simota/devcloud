@@ -8,6 +8,7 @@ members = [
   "orchestrator",
   "services/applicationautoscaling",
   "services/bigquery",
+  "services/cloudrun",
   "services/dashboard",
   "services/dynamodb",
   "services/event-relay",
