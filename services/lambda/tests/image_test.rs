@@ -701,3 +701,45 @@ async fn shutdown_waits_for_containers_of_cancelled_invocations() {
         "shutdown returned before the cancelled invocation's container was removed"
     );
 }
+
+#[tokio::test]
+async fn a_missing_docker_cli_is_explained() {
+    let e = env("nocli", Some("/nonexistent/devcloud-test/docker"));
+    assert_eq!(
+        create_image(&e.server, "img-fn", "my-repo/fn:1", 3)
+            .await
+            .status,
+        201
+    );
+    let body = json!({
+        "FunctionName": "ep-fn", "PackageType": "Image", "Role": "r",
+        "ImageConfig": { "EntryPoint": ["/lambda-entrypoint.sh"] },
+        "Code": { "ImageUri": "my-repo/fn:1" },
+    });
+    assert_eq!(
+        call(
+            &e.server,
+            "POST",
+            "/2015-03-31/functions",
+            &[],
+            body.to_string().as_bytes()
+        )
+        .await
+        .status,
+        201
+    );
+    // Both the plain run and the EntryPoint-only path (image inspect first).
+    for name in ["img-fn", "ep-fn"] {
+        let r = invoke(&e.server, name, b"{}").await;
+        assert_eq!(r.status, 502);
+        let msg = String::from_utf8_lossy(&r.body).into_owned();
+        assert!(
+            msg.contains("was not found on devcloud's PATH"),
+            "{name}: {msg}"
+        );
+        assert!(
+            msg.contains("run devcloud-lambda (or devcloud) on the host"),
+            "{name}: {msg}"
+        );
+    }
+}

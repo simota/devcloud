@@ -71,6 +71,13 @@ fn main() {
         }
     };
 
+    let docker = (env("DEVCLOUD_LAMBDA_DOCKER") == "true").then(|| "docker".to_string());
+    if docker.is_some() && !on_path("docker") {
+        eprintln!(
+            "devcloud-lambda: warning: DEVCLOUD_LAMBDA_DOCKER=true but no docker CLI is on PATH; invoking container image functions will fail (this Docker image does not include Docker)"
+        );
+    }
+
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -97,7 +104,7 @@ fn main() {
             storage_path: storage,
             object_store_root: (!s3_storage.is_empty()).then(|| PathBuf::from(s3_storage)),
             interpreters: devcloud_lambda::runtime::Interpreters {
-                docker: (env("DEVCLOUD_LAMBDA_DOCKER") == "true").then(|| "docker".to_string()),
+                docker,
                 ..Default::default()
             },
             function_credentials,
@@ -114,6 +121,11 @@ fn main() {
             std::process::exit(1);
         }
     });
+}
+
+fn on_path(bin: &str) -> bool {
+    std::env::var_os("PATH")
+        .is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join(bin).is_file()))
 }
 
 async fn shutdown_signal() {
