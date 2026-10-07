@@ -80,6 +80,10 @@ pub struct Config {
     /// Directory standing in for Lambda's `/opt` (layer contents); `None`
     /// means `/opt` itself.
     pub opt_dir: Option<PathBuf>,
+    /// How long an idle execution environment is kept warm; `None` means
+    /// [`runtime::DEFAULT_IDLE_TIMEOUT`], zero disables reuse (every
+    /// invocation is a cold start).
+    pub idle_timeout: Option<std::time::Duration>,
 }
 
 /// One HTTP reply: status, extra headers, body. `X-Amzn-ErrorType` is carried
@@ -206,6 +210,8 @@ pub struct Server {
     function_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     /// Async (`Event`) invocations still running; aborted on shutdown.
     background: Mutex<Background>,
+    /// Warm execution environments.
+    pool: Arc<runtime::Pool>,
 }
 
 #[derive(Default)]
@@ -236,9 +242,15 @@ impl Server {
             code: CodeStore::new(PathBuf::from(&config.storage_path).join("functions")),
             function_locks: Mutex::new(HashMap::new()),
             background: Mutex::new(Background::default()),
+            pool: runtime::Pool::new(
+                PathBuf::from(&config.storage_path).join("environments"),
+                config.idle_timeout.unwrap_or(runtime::DEFAULT_IDLE_TIMEOUT),
+            ),
             config,
         };
         if !server.config.storage_path.is_empty() {
+            // Scratch space of environments a previous process left behind.
+            let _ = std::fs::remove_dir_all(server.storage().join("environments"));
             if let Err(e) = server.load() {
                 server.load_err = Some(e);
             }
@@ -643,11 +655,13 @@ impl Server {
                 rec.ephemeral_storage_size = size;
             }
             rec.last_modified = now_lambda();
-            rec.revision_id = new_revision.clone();
-            Ok(rec.clone())
+            let retired = std::mem::replace(&mut rec.revision_id, new_revision.clone());
+            Ok((rec.clone(), retired))
         });
         match result {
-            Ok(rec) => {
+            Ok((rec, retired)) => {
+                // Environments of the previous revision can never serve again.
+                self.pool.retire(&name, &retired);
                 emit("lambda.function.updated", json!({ "functionName": name }));
                 Reply::json(200, &self.configuration_json(&rec))
             }
@@ -720,14 +734,16 @@ impl Server {
                 rec.architectures = a;
             }
             rec.last_modified = now_lambda();
-            rec.revision_id = new_revision.clone();
-            Ok((rec.clone(), previous))
+            let retired = std::mem::replace(&mut rec.revision_id, new_revision.clone());
+            Ok((rec.clone(), previous, retired))
         });
         match result {
-            Ok((rec, previous)) => {
+            Ok((rec, previous, retired)) => {
                 if previous != rec.code_sha256 {
                     self.code.retire(&name, &previous);
                 }
+                // Environments of the previous revision can never serve again.
+                self.pool.retire(&name, &retired);
                 emit("lambda.function.updated", json!({ "functionName": name }));
                 Reply::json(200, &self.configuration_json(&rec))
             }
@@ -757,6 +773,7 @@ impl Server {
             Err(r) => return r,
         };
         // Running invocations keep their tree until they finish.
+        self.pool.retire(&name, &removed.revision_id);
         self.code.retire(&name, &removed.code_sha256);
         emit("lambda.function.deleted", json!({ "functionName": name }));
         Reply::empty(204)
@@ -957,7 +974,6 @@ impl Server {
             runtime: record.runtime.clone(),
             handler: record.handler.clone(),
             code_dir: lease.dir().to_path_buf(),
-            work_dir: self.storage().join("invocations").join(&request_id),
             function_name: record.function_name.clone(),
             function_arn: self.function_arn(&record.function_name),
             memory_size: record.memory_size,
@@ -972,6 +988,7 @@ impl Server {
                 .clone()
                 .unwrap_or_else(|| PathBuf::from("/opt")),
             credentials: self.config.function_credentials.clone(),
+            env_key: record.revision_id.clone(),
         };
 
         if invocation_type == "Event" {
@@ -1018,16 +1035,18 @@ impl Server {
         }
     }
 
-    /// Runs one invocation. `_lease` pins the code tree it started with until
-    /// the handler process is done, even if the code is updated meanwhile.
+    /// Runs one invocation. `lease` pins the code tree it started with until
+    /// the handler is done (or, for a new environment, until the environment
+    /// stops), even if the code is updated meanwhile.
     async fn execute(
         &self,
         inv: Invocation,
         invocation_type: &str,
-        _lease: Lease,
+        lease: Lease,
     ) -> Result<(Outcome, String), RuntimeError> {
         let started_at = now_rfc3339();
-        let result = runtime::run(&inv, &self.config.interpreters).await;
+        let result =
+            runtime::run(&inv, &self.config.interpreters, &self.pool, Box::new(lease)).await;
         let (status, duration_ms, log) = match &result {
             Ok(done) => (
                 match done.outcome {
@@ -1081,6 +1100,12 @@ impl Server {
         };
         tasks.abort_all();
         while tasks.join_next().await.is_some() {}
+        self.pool.close();
+    }
+
+    /// Warm execution environments currently idle for `function`.
+    pub fn idle_environments(&self, function: &str) -> usize {
+        self.pool.idle_count(function)
     }
 
     fn not_found(&self, name: &str) -> Reply {

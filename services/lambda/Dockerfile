@@ -11,7 +11,8 @@
 # Handlers run as python3 / node child processes inside this container, using
 # Debian bookworm's interpreters (Python 3.11, Node 18) whatever the function's
 # Runtime version says; a mismatch is flagged as a [WARNING] line in the
-# invocation log. Every invocation starts a fresh process (no warm starts).
+# invocation log. Environments stay warm between invocations for
+# DEVCLOUD_LAMBDA_IDLE_TIMEOUT_SECONDS (default 300; 0 = always cold).
 # Layer contents: mount them at /opt (e.g. -v ./deps:/opt/python); /opt/python
 # and /opt/nodejs/node_modules are on the default PYTHONPATH / NODE_PATH.
 # Credentials for handlers: DEVCLOUD_LAMBDA_FUNCTION_ACCESS_KEY_ID /

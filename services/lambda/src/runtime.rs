@@ -1,307 +1,39 @@
-//! Local execution of one Lambda invocation.
+//! Local execution of Lambda invocations in reusable execution environments.
 //!
-//! Each invocation spawns a fresh interpreter (`python3` / `node`) with a small
-//! embedded bootstrap that imports the configured handler, feeds it the event
-//! on stdin, and writes the handler outcome as JSON to a per-invocation result
-//! file. stdout/stderr become the invocation log. The child runs with a cleared
-//! environment (only `PATH`, Lambda's reserved variables, and the function's own
-//! `Environment.Variables`), so host credentials never leak into handler code;
-//! the only credentials a handler sees are the ones configured for functions
-//! ([`FunctionCredentials`]).
+//! An environment is one interpreter process (`python3` / `node`) running a
+//! small embedded bootstrap (`bootstrap/`): it loads the configured handler
+//! once (the init phase, reported as `Init Duration`), then serves invocations
+//! one at a time — requests arrive as JSON lines on a private pipe (fd 3; the
+//! handler's own stdin is empty, as on AWS), each outcome goes to
+//! a per-request result file, and a marker line on stdout ends the invocation
+//! and its slice of the log. Idle environments are kept warm in a [`Pool`].
+//! The child runs with a cleared environment (only `PATH`, Lambda's reserved
+//! variables, and the function's own `Environment.Variables`), so host
+//! credentials never leak into handler code; the only credentials a handler
+//! sees are the ones configured for functions ([`FunctionCredentials`]).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::mpsc;
 
 /// Per-stream log bytes kept while an invocation runs (the API tail is 4 KiB).
 const LOG_CAPTURE_BYTES: usize = 64 * 1024;
 
+/// Default for how long an idle environment is kept warm.
+pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+
 /// How long log readers may keep draining after the process group is killed.
 const LOG_DRAIN_GRACE: Duration = Duration::from_millis(500);
 
-const PYTHON_BOOTSTRAP: &str = r#"
-import importlib, json, os, sys, time, traceback
-
-def _devcloud_main():
-    result_path = os.environ.pop("_DEVCLOUD_RESULT_PATH")
-    deadline_ms = int(os.environ.pop("_DEVCLOUD_DEADLINE_MS"))
-    request_id = os.environ.pop("_DEVCLOUD_REQUEST_ID")
-    function_arn = os.environ.pop("_DEVCLOUD_FUNCTION_ARN")
-    expected_version = os.environ.pop("_DEVCLOUD_RUNTIME_VERSION", "")
-    real_stdout = sys.stdout
-    sys.stderr = sys.stdout
-    actual_version = "%d.%d" % sys.version_info[:2]
-    if expected_version and expected_version != actual_version:
-        print("[WARNING] devcloud: runtime %s is running on Python %s (%s)" % (os.environ["AWS_EXECUTION_ENV"][len("AWS_Lambda_"):], sys.version.split()[0], sys.executable))
-
-    def write(obj):
-        with open(result_path, "w") as f:
-            json.dump(obj, f)
-
-    def failure(message, error_type, stack):
-        write({"error": {"errorMessage": message, "errorType": error_type, "requestId": request_id, "stackTrace": stack}})
-
-    class LambdaContext:
-        function_name = os.environ["AWS_LAMBDA_FUNCTION_NAME"]
-        function_version = os.environ["AWS_LAMBDA_FUNCTION_VERSION"]
-        invoked_function_arn = function_arn
-        memory_limit_in_mb = os.environ["AWS_LAMBDA_FUNCTION_MEMORY_SIZE"]
-        aws_request_id = request_id
-        log_group_name = os.environ["AWS_LAMBDA_LOG_GROUP_NAME"]
-        log_stream_name = os.environ["AWS_LAMBDA_LOG_STREAM_NAME"]
-        identity = None
-        client_context = None
-
-        def get_remaining_time_in_millis(self):
-            return max(0, deadline_ms - int(time.time() * 1000))
-
-    root = os.environ["LAMBDA_TASK_ROOT"]
-    sys.path.insert(0, root)
-    handler_spec = os.environ["_HANDLER"]
-    module_name, _, func_name = handler_spec.rpartition(".")
-    if not module_name:
-        failure("Bad handler '%s': not enough values to unpack (expected 2, got 1)" % handler_spec, "Runtime.MalformedHandlerName", [])
-        return
-    try:
-        module = importlib.import_module(module_name.replace("/", "."))
-    except Exception as e:
-        failure("Unable to import module '%s': %s" % (module_name, e), "Runtime.ImportModuleError", [])
-        return
-    handler = getattr(module, func_name, None)
-    if handler is None:
-        failure("Handler '%s' missing on module '%s'" % (func_name, module_name), "Runtime.HandlerNotFound", [])
-        return
-    event = json.loads(sys.stdin.read() or "{}")
-    try:
-        result = handler(event, LambdaContext())
-    except Exception as e:
-        frames = traceback.extract_tb(e.__traceback__)[1:]
-        print("[ERROR] %s: %s" % (type(e).__name__, e))
-        failure(str(e), type(e).__name__, traceback.format_list(frames))
-        return
-    try:
-        body = json.dumps(result)
-    except Exception as e:
-        failure("Unable to marshal response: %s" % e, "Runtime.MarshalError", [])
-        return
-    real_stdout.flush()
-    write({"result": body})
-
-try:
-    _devcloud_main()
-except BaseException:
-    traceback.print_exc()
-finally:
-    # The result is on disk: end now. A normal interpreter exit would wait
-    # for non-daemon threads the handler left behind and turn a finished
-    # invocation into a timeout.
-    sys.stdout.flush()
-    sys.__stdout__.flush()
-    sys.__stderr__.flush()
-    os._exit(0)
-"#;
-
-const NODE_BOOTSTRAP: &str = r#"
-const fs = require('fs');
-const path = require('path');
-const url = require('url');
-
-// Node's ESM loader ignores NODE_PATH, which is how layer dependencies under
-// /opt are found. As in the Lambda Node runtime, ES module handlers resolve
-// them too: a resolve hook retries a bare specifier the default resolution
-// could not find against each NODE_PATH directory.
-const ESM_LAYER_HOOK = `
-import { createRequire } from 'node:module';
-import path from 'node:path';
-import { pathToFileURL } from 'node:url';
-let dirs = [];
-export function initialize(data) { dirs = data.dirs; }
-export async function resolve(specifier, context, next) {
-  try {
-    return await next(specifier, context);
-  } catch (e) {
-    const bare = !/^([./]|[a-zA-Z][a-zA-Z0-9+.-]*:)/.test(specifier);
-    if (!bare || !e || e.code !== 'ERR_MODULE_NOT_FOUND') throw e;
-    for (const dir of dirs) {
-      // ESM resolution looks in <ancestor>/node_modules of the parent.
-      if (path.basename(dir) === 'node_modules') {
-        try {
-          return await next(specifier, { ...context, parentURL: pathToFileURL(path.join(path.dirname(dir), 'index.mjs')).href });
-        } catch {}
-      }
-      try {
-        // CommonJS resolution honours NODE_PATH as is (any directory name).
-        const file = createRequire(path.join(dir, 'index.js')).resolve(specifier);
-        return { url: pathToFileURL(file).href, shortCircuit: true };
-      } catch {}
-    }
-    throw e;
-  }
-}
-`;
-// `.mjs`, or `.js` under a package.json with "type": "module" (the nearest
-// package.json decides, as in Node).
-const isEsm = (file) => {
-  if (file.endsWith('.mjs')) return true;
-  if (!file.endsWith('.js')) return false;
-  for (let dir = path.dirname(file); ; dir = path.dirname(dir)) {
-    const pkg = path.join(dir, 'package.json');
-    if (fs.existsSync(pkg)) {
-      try {
-        return JSON.parse(fs.readFileSync(pkg, 'utf8')).type === 'module';
-      } catch {
-        return false;
-      }
-    }
-    if (path.dirname(dir) === dir) return false;
-  }
-};
-
-let esmHookRegistered = false;
-const importEsm = (file) => {
-  const dirs = (process.env.NODE_PATH || '').split(path.delimiter).filter(Boolean);
-  const { register } = require('module');
-  if (!esmHookRegistered && dirs.length && typeof register === 'function') {
-    register(`data:text/javascript,${encodeURIComponent(ESM_LAYER_HOOK)}`, { data: { dirs } });
-    esmHookRegistered = true;
-  }
-  return import(url.pathToFileURL(file).href);
-};
-
-(async () => {
-  const resultPath = process.env._DEVCLOUD_RESULT_PATH;
-  const deadlineMs = Number(process.env._DEVCLOUD_DEADLINE_MS);
-  const requestId = process.env._DEVCLOUD_REQUEST_ID;
-  const functionArn = process.env._DEVCLOUD_FUNCTION_ARN;
-  const expectedVersion = process.env._DEVCLOUD_RUNTIME_VERSION || '';
-  for (const k of ['_DEVCLOUD_RESULT_PATH', '_DEVCLOUD_DEADLINE_MS', '_DEVCLOUD_REQUEST_ID', '_DEVCLOUD_FUNCTION_ARN', '_DEVCLOUD_RUNTIME_VERSION']) delete process.env[k];
-  process.stderr.write = process.stdout.write.bind(process.stdout);
-  if (expectedVersion && expectedVersion !== process.versions.node.split('.')[0]) {
-    console.log(`[WARNING] devcloud: runtime ${process.env.AWS_EXECUTION_ENV.slice('AWS_Lambda_'.length)} is running on Node.js ${process.versions.node} (${process.execPath})`);
-  }
-  const write = (obj) => fs.writeFileSync(resultPath, JSON.stringify(obj));
-  const errorBody = (e, type) => ({
-    errorType: type || (e && e.name) || 'Error',
-    errorMessage: e && e.message !== undefined ? String(e.message) : String(e),
-    trace: e && e.stack ? String(e.stack).split('\n') : [],
-  });
-  // Pipe writes are asynchronous: exit only once everything queued on stdout
-  // (stderr is routed there too) has been handed to the OS, or the log tail
-  // would be cut off.
-  const done = (obj) => { write(obj); process.stdout.write('', () => process.exit(0)); };
-
-  const root = process.env.LAMBDA_TASK_ROOT;
-  // As in the AWS Node runtime: `dir/module.prop.path` — the module is the
-  // basename up to its *first* dot, the rest is a property path into the
-  // exports (`index.api.handler` → module `index`, `exports.api.handler`).
-  const spec = process.env._HANDLER;
-  const slash = spec.lastIndexOf('/');
-  const dot = spec.indexOf('.', slash + 1);
-  if (dot <= slash + 1 || dot === spec.length - 1) {
-    return done({ error: { errorType: 'Runtime.MalformedHandlerName', errorMessage: `Bad handler ${spec}`, trace: [] } });
-  }
-  const modName = spec.slice(0, dot);
-  const fnName = spec.slice(dot + 1);
-  const fnPath = fnName.split('.');
-  let mod;
-  try {
-    // Like the AWS Node runtime: `<name>.js|.mjs|.cjs` first, then Node's own
-    // resolution (directory index.js, package.json "main"/"exports", ...).
-    const base = path.resolve(root, modName);
-    const file = ['.js', '.mjs', '.cjs'].map((ext) => base + ext).find((f) => fs.existsSync(f))
-      || require.resolve(base);
-    if (isEsm(file)) {
-      // Through import(), never require(): Node 22's require() can load ESM
-      // too, but without the layer resolve hook.
-      mod = await importEsm(file);
-    } else {
-      try {
-        mod = require(file);
-      } catch (e) {
-        // ESM that require() cannot load synchronously (Node 22 can require
-        // some ESM, but not modules with top-level await).
-        if (e && (e.code === 'ERR_REQUIRE_ESM' || e.code === 'ERR_REQUIRE_ASYNC_MODULE')) {
-          mod = await importEsm(file);
-        } else throw e;
-      }
-    }
-  } catch (e) {
-    return done({ error: errorBody(e, 'Runtime.ImportModuleError') });
-  }
-  const walk = (root) => fnPath.reduce((obj, key) => (obj == null ? undefined : obj[key]), root);
-  const fn = walk(mod) !== undefined ? walk(mod) : walk(mod.default);
-  if (typeof fn !== 'function') {
-    return done({ error: { errorType: 'Runtime.HandlerNotFound', errorMessage: `${modName}.${fnName} is undefined or not exported`, trace: [] } });
-  }
-  const event = JSON.parse(fs.readFileSync(0, 'utf8') || '{}');
-  const context = {
-    functionName: process.env.AWS_LAMBDA_FUNCTION_NAME,
-    functionVersion: process.env.AWS_LAMBDA_FUNCTION_VERSION,
-    invokedFunctionArn: functionArn,
-    memoryLimitInMB: process.env.AWS_LAMBDA_FUNCTION_MEMORY_SIZE,
-    awsRequestId: requestId,
-    logGroupName: process.env.AWS_LAMBDA_LOG_GROUP_NAME,
-    logStreamName: process.env.AWS_LAMBDA_LOG_STREAM_NAME,
-    callbackWaitsForEmptyEventLoop: true,
-    getRemainingTimeInMillis: () => Math.max(0, deadlineMs - Date.now()),
-  };
-  let result;
-  let failure;
-  // Separate flag: `Promise.reject()` / `throw undefined` fail with an
-  // undefined reason, which must still be reported as a function error.
-  let failed = false;
-  let settledByCallback = false;
-  try {
-    // Same completion rules as the AWS Node runtime: a returned promise
-    // settles the invocation; otherwise wait for the callback, however the
-    // handler declares it (default value, rest args, `arguments`). If the
-    // event loop drains without a callback, the result is null. `fn.length`
-    // says nothing about whether a callback is coming.
-    result = await new Promise((resolve, reject) => {
-      const callback = (err, res) => {
-        settledByCallback = true;
-        return err ? reject(err) : resolve(res);
-      };
-      // No callback by the time the loop drains → null. Deferred one tick so
-      // a handler that itself calls back from a `beforeExit` listener (in
-      // the same emission) still wins.
-      process.once('beforeExit', () => setImmediate(() => resolve(undefined)));
-      const ret = fn(event, context, callback);
-      if (ret && typeof ret.then === 'function') ret.then(resolve, reject);
-    });
-  } catch (e) {
-    failed = true;
-    failure = e;
-  }
-  if (failed) {
-    console.error(`ERROR\tInvoke Error\t${failure && failure.stack ? failure.stack : failure}`);
-    return done({ error: errorBody(failure) });
-  }
-  let body;
-  try {
-    body = JSON.stringify(result === undefined ? null : result);
-  } catch (e) {
-    return done({ error: errorBody(e, 'Runtime.MarshalError') });
-  }
-  // A successful callback response honours callbackWaitsForEmptyEventLoop
-  // (default true): record the result now and let the process end on its own
-  // once timers and I/O the handler left running have finished — devcloud
-  // waits for the exit (bounded by the function timeout). No second
-  // `beforeExit` is awaited: it may already have fired, e.g. when the handler
-  // itself called back from a `beforeExit` listener. Errors, promise results,
-  // and handlers that set the flag to false end immediately.
-  if (settledByCallback && context.callbackWaitsForEmptyEventLoop) {
-    write({ result: body });
-    return;
-  }
-  done({ result: body });
-})();
-"#;
+const PYTHON_BOOTSTRAP: &str = include_str!("bootstrap/python.py");
+const NODE_BOOTSTRAP: &str = include_str!("bootstrap/node.js");
 
 /// Interpreter family a runtime identifier maps to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -406,7 +138,6 @@ pub struct Invocation {
     pub runtime: String,
     pub handler: String,
     pub code_dir: PathBuf,
-    pub work_dir: PathBuf,
     pub function_name: String,
     pub function_arn: String,
     pub memory_size: i64,
@@ -420,6 +151,9 @@ pub struct Invocation {
     /// `PYTHONPATH` / `NODE_PATH`.
     pub opt_dir: PathBuf,
     pub credentials: Option<FunctionCredentials>,
+    /// The function configuration an environment is started from (its
+    /// revision): only an idle environment with the same key is reused.
+    pub env_key: String,
 }
 
 /// The handler's outcome as Lambda reports it on the wire.
@@ -436,7 +170,10 @@ pub struct Completed {
     pub outcome: Outcome,
     /// Combined log output, framed with START/END/REPORT lines like CloudWatch.
     pub log: String,
+    /// The invoke phase only; a cold start's init is in `init_duration`.
     pub duration: Duration,
+    /// Set on a cold start: how long the environment took to load the handler.
+    pub init_duration: Option<Duration>,
 }
 
 /// A failure to run the function at all (as opposed to a function error).
@@ -454,13 +191,489 @@ struct BootstrapResult {
     error: Option<serde_json::Value>,
 }
 
-pub async fn run(inv: &Invocation, interpreters: &Interpreters) -> Result<Completed, RuntimeError> {
+/// Execution environments kept warm between invocations, per function.
+///
+/// An environment serves one invocation at a time; concurrent invocations of
+/// the same function each get their own. After an invocation the environment
+/// goes back to the pool and is stopped once it has been idle for
+/// `idle_timeout` (zero: never reused, every invocation is a cold start), when
+/// its function is deleted or reconfigured, or when the pool closes.
+pub struct Pool {
+    work_root: PathBuf,
+    idle_timeout: Duration,
+    seq: AtomicU64,
+    state: Mutex<PoolState>,
+}
+
+#[derive(Default)]
+struct PoolState {
+    idle: HashMap<String, Vec<Environment>>,
+    /// Keys (function revisions) that must never serve again. Revision ids
+    /// are never reused, so entries stay valid for the process lifetime.
+    retired: HashSet<String>,
+    closed: bool,
+}
+
+impl Pool {
+    /// `work_root` holds per-environment scratch directories.
+    pub fn new(work_root: PathBuf, idle_timeout: Duration) -> Arc<Self> {
+        Arc::new(Pool {
+            work_root,
+            idle_timeout,
+            seq: AtomicU64::new(0),
+            state: Mutex::new(PoolState::default()),
+        })
+    }
+
+    /// Number of idle environments of `function` (introspection and tests).
+    pub fn idle_count(&self, function: &str) -> usize {
+        let st = self.state.lock().unwrap();
+        st.idle.get(function).map_or(0, Vec::len)
+    }
+
+    /// Retires configuration `key` of `function` (updated or deleted): its
+    /// idle environments stop now, and environments still running an
+    /// invocation stop when it ends instead of returning to the pool.
+    pub fn retire(&self, function: &str, key: &str) {
+        let stopped = {
+            let mut st = self.state.lock().unwrap();
+            st.retired.insert(key.to_string());
+            st.idle.remove(function)
+        };
+        drop(stopped);
+    }
+
+    /// Stops every idle environment and refuses to keep any from now on.
+    pub fn close(&self) {
+        let stopped = {
+            let mut st = self.state.lock().unwrap();
+            st.closed = true;
+            std::mem::take(&mut st.idle)
+        };
+        drop(stopped);
+    }
+
+    /// An idle environment of `function` started from `key`, if one is still
+    /// healthy. Environments of another configuration are stopped: they can
+    /// never be used again.
+    fn take(&self, function: &str, key: &str) -> Option<Environment> {
+        let mut stopped = Vec::new();
+        let mut found = None;
+        {
+            let mut st = self.state.lock().unwrap();
+            let list = st.idle.get_mut(function)?;
+            while let Some(mut env) = list.pop() {
+                if env.key == key && env.healthy() {
+                    found = Some(env);
+                    break;
+                }
+                stopped.push(env);
+            }
+            if list.is_empty() {
+                st.idle.remove(function);
+            }
+        }
+        drop(stopped);
+        found
+    }
+
+    fn give_back(self: &Arc<Self>, function: &str, mut env: Environment) {
+        if self.idle_timeout.is_zero() {
+            return;
+        }
+        env.idle_since = Instant::now();
+        let id = env.id;
+        {
+            let mut st = self.state.lock().unwrap();
+            if st.closed || st.retired.contains(&env.key) {
+                drop(st);
+                drop(env);
+                return;
+            }
+            st.idle.entry(function.to_string()).or_default().push(env);
+        }
+        let pool = Arc::downgrade(self);
+        let function = function.to_string();
+        let idle_timeout = self.idle_timeout;
+        tokio::spawn(async move {
+            tokio::time::sleep(idle_timeout).await;
+            if let Some(pool) = pool.upgrade() {
+                pool.expire(&function, id);
+            }
+        });
+    }
+
+    /// Stops environment `id` if it has been idle for the whole timeout (it
+    /// may have served another invocation since this timer was armed).
+    fn expire(&self, function: &str, id: u64) {
+        let stopped = {
+            let mut st = self.state.lock().unwrap();
+            let Some(list) = st.idle.get_mut(function) else {
+                return;
+            };
+            let Some(pos) = list
+                .iter()
+                .position(|e| e.id == id && e.idle_since.elapsed() >= self.idle_timeout)
+            else {
+                return;
+            };
+            let env = list.swap_remove(pos);
+            if list.is_empty() {
+                st.idle.remove(function);
+            }
+            env
+        };
+        drop(stopped);
+    }
+}
+
+/// What the stdout reader reports: a bootstrap marker line (with the output
+/// that preceded it), or end of stream (with whatever output remained).
+enum StreamEvent {
+    Marker { tag: String, log: Vec<u8> },
+    Eof,
+}
+
+/// Splits a stdout stream at `<prefix><tag>\n` marker lines, keeping only
+/// the newest [`LOG_CAPTURE_BYTES`] of output between markers.
+struct Scanner {
+    prefix: Vec<u8>,
+    buf: Vec<u8>,
+    scan_from: usize,
+}
+
+impl Scanner {
+    fn new(prefix: Vec<u8>) -> Self {
+        Scanner {
+            prefix,
+            buf: Vec::new(),
+            scan_from: 0,
+        }
+    }
+
+    /// Appends `data` and returns every marker it completed, in order.
+    fn push(&mut self, data: &[u8]) -> Vec<(String, Vec<u8>)> {
+        self.buf.extend_from_slice(data);
+        let mut markers = Vec::new();
+        loop {
+            let Some(i) = find(&self.buf[self.scan_from..], &self.prefix) else {
+                self.scan_from = self.buf.len().saturating_sub(self.prefix.len() - 1);
+                break;
+            };
+            let at = self.scan_from + i;
+            let after = at + self.prefix.len();
+            let Some(nl) = self.buf[after..].iter().position(|&b| b == b'\n') else {
+                // The rest of the marker line is still on its way.
+                self.scan_from = at;
+                break;
+            };
+            let tag = String::from_utf8_lossy(&self.buf[after..after + nl]).into_owned();
+            let log = self.buf[..at].to_vec();
+            self.buf.drain(..after + nl + 1);
+            self.scan_from = 0;
+            markers.push((tag, log));
+        }
+        if self.buf.len() > LOG_CAPTURE_BYTES {
+            let excess = (self.buf.len() - LOG_CAPTURE_BYTES).min(self.scan_from);
+            self.buf.drain(..excess);
+            self.scan_from -= excess;
+        }
+        markers
+    }
+
+    /// The output after the last marker.
+    fn take_rest(&mut self) -> Vec<u8> {
+        self.scan_from = 0;
+        std::mem::take(&mut self.buf)
+    }
+}
+
+fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+/// One running bootstrap process: a Lambda execution environment.
+struct Environment {
+    id: u64,
+    key: String,
+    child: tokio::process::Child,
+    pgid: Option<u32>,
+    control: ControlWriter,
+    events: mpsc::UnboundedReceiver<StreamEvent>,
+    stdout: Arc<Mutex<Scanner>>,
+    stderr: Arc<Mutex<Vec<u8>>>,
+    tasks: Vec<tokio::task::AbortHandle>,
+    work_dir: PathBuf,
+    idle_since: Instant,
+    /// Keeps the code tree the environment runs from in place.
+    _code: Box<dyn Send>,
+}
+
+/// How waiting on an environment ended.
+enum Wait {
+    Marker {
+        tag: String,
+        log: Vec<u8>,
+    },
+    /// The process ended; `crashed` describes a non-zero exit or signal.
+    Exited {
+        crashed: Option<String>,
+        log: Vec<u8>,
+    },
+    TimedOut {
+        log: Vec<u8>,
+    },
+}
+
+impl Environment {
+    fn healthy(&mut self) -> bool {
+        matches!(self.child.try_wait(), Ok(None)) && self.events.is_empty()
+    }
+
+    /// Waits for the next marker, the process ending, or `deadline`.
+    async fn wait(&mut self, deadline: tokio::time::Instant) -> Wait {
+        enum Woke {
+            Event(Option<StreamEvent>),
+            Exit(std::io::Result<std::process::ExitStatus>),
+            Deadline,
+        }
+        let woke = tokio::select! {
+            ev = self.events.recv() => Woke::Event(ev),
+            status = self.child.wait() => Woke::Exit(status),
+            _ = tokio::time::sleep_until(deadline) => Woke::Deadline,
+        };
+        let status = match woke {
+            Woke::Event(Some(StreamEvent::Marker { tag, log })) => {
+                let mut log = log;
+                log.extend(self.take_stderr());
+                return Wait::Marker { tag, log };
+            }
+            // stdout closed: the process is ending (or already gone).
+            Woke::Event(_) => match tokio::time::timeout_at(deadline, self.child.wait()).await {
+                Ok(status) => status,
+                Err(_) => {
+                    self.kill_group();
+                    return Wait::TimedOut {
+                        log: self.drain().await,
+                    };
+                }
+            },
+            Woke::Exit(status) => status,
+            Woke::Deadline => {
+                self.kill_group();
+                return Wait::TimedOut {
+                    log: self.drain().await,
+                };
+            }
+        };
+        let crashed = match status {
+            Ok(s) if s.success() => None,
+            Ok(s) => Some(s.to_string()),
+            Err(e) => Some(e.to_string()),
+        };
+        // Descendants still holding the log pipes go down with the group.
+        self.kill_group();
+        Wait::Exited {
+            crashed,
+            log: self.drain().await,
+        }
+    }
+
+    /// The output still buffered once the process group is gone: readers get
+    /// a bounded grace period (a descendant that escaped the group can keep a
+    /// pipe open forever), then whatever they collected is kept.
+    async fn drain(&mut self) -> Vec<u8> {
+        let mut log = Vec::new();
+        let deadline = tokio::time::Instant::now() + LOG_DRAIN_GRACE;
+        while let Ok(Some(ev)) = tokio::time::timeout_at(deadline, self.events.recv()).await {
+            match ev {
+                StreamEvent::Marker { log: part, .. } => log.extend(part),
+                StreamEvent::Eof => break,
+            }
+        }
+        log.extend(self.stdout.lock().unwrap().take_rest());
+        log.extend(self.take_stderr());
+        log
+    }
+
+    fn take_stderr(&self) -> Vec<u8> {
+        std::mem::take(&mut *self.stderr.lock().unwrap())
+    }
+
+    /// Kills the group once; later calls (and the drop) are no-ops, so a
+    /// recycled process-group id is never signalled.
+    fn kill_group(&mut self) {
+        if let Some(pgid) = self.pgid.take() {
+            kill_process_group(pgid);
+        }
+    }
+}
+
+impl Drop for Environment {
+    fn drop(&mut self) {
+        self.kill_group();
+        for task in &self.tasks {
+            task.abort();
+        }
+        let _ = std::fs::remove_dir_all(&self.work_dir);
+    }
+}
+
+/// Runs one invocation, in a warm environment from `pool` when there is one,
+/// otherwise in a new one (a cold start). `code` keeps the invocation's code
+/// tree in place; a new environment holds on to it for its whole life.
+pub async fn run(
+    inv: &Invocation,
+    interpreters: &Interpreters,
+    pool: &Arc<Pool>,
+    code: Box<dyn Send>,
+) -> Result<Completed, RuntimeError> {
     let family =
         family(&inv.runtime).ok_or_else(|| RuntimeError::Unsupported(inv.runtime.clone()))?;
-    std::fs::create_dir_all(&inv.work_dir).map_err(|e| RuntimeError::Spawn(e.to_string()))?;
-    let result_path = inv.work_dir.join("result.json");
+    let timeout = Duration::from_secs(inv.timeout_seconds.max(1) as u64);
+
+    let (mut env, init) = match pool.take(&inv.function_name, &inv.env_key) {
+        Some(env) => (env, None),
+        None => {
+            let started = Instant::now();
+            let mut env = spawn(family, inv, interpreters, pool, code)?;
+            // Init gets its own budget of one function timeout.
+            match env.wait(tokio::time::Instant::now() + timeout).await {
+                Wait::Marker { tag, log } if tag == "ready" => {
+                    (env, Some((started.elapsed(), log)))
+                }
+                other => return Ok(failed_init(inv, other, started.elapsed())),
+            }
+        }
+    };
+
+    let result_path = env.work_dir.join(format!("{}.json", inv.request_id));
+    let deadline_ms = now_millis() + timeout.as_millis();
+    let request = serde_json::json!({
+        "requestId": inv.request_id,
+        "deadlineMs": deadline_ms as u64,
+        "resultPath": result_path,
+        "event": String::from_utf8_lossy(&inv.payload),
+    });
+    let mut line = serde_json::to_vec(&request).unwrap_or_default();
+    line.push(b'\n');
+
     let started = Instant::now();
-    let deadline_ms = now_millis() + inv.timeout_seconds.max(1) as u128 * 1000;
+    let deadline = tokio::time::Instant::now() + timeout;
+    // A dead environment fails the write; `wait` then reports how it ended.
+    let _ = tokio::time::timeout_at(deadline, env.control.write_all(&line)).await;
+    let waited = env.wait(deadline).await;
+    let duration = started.elapsed();
+
+    let mut reusable = false;
+    let (outcome, body, timed_out) = match waited {
+        Wait::Marker { tag, log } => {
+            reusable = tag == "done";
+            (read_result(&result_path), log, false)
+        }
+        Wait::Exited {
+            crashed: Some(status),
+            log,
+        } => (
+            Outcome::FunctionError(error_doc(
+                &format!(
+                    "RequestId: {} Error: Runtime exited with error: {status}",
+                    inv.request_id
+                ),
+                "Runtime.ExitError",
+            )),
+            log,
+            false,
+        ),
+        // A clean exit can still have recorded the result (a Node callback
+        // whose event loop had already drained).
+        Wait::Exited { crashed: None, log } => (read_result(&result_path), log, false),
+        Wait::TimedOut { log } => (timed_out_error(inv), log, true),
+    };
+    let _ = std::fs::remove_file(&result_path);
+
+    let log = frame_log(
+        inv,
+        init.as_ref()
+            .map(|(d, log)| (*d, String::from_utf8_lossy(log).into_owned())),
+        &String::from_utf8_lossy(&body),
+        duration,
+        timed_out,
+    );
+    if reusable {
+        pool.give_back(&inv.function_name, env);
+    }
+    Ok(Completed {
+        outcome,
+        log,
+        duration,
+        init_duration: init.map(|(d, _)| d),
+    })
+}
+
+/// The invocation's result when the environment never became ready.
+fn failed_init(inv: &Invocation, waited: Wait, init: Duration) -> Completed {
+    let (outcome, log, timed_out) = match waited {
+        Wait::TimedOut { log } => (timed_out_error(inv), log, true),
+        Wait::Exited { crashed, log } => (
+            Outcome::FunctionError(error_doc(
+                &format!(
+                    "RequestId: {} Error: Runtime exited with error: {}",
+                    inv.request_id,
+                    crashed.unwrap_or_else(|| "exit status 0".to_string())
+                ),
+                "Runtime.ExitError",
+            )),
+            log,
+            false,
+        ),
+        Wait::Marker { log, .. } => (
+            Outcome::FunctionError(error_doc(
+                "runtime produced an invalid result",
+                "Runtime.InvalidResult",
+            )),
+            log,
+            false,
+        ),
+    };
+    Completed {
+        outcome,
+        log: frame_log(
+            inv,
+            Some((init, String::from_utf8_lossy(&log).into_owned())),
+            "",
+            Duration::ZERO,
+            timed_out,
+        ),
+        duration: Duration::ZERO,
+        init_duration: Some(init),
+    }
+}
+
+fn timed_out_error(inv: &Invocation) -> Outcome {
+    Outcome::FunctionError(error_doc(
+        &format!(
+            "{} {} Task timed out after {}.00 seconds",
+            crate::time_fmt::now_rfc3339(),
+            inv.request_id,
+            inv.timeout_seconds.max(1)
+        ),
+        "Sandbox.Timedout",
+    ))
+}
+
+/// Starts a bootstrap process for `inv`'s function.
+fn spawn(
+    family: Family,
+    inv: &Invocation,
+    interpreters: &Interpreters,
+    pool: &Pool,
+    code: Box<dyn Send>,
+) -> Result<Environment, RuntimeError> {
+    let id = pool.seq.fetch_add(1, Ordering::Relaxed);
+    let work_dir = pool.work_root.join(format!("env-{id}"));
+    std::fs::create_dir_all(&work_dir).map_err(|e| RuntimeError::Spawn(e.to_string()))?;
+    let marker = new_marker(id);
 
     let bin = match family {
         Family::Python => &interpreters.python,
@@ -469,132 +682,167 @@ pub async fn run(inv: &Invocation, interpreters: &Interpreters) -> Result<Comple
     // Resolve the interpreter against devcloud's own PATH: the function may set
     // its own PATH, which applies to the handler, not to finding python/node.
     let program = interpreters.resolve(family, &inv.runtime).ok_or_else(|| {
+        let _ = std::fs::remove_dir_all(&work_dir);
         RuntimeError::Spawn(format!(
             "start {bin} for runtime {}: interpreter not found on devcloud's PATH",
             inv.runtime
         ))
     })?;
-    let mut cmd = match family {
-        Family::Python => {
-            let mut c = tokio::process::Command::new(&program);
-            // Unbuffered: output written before a timeout's SIGKILL must
-            // still reach the log (a pipe would otherwise be block-buffered).
-            c.arg("-u").arg("-c").arg(PYTHON_BOOTSTRAP);
-            c
-        }
-        Family::Node => {
-            let mut c = tokio::process::Command::new(&program);
-            c.arg("-e").arg(NODE_BOOTSTRAP);
-            c
-        }
+    let mut cmd = tokio::process::Command::new(&program);
+    match family {
+        // Unbuffered: output written before a timeout's SIGKILL must still
+        // reach the log (a pipe would otherwise be block-buffered).
+        Family::Python => cmd.arg("-u").arg("-c").arg(PYTHON_BOOTSTRAP),
+        Family::Node => cmd.arg("-e").arg(NODE_BOOTSTRAP),
     };
     // Precedence: devcloud defaults < the function's Environment.Variables <
     // Lambda-reserved variables (which CreateFunction refuses to accept).
     cmd.env_clear()
         .envs(default_env(family, inv))
         .envs(&inv.environment)
-        .envs(reserved_env(inv, &result_path, deadline_ms))
+        .envs(reserved_env(inv, id))
+        .env("_DEVCLOUD_MARKER", &marker)
         .current_dir(&inv.code_dir)
-        .stdin(Stdio::piped())
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    // Own process group, so a timeout (or exit) can take down anything the
+    // Own process group, so stopping the environment takes down anything the
     // handler spawned along with the interpreter.
     #[cfg(unix)]
     cmd.process_group(0);
-
-    let mut child = cmd.spawn().map_err(|e| {
+    let control = attach_control_pipe(&mut cmd).map_err(|e| {
+        let _ = std::fs::remove_dir_all(&work_dir);
         RuntimeError::Spawn(format!("start {bin} for runtime {}: {e}", inv.runtime))
     })?;
 
-    // From here on, every exit path — including this future being dropped
-    // when devcloud shuts down — tears down the process group and the I/O
-    // tasks (see `Cleanup::drop`).
-    let mut cleanup = Cleanup {
-        pgid: child.id(),
-        tasks: Vec::new(),
-    };
-    let mut stdin = child.stdin.take().expect("piped stdin");
-    let payload = inv.payload.clone();
-    let stdin_task = tokio::spawn(async move {
-        let _ = stdin.write_all(&payload).await;
-        let _ = stdin.shutdown().await;
-    });
-    cleanup.tasks.push(stdin_task.abort_handle());
-    let out_buf = Arc::new(Mutex::new(Vec::new()));
-    let err_buf = Arc::new(Mutex::new(Vec::new()));
-    let mut out_task = tokio::spawn(collect(
+    let mut child = cmd.spawn().map_err(|e| {
+        let _ = std::fs::remove_dir_all(&work_dir);
+        RuntimeError::Spawn(format!("start {bin} for runtime {}: {e}", inv.runtime))
+    })?;
+    // The child has its copy of the read end now.
+    drop(cmd);
+    let (tx, events) = mpsc::unbounded_channel();
+    let stdout = Arc::new(Mutex::new(Scanner::new(format!("{marker} ").into_bytes())));
+    let stderr = Arc::new(Mutex::new(Vec::new()));
+    let out_task = tokio::spawn(scan(
         child.stdout.take().expect("piped stdout"),
-        Arc::clone(&out_buf),
+        Arc::clone(&stdout),
+        tx,
     ));
-    let mut err_task = tokio::spawn(collect(
+    let err_task = tokio::spawn(collect(
         child.stderr.take().expect("piped stderr"),
-        Arc::clone(&err_buf),
+        Arc::clone(&stderr),
     ));
-    cleanup.tasks.push(out_task.abort_handle());
-    cleanup.tasks.push(err_task.abort_handle());
-
-    let timeout = Duration::from_secs(inv.timeout_seconds.max(1) as u64);
-    let waited = tokio::time::timeout(timeout, child.wait()).await;
-    let timed_out = waited.is_err();
-    // How the runtime ended matters: a handler can call back with success and
-    // then crash (e.g. an uncaught exception in a timer while the event loop
-    // drains). A non-zero exit or a signal outranks the stored result.
-    let crashed = match &waited {
-        Ok(Ok(status)) if !status.success() => Some(status.to_string()),
-        Ok(Err(e)) => Some(e.to_string()),
-        _ => None,
-    };
-    // The invocation is over either way: stop the interpreter and every
-    // descendant still holding the log pipes open.
-    cleanup.kill_group();
-    let _ = child.kill().await;
-    // A descendant that escaped the group can keep a pipe open forever; give
-    // the readers a bounded grace period, keep whatever they collected, and
-    // abort them (dropping a JoinHandle would only detach them).
-    let deadline = tokio::time::Instant::now() + LOG_DRAIN_GRACE;
-    let _ = tokio::time::timeout_at(deadline, &mut out_task).await;
-    let _ = tokio::time::timeout_at(deadline, &mut err_task).await;
-    drop(cleanup);
-    let duration = started.elapsed();
-    let mut log_body = std::mem::take(&mut *out_buf.lock().unwrap());
-    log_body.extend(std::mem::take(&mut *err_buf.lock().unwrap()));
-
-    let outcome = if timed_out {
-        Outcome::FunctionError(error_doc(
-            &format!(
-                "{} {} Task timed out after {}.00 seconds",
-                crate::time_fmt::now_rfc3339(),
-                inv.request_id,
-                inv.timeout_seconds.max(1)
-            ),
-            "Sandbox.Timedout",
-        ))
-    } else if let Some(status) = crashed {
-        Outcome::FunctionError(error_doc(
-            &format!(
-                "RequestId: {} Error: Runtime exited with error: {status}",
-                inv.request_id
-            ),
-            "Runtime.ExitError",
-        ))
-    } else {
-        read_result(&result_path)
-    };
-    let _ = std::fs::remove_dir_all(&inv.work_dir);
-
-    let log = frame_log(
-        inv,
-        &String::from_utf8_lossy(&log_body),
-        duration,
-        timed_out,
-    );
-    Ok(Completed {
-        outcome,
-        log,
-        duration,
+    Ok(Environment {
+        id,
+        key: inv.env_key.clone(),
+        pgid: child.id(),
+        child,
+        control,
+        events,
+        stdout,
+        stderr,
+        tasks: vec![out_task.abort_handle(), err_task.abort_handle()],
+        work_dir,
+        idle_since: Instant::now(),
+        _code: code,
     })
+}
+
+/// Where devcloud writes invocation requests to a bootstrap.
+#[cfg(unix)]
+type ControlWriter = tokio::net::unix::pipe::Sender;
+#[cfg(not(unix))]
+type ControlWriter = tokio::process::ChildStdin;
+
+/// Fd the bootstrap reads requests from.
+#[cfg(unix)]
+const CONTROL_FD: i32 = 3;
+
+/// Gives `cmd`'s child the read end of a new pipe as [`CONTROL_FD`] and
+/// returns the write end. Requests must not travel on stdin: a handler that
+/// reads its stdin would consume them (or block forever waiting for EOF).
+#[cfg(unix)]
+fn attach_control_pipe(cmd: &mut tokio::process::Command) -> std::io::Result<ControlWriter> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    let mut fds = [0 as libc::c_int; 2];
+    // SAFETY: `fds` is a valid two-element buffer; on success both
+    // descriptors are new and owned here. FD_CLOEXEC (set right after; macOS
+    // has no pipe2) keeps them out of other children; the dup2 below gives
+    // only this child its copy.
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: both descriptors were just created and are owned by nobody else.
+    let (read, write) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+    for fd in [&read, &write] {
+        // SAFETY: plain fcntl on a descriptor we own.
+        unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) };
+    }
+    let read_fd = read.as_raw_fd();
+    // SAFETY: the closure only calls async-signal-safe functions (dup2,
+    // fcntl) between fork and exec. `read` outlives the spawn: it moves into
+    // the closure, which `cmd` keeps until it is dropped.
+    unsafe {
+        cmd.pre_exec(move || {
+            let _keep = &read;
+            if read_fd == CONTROL_FD {
+                // dup2 onto itself would keep FD_CLOEXEC set.
+                if libc::fcntl(read_fd, libc::F_SETFD, 0) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            } else if libc::dup2(read_fd, CONTROL_FD) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    tokio::net::unix::pipe::Sender::from_owned_fd(write)
+}
+
+#[cfg(not(unix))]
+fn attach_control_pipe(_cmd: &mut tokio::process::Command) -> std::io::Result<ControlWriter> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "local handler execution needs a Unix host",
+    ))
+}
+
+/// A marker prefix the handler's own output will not contain by accident.
+fn new_marker(id: u64) -> String {
+    use sha2::{Digest, Sha256};
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let digest = Sha256::digest(format!("{nanos}:{id}:{}", std::process::id()).as_bytes());
+    format!("devcloud-{}", hex::encode(&digest[..16]))
+}
+
+/// Feeds stdout through the marker scanner, reporting markers and the end of
+/// the stream. Output between markers stays in the shared scanner, so a
+/// reader abandoned after the drain deadline still leaves it behind.
+async fn scan<R: tokio::io::AsyncRead + Unpin>(
+    mut reader: R,
+    scanner: Arc<Mutex<Scanner>>,
+    tx: mpsc::UnboundedSender<StreamEvent>,
+) {
+    let mut chunk = [0u8; 8192];
+    loop {
+        match reader.read(&mut chunk).await {
+            Ok(0) | Err(_) => {
+                let _ = tx.send(StreamEvent::Eof);
+                return;
+            }
+            Ok(n) => {
+                let markers = scanner.lock().unwrap().push(&chunk[..n]);
+                for (tag, log) in markers {
+                    let _ = tx.send(StreamEvent::Marker { tag, log });
+                }
+            }
+        }
+    }
 }
 
 /// Appends everything `reader` yields into `buf` as it arrives, so a reader
@@ -617,31 +865,6 @@ fn append_bounded(buf: &mut Vec<u8>, data: &[u8]) {
     if buf.len() > LOG_CAPTURE_BYTES {
         let excess = buf.len() - LOG_CAPTURE_BYTES;
         buf.drain(..excess);
-    }
-}
-
-/// Tears down an invocation's process group and I/O tasks when dropped.
-struct Cleanup {
-    pgid: Option<u32>,
-    tasks: Vec<tokio::task::AbortHandle>,
-}
-
-impl Cleanup {
-    /// Kills the group once; later calls (and the drop) are no-ops, so a
-    /// recycled process-group id is never signalled.
-    fn kill_group(&mut self) {
-        if let Some(pgid) = self.pgid.take() {
-            kill_process_group(pgid);
-        }
-    }
-}
-
-impl Drop for Cleanup {
-    fn drop(&mut self) {
-        self.kill_group();
-        for task in &self.tasks {
-            task.abort();
-        }
     }
 }
 
@@ -717,7 +940,7 @@ fn default_env(family: Family, inv: &Invocation) -> Vec<(String, String)> {
     env
 }
 
-fn reserved_env(inv: &Invocation, result_path: &Path, deadline_ms: u128) -> Vec<(String, String)> {
+fn reserved_env(inv: &Invocation, env_id: u64) -> Vec<(String, String)> {
     let task_root = inv.code_dir.to_string_lossy().into_owned();
     let mut env: Vec<(String, String)> = vec![
         ("AWS_LAMBDA_FUNCTION_NAME".into(), inv.function_name.clone()),
@@ -732,7 +955,7 @@ fn reserved_env(inv: &Invocation, result_path: &Path, deadline_ms: u128) -> Vec<
         ),
         (
             "AWS_LAMBDA_LOG_STREAM_NAME".into(),
-            format!("devcloud/[$LATEST]{}", inv.request_id),
+            format!("devcloud/[$LATEST]env-{env_id}"),
         ),
         ("AWS_REGION".into(), inv.region.clone()),
         ("AWS_DEFAULT_REGION".into(), inv.region.clone()),
@@ -743,12 +966,7 @@ fn reserved_env(inv: &Invocation, result_path: &Path, deadline_ms: u128) -> Vec<
         ("LAMBDA_TASK_ROOT".into(), task_root.clone()),
         ("LAMBDA_RUNTIME_DIR".into(), task_root),
         ("_HANDLER".into(), inv.handler.clone()),
-        (
-            "_DEVCLOUD_RESULT_PATH".into(),
-            result_path.to_string_lossy().into_owned(),
-        ),
-        ("_DEVCLOUD_DEADLINE_MS".into(), deadline_ms.to_string()),
-        ("_DEVCLOUD_REQUEST_ID".into(), inv.request_id.clone()),
+        ("AWS_LAMBDA_INITIALIZATION_TYPE".into(), "on-demand".into()),
         ("_DEVCLOUD_FUNCTION_ARN".into(), inv.function_arn.clone()),
         (
             "_DEVCLOUD_RUNTIME_VERSION".into(),
@@ -800,14 +1018,33 @@ fn error_doc(message: &str, error_type: &str) -> Vec<u8> {
     .unwrap_or_default()
 }
 
-fn frame_log(inv: &Invocation, body: &str, duration: Duration, timed_out: bool) -> String {
+/// CloudWatch-style framing. A cold start (`init`: duration and the output
+/// of the init phase) adds an `INIT_START` section and `Init Duration`.
+fn frame_log(
+    inv: &Invocation,
+    init: Option<(Duration, String)>,
+    body: &str,
+    duration: Duration,
+    timed_out: bool,
+) -> String {
     let ms = duration.as_secs_f64() * 1000.0;
     let billed = (ms.ceil() as u64).max(1);
-    let mut log = format!("START RequestId: {} Version: $LATEST\n", inv.request_id);
-    log.push_str(body);
-    if !body.is_empty() && !body.ends_with('\n') {
-        log.push('\n');
+    let mut log = String::new();
+    let push_block = |log: &mut String, text: &str| {
+        log.push_str(text);
+        if !text.is_empty() && !text.ends_with('\n') {
+            log.push('\n');
+        }
+    };
+    if let Some((_, init_log)) = &init {
+        log.push_str(&format!("INIT_START Runtime Version: {}\n", inv.runtime));
+        push_block(&mut log, init_log);
     }
+    log.push_str(&format!(
+        "START RequestId: {} Version: $LATEST\n",
+        inv.request_id
+    ));
+    push_block(&mut log, body);
     if timed_out {
         log.push_str(&format!(
             "{} {} Task timed out after {}.00 seconds\n",
@@ -818,9 +1055,16 @@ fn frame_log(inv: &Invocation, body: &str, duration: Duration, timed_out: bool) 
     }
     log.push_str(&format!("END RequestId: {}\n", inv.request_id));
     log.push_str(&format!(
-        "REPORT RequestId: {}\tDuration: {:.2} ms\tBilled Duration: {} ms\tMemory Size: {} MB\n",
+        "REPORT RequestId: {}\tDuration: {:.2} ms\tBilled Duration: {} ms\tMemory Size: {} MB",
         inv.request_id, ms, billed, inv.memory_size
     ));
+    if let Some((init_duration, _)) = init {
+        log.push_str(&format!(
+            "\tInit Duration: {:.2} ms",
+            init_duration.as_secs_f64() * 1000.0
+        ));
+    }
+    log.push('\n');
     log
 }
 
@@ -881,6 +1125,36 @@ mod tests {
             resolve_program("python3"),
             "falls back to python3 when the versioned binary is missing"
         );
+    }
+
+    #[test]
+    fn scanner_splits_output_at_markers_across_chunks() {
+        let mut s = Scanner::new(b"devcloud-ab ".to_vec());
+        assert!(s.push(b"hello devcl").is_empty());
+        assert!(
+            s.push(b"oud-ab do").is_empty(),
+            "marker line not complete yet"
+        );
+        assert_eq!(
+            s.push(b"ne\nnext devcloud-ab ready\ntail"),
+            vec![
+                ("done".to_string(), b"hello ".to_vec()),
+                ("ready".to_string(), b"next ".to_vec()),
+            ]
+        );
+        assert_eq!(s.take_rest(), b"tail");
+    }
+
+    #[test]
+    fn scanner_keeps_only_the_newest_bytes_between_markers() {
+        let mut s = Scanner::new(b"devcloud-ab ".to_vec());
+        for _ in 0..(LOG_CAPTURE_BYTES / 1024 + 8) {
+            assert!(s.push(&[b'x'; 1024]).is_empty());
+        }
+        let markers = s.push(b"TAILdevcloud-ab done\n");
+        assert_eq!(markers.len(), 1);
+        assert!(markers[0].1.len() <= LOG_CAPTURE_BYTES + 4);
+        assert!(markers[0].1.ends_with(b"TAIL"));
     }
 
     #[test]

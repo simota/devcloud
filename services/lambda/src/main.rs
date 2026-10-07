@@ -14,6 +14,8 @@
 //!   DEVCLOUD_LAMBDA_FUNCTION_SESSION_TOKEN credentials passed to every handler (optional;
 //!                              both the key id and the secret are needed)
 //!   DEVCLOUD_LAMBDA_OPT_DIR    stand-in for Lambda's /opt (layer contents), default /opt
+//!   DEVCLOUD_LAMBDA_IDLE_TIMEOUT_SECONDS how long an idle execution environment stays
+//!                              warm, default 300; 0 = a cold start for every invocation
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -41,6 +43,16 @@ fn main() {
     }
     let s3_storage = env("DEVCLOUD_LAMBDA_S3_STORAGE");
     let opt_dir = env("DEVCLOUD_LAMBDA_OPT_DIR");
+    let idle_timeout = match env("DEVCLOUD_LAMBDA_IDLE_TIMEOUT_SECONDS").as_str() {
+        "" => None,
+        v => match v.parse::<u64>() {
+            Ok(secs) => Some(std::time::Duration::from_secs(secs)),
+            Err(_) => {
+                eprintln!("devcloud-lambda: DEVCLOUD_LAMBDA_IDLE_TIMEOUT_SECONDS must be a whole number of seconds");
+                std::process::exit(2);
+            }
+        },
+    };
     let function_credentials = FunctionCredentials {
         access_key_id: env("DEVCLOUD_LAMBDA_FUNCTION_ACCESS_KEY_ID"),
         secret_access_key: env("DEVCLOUD_LAMBDA_FUNCTION_SECRET_ACCESS_KEY"),
@@ -86,6 +98,7 @@ fn main() {
             interpreters: Default::default(),
             function_credentials,
             opt_dir: (!opt_dir.is_empty()).then(|| PathBuf::from(opt_dir)),
+            idle_timeout,
         };
         let server = Arc::new(Server::new(config));
         if let Some(err) = server.load_err() {

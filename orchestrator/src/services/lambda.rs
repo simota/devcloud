@@ -34,6 +34,11 @@ pub async fn run(
         function_credentials: function_credentials(&cfg.services.lambda)?,
         opt_dir: (!cfg.services.lambda.opt_dir.is_empty())
             .then(|| PathBuf::from(&cfg.services.lambda.opt_dir)),
+        idle_timeout: cfg
+            .services
+            .lambda
+            .idle_timeout_seconds
+            .map(|s| std::time::Duration::from_secs(s.into())),
     };
 
     let server = Arc::new(Server::new(config));

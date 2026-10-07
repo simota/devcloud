@@ -332,6 +332,9 @@ pub struct LambdaServiceConfig {
     pub function_session_token: String,
     /// Stand-in for Lambda's `/opt` (layer contents). Empty = `/opt`.
     pub opt_dir: String,
+    /// Seconds an idle execution environment stays warm; `None` = the
+    /// service default, 0 = every invocation is a cold start.
+    pub idle_timeout_seconds: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -1184,6 +1187,10 @@ pub fn apply_config_value(cfg: &mut Config, path: &[String], value: &str) -> io:
             cfg.services.lambda.function_session_token = value.to_string()
         }
         "services.lambda.optDir" => cfg.services.lambda.opt_dir = value.to_string(),
+        "services.lambda.idleTimeoutSeconds" => {
+            cfg.services.lambda.idle_timeout_seconds =
+                Some(parse_int("services.lambda.idleTimeoutSeconds", value)?);
+        }
         "services.cloudRun.enabled" => {
             cfg.services.cloud_run.enabled = parse_bool("services.cloudRun.enabled", value)?
         }
@@ -1319,11 +1326,16 @@ fn fmt_bool(b: bool) -> &'static str {
 /// The optional `services.lambda` keys, rendered only when set so the default
 /// output stays unchanged.
 fn lambda_optional_lines(l: &LambdaServiceConfig) -> String {
+    let idle = l
+        .idle_timeout_seconds
+        .map(|s| s.to_string())
+        .unwrap_or_default();
     [
         ("functionAccessKeyId", &l.function_access_key_id),
         ("functionSecretAccessKey", &l.function_secret_access_key),
         ("functionSessionToken", &l.function_session_token),
         ("optDir", &l.opt_dir),
+        ("idleTimeoutSeconds", &idle),
     ]
     .into_iter()
     .filter(|(_, v)| !v.is_empty())
@@ -2091,9 +2103,10 @@ mod tests {
         cfg.services.lambda.function_access_key_id = "AKIDLOCAL".into();
         cfg.services.lambda.function_secret_access_key = "local-secret".into();
         cfg.services.lambda.opt_dir = "/srv/lambda-opt".into();
+        cfg.services.lambda.idle_timeout_seconds = Some(0);
         let yaml = default_config_yaml(&cfg);
         assert!(yaml.contains(
-            "  lambda:\n    enabled: true\n    region: us-east-1\n    functionAccessKeyId: AKIDLOCAL\n    functionSecretAccessKey: local-secret\n    optDir: /srv/lambda-opt\n  cloudRun:\n"
+            "  lambda:\n    enabled: true\n    region: us-east-1\n    functionAccessKeyId: AKIDLOCAL\n    functionSecretAccessKey: local-secret\n    optDir: /srv/lambda-opt\n    idleTimeoutSeconds: 0\n  cloudRun:\n"
         ));
         let parsed = parse_yaml_in_memory(&yaml).expect("parse yaml");
         assert_eq!(parsed.services.lambda, cfg.services.lambda);
