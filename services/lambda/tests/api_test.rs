@@ -3000,3 +3000,313 @@ async fn chunked_invoke_bodies_reach_the_handler() {
     let _ = tx.send(());
     serving.await.unwrap().unwrap();
 }
+
+// ── runtime environment: layers (/opt), credentials, runtime versions ──────
+
+/// Creates `name` from a single-file package and invokes it once with a log tail.
+async fn deploy_and_invoke(
+    server: &Arc<Server>,
+    name: &str,
+    runtime: &str,
+    handler: &str,
+    file: (&str, &[u8]),
+) -> (Resp, String) {
+    let zip = build_stored(&[file]);
+    let body = json!({
+        "FunctionName": name,
+        "Runtime": runtime,
+        "Role": "r",
+        "Handler": handler,
+        "Code": { "ZipFile": b64(&zip) },
+    });
+    let created = call(
+        server,
+        "POST",
+        "/2015-03-31/functions",
+        &[],
+        body.to_string().as_bytes(),
+    )
+    .await;
+    assert_eq!(
+        created.status,
+        201,
+        "{}",
+        String::from_utf8_lossy(&created.body)
+    );
+    let r = call(
+        server,
+        "POST",
+        &format!("/2015-03-31/functions/{name}/invocations"),
+        &[("X-Amz-Log-Type", "Tail")],
+        b"{}",
+    )
+    .await;
+    let log = base64::engine::general_purpose::STANDARD
+        .decode(r.header("X-Amz-Log-Result").unwrap_or_default())
+        .unwrap();
+    (r, String::from_utf8(log).unwrap())
+}
+
+#[tokio::test]
+async fn layer_directories_under_opt_are_importable() {
+    let dir = temp_dir("optdir");
+    let opt = dir.join("opt");
+    let site = opt.join("python/lib/python3.12/site-packages");
+    std::fs::create_dir_all(&site).unwrap();
+    std::fs::write(opt.join("python/toplib.py"), "NAME = 'top'\n").unwrap();
+    std::fs::write(site.join("sitelib.py"), "NAME = 'site'\n").unwrap();
+    let node_modules = opt.join("nodejs/node_modules/nodelib");
+    std::fs::create_dir_all(&node_modules).unwrap();
+    std::fs::write(node_modules.join("index.js"), "exports.NAME = 'node';\n").unwrap();
+    let server = Arc::new(Server::new(Config {
+        opt_dir: Some(opt.clone()),
+        ..config_for(&dir)
+    }));
+
+    if has("python3") {
+        let (r, log) = deploy_and_invoke(
+            &server,
+            "py-layer",
+            "python3.12",
+            "app.handler",
+            (
+                "app.py",
+                b"import toplib, sitelib\ndef handler(e, c):\n    return [toplib.NAME, sitelib.NAME]\n",
+            ),
+        )
+        .await;
+        assert_eq!(r.header("X-Amz-Function-Error"), None, "{log}");
+        assert_eq!(r.json(), json!(["top", "site"]));
+    } else {
+        eprintln!("skipping python part: python3 not available");
+    }
+    if has("node") {
+        let (r, log) = deploy_and_invoke(
+            &server,
+            "node-layer",
+            "nodejs20.x",
+            "index.handler",
+            (
+                "index.js",
+                b"exports.handler = async () => require('nodelib').NAME;\n",
+            ),
+        )
+        .await;
+        assert_eq!(r.header("X-Amz-Function-Error"), None, "{log}");
+        assert_eq!(r.body, b"\"node\"");
+        // ES module handlers resolve layer dependencies too (Node's ESM
+        // loader alone ignores NODE_PATH).
+        let (r, log) = deploy_and_invoke(
+            &server,
+            "esm-layer",
+            "nodejs20.x",
+            "index.handler",
+            (
+                "index.mjs",
+                b"import { NAME } from 'nodelib';\nexport const handler = async () => NAME;\n",
+            ),
+        )
+        .await;
+        assert_eq!(r.header("X-Amz-Function-Error"), None, "{log}");
+        assert_eq!(r.body, b"\"node\"");
+        // `.js` that is ESM by its package.json `"type": "module"`.
+        let zip = build_stored(&[
+            ("package.json", br#"{"type": "module"}"#),
+            (
+                "index.js",
+                b"import { NAME } from 'nodelib';\nexport const handler = async () => NAME;\n",
+            ),
+        ]);
+        let body = json!({
+            "FunctionName": "esm-js-layer", "Runtime": "nodejs20.x", "Role": "r",
+            "Handler": "index.handler", "Code": { "ZipFile": b64(&zip) },
+        });
+        let created = call(
+            &server,
+            "POST",
+            "/2015-03-31/functions",
+            &[],
+            body.to_string().as_bytes(),
+        )
+        .await;
+        assert_eq!(created.status, 201);
+        let r = call(
+            &server,
+            "POST",
+            "/2015-03-31/functions/esm-js-layer/invocations",
+            &[],
+            b"{}",
+        )
+        .await;
+        assert_eq!(
+            r.header("X-Amz-Function-Error"),
+            None,
+            "{}",
+            String::from_utf8_lossy(&r.body)
+        );
+        assert_eq!(r.body, b"\"node\"");
+    } else {
+        eprintln!("skipping node part: node not available");
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn configured_function_credentials_reach_the_handler() {
+    if !has("python3") {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    const READ_CREDS: &[u8] = b"import os\ndef handler(e, c):\n    return [os.environ.get(k) for k in ('AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY', 'AWS_SESSION_TOKEN')]\n";
+
+    let e = env("nocreds");
+    let (r, _) = deploy_and_invoke(
+        &e.server,
+        "creds-fn",
+        "python3.12",
+        "app.handler",
+        ("app.py", READ_CREDS),
+    )
+    .await;
+    assert_eq!(
+        r.json(),
+        json!([null, null, null]),
+        "no credentials unless configured"
+    );
+
+    let dir = temp_dir("creds");
+    let server = Arc::new(Server::new(Config {
+        function_credentials: Some(devcloud_lambda::runtime::FunctionCredentials {
+            access_key_id: "AKIDLOCAL".into(),
+            secret_access_key: "local-secret".into(),
+            session_token: String::new(),
+        }),
+        ..config_for(&dir)
+    }));
+    let (r, log) = deploy_and_invoke(
+        &server,
+        "creds-fn",
+        "python3.12",
+        "app.handler",
+        ("app.py", READ_CREDS),
+    )
+    .await;
+    assert_eq!(r.json(), json!(["AKIDLOCAL", "local-secret", null]));
+    assert!(
+        !log.contains("local-secret"),
+        "credentials never reach the log: {log}"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn runtime_version_mismatch_is_logged_as_a_warning() {
+    let e = env("vermismatch");
+    if has("python3") {
+        // No host has python3.99: the default python3 runs it, with a warning.
+        let (r, log) = deploy_and_invoke(
+            &e.server,
+            "py-ver",
+            "python3.99",
+            "app.handler",
+            ("app.py", b"def handler(e, c):\n    return 1\n"),
+        )
+        .await;
+        assert_eq!(r.header("X-Amz-Function-Error"), None, "{log}");
+        assert!(
+            log.contains("[WARNING] devcloud: runtime python3.99 is running on Python "),
+            "{log}"
+        );
+    } else {
+        eprintln!("skipping python part: python3 not available");
+    }
+    if has("node") {
+        let (r, log) = deploy_and_invoke(
+            &e.server,
+            "node-ver",
+            "nodejs99.x",
+            "index.handler",
+            ("index.js", b"exports.handler = async () => 1;\n"),
+        )
+        .await;
+        assert_eq!(r.header("X-Amz-Function-Error"), None, "{log}");
+        assert!(
+            log.contains("[WARNING] devcloud: runtime nodejs99.x is running on Node.js "),
+            "{log}"
+        );
+    } else {
+        eprintln!("skipping node part: node not available");
+    }
+}
+
+#[tokio::test]
+async fn relative_opt_dir_is_resolved_against_devcloud_cwd() {
+    if !has("python3") {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let dir = temp_dir("relopt");
+    let opt = dir.join("opt");
+    std::fs::create_dir_all(opt.join("python")).unwrap();
+    std::fs::write(opt.join("python/rellib.py"), "NAME = 'rel'\n").unwrap();
+    let rel = pathdiff(&opt, &std::env::current_dir().unwrap());
+    let server = Arc::new(Server::new(Config {
+        opt_dir: Some(PathBuf::from(rel)),
+        ..config_for(&dir)
+    }));
+    let (r, log) = deploy_and_invoke(
+        &server,
+        "rel-opt",
+        "python3.12",
+        "app.handler",
+        (
+            "app.py",
+            b"import rellib\ndef handler(e, c):\n    return rellib.NAME\n",
+        ),
+    )
+    .await;
+    assert_eq!(r.header("X-Amz-Function-Error"), None, "{log}");
+    assert_eq!(r.body, b"\"rel\"");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn environment_variable_names_follow_the_lambda_pattern() {
+    let e = env("envnames");
+    assert_eq!(create_python(&e.server, "names-fn").await.status, 201);
+    for bad in [
+        "ZZZ=ignored\nAWS_LAMBDA_FUNCTION_NAME",
+        "1BAD",
+        "_X",
+        "WITH-DASH",
+        "with space",
+    ] {
+        let r = call(
+            &e.server,
+            "PUT",
+            "/2015-03-31/functions/names-fn/configuration",
+            &[],
+            json!({ "Environment": { "Variables": { bad: "x" } } })
+                .to_string()
+                .as_bytes(),
+        )
+        .await;
+        assert_eq!(
+            r.status,
+            400,
+            "{bad:?}: {}",
+            String::from_utf8_lossy(&r.body)
+        );
+    }
+    let r = call(
+        &e.server,
+        "PUT",
+        "/2015-03-31/functions/names-fn/configuration",
+        &[],
+        json!({ "Environment": { "Variables": { "Ok_Name2": "x", "A": "1" } } })
+            .to_string()
+            .as_bytes(),
+    )
+    .await;
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+}

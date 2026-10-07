@@ -24,7 +24,7 @@ fn lambda_from_unix(secs: i64, millis: u32) -> String {
     format!("{}.{:03}+0000", base.trim_end_matches('Z'), millis)
 }
 
-fn rfc3339_from_unix(secs: i64, nanos: u32) -> String {
+pub(crate) fn rfc3339_from_unix(secs: i64, nanos: u32) -> String {
     let days = secs.div_euclid(86_400);
     let secs_of_day = secs.rem_euclid(86_400);
     let (year, month, day) = civil_from_days(days);

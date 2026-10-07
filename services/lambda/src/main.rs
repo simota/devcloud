@@ -10,10 +10,18 @@
 //!   DEVCLOUD_LAMBDA_AUTH_MODE  relaxed (default), signed-relaxed, or strict
 //!   DEVCLOUD_LAMBDA_ACCESS_KEY_ID / DEVCLOUD_LAMBDA_SECRET_ACCESS_KEY strict-mode creds
 //!   DEVCLOUD_LAMBDA_S3_STORAGE devcloud-s3 storage root, enabling Code.S3Bucket/S3Key (optional)
+//!   DEVCLOUD_LAMBDA_FUNCTION_ACCESS_KEY_ID / DEVCLOUD_LAMBDA_FUNCTION_SECRET_ACCESS_KEY /
+//!   DEVCLOUD_LAMBDA_FUNCTION_SESSION_TOKEN credentials passed to every handler (optional;
+//!                              both the key id and the secret are needed)
+//!   DEVCLOUD_LAMBDA_OPT_DIR    stand-in for Lambda's /opt (layer contents), default /opt
+//!   DEVCLOUD_LAMBDA_DOCKER     true: run PackageType Image functions with the docker CLI
+//!   DEVCLOUD_LAMBDA_IDLE_TIMEOUT_SECONDS how long an idle execution environment stays
+//!                              warm, default 300; 0 = a cold start for every invocation
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use devcloud_lambda::runtime::FunctionCredentials;
 use devcloud_lambda::{Config, Server};
 
 fn env(name: &str) -> String {
@@ -35,6 +43,33 @@ fn main() {
         std::process::exit(2);
     }
     let s3_storage = env("DEVCLOUD_LAMBDA_S3_STORAGE");
+    let opt_dir = env("DEVCLOUD_LAMBDA_OPT_DIR");
+    let idle_timeout = match env("DEVCLOUD_LAMBDA_IDLE_TIMEOUT_SECONDS").as_str() {
+        "" => None,
+        v => match v.parse::<u64>() {
+            Ok(secs) => Some(std::time::Duration::from_secs(secs)),
+            Err(_) => {
+                eprintln!("devcloud-lambda: DEVCLOUD_LAMBDA_IDLE_TIMEOUT_SECONDS must be a whole number of seconds");
+                std::process::exit(2);
+            }
+        },
+    };
+    let function_credentials = FunctionCredentials {
+        access_key_id: env("DEVCLOUD_LAMBDA_FUNCTION_ACCESS_KEY_ID"),
+        secret_access_key: env("DEVCLOUD_LAMBDA_FUNCTION_SECRET_ACCESS_KEY"),
+        session_token: env("DEVCLOUD_LAMBDA_FUNCTION_SESSION_TOKEN"),
+    };
+    let function_credentials = match (
+        function_credentials.access_key_id.is_empty(),
+        function_credentials.secret_access_key.is_empty(),
+    ) {
+        (false, false) => Some(function_credentials),
+        (true, true) => None,
+        _ => {
+            eprintln!("devcloud-lambda: set both DEVCLOUD_LAMBDA_FUNCTION_ACCESS_KEY_ID and DEVCLOUD_LAMBDA_FUNCTION_SECRET_ACCESS_KEY, or neither");
+            std::process::exit(2);
+        }
+    };
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -61,7 +96,13 @@ fn main() {
             secret_access_key: env("DEVCLOUD_LAMBDA_SECRET_ACCESS_KEY"),
             storage_path: storage,
             object_store_root: (!s3_storage.is_empty()).then(|| PathBuf::from(s3_storage)),
-            interpreters: Default::default(),
+            interpreters: devcloud_lambda::runtime::Interpreters {
+                docker: (env("DEVCLOUD_LAMBDA_DOCKER") == "true").then(|| "docker".to_string()),
+                ..Default::default()
+            },
+            function_credentials,
+            opt_dir: (!opt_dir.is_empty()).then(|| PathBuf::from(opt_dir)),
+            idle_timeout,
         };
         let server = Arc::new(Server::new(config));
         if let Some(err) = server.load_err() {

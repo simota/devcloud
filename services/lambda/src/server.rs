@@ -19,7 +19,10 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use crate::code_store::{CodeStore, Lease, StageError};
-use crate::runtime::{self, Interpreters, Invocation, Outcome, RuntimeError};
+use crate::container::ImageSpec;
+use crate::function_url::{self, UrlConfig};
+use crate::http::Request;
+use crate::runtime::{self, FunctionCredentials, Interpreters, Invocation, Outcome, RuntimeError};
 use crate::time_fmt::{now_lambda, now_rfc3339};
 
 const MAX_SYNC_PAYLOAD_BYTES: usize = 6 * 1024 * 1024;
@@ -74,6 +77,16 @@ pub struct Config {
     /// `Code.S3Bucket`/`Code.S3Key` deployment packages. `None` disables it.
     pub object_store_root: Option<PathBuf>,
     pub interpreters: Interpreters,
+    /// Credentials every handler receives in place of an execution role's.
+    /// `None` leaves `AWS_ACCESS_KEY_ID` & co. unset.
+    pub function_credentials: Option<FunctionCredentials>,
+    /// Directory standing in for Lambda's `/opt` (layer contents); `None`
+    /// means `/opt` itself.
+    pub opt_dir: Option<PathBuf>,
+    /// How long an idle execution environment is kept warm; `None` means
+    /// [`runtime::DEFAULT_IDLE_TIMEOUT`], zero disables reuse (every
+    /// invocation is a cold start).
+    pub idle_timeout: Option<std::time::Duration>,
 }
 
 /// One HTTP reply: status, extra headers, body. `X-Amzn-ErrorType` is carried
@@ -158,6 +171,44 @@ struct FunctionRecord {
     architectures: Vec<String>,
     #[serde(default = "default_ephemeral")]
     ephemeral_storage_size: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    function_url: Option<UrlConfig>,
+    #[serde(default = "default_package_type")]
+    package_type: String,
+    /// Image functions only.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    image_uri: String,
+    #[serde(default, skip_serializing_if = "ImageConfig::is_empty")]
+    image_config: ImageConfig,
+}
+
+impl FunctionRecord {
+    fn is_image(&self) -> bool {
+        self.package_type == "Image"
+    }
+}
+
+/// `ImageConfig`: overrides of the image's entrypoint, command, and working
+/// directory.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "PascalCase", deny_unknown_fields)]
+struct ImageConfig {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    entry_point: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    command: Vec<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    working_directory: String,
+}
+
+impl ImageConfig {
+    fn is_empty(&self) -> bool {
+        *self == ImageConfig::default()
+    }
+}
+
+fn default_package_type() -> String {
+    "Zip".to_string()
 }
 
 fn default_architectures() -> Vec<String> {
@@ -200,6 +251,8 @@ pub struct Server {
     function_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     /// Async (`Event`) invocations still running; aborted on shutdown.
     background: Mutex<Background>,
+    /// Warm execution environments.
+    pool: Arc<runtime::Pool>,
 }
 
 #[derive(Default)]
@@ -211,10 +264,15 @@ struct Background {
 impl Server {
     pub fn new(mut config: Config) -> Self {
         // Handlers run with their code directory as cwd, so every path handed
-        // to the child (task root, result file) must be absolute.
+        // to the child (task root, result file, /opt) must be absolute.
         if !config.storage_path.is_empty() {
             if let Ok(abs) = std::path::absolute(&config.storage_path) {
                 config.storage_path = abs.to_string_lossy().into_owned();
+            }
+        }
+        if let Some(opt) = config.opt_dir.as_mut() {
+            if let Ok(abs) = std::path::absolute(&*opt) {
+                *opt = abs;
             }
         }
         let mut server = Server {
@@ -225,9 +283,15 @@ impl Server {
             code: CodeStore::new(PathBuf::from(&config.storage_path).join("functions")),
             function_locks: Mutex::new(HashMap::new()),
             background: Mutex::new(Background::default()),
+            pool: runtime::Pool::new(
+                PathBuf::from(&config.storage_path).join("environments"),
+                config.idle_timeout.unwrap_or(runtime::DEFAULT_IDLE_TIMEOUT),
+            ),
             config,
         };
         if !server.config.storage_path.is_empty() {
+            // Scratch space of environments a previous process left behind.
+            let _ = std::fs::remove_dir_all(server.storage().join("environments"));
             if let Err(e) = server.load() {
                 server.load_err = Some(e);
             }
@@ -279,8 +343,9 @@ impl Server {
             Err(e) => return Err(e.to_string()),
         };
         let persisted: PersistedState = serde_json::from_slice(&data).map_err(|e| e.to_string())?;
-        // Re-extract any package whose extracted tree went missing.
-        for record in persisted.functions.values() {
+        // Re-extract any package whose extracted tree went missing (image
+        // functions have no package).
+        for record in persisted.functions.values().filter(|r| !r.is_image()) {
             self.code
                 .ensure_tree(&record.function_name, &record.code_sha256)?;
         }
@@ -400,22 +465,40 @@ impl Server {
         if let Err(r) = validate_function_name(&name) {
             return r;
         }
-        let package_type = str_field(&req, "PackageType");
-        if !package_type.is_empty() && package_type != "Zip" {
-            return invalid_param("devcloud lambda supports only PackageType Zip");
-        }
+        let package_type = match str_field(&req, "PackageType").as_str() {
+            "" | "Zip" => "Zip",
+            "Image" => "Image",
+            other => {
+                return validation(&format!(
+                    "1 validation error detected: Value '{other}' at 'packageType' failed to satisfy constraint: Member must satisfy enum value set: [Image, Zip]"
+                ))
+            }
+        };
+        let is_image = package_type == "Image";
         let role = str_field(&req, "Role");
         if role.is_empty() {
             return validation("1 validation error detected: Value null at 'role' failed to satisfy constraint: Member must not be null");
         }
         let runtime_id = str_field(&req, "Runtime");
-        if let Err(r) = validate_runtime(&runtime_id) {
-            return r;
-        }
         let handler = str_field(&req, "Handler");
-        if handler.is_empty() {
-            return invalid_param("Handler is required for Zip package type");
+        if is_image {
+            if !runtime_id.is_empty() || !handler.is_empty() {
+                return invalid_param(
+                    "Runtime and Handler are not supported for the Image package type",
+                );
+            }
+        } else {
+            if let Err(r) = validate_runtime(&runtime_id) {
+                return r;
+            }
+            if handler.is_empty() {
+                return invalid_param("Handler is required for Zip package type");
+            }
         }
+        let image_config = match image_config(&req, is_image) {
+            Ok(c) => c.unwrap_or_default(),
+            Err(r) => return r,
+        };
         let timeout = match int_field(&req, "Timeout", 3, 1, 900, "timeout") {
             Ok(v) => v,
             Err(r) => return r,
@@ -432,9 +515,16 @@ impl Server {
             Ok(v) => v.unwrap_or_else(default_ephemeral),
             Err(r) => return r,
         };
-        let zip = match self.package_bytes(req.get("Code")) {
-            Ok(z) => z,
-            Err(r) => return r,
+        let (zip, image_uri) = if is_image {
+            match image_uri(req.get("Code")) {
+                Ok(u) => (Vec::new(), u),
+                Err(r) => return r,
+            }
+        } else {
+            match self.package_bytes(req.get("Code")) {
+                Ok(z) => (z, String::new()),
+                Err(r) => return r,
+            }
         };
         let tags = match string_map(req.get("Tags"), "tags") {
             Ok(t) => t,
@@ -455,10 +545,16 @@ impl Server {
             );
         }
 
-        let sha = code_sha256(&zip);
-        if let Err(r) = self.stage_package(&name, &zip, &sha) {
-            self.code.retire(&name, &sha);
-            return r;
+        let sha = if is_image {
+            code_sha256(image_uri.as_bytes())
+        } else {
+            code_sha256(&zip)
+        };
+        if !is_image {
+            if let Err(r) = self.stage_package(&name, &zip, &sha) {
+                self.code.retire(&name, &sha);
+                return r;
+            }
         }
         let record = FunctionRecord {
             function_name: name.clone(),
@@ -476,6 +572,10 @@ impl Server {
             tags,
             architectures,
             ephemeral_storage_size,
+            function_url: None,
+            package_type: package_type.to_string(),
+            image_uri,
+            image_config,
         };
         let result = self.commit(|st| {
             if st.functions.contains_key(&name) {
@@ -540,20 +640,29 @@ impl Server {
         } else {
             self.config.endpoint.trim_end_matches('/').to_string()
         };
+        let code = if record.is_image() {
+            json!({
+                "RepositoryType": "ECR",
+                "ImageUri": record.image_uri,
+                "ResolvedImageUri": record.image_uri,
+            })
+        } else {
+            json!({
+                "RepositoryType": "S3",
+                // Pinned to this code version: after an update the link
+                // expires instead of silently serving different code.
+                "Location": format!(
+                    "{base}/_devcloud/functions/{}/code.zip?CodeSha256={}",
+                    record.function_name,
+                    query_encode(&record.code_sha256)
+                ),
+            })
+        };
         Reply::json(
             200,
             &json!({
                 "Configuration": self.configuration_json(&record),
-                "Code": {
-                    "RepositoryType": "S3",
-                    // Pinned to this code version: after an update the link
-                    // expires instead of silently serving different code.
-                    "Location": format!(
-                        "{base}/_devcloud/functions/{}/code.zip?CodeSha256={}",
-                        record.function_name,
-                        query_encode(&record.code_sha256)
-                    ),
-                },
+                "Code": code,
                 "Tags": record.tags,
             }),
         )
@@ -597,6 +706,10 @@ impl Server {
             Ok(v) => v,
             Err(r) => return r,
         };
+        let new_image_config = match image_config(&req, true) {
+            Ok(c) => c,
+            Err(r) => return r,
+        };
         let revision = str_field(&req, "RevisionId");
         let new_revision = self.new_id();
         let result = self.commit(|st| {
@@ -606,6 +719,20 @@ impl Server {
                 .ok_or_else(|| self.not_found(&name))?;
             if !revision.is_empty() && revision != rec.revision_id {
                 return Err(revision_mismatch());
+            }
+            if rec.is_image() {
+                if !runtime_id.is_empty() || !str_field(&req, "Handler").is_empty() {
+                    return Err(invalid_param(
+                        "Runtime and Handler are not supported for the Image package type",
+                    ));
+                }
+                if let Some(c) = new_image_config.clone() {
+                    rec.image_config = c;
+                }
+            } else if new_image_config.is_some() {
+                return Err(invalid_param(
+                    "ImageConfig is supported only for the Image package type",
+                ));
             }
             if !runtime_id.is_empty() {
                 rec.runtime = runtime_id.clone();
@@ -632,11 +759,13 @@ impl Server {
                 rec.ephemeral_storage_size = size;
             }
             rec.last_modified = now_lambda();
-            rec.revision_id = new_revision.clone();
-            Ok(rec.clone())
+            let retired = std::mem::replace(&mut rec.revision_id, new_revision.clone());
+            Ok((rec.clone(), retired))
         });
         match result {
-            Ok(rec) => {
+            Ok((rec, retired)) => {
+                // Environments of the previous revision can never serve again.
+                self.pool.retire(&name, &retired);
                 emit("lambda.function.updated", json!({ "functionName": name }));
                 Reply::json(200, &self.configuration_json(&rec))
             }
@@ -649,15 +778,27 @@ impl Server {
             Ok(v) => v,
             Err(r) => return r,
         };
-        let name = match self.lookup(id, None) {
-            Ok(r) => r.function_name,
+        let (name, is_image) = match self.lookup(id, None) {
+            Ok(r) => (r.function_name.clone(), r.is_image()),
             Err(r) => return r,
         };
-        let zip = match self.package_bytes(Some(&req)) {
-            Ok(z) => z,
-            Err(r) => return r,
+        // The package type is fixed at creation, as on AWS.
+        let (zip, image_uri) = if is_image {
+            match image_uri(Some(&req)) {
+                Ok(u) => (Vec::new(), u),
+                Err(r) => return r,
+            }
+        } else {
+            match self.package_bytes(Some(&req)) {
+                Ok(z) => (z, String::new()),
+                Err(r) => return r,
+            }
         };
-        let sha = code_sha256(&zip);
+        let sha = if is_image {
+            code_sha256(image_uri.as_bytes())
+        } else {
+            code_sha256(&zip)
+        };
         let revision = str_field(&req, "RevisionId");
         let architectures = match architectures(&req) {
             Ok(a) => a,
@@ -679,6 +820,9 @@ impl Server {
             let mut preview = current;
             preview.code_sha256 = sha;
             preview.code_size = zip.len() as i64;
+            if is_image {
+                preview.image_uri = image_uri;
+            }
             if let Some(a) = architectures {
                 preview.architectures = a;
             }
@@ -686,11 +830,13 @@ impl Server {
         }
         // The new version gets its own files; the committed one stays intact
         // until the configuration switch below is persisted.
-        if let Err(r) = self.stage_package(&name, &zip, &sha) {
-            if sha != current.code_sha256 {
-                self.code.retire(&name, &sha);
+        if !is_image {
+            if let Err(r) = self.stage_package(&name, &zip, &sha) {
+                if sha != current.code_sha256 {
+                    self.code.retire(&name, &sha);
+                }
+                return r;
             }
-            return r;
         }
         let new_revision = self.new_id();
         let result = self.commit(|st| {
@@ -703,20 +849,25 @@ impl Server {
             }
             let previous = std::mem::replace(&mut rec.code_sha256, sha.clone());
             rec.code_size = zip.len() as i64;
+            if is_image {
+                rec.image_uri = image_uri.clone();
+            }
             // Architectures travel with the code (UpdateFunctionCode), and are
             // committed together with it.
             if let Some(a) = architectures.clone() {
                 rec.architectures = a;
             }
             rec.last_modified = now_lambda();
-            rec.revision_id = new_revision.clone();
-            Ok((rec.clone(), previous))
+            let retired = std::mem::replace(&mut rec.revision_id, new_revision.clone());
+            Ok((rec.clone(), previous, retired))
         });
         match result {
-            Ok((rec, previous)) => {
+            Ok((rec, previous, retired)) => {
                 if previous != rec.code_sha256 {
                     self.code.retire(&name, &previous);
                 }
+                // Environments of the previous revision can never serve again.
+                self.pool.retire(&name, &retired);
                 emit("lambda.function.updated", json!({ "functionName": name }));
                 Reply::json(200, &self.configuration_json(&rec))
             }
@@ -746,9 +897,248 @@ impl Server {
             Err(r) => return r,
         };
         // Running invocations keep their tree until they finish.
+        self.pool.retire(&name, &removed.revision_id);
         self.code.retire(&name, &removed.code_sha256);
         emit("lambda.function.deleted", json!({ "functionName": name }));
         Reply::empty(204)
+    }
+
+    // ---- function URLs ------------------------------------------------------
+
+    fn function_url_json(&self, name: &str, url: &UrlConfig, with_last_modified: bool) -> Value {
+        let mut v = json!({
+            "FunctionUrl": function_url::function_url(&self.config.endpoint, &url.url_id, self.region()),
+            "FunctionArn": self.function_arn(name),
+            "AuthType": url.auth_type,
+            "CreationTime": url.creation_time,
+            "InvokeMode": url.invoke_mode,
+        });
+        if let Some(cors) = &url.cors {
+            v["Cors"] = serde_json::to_value(cors).unwrap_or_default();
+        }
+        if with_last_modified {
+            v["LastModifiedTime"] = json!(url.last_modified_time);
+        }
+        v
+    }
+
+    fn url_not_found(&self, name: &str) -> Reply {
+        Reply::error(
+            404,
+            "ResourceNotFoundException",
+            &format!(
+                "The resource you requested does not exist. (Function URL config for {})",
+                self.function_arn(name)
+            ),
+        )
+    }
+
+    /// `POST /2021-10-31/functions/<id>/url`.
+    pub fn create_function_url_config(
+        &self,
+        id: &str,
+        query: &BTreeMap<String, String>,
+        body: &[u8],
+    ) -> Reply {
+        let settings = match parse_json(body).and_then(|req| function_url::parse_settings(&req)) {
+            Ok(s) => s,
+            Err(r) => return r,
+        };
+        let Some(auth_type) = settings.auth_type else {
+            return validation("1 validation error detected: Value null at 'authType' failed to satisfy constraint: Member must not be null");
+        };
+        let name = match self.lookup(id, query.get("Qualifier").map(String::as_str)) {
+            Ok(r) => r.function_name,
+            Err(r) => return r,
+        };
+        let now = now_rfc3339();
+        let url = UrlConfig {
+            url_id: hex::encode(&Sha256::digest(self.new_id().as_bytes())[..16]),
+            auth_type,
+            cors: settings.cors,
+            invoke_mode: settings
+                .invoke_mode
+                .unwrap_or_else(|| "BUFFERED".to_string()),
+            creation_time: now.clone(),
+            last_modified_time: now,
+        };
+        let result = self.commit(|st| {
+            let rec = st
+                .functions
+                .get_mut(&name)
+                .ok_or_else(|| self.not_found(&name))?;
+            if rec.function_url.is_some() {
+                return Err(Reply::error(
+                    409,
+                    "ResourceConflictException",
+                    &format!(
+                        "Failed to create function url config for [functionArn = {}]. Error message:  FunctionUrlConfig exists for this Lambda function",
+                        self.function_arn(&name)
+                    ),
+                ));
+            }
+            rec.function_url = Some(url.clone());
+            Ok(())
+        });
+        match result {
+            Ok(()) => Reply::json(201, &self.function_url_json(&name, &url, false)),
+            Err(r) => r,
+        }
+    }
+
+    /// `GET /2021-10-31/functions/<id>/url`.
+    pub fn get_function_url_config(&self, id: &str, query: &BTreeMap<String, String>) -> Reply {
+        let rec = match self.lookup(id, query.get("Qualifier").map(String::as_str)) {
+            Ok(r) => r,
+            Err(r) => return r,
+        };
+        match &rec.function_url {
+            Some(url) => Reply::json(200, &self.function_url_json(&rec.function_name, url, true)),
+            None => self.url_not_found(&rec.function_name),
+        }
+    }
+
+    /// `PUT /2021-10-31/functions/<id>/url`: only the fields present change.
+    pub fn update_function_url_config(
+        &self,
+        id: &str,
+        query: &BTreeMap<String, String>,
+        body: &[u8],
+    ) -> Reply {
+        let settings = match parse_json(body).and_then(|req| function_url::parse_settings(&req)) {
+            Ok(s) => s,
+            Err(r) => return r,
+        };
+        let name = match self.lookup(id, query.get("Qualifier").map(String::as_str)) {
+            Ok(r) => r.function_name,
+            Err(r) => return r,
+        };
+        let result = self.commit(|st| {
+            let rec = st
+                .functions
+                .get_mut(&name)
+                .ok_or_else(|| self.not_found(&name))?;
+            let url = rec
+                .function_url
+                .as_mut()
+                .ok_or_else(|| self.url_not_found(&name))?;
+            if let Some(a) = settings.auth_type {
+                url.auth_type = a;
+            }
+            if let Some(c) = settings.cors {
+                url.cors = Some(c);
+            }
+            if let Some(m) = settings.invoke_mode {
+                url.invoke_mode = m;
+            }
+            url.last_modified_time = now_rfc3339();
+            Ok(url.clone())
+        });
+        match result {
+            Ok(url) => Reply::json(200, &self.function_url_json(&name, &url, true)),
+            Err(r) => r,
+        }
+    }
+
+    /// `DELETE /2021-10-31/functions/<id>/url`.
+    pub fn delete_function_url_config(&self, id: &str, query: &BTreeMap<String, String>) -> Reply {
+        let name = match self.lookup(id, query.get("Qualifier").map(String::as_str)) {
+            Ok(r) => r.function_name,
+            Err(r) => return r,
+        };
+        let result = self.commit(|st| {
+            let rec = st
+                .functions
+                .get_mut(&name)
+                .ok_or_else(|| self.not_found(&name))?;
+            rec.function_url
+                .take()
+                .map(|_| ())
+                .ok_or_else(|| self.url_not_found(&name))
+        });
+        match result {
+            Ok(()) => Reply::empty(204),
+            Err(r) => r,
+        }
+    }
+
+    /// `GET /2021-10-31/functions/<id>/urls` (at most one: only `$LATEST`).
+    pub fn list_function_url_configs(&self, id: &str) -> Reply {
+        let rec = match self.lookup(id, None) {
+            Ok(r) => r,
+            Err(r) => return r,
+        };
+        let configs: Vec<Value> = rec
+            .function_url
+            .iter()
+            .map(|u| self.function_url_json(&rec.function_name, u, true))
+            .collect();
+        Reply::json(200, &json!({ "FunctionUrlConfigs": configs }))
+    }
+
+    /// Serves one request addressed to a function URL: CORS preflight, the
+    /// URL's AuthType, then a synchronous invoke with a payload 2.0 event.
+    pub async fn serve_function_url(
+        self: &Arc<Self>,
+        req: &Request,
+        url_id: &str,
+        raw_path: &str,
+    ) -> Reply {
+        let target = {
+            let st = self.state.lock().unwrap();
+            st.functions.values().find_map(|r| {
+                r.function_url
+                    .as_ref()
+                    .filter(|u| u.url_id == url_id)
+                    .map(|u| (r.function_name.clone(), u.clone()))
+            })
+        };
+        let Some((name, url)) = target else {
+            return function_url::forbidden();
+        };
+        let origin = req.headers.get("origin").map(String::as_str).unwrap_or("");
+        if let Some(cors) = &url.cors {
+            if req.method == "OPTIONS" && req.headers.contains_key("access-control-request-method")
+            {
+                return function_url::preflight(cors, &req.headers);
+            }
+        }
+        let iam_access_key = if url.auth_type == "AWS_IAM" {
+            match function_url::verify_iam(req, &self.config) {
+                Ok(key) => Some(key),
+                Err(r) => return r,
+            }
+        } else {
+            None
+        };
+        let request_id = self.new_id();
+        let event = function_url::build_event(
+            req,
+            &function_url::EventContext {
+                url_id,
+                raw_path,
+                account_id: self.account_id(),
+                request_id: &request_id,
+                iam_access_key: iam_access_key.as_deref(),
+                domain_name: format!("{url_id}.lambda-url.{}.localhost", self.region()),
+            },
+        );
+        let payload = serde_json::to_vec(&event).unwrap_or_default();
+        let invoked = self
+            .invoke_pinned(
+                &name,
+                &BTreeMap::new(),
+                "RequestResponse",
+                "",
+                &payload,
+                Some(&url),
+            )
+            .await;
+        let reply = function_url::map_response(invoked);
+        match &url.cors {
+            Some(cors) => function_url::apply_cors(reply, cors, origin),
+            None => reply,
+        }
     }
 
     pub fn list_tags(&self, arn: &str) -> Reply {
@@ -885,6 +1275,24 @@ impl Server {
         log_type: &str,
         payload: &[u8],
     ) -> Reply {
+        self.invoke_pinned(id, query, invocation_type, log_type, payload, None)
+            .await
+    }
+
+    /// [`Self::invoke`], refused with 403 unless the function being run still
+    /// carries `url` — the function URL configuration the request was
+    /// authorized against. The check and the code lease happen under one
+    /// state lock, so a URL request can never run a function that was
+    /// deleted and recreated (or reconfigured) after its authorization.
+    async fn invoke_pinned(
+        self: &Arc<Self>,
+        id: &str,
+        query: &BTreeMap<String, String>,
+        invocation_type: &str,
+        log_type: &str,
+        payload: &[u8],
+        url: Option<&UrlConfig>,
+    ) -> Reply {
         let invocation_type = if invocation_type.is_empty() {
             "RequestResponse"
         } else {
@@ -900,6 +1308,11 @@ impl Server {
                 Ok(r) => r,
                 Err(r) => return r,
             };
+        if let Some(url) = url {
+            if record.function_url.as_ref() != Some(url) {
+                return function_url::forbidden();
+            }
+        }
         let limit = if invocation_type == "Event" {
             MAX_ASYNC_PAYLOAD_BYTES
         } else {
@@ -930,7 +1343,20 @@ impl Server {
         if invocation_type == "DryRun" {
             return Reply::empty(204);
         }
-        if runtime::family(&record.runtime).is_none() {
+        let image = record.is_image().then(|| ImageSpec {
+            uri: record.image_uri.clone(),
+            entry_point: record.image_config.entry_point.clone(),
+            command: record.image_config.command.clone(),
+            working_directory: record.image_config.working_directory.clone(),
+        });
+        if image.is_some() && self.config.interpreters.docker.is_none() {
+            return Reply::error(
+                502,
+                "ServiceException",
+                "devcloud runs container image functions with Docker: enable services.lambda.docker (DEVCLOUD_LAMBDA_DOCKER=true for devcloud-lambda)",
+            );
+        }
+        if image.is_none() && runtime::family(&record.runtime).is_none() {
             return Reply::error(
                 502,
                 "InvalidRuntimeException",
@@ -946,7 +1372,6 @@ impl Server {
             runtime: record.runtime.clone(),
             handler: record.handler.clone(),
             code_dir: lease.dir().to_path_buf(),
-            work_dir: self.storage().join("invocations").join(&request_id),
             function_name: record.function_name.clone(),
             function_arn: self.function_arn(&record.function_name),
             memory_size: record.memory_size,
@@ -955,6 +1380,14 @@ impl Server {
             request_id: request_id.clone(),
             environment: record.environment.clone(),
             payload: payload.to_vec(),
+            opt_dir: self
+                .config
+                .opt_dir
+                .clone()
+                .unwrap_or_else(|| PathBuf::from("/opt")),
+            credentials: self.config.function_credentials.clone(),
+            env_key: record.revision_id.clone(),
+            image,
         };
 
         if invocation_type == "Event" {
@@ -1001,16 +1434,18 @@ impl Server {
         }
     }
 
-    /// Runs one invocation. `_lease` pins the code tree it started with until
-    /// the handler process is done, even if the code is updated meanwhile.
+    /// Runs one invocation. `lease` pins the code tree it started with until
+    /// the handler is done (or, for a new environment, until the environment
+    /// stops), even if the code is updated meanwhile.
     async fn execute(
         &self,
         inv: Invocation,
         invocation_type: &str,
-        _lease: Lease,
+        lease: Lease,
     ) -> Result<(Outcome, String), RuntimeError> {
         let started_at = now_rfc3339();
-        let result = runtime::run(&inv, &self.config.interpreters).await;
+        let result =
+            runtime::run(&inv, &self.config.interpreters, &self.pool, Box::new(lease)).await;
         let (status, duration_ms, log) = match &result {
             Ok(done) => (
                 match done.outcome {
@@ -1064,6 +1499,12 @@ impl Server {
         };
         tasks.abort_all();
         while tasks.join_next().await.is_some() {}
+        self.pool.close().await;
+    }
+
+    /// Warm execution environments currently idle for `function`.
+    pub fn idle_environments(&self, function: &str) -> usize {
+        self.pool.idle_count(function)
     }
 
     fn not_found(&self, name: &str) -> Reply {
@@ -1184,7 +1625,7 @@ impl Server {
             }
         } else if code.get("ImageUri").is_some() {
             return Err(invalid_param(
-                "devcloud lambda supports only Zip packages (ImageUri given)",
+                "ImageUri is supported only for the Image package type",
             ));
         } else {
             return Err(invalid_param("Please provide a source for function code."));
@@ -1221,7 +1662,7 @@ impl Server {
             "RevisionId": r.revision_id,
             "State": "Active",
             "LastUpdateStatus": "Successful",
-            "PackageType": "Zip",
+            "PackageType": r.package_type,
             "Architectures": r.architectures,
             "EphemeralStorage": { "Size": r.ephemeral_storage_size },
             "LoggingConfig": {
@@ -1231,6 +1672,15 @@ impl Server {
         });
         if !r.environment.is_empty() {
             v["Environment"] = json!({ "Variables": r.environment });
+        }
+        if r.is_image() {
+            if let Some(obj) = v.as_object_mut() {
+                obj.remove("Runtime");
+                obj.remove("Handler");
+            }
+            if !r.image_config.is_empty() {
+                v["ImageConfigResponse"] = json!({ "ImageConfig": r.image_config });
+            }
         }
         v
     }
@@ -1390,6 +1840,14 @@ fn env_vars(req: &Value) -> Result<Option<BTreeMap<String, String>>, Reply> {
         return Err(invalid_param("Environment must be an object"));
     }
     let vars = string_map(env.get("Variables"), "Environment.Variables")?;
+    // Lambda's key pattern (single letters allowed, as devcloud always did).
+    // It also keeps names from smuggling extra lines (or `=`) into a
+    // container's env-file.
+    if let Some(bad) = vars.keys().find(|k| !valid_env_key(k)) {
+        return Err(validation(&format!(
+            "1 validation error detected: Value '{bad}' at 'environment.variables' failed to satisfy constraint: Map keys must satisfy constraint: [Member must satisfy regular expression pattern: [a-zA-Z]([a-zA-Z0-9_])+]"
+        )));
+    }
     let reserved: Vec<&str> = vars
         .keys()
         .map(String::as_str)
@@ -1402,6 +1860,14 @@ fn env_vars(req: &Value) -> Result<Option<BTreeMap<String, String>>, Reply> {
         )));
     }
     Ok(Some(vars))
+}
+
+/// `[a-zA-Z][a-zA-Z0-9_]*`: Lambda's environment variable key pattern, minus
+/// its two-character minimum.
+fn valid_env_key(key: &str) -> bool {
+    let mut chars = key.chars();
+    chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// `EphemeralStorage.Size` (MiB, 512–10240). `Ok(None)` when absent.
@@ -1449,6 +1915,39 @@ fn validate_function_name(name: &str) -> Result<(), Reply> {
     Ok(())
 }
 
+/// `Code.ImageUri` of an Image function; zip sources are refused.
+fn image_uri(code: Option<&Value>) -> Result<String, Reply> {
+    let code = code.ok_or_else(|| {
+        validation("1 validation error detected: Value null at 'code' failed to satisfy constraint: Member must not be null")
+    })?;
+    if code.get("ZipFile").is_some() || code.get("S3Bucket").is_some() {
+        return Err(invalid_param(
+            "ZipFile and S3Bucket are not supported for the Image package type",
+        ));
+    }
+    match code.get("ImageUri").and_then(Value::as_str).map(str::trim) {
+        Some(uri) if !uri.is_empty() => Ok(uri.to_string()),
+        _ => Err(invalid_param(
+            "ImageUri is required for the Image package type",
+        )),
+    }
+}
+
+/// `ImageConfig`, if the request has one; only Image functions take it.
+fn image_config(req: &Value, is_image: bool) -> Result<Option<ImageConfig>, Reply> {
+    let Some(value) = req.get("ImageConfig").filter(|v| !v.is_null()) else {
+        return Ok(None);
+    };
+    if !is_image {
+        return Err(invalid_param(
+            "ImageConfig is supported only for the Image package type",
+        ));
+    }
+    serde_json::from_value(value.clone())
+        .map(Some)
+        .map_err(|e| invalid_param(&format!("Invalid ImageConfig: {e}")))
+}
+
 fn validate_runtime(runtime_id: &str) -> Result<(), Reply> {
     if runtime_id.is_empty() {
         return Err(invalid_param("Runtime is required for Zip package type"));
@@ -1478,6 +1977,89 @@ fn emit(event_type: &str, payload: Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A URL request authorized against one function must not run another:
+    /// the function deleted and recreated (with or without a new URL) while
+    /// the request was in flight, or its URL reconfigured.
+    #[tokio::test]
+    async fn url_invocations_run_only_the_function_they_were_authorized_for() {
+        let dir = std::env::temp_dir().join(format!(
+            "devcloud-lambda-pinned-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let server = Arc::new(Server::new(Config {
+            storage_path: dir.to_string_lossy().into_owned(),
+            ..Config::default()
+        }));
+        let zip = crate::zip::build_stored(&[("app.py", b"def handler(e, c):\n    return 1\n")]);
+        let create = || {
+            json!({
+                "FunctionName": "pinned", "Runtime": "python3.12", "Role": "r",
+                "Handler": "app.handler",
+                "Code": { "ZipFile": base64::engine::general_purpose::STANDARD.encode(&zip) },
+            })
+            .to_string()
+        };
+        let none = json!({ "AuthType": "NONE" }).to_string();
+        let no_query = BTreeMap::new();
+        let url_of = |server: &Server| {
+            server.state.lock().unwrap().functions["pinned"]
+                .function_url
+                .clone()
+        };
+        let dry_run = |url: UrlConfig| {
+            let server = Arc::clone(&server);
+            async move {
+                server
+                    .invoke_pinned("pinned", &BTreeMap::new(), "DryRun", "", b"{}", Some(&url))
+                    .await
+                    .status
+            }
+        };
+
+        assert_eq!(server.create_function(create().as_bytes()).status, 201);
+        assert_eq!(
+            server
+                .create_function_url_config("pinned", &no_query, none.as_bytes())
+                .status,
+            201
+        );
+        let authorized = url_of(&server).unwrap();
+        assert_eq!(
+            dry_run(authorized.clone()).await,
+            204,
+            "same function, same URL"
+        );
+
+        // Deleted and recreated without a URL.
+        assert_eq!(server.delete_function("pinned", &no_query).status, 204);
+        assert_eq!(server.create_function(create().as_bytes()).status, 201);
+        assert_eq!(dry_run(authorized.clone()).await, 403);
+        // ... or recreated with a URL of its own.
+        assert_eq!(
+            server
+                .create_function_url_config("pinned", &no_query, none.as_bytes())
+                .status,
+            201
+        );
+        assert_eq!(dry_run(authorized).await, 403);
+
+        // The URL reconfigured (NONE -> AWS_IAM) mid-request.
+        let current = url_of(&server).unwrap();
+        let iam = json!({ "AuthType": "AWS_IAM" }).to_string();
+        assert_eq!(
+            server
+                .update_function_url_config("pinned", &no_query, iam.as_bytes())
+                .status,
+            200
+        );
+        assert_eq!(dry_run(current).await, 403);
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn parses_function_identifiers() {
