@@ -293,6 +293,7 @@ impl Server {
             pool: runtime::Pool::new(
                 PathBuf::from(&config.storage_path).join("environments"),
                 config.idle_timeout.unwrap_or(runtime::DEFAULT_IDLE_TIMEOUT),
+                instance_id(&config.storage_path),
             ),
             config,
         };
@@ -1520,6 +1521,24 @@ impl Server {
         self.pool.close().await;
     }
 
+    /// Removes function containers that a previous, killed run of this
+    /// instance (same storage) left behind. Call once at startup, before
+    /// serving; a no-op without Docker.
+    pub async fn remove_orphaned_containers(&self) {
+        let Some(docker) = self.config.interpreters.docker.as_deref() else {
+            return;
+        };
+        match runtime::remove_orphaned_containers(docker, self.pool.owner()).await {
+            Ok(0) => {}
+            Ok(n) => eprintln!(
+                "devcloud-lambda: removed {n} function container(s) left by a previous run"
+            ),
+            Err(e) => eprintln!(
+                "devcloud-lambda: warning: could not look for containers left by a previous run: {e}"
+            ),
+        }
+    }
+
     /// Warm execution environments currently idle for `function`.
     pub fn idle_environments(&self, function: &str) -> usize {
         self.pool.idle_count(function)
@@ -1990,6 +2009,34 @@ fn emit(event_type: &str, payload: Value) {
     if let Some(tx) = crate::event_sink() {
         let _ = tx.send(event.to_string());
     }
+}
+
+/// This instance's id: kept in `<storage>/instance-id` so it survives
+/// restarts (and identifies containers a killed run left behind), distinct
+/// per storage so instances sharing a Docker daemon never touch each
+/// other's containers. Without storage the id is per process.
+fn instance_id(storage: &str) -> String {
+    let fresh = || {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        hex::encode(&Sha256::digest(format!("{nanos}:{}", std::process::id()).as_bytes())[..8])
+    };
+    if storage.is_empty() {
+        return fresh();
+    }
+    let path = PathBuf::from(storage).join("instance-id");
+    if let Ok(id) = std::fs::read_to_string(&path) {
+        let id = id.trim();
+        if !id.is_empty() && id.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return id.to_string();
+        }
+    }
+    let id = fresh();
+    let _ = std::fs::create_dir_all(storage);
+    let _ = std::fs::write(&path, &id);
+    id
 }
 
 /// An invocation log for devcloud's stdout: every line tagged with the

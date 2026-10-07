@@ -127,6 +127,7 @@ fn main() {
             eprintln!("devcloud-lambda: failed to load state: {err}");
             std::process::exit(1);
         }
+        server.remove_orphaned_containers().await;
         if let Err(e) = devcloud_lambda::http::serve(listener, server, shutdown_signal()).await {
             eprintln!("devcloud-lambda: serve error: {e}");
             std::process::exit(1);

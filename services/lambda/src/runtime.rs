@@ -222,6 +222,8 @@ struct BootstrapResult {
 /// its function is deleted or reconfigured, or when the pool closes.
 pub struct Pool {
     work_root: PathBuf,
+    /// This devcloud instance's id, labelled onto its function containers.
+    owner: String,
     idle_timeout: Duration,
     seq: AtomicU64,
     state: Mutex<PoolState>,
@@ -245,15 +247,22 @@ struct PoolState {
 }
 
 impl Pool {
-    /// `work_root` holds per-environment scratch directories.
-    pub fn new(work_root: PathBuf, idle_timeout: Duration) -> Arc<Self> {
+    /// `work_root` holds per-environment scratch directories; `owner`
+    /// identifies this devcloud instance on the containers it starts.
+    pub fn new(work_root: PathBuf, idle_timeout: Duration, owner: String) -> Arc<Self> {
         Arc::new(Pool {
             work_root,
+            owner,
             idle_timeout,
             seq: AtomicU64::new(0),
             state: Mutex::new(PoolState::default()),
             removals: Removals::default(),
         })
+    }
+
+    /// This devcloud instance's id (see [`container::OWNER_LABEL`]).
+    pub fn owner(&self) -> &str {
+        &self.owner
     }
 
     /// Number of idle environments of `function` (introspection and tests).
@@ -1055,6 +1064,7 @@ async fn start_container(
         &reach,
         inv.memory_size,
         &env_file,
+        &pool.owner,
     ))
     .stdin(Stdio::null())
     .stdout(Stdio::piped())
@@ -1131,6 +1141,38 @@ async fn start_container(
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+}
+
+/// Removes the function containers a previous run of devcloud instance
+/// `owner` left behind (it was killed before it could remove them). Returns
+/// how many were removed. Containers of other instances are not touched.
+pub async fn remove_orphaned_containers(docker: &str, owner: &str) -> Result<usize, String> {
+    let deadline = Instant::now() + DOCKER_RM_TIMEOUT;
+    let filter = format!("label={}={owner}", container::OWNER_LABEL);
+    let listed = docker_output(docker, &["ps", "-aq", "--filter", &filter], deadline).await?;
+    if !listed.status.success() {
+        return Err(format!(
+            "docker ps: {}",
+            String::from_utf8_lossy(&listed.stderr).trim()
+        ));
+    }
+    let ids: Vec<String> = String::from_utf8_lossy(&listed.stdout)
+        .split_whitespace()
+        .map(str::to_string)
+        .collect();
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    let mut args = vec!["rm", "-f"];
+    args.extend(ids.iter().map(String::as_str));
+    let removed = docker_output(docker, &args, deadline).await?;
+    if !removed.status.success() {
+        return Err(format!(
+            "docker rm: {}",
+            String::from_utf8_lossy(&removed.stderr).trim()
+        ));
+    }
+    Ok(ids.len())
 }
 
 /// The image's default CMD, pulling the image first if it is not local.
@@ -1696,7 +1738,7 @@ mod tests {
 
     #[test]
     fn version_mismatch_is_reported_once_per_function_and_runtime() {
-        let pool = Pool::new(std::env::temp_dir(), DEFAULT_IDLE_TIMEOUT);
+        let pool = Pool::new(std::env::temp_dir(), DEFAULT_IDLE_TIMEOUT, "t".into());
         let inv = |function: &str, runtime: &str| Invocation {
             runtime: runtime.into(),
             handler: "app.handler".into(),
