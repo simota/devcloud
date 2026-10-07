@@ -1,12 +1,13 @@
 //! Lambda service, run in-process as a supervisor task.
 
 use std::future::Future;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use devcloud_lambda::runtime::FunctionCredentials;
 use devcloud_lambda::{Config, Server};
 
-use crate::config::Config as OrchestratorConfig;
+use crate::config::{Config as OrchestratorConfig, LambdaServiceConfig};
 
 /// Runs the Lambda HTTP server until it errors or `shutdown` resolves.
 ///
@@ -30,6 +31,9 @@ pub async fn run(
         endpoint: format!("http://{addr}"),
         object_store_root: cfg.services.s3.enabled.then(|| root.join("s3/buckets")),
         interpreters: Default::default(),
+        function_credentials: function_credentials(&cfg.services.lambda)?,
+        opt_dir: (!cfg.services.lambda.opt_dir.is_empty())
+            .then(|| PathBuf::from(&cfg.services.lambda.opt_dir)),
     };
 
     let server = Arc::new(Server::new(config));
@@ -43,4 +47,21 @@ pub async fn run(
     devcloud_lambda::http::serve(listener, server, shutdown)
         .await
         .map_err(|e| format!("lambda: server error: {e}"))
+}
+
+/// Credentials for handlers, from `services.lambda.function*`. A key id
+/// without a secret (or the reverse) is a configuration error.
+fn function_credentials(l: &LambdaServiceConfig) -> Result<Option<FunctionCredentials>, String> {
+    match (
+        l.function_access_key_id.is_empty(),
+        l.function_secret_access_key.is_empty(),
+    ) {
+        (true, true) => Ok(None),
+        (false, false) => Ok(Some(FunctionCredentials {
+            access_key_id: l.function_access_key_id.clone(),
+            secret_access_key: l.function_secret_access_key.clone(),
+            session_token: l.function_session_token.clone(),
+        })),
+        _ => Err("lambda: set both services.lambda.functionAccessKeyId and functionSecretAccessKey, or neither".to_string()),
+    }
 }

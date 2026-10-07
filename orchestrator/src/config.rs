@@ -325,6 +325,13 @@ pub struct AppAutoScalingServiceConfig {
 pub struct LambdaServiceConfig {
     pub enabled: bool,
     pub region: String,
+    /// Credentials handed to every handler (`AWS_ACCESS_KEY_ID` & co.). Empty
+    /// key id / secret = none.
+    pub function_access_key_id: String,
+    pub function_secret_access_key: String,
+    pub function_session_token: String,
+    /// Stand-in for Lambda's `/opt` (layer contents). Empty = `/opt`.
+    pub opt_dir: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -571,6 +578,7 @@ pub fn default_config() -> Config {
             lambda: LambdaServiceConfig {
                 enabled: true,
                 region: "us-east-1".to_string(),
+                ..Default::default()
             },
             cloud_run: CloudRunServiceConfig {
                 enabled: true,
@@ -1166,6 +1174,16 @@ pub fn apply_config_value(cfg: &mut Config, path: &[String], value: &str) -> io:
             cfg.services.lambda.enabled = parse_bool("services.lambda.enabled", value)?
         }
         "services.lambda.region" => cfg.services.lambda.region = value.to_string(),
+        "services.lambda.functionAccessKeyId" => {
+            cfg.services.lambda.function_access_key_id = value.to_string()
+        }
+        "services.lambda.functionSecretAccessKey" => {
+            cfg.services.lambda.function_secret_access_key = value.to_string()
+        }
+        "services.lambda.functionSessionToken" => {
+            cfg.services.lambda.function_session_token = value.to_string()
+        }
+        "services.lambda.optDir" => cfg.services.lambda.opt_dir = value.to_string(),
         "services.cloudRun.enabled" => {
             cfg.services.cloud_run.enabled = parse_bool("services.cloudRun.enabled", value)?
         }
@@ -1296,6 +1314,21 @@ fn fmt_bool(b: bool) -> &'static str {
     } else {
         "false"
     }
+}
+
+/// The optional `services.lambda` keys, rendered only when set so the default
+/// output stays unchanged.
+fn lambda_optional_lines(l: &LambdaServiceConfig) -> String {
+    [
+        ("functionAccessKeyId", &l.function_access_key_id),
+        ("functionSecretAccessKey", &l.function_secret_access_key),
+        ("functionSessionToken", &l.function_session_token),
+        ("optDir", &l.opt_dir),
+    ]
+    .into_iter()
+    .filter(|(_, v)| !v.is_empty())
+    .map(|(k, v)| format!("    {k}: {v}\n"))
+    .collect()
 }
 
 /// Replicate legacy `defaultConfigYAML(cfg)`. The output MUST be byte-identical to
@@ -1491,6 +1524,7 @@ pub fn default_config_yaml(cfg: &Config) -> String {
             "  lambda:\n",
             "    enabled: {lambda_enabled}\n",
             "    region: {lambda_region}\n",
+            "{lambda_optional}",
             "  cloudRun:\n",
             "    enabled: {cloud_run_enabled}\n",
             "    project: {cloud_run_project}\n",
@@ -1642,6 +1676,7 @@ pub fn default_config_yaml(cfg: &Config) -> String {
         aas_region = sv.app_auto_scaling.region,
         lambda_enabled = fmt_bool(sv.lambda.enabled),
         lambda_region = sv.lambda.region,
+        lambda_optional = lambda_optional_lines(&sv.lambda),
         cloud_run_enabled = fmt_bool(sv.cloud_run.enabled),
         cloud_run_project = sv.cloud_run.project,
         cloud_run_region = sv.cloud_run.region,
@@ -2047,6 +2082,21 @@ mod tests {
         parsed.services.pubsub.data_dir = cfg.services.pubsub.data_dir.clone();
         parsed.services.pubsub.message_data_dir = cfg.services.pubsub.message_data_dir.clone();
         assert_eq!(parsed, cfg);
+    }
+
+    #[test]
+    fn lambda_optional_keys_round_trip_and_stay_out_of_the_default_yaml() {
+        let mut cfg = default_config();
+        assert!(!default_config_yaml(&cfg).contains("functionAccessKeyId"));
+        cfg.services.lambda.function_access_key_id = "AKIDLOCAL".into();
+        cfg.services.lambda.function_secret_access_key = "local-secret".into();
+        cfg.services.lambda.opt_dir = "/srv/lambda-opt".into();
+        let yaml = default_config_yaml(&cfg);
+        assert!(yaml.contains(
+            "  lambda:\n    enabled: true\n    region: us-east-1\n    functionAccessKeyId: AKIDLOCAL\n    functionSecretAccessKey: local-secret\n    optDir: /srv/lambda-opt\n  cloudRun:\n"
+        ));
+        let parsed = parse_yaml_in_memory(&yaml).expect("parse yaml");
+        assert_eq!(parsed.services.lambda, cfg.services.lambda);
     }
 
     #[test]

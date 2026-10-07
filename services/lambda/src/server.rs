@@ -19,7 +19,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use crate::code_store::{CodeStore, Lease, StageError};
-use crate::runtime::{self, Interpreters, Invocation, Outcome, RuntimeError};
+use crate::runtime::{self, FunctionCredentials, Interpreters, Invocation, Outcome, RuntimeError};
 use crate::time_fmt::{now_lambda, now_rfc3339};
 
 const MAX_SYNC_PAYLOAD_BYTES: usize = 6 * 1024 * 1024;
@@ -74,6 +74,12 @@ pub struct Config {
     /// `Code.S3Bucket`/`Code.S3Key` deployment packages. `None` disables it.
     pub object_store_root: Option<PathBuf>,
     pub interpreters: Interpreters,
+    /// Credentials every handler receives in place of an execution role's.
+    /// `None` leaves `AWS_ACCESS_KEY_ID` & co. unset.
+    pub function_credentials: Option<FunctionCredentials>,
+    /// Directory standing in for Lambda's `/opt` (layer contents); `None`
+    /// means `/opt` itself.
+    pub opt_dir: Option<PathBuf>,
 }
 
 /// One HTTP reply: status, extra headers, body. `X-Amzn-ErrorType` is carried
@@ -211,10 +217,15 @@ struct Background {
 impl Server {
     pub fn new(mut config: Config) -> Self {
         // Handlers run with their code directory as cwd, so every path handed
-        // to the child (task root, result file) must be absolute.
+        // to the child (task root, result file, /opt) must be absolute.
         if !config.storage_path.is_empty() {
             if let Ok(abs) = std::path::absolute(&config.storage_path) {
                 config.storage_path = abs.to_string_lossy().into_owned();
+            }
+        }
+        if let Some(opt) = config.opt_dir.as_mut() {
+            if let Ok(abs) = std::path::absolute(&*opt) {
+                *opt = abs;
             }
         }
         let mut server = Server {
@@ -955,6 +966,12 @@ impl Server {
             request_id: request_id.clone(),
             environment: record.environment.clone(),
             payload: payload.to_vec(),
+            opt_dir: self
+                .config
+                .opt_dir
+                .clone()
+                .unwrap_or_else(|| PathBuf::from("/opt")),
+            credentials: self.config.function_credentials.clone(),
         };
 
         if invocation_type == "Event" {

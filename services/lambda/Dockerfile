@@ -9,7 +9,13 @@
 #   docker run --rm -p 3001:3001 -v devcloud-lambda-data:/data devcloud-lambda
 #
 # Handlers run as python3 / node child processes inside this container, using
-# Debian bookworm's interpreters whatever the function's Runtime version says.
+# Debian bookworm's interpreters (Python 3.11, Node 18) whatever the function's
+# Runtime version says; a mismatch is flagged as a [WARNING] line in the
+# invocation log. Every invocation starts a fresh process (no warm starts).
+# Layer contents: mount them at /opt (e.g. -v ./deps:/opt/python); /opt/python
+# and /opt/nodejs/node_modules are on the default PYTHONPATH / NODE_PATH.
+# Credentials for handlers: DEVCLOUD_LAMBDA_FUNCTION_ACCESS_KEY_ID /
+# DEVCLOUD_LAMBDA_FUNCTION_SECRET_ACCESS_KEY (/ DEVCLOUD_LAMBDA_FUNCTION_SESSION_TOKEN).
 # Auth defaults to relaxed. Strict auth: pass DEVCLOUD_LAMBDA_AUTH_MODE=strict together with
 # DEVCLOUD_LAMBDA_ACCESS_KEY_ID / DEVCLOUD_LAMBDA_SECRET_ACCESS_KEY / DEVCLOUD_LAMBDA_REGION.
 # Code.S3Bucket/S3Key: mount a devcloud-s3 data volume and set DEVCLOUD_LAMBDA_S3_STORAGE to it.

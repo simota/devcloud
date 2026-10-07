@@ -5,7 +5,9 @@
 //! on stdin, and writes the handler outcome as JSON to a per-invocation result
 //! file. stdout/stderr become the invocation log. The child runs with a cleared
 //! environment (only `PATH`, Lambda's reserved variables, and the function's own
-//! `Environment.Variables`), so host credentials never leak into handler code.
+//! `Environment.Variables`), so host credentials never leak into handler code;
+//! the only credentials a handler sees are the ones configured for functions
+//! ([`FunctionCredentials`]).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -30,8 +32,12 @@ def _devcloud_main():
     deadline_ms = int(os.environ.pop("_DEVCLOUD_DEADLINE_MS"))
     request_id = os.environ.pop("_DEVCLOUD_REQUEST_ID")
     function_arn = os.environ.pop("_DEVCLOUD_FUNCTION_ARN")
+    expected_version = os.environ.pop("_DEVCLOUD_RUNTIME_VERSION", "")
     real_stdout = sys.stdout
     sys.stderr = sys.stdout
+    actual_version = "%d.%d" % sys.version_info[:2]
+    if expected_version and expected_version != actual_version:
+        print("[WARNING] devcloud: runtime %s is running on Python %s (%s)" % (os.environ["AWS_EXECUTION_ENV"][len("AWS_Lambda_"):], sys.version.split()[0], sys.executable))
 
     def write(obj):
         with open(result_path, "w") as f:
@@ -104,13 +110,80 @@ const NODE_BOOTSTRAP: &str = r#"
 const fs = require('fs');
 const path = require('path');
 const url = require('url');
+
+// Node's ESM loader ignores NODE_PATH, which is how layer dependencies under
+// /opt are found. As in the Lambda Node runtime, ES module handlers resolve
+// them too: a resolve hook retries a bare specifier the default resolution
+// could not find against each NODE_PATH directory.
+const ESM_LAYER_HOOK = `
+import { createRequire } from 'node:module';
+import path from 'node:path';
+import { pathToFileURL } from 'node:url';
+let dirs = [];
+export function initialize(data) { dirs = data.dirs; }
+export async function resolve(specifier, context, next) {
+  try {
+    return await next(specifier, context);
+  } catch (e) {
+    const bare = !/^([./]|[a-zA-Z][a-zA-Z0-9+.-]*:)/.test(specifier);
+    if (!bare || !e || e.code !== 'ERR_MODULE_NOT_FOUND') throw e;
+    for (const dir of dirs) {
+      // ESM resolution looks in <ancestor>/node_modules of the parent.
+      if (path.basename(dir) === 'node_modules') {
+        try {
+          return await next(specifier, { ...context, parentURL: pathToFileURL(path.join(path.dirname(dir), 'index.mjs')).href });
+        } catch {}
+      }
+      try {
+        // CommonJS resolution honours NODE_PATH as is (any directory name).
+        const file = createRequire(path.join(dir, 'index.js')).resolve(specifier);
+        return { url: pathToFileURL(file).href, shortCircuit: true };
+      } catch {}
+    }
+    throw e;
+  }
+}
+`;
+// `.mjs`, or `.js` under a package.json with "type": "module" (the nearest
+// package.json decides, as in Node).
+const isEsm = (file) => {
+  if (file.endsWith('.mjs')) return true;
+  if (!file.endsWith('.js')) return false;
+  for (let dir = path.dirname(file); ; dir = path.dirname(dir)) {
+    const pkg = path.join(dir, 'package.json');
+    if (fs.existsSync(pkg)) {
+      try {
+        return JSON.parse(fs.readFileSync(pkg, 'utf8')).type === 'module';
+      } catch {
+        return false;
+      }
+    }
+    if (path.dirname(dir) === dir) return false;
+  }
+};
+
+let esmHookRegistered = false;
+const importEsm = (file) => {
+  const dirs = (process.env.NODE_PATH || '').split(path.delimiter).filter(Boolean);
+  const { register } = require('module');
+  if (!esmHookRegistered && dirs.length && typeof register === 'function') {
+    register(`data:text/javascript,${encodeURIComponent(ESM_LAYER_HOOK)}`, { data: { dirs } });
+    esmHookRegistered = true;
+  }
+  return import(url.pathToFileURL(file).href);
+};
+
 (async () => {
   const resultPath = process.env._DEVCLOUD_RESULT_PATH;
   const deadlineMs = Number(process.env._DEVCLOUD_DEADLINE_MS);
   const requestId = process.env._DEVCLOUD_REQUEST_ID;
   const functionArn = process.env._DEVCLOUD_FUNCTION_ARN;
-  for (const k of ['_DEVCLOUD_RESULT_PATH', '_DEVCLOUD_DEADLINE_MS', '_DEVCLOUD_REQUEST_ID', '_DEVCLOUD_FUNCTION_ARN']) delete process.env[k];
+  const expectedVersion = process.env._DEVCLOUD_RUNTIME_VERSION || '';
+  for (const k of ['_DEVCLOUD_RESULT_PATH', '_DEVCLOUD_DEADLINE_MS', '_DEVCLOUD_REQUEST_ID', '_DEVCLOUD_FUNCTION_ARN', '_DEVCLOUD_RUNTIME_VERSION']) delete process.env[k];
   process.stderr.write = process.stdout.write.bind(process.stdout);
+  if (expectedVersion && expectedVersion !== process.versions.node.split('.')[0]) {
+    console.log(`[WARNING] devcloud: runtime ${process.env.AWS_EXECUTION_ENV.slice('AWS_Lambda_'.length)} is running on Node.js ${process.versions.node} (${process.execPath})`);
+  }
   const write = (obj) => fs.writeFileSync(resultPath, JSON.stringify(obj));
   const errorBody = (e, type) => ({
     errorType: type || (e && e.name) || 'Error',
@@ -142,8 +215,10 @@ const url = require('url');
     const base = path.resolve(root, modName);
     const file = ['.js', '.mjs', '.cjs'].map((ext) => base + ext).find((f) => fs.existsSync(f))
       || require.resolve(base);
-    if (file.endsWith('.mjs')) {
-      mod = await import(url.pathToFileURL(file).href);
+    if (isEsm(file)) {
+      // Through import(), never require(): Node 22's require() can load ESM
+      // too, but without the layer resolve hook.
+      mod = await importEsm(file);
     } else {
       try {
         mod = require(file);
@@ -151,7 +226,7 @@ const url = require('url');
         // ESM that require() cannot load synchronously (Node 22 can require
         // some ESM, but not modules with top-level await).
         if (e && (e.code === 'ERR_REQUIRE_ESM' || e.code === 'ERR_REQUIRE_ASYNC_MODULE')) {
-          mod = await import(url.pathToFileURL(file).href);
+          mod = await importEsm(file);
         } else throw e;
       }
     }
@@ -247,19 +322,81 @@ pub fn family(runtime: &str) -> Option<Family> {
     }
 }
 
+/// The language version a runtime identifier names, as the interpreter reports
+/// it: `python3.12` → `3.12`, `nodejs20.x` → `20`. `None` when the identifier
+/// carries no usable version.
+pub fn version(runtime: &str) -> Option<String> {
+    let (rest, family) = if let Some(rest) = runtime.strip_prefix("python") {
+        (rest, Family::Python)
+    } else if let Some(rest) = runtime.strip_prefix("nodejs") {
+        (rest, Family::Node)
+    } else {
+        return None;
+    };
+    let v = match family {
+        Family::Python => rest,
+        Family::Node => rest.strip_suffix(".x").unwrap_or(rest),
+    };
+    let numeric = !v.is_empty()
+        && v.split('.')
+            .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()));
+    numeric.then(|| v.to_string())
+}
+
 /// Host interpreter binaries (overridable for tests / non-standard installs).
+///
+/// With the default `python3`, a Python runtime first looks for the matching
+/// versioned binary (`python3.12` for `python3.12`) on devcloud's `PATH`, so a
+/// host with several Pythons runs each function on the version it asked for.
 #[derive(Debug, Clone)]
 pub struct Interpreters {
     pub python: String,
     pub node: String,
 }
 
+const DEFAULT_PYTHON: &str = "python3";
+
 impl Default for Interpreters {
     fn default() -> Self {
         Interpreters {
-            python: "python3".to_string(),
+            python: DEFAULT_PYTHON.to_string(),
             node: "node".to_string(),
         }
+    }
+}
+
+impl Interpreters {
+    /// The interpreter to start for `runtime`, resolved to an absolute path.
+    fn resolve(&self, family: Family, runtime: &str) -> Option<PathBuf> {
+        match family {
+            Family::Python => {
+                let versioned = (self.python == DEFAULT_PYTHON)
+                    .then(|| version(runtime))
+                    .flatten()
+                    .and_then(|v| resolve_program(&format!("python{v}")));
+                versioned.or_else(|| resolve_program(&self.python))
+            }
+            Family::Node => resolve_program(&self.node),
+        }
+    }
+}
+
+/// Credentials handed to every handler as `AWS_ACCESS_KEY_ID` /
+/// `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN`, standing in for the
+/// execution role's credentials Lambda injects.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct FunctionCredentials {
+    pub access_key_id: String,
+    pub secret_access_key: String,
+    /// Omitted from the environment when empty.
+    pub session_token: String,
+}
+
+impl std::fmt::Debug for FunctionCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FunctionCredentials")
+            .field("access_key_id", &self.access_key_id)
+            .finish_non_exhaustive()
     }
 }
 
@@ -278,6 +415,11 @@ pub struct Invocation {
     pub request_id: String,
     pub environment: BTreeMap<String, String>,
     pub payload: Vec<u8>,
+    /// Stand-in for Lambda's `/opt`, where layers are extracted: its
+    /// `python/` and `nodejs/node_modules/` trees are on the default
+    /// `PYTHONPATH` / `NODE_PATH`.
+    pub opt_dir: PathBuf,
+    pub credentials: Option<FunctionCredentials>,
 }
 
 /// The handler's outcome as Lambda reports it on the wire.
@@ -326,7 +468,7 @@ pub async fn run(inv: &Invocation, interpreters: &Interpreters) -> Result<Comple
     };
     // Resolve the interpreter against devcloud's own PATH: the function may set
     // its own PATH, which applies to the handler, not to finding python/node.
-    let program = resolve_program(bin).ok_or_else(|| {
+    let program = interpreters.resolve(family, &inv.runtime).ok_or_else(|| {
         RuntimeError::Spawn(format!(
             "start {bin} for runtime {}: interpreter not found on devcloud's PATH",
             inv.runtime
@@ -349,7 +491,7 @@ pub async fn run(inv: &Invocation, interpreters: &Interpreters) -> Result<Comple
     // Precedence: devcloud defaults < the function's Environment.Variables <
     // Lambda-reserved variables (which CreateFunction refuses to accept).
     cmd.env_clear()
-        .envs(default_env())
+        .envs(default_env(family, inv))
         .envs(&inv.environment)
         .envs(reserved_env(inv, &result_path, deadline_ms))
         .current_dir(&inv.code_dir)
@@ -546,8 +688,9 @@ fn is_executable(path: &Path) -> bool {
     }
 }
 
-/// Values Lambda provides but lets functions override (`TZ`, `LANG`, `PATH`).
-fn default_env() -> Vec<(String, String)> {
+/// Values Lambda provides but lets functions override (`TZ`, `LANG`, `PATH`,
+/// and the `/opt` layer paths in `PYTHONPATH` / `NODE_PATH`).
+fn default_env(family: Family, inv: &Invocation) -> Vec<(String, String)> {
     let mut env = vec![
         ("TZ".to_string(), "UTC".to_string()),
         ("LANG".to_string(), "en_US.UTF-8".to_string()),
@@ -556,12 +699,27 @@ fn default_env() -> Vec<(String, String)> {
     if let Ok(path) = std::env::var("PATH") {
         env.push(("PATH".to_string(), path));
     }
+    let opt = inv.opt_dir.to_string_lossy();
+    let v = version(&inv.runtime);
+    let layer_path = match (family, v) {
+        (Family::Python, Some(v)) => (
+            "PYTHONPATH",
+            format!("{opt}/python/lib/python{v}/site-packages:{opt}/python"),
+        ),
+        (Family::Python, None) => ("PYTHONPATH", format!("{opt}/python")),
+        (Family::Node, Some(v)) => (
+            "NODE_PATH",
+            format!("{opt}/nodejs/node{v}/node_modules:{opt}/nodejs/node_modules"),
+        ),
+        (Family::Node, None) => ("NODE_PATH", format!("{opt}/nodejs/node_modules")),
+    };
+    env.push((layer_path.0.to_string(), layer_path.1));
     env
 }
 
 fn reserved_env(inv: &Invocation, result_path: &Path, deadline_ms: u128) -> Vec<(String, String)> {
     let task_root = inv.code_dir.to_string_lossy().into_owned();
-    vec![
+    let mut env: Vec<(String, String)> = vec![
         ("AWS_LAMBDA_FUNCTION_NAME".into(), inv.function_name.clone()),
         ("AWS_LAMBDA_FUNCTION_VERSION".into(), "$LATEST".into()),
         (
@@ -592,7 +750,22 @@ fn reserved_env(inv: &Invocation, result_path: &Path, deadline_ms: u128) -> Vec<
         ("_DEVCLOUD_DEADLINE_MS".into(), deadline_ms.to_string()),
         ("_DEVCLOUD_REQUEST_ID".into(), inv.request_id.clone()),
         ("_DEVCLOUD_FUNCTION_ARN".into(), inv.function_arn.clone()),
-    ]
+        (
+            "_DEVCLOUD_RUNTIME_VERSION".into(),
+            version(&inv.runtime).unwrap_or_default(),
+        ),
+    ];
+    if let Some(creds) = &inv.credentials {
+        env.push(("AWS_ACCESS_KEY_ID".into(), creds.access_key_id.clone()));
+        env.push((
+            "AWS_SECRET_ACCESS_KEY".into(),
+            creds.secret_access_key.clone(),
+        ));
+        if !creds.session_token.is_empty() {
+            env.push(("AWS_SESSION_TOKEN".into(), creds.session_token.clone()));
+        }
+    }
+    env
 }
 
 fn read_result(path: &Path) -> Outcome {
@@ -668,6 +841,61 @@ mod tests {
         assert_eq!(family("nodejs20.x"), Some(Family::Node));
         assert_eq!(family("java21"), None);
         assert_eq!(family("provided.al2023"), None);
+    }
+
+    #[test]
+    fn version_mapping() {
+        assert_eq!(version("python3.12").as_deref(), Some("3.12"));
+        assert_eq!(version("python3.9").as_deref(), Some("3.9"));
+        assert_eq!(version("nodejs20.x").as_deref(), Some("20"));
+        assert_eq!(version("nodejs").as_deref(), None);
+        assert_eq!(version("python3.x").as_deref(), None);
+        assert_eq!(version("java21").as_deref(), None);
+    }
+
+    #[test]
+    fn default_python_prefers_the_runtime_versioned_binary() {
+        let defaults = Interpreters::default();
+        let pinned = Interpreters {
+            python: resolve_program("python3")
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "python3".into()),
+            ..Interpreters::default()
+        };
+        for minor in 8..=20 {
+            let runtime = format!("python3.{minor}");
+            let Some(versioned) = resolve_program(&runtime) else {
+                continue;
+            };
+            assert_eq!(defaults.resolve(Family::Python, &runtime), Some(versioned));
+            if pinned.python != DEFAULT_PYTHON {
+                assert_eq!(
+                    pinned.resolve(Family::Python, &runtime),
+                    resolve_program(&pinned.python),
+                    "an explicit interpreter is used as configured"
+                );
+            }
+        }
+        assert_eq!(
+            defaults.resolve(Family::Python, "python3.99"),
+            resolve_program("python3"),
+            "falls back to python3 when the versioned binary is missing"
+        );
+    }
+
+    #[test]
+    fn credentials_debug_hides_secrets() {
+        let creds = FunctionCredentials {
+            access_key_id: "AKID".into(),
+            secret_access_key: "s3cr3t".into(),
+            session_token: "t0ken".into(),
+        };
+        let shown = format!("{creds:?}");
+        assert!(shown.contains("AKID"));
+        assert!(
+            !shown.contains("s3cr3t") && !shown.contains("t0ken"),
+            "{shown}"
+        );
     }
 
     #[tokio::test]
