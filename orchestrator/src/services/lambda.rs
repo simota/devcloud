@@ -25,6 +25,8 @@ pub async fn run(
         region: cfg.services.lambda.region.clone(),
         account_id: cfg.auth.lambda.account_id.clone(),
         auth_mode: cfg.auth.lambda.mode.clone(),
+        url_auth_mode: cfg.services.lambda.url_auth_mode.clone(),
+        log_invocations: cfg.services.lambda.log_invocations,
         access_key_id: cfg.auth.lambda.access_key_id.clone(),
         secret_access_key: cfg.auth.lambda.secret_access_key.clone(),
         storage_path: root.join("lambda").to_string_lossy().into_owned(),
@@ -32,6 +34,8 @@ pub async fn run(
         object_store_root: cfg.services.s3.enabled.then(|| root.join("s3/buckets")),
         interpreters: devcloud_lambda::runtime::Interpreters {
             docker: cfg.services.lambda.docker.then(|| "docker".to_string()),
+            docker_network: Some(cfg.services.lambda.docker_network.clone())
+                .filter(|n| !n.is_empty()),
             ..Default::default()
         },
         function_credentials: function_credentials(&cfg.services.lambda)?,

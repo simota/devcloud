@@ -77,6 +77,13 @@ pub struct Config {
     /// `Code.S3Bucket`/`Code.S3Key` deployment packages. `None` disables it.
     pub object_store_root: Option<PathBuf>,
     pub interpreters: Interpreters,
+    /// Auth mode for `AuthType: AWS_IAM` function URLs (`relaxed`,
+    /// `signed-relaxed`, `strict`); empty follows `auth_mode`. Lets URL
+    /// signatures be verified while the API itself stays relaxed.
+    pub url_auth_mode: String,
+    /// Also print every invocation's framed log (INIT_START/START/END/
+    /// REPORT and the handler's output) to stdout, like a CloudWatch stream.
+    pub log_invocations: bool,
     /// Credentials every handler receives in place of an execution role's.
     /// `None` leaves `AWS_ACCESS_KEY_ID` & co. unset.
     pub function_credentials: Option<FunctionCredentials>,
@@ -953,7 +960,7 @@ impl Server {
         };
         let now = now_rfc3339();
         let url = UrlConfig {
-            url_id: hex::encode(&Sha256::digest(self.new_id().as_bytes())[..16]),
+            url_id: function_url::url_id_for(self.account_id(), self.region(), &name),
             auth_type,
             cors: settings.cors,
             invoke_mode: settings
@@ -1078,10 +1085,10 @@ impl Server {
 
     /// Serves one request addressed to a function URL: CORS preflight, the
     /// URL's AuthType, then a synchronous invoke with a payload 2.0 event.
-    pub async fn serve_function_url(
+    pub(crate) async fn serve_function_url(
         self: &Arc<Self>,
         req: &Request,
-        url_id: &str,
+        target: &function_url::UrlTarget,
         raw_path: &str,
     ) -> Reply {
         let target = {
@@ -1089,7 +1096,10 @@ impl Server {
             st.functions.values().find_map(|r| {
                 r.function_url
                     .as_ref()
-                    .filter(|u| u.url_id == url_id)
+                    .filter(|u| match target {
+                        function_url::UrlTarget::Id(id) => &u.url_id == id,
+                        function_url::UrlTarget::Function(name) => &r.function_name == name,
+                    })
                     .map(|u| (r.function_name.clone(), u.clone()))
             })
         };
@@ -1111,6 +1121,7 @@ impl Server {
         } else {
             None
         };
+        let url_id = url.url_id.as_str();
         let request_id = self.new_id();
         let event = function_url::build_event(
             req,
@@ -1458,6 +1469,13 @@ impl Server {
             Err(RuntimeError::Unsupported(_)) => ("InvalidRuntime", 0.0, String::new()),
             Err(RuntimeError::Spawn(msg)) => ("SpawnFailed", 0.0, format!("{msg}\n")),
         };
+        if self.config.log_invocations && !log.is_empty() {
+            // One write per invocation, so concurrent invocations do not
+            // interleave mid-line.
+            use std::io::Write;
+            let out = tagged_log(&inv.function_name, &log);
+            let _ = std::io::stdout().lock().write_all(out.as_bytes());
+        }
         self.record_invocation(InvocationRecord {
             request_id: inv.request_id.clone(),
             function_name: inv.function_name.clone(),
@@ -1974,9 +1992,26 @@ fn emit(event_type: &str, payload: Value) {
     }
 }
 
+/// An invocation log for devcloud's stdout: every line tagged with the
+/// function, like a CloudWatch log stream name.
+fn tagged_log(function: &str, log: &str) -> String {
+    log.lines()
+        .map(|line| format!("[{function}] {line}\n"))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stdout_logs_tag_every_line_with_the_function() {
+        let log = "START RequestId: r Version: $LATEST\nhello\nEND RequestId: r\nREPORT RequestId: r\tDuration: 1.00 ms\n";
+        assert_eq!(
+            tagged_log("fn", log),
+            "[fn] START RequestId: r Version: $LATEST\n[fn] hello\n[fn] END RequestId: r\n[fn] REPORT RequestId: r\tDuration: 1.00 ms\n"
+        );
+    }
 
     /// A URL request authorized against one function must not run another:
     /// the function deleted and recreated (with or without a new URL) while

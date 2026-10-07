@@ -337,6 +337,12 @@ pub struct LambdaServiceConfig {
     pub idle_timeout_seconds: Option<u32>,
     /// Run `PackageType: Image` functions with `docker run`.
     pub docker: bool,
+    /// Docker network devcloud runs on (when devcloud itself is a container).
+    pub docker_network: String,
+    /// Auth mode for `AWS_IAM` function URLs; empty follows `auth.lambda.mode`.
+    pub url_auth_mode: String,
+    /// Print every invocation's log to devcloud's stdout.
+    pub log_invocations: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -1192,6 +1198,12 @@ pub fn apply_config_value(cfg: &mut Config, path: &[String], value: &str) -> io:
         "services.lambda.docker" => {
             cfg.services.lambda.docker = parse_bool("services.lambda.docker", value)?
         }
+        "services.lambda.dockerNetwork" => cfg.services.lambda.docker_network = value.to_string(),
+        "services.lambda.urlAuthMode" => cfg.services.lambda.url_auth_mode = value.to_string(),
+        "services.lambda.logInvocations" => {
+            cfg.services.lambda.log_invocations =
+                parse_bool("services.lambda.logInvocations", value)?
+        }
         "services.lambda.idleTimeoutSeconds" => {
             cfg.services.lambda.idle_timeout_seconds =
                 Some(parse_int("services.lambda.idleTimeoutSeconds", value)?);
@@ -1336,6 +1348,7 @@ fn lambda_optional_lines(l: &LambdaServiceConfig) -> String {
         .map(|s| s.to_string())
         .unwrap_or_default();
     let docker = if l.docker { "true" } else { "" }.to_string();
+    let log_invocations = if l.log_invocations { "true" } else { "" }.to_string();
     [
         ("functionAccessKeyId", &l.function_access_key_id),
         ("functionSecretAccessKey", &l.function_secret_access_key),
@@ -1343,6 +1356,9 @@ fn lambda_optional_lines(l: &LambdaServiceConfig) -> String {
         ("optDir", &l.opt_dir),
         ("idleTimeoutSeconds", &idle),
         ("docker", &docker),
+        ("dockerNetwork", &l.docker_network),
+        ("urlAuthMode", &l.url_auth_mode),
+        ("logInvocations", &log_invocations),
     ]
     .into_iter()
     .filter(|(_, v)| !v.is_empty())
@@ -2112,9 +2128,12 @@ mod tests {
         cfg.services.lambda.opt_dir = "/srv/lambda-opt".into();
         cfg.services.lambda.idle_timeout_seconds = Some(0);
         cfg.services.lambda.docker = true;
+        cfg.services.lambda.docker_network = "app_default".into();
+        cfg.services.lambda.url_auth_mode = "strict".into();
+        cfg.services.lambda.log_invocations = true;
         let yaml = default_config_yaml(&cfg);
         assert!(yaml.contains(
-            "  lambda:\n    enabled: true\n    region: us-east-1\n    functionAccessKeyId: AKIDLOCAL\n    functionSecretAccessKey: local-secret\n    optDir: /srv/lambda-opt\n    idleTimeoutSeconds: 0\n    docker: true\n  cloudRun:\n"
+            "  lambda:\n    enabled: true\n    region: us-east-1\n    functionAccessKeyId: AKIDLOCAL\n    functionSecretAccessKey: local-secret\n    optDir: /srv/lambda-opt\n    idleTimeoutSeconds: 0\n    docker: true\n    dockerNetwork: app_default\n    urlAuthMode: strict\n    logInvocations: true\n  cloudRun:\n"
         ));
         let parsed = parse_yaml_in_memory(&yaml).expect("parse yaml");
         assert_eq!(parsed.services.lambda, cfg.services.lambda);

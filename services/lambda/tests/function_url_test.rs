@@ -869,3 +869,75 @@ async fn credentialed_cors_answers_wildcards_with_concrete_values() {
     }
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[tokio::test]
+async fn url_auth_mode_verifies_url_signatures_while_the_api_stays_relaxed() {
+    let dir = temp_dir("urlauth");
+    let server = Arc::new(Server::new(Config {
+        url_auth_mode: "strict".into(),
+        access_key_id: "dev".into(),
+        secret_access_key: "dev".into(),
+        ..config_for(&dir)
+    }));
+    // The API itself is still relaxed: unsigned control calls work.
+    create_function(&server, "web").await;
+    let url = create_url(&server, "web", json!({ "AuthType": "AWS_IAM" })).await;
+    assert_eq!(url.status, 201);
+    let (id, _) = url_parts(url.json()["FunctionUrl"].as_str().unwrap());
+    fn refs(h: &[(String, String)]) -> Vec<(&str, &str)> {
+        h.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect()
+    }
+    let path = format!("/_url/{id}/hello");
+    let mut forged = sign("GET", &path, b"", "127.0.0.1:19010");
+    forged[2].1 = forged[2].1.replace("Signature=", "Signature=0");
+    let bad = call(&server, "GET", &path, &refs(&forged), b"").await;
+    assert_eq!(
+        bad.status, 403,
+        "a wrong signature is refused despite the relaxed API"
+    );
+    if has_python() {
+        let good = sign("GET", &path, b"", "127.0.0.1:19010");
+        let ok = call(&server, "GET", &path, &refs(&good), b"").await;
+        assert_eq!(ok.status, 200, "{}", String::from_utf8_lossy(&ok.body));
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn function_urls_are_stable_and_reachable_by_function_name() {
+    let dir = temp_dir("stableurl");
+    let server = Arc::new(Server::new(config_for(&dir)));
+    create_function(&server, "web").await;
+    let first = create_url(&server, "web", json!({ "AuthType": "NONE" }))
+        .await
+        .json()["FunctionUrl"]
+        .clone();
+    // Recreating the URL, the function, or the whole state gives the same URL.
+    call(&server, "DELETE", "/2021-10-31/functions/web/url", &[], b"").await;
+    let again = create_url(&server, "web", json!({ "AuthType": "NONE" }))
+        .await
+        .json()["FunctionUrl"]
+        .clone();
+    assert_eq!(first, again);
+    let _ = std::fs::remove_dir_all(&dir);
+    let fresh = Arc::new(Server::new(config_for(&dir)));
+    create_function(&fresh, "web").await;
+    let after_wipe = create_url(&fresh, "web", json!({ "AuthType": "NONE" }))
+        .await
+        .json()["FunctionUrl"]
+        .clone();
+    assert_eq!(first, after_wipe, "same URL after the data volume is wiped");
+
+    // `/urls/<function>/` reaches the same URL without its id.
+    let r = call(&fresh, "GET", "/urls/web/some/path?mode=plain", &[], b"").await;
+    if has_python() {
+        assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+        assert_eq!(r.json(), json!({ "hello": "world" }));
+    }
+    let missing = call(&fresh, "GET", "/urls/nope/", &[], b"").await;
+    assert_eq!(
+        missing.status, 403,
+        "unknown function names look like unknown URL ids"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}

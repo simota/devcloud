@@ -32,12 +32,45 @@ pub struct ImageSpec {
     pub working_directory: String,
 }
 
+/// How devcloud reaches the RIE in a function's container.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Reach {
+    /// The RIE port is published on this loopback port of the Docker host
+    /// (devcloud runs on the host).
+    Loopback(u16),
+    /// The container joins this Docker network and is reached by name
+    /// (devcloud itself runs in a container on that network).
+    Network(String),
+}
+
+/// Where to connect for one container.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Endpoint {
+    pub host: String,
+    pub port: u16,
+}
+
+impl Reach {
+    pub fn endpoint(&self, container_name: &str) -> Endpoint {
+        match self {
+            Reach::Loopback(port) => Endpoint {
+                host: "127.0.0.1".into(),
+                port: *port,
+            },
+            Reach::Network(_) => Endpoint {
+                host: container_name.into(),
+                port: RIE_PORT,
+            },
+        }
+    }
+}
+
 /// `docker run` arguments. Environment variables come from `env_file`, never
 /// the command line, where any local user could read them.
 pub fn run_args(
     spec: &ImageSpec,
     name: &str,
-    host_port: u16,
+    reach: &Reach,
     memory_mb: i64,
     env_file: &std::path::Path,
 ) -> Vec<String> {
@@ -46,12 +79,20 @@ pub fn run_args(
         "--rm".to_string(),
         "--name".to_string(),
         name.to_string(),
-        "-p".to_string(),
-        format!("127.0.0.1:{host_port}:{RIE_PORT}"),
-        // MemorySize is a real limit here, unlike for local processes.
-        "--memory".to_string(),
-        format!("{memory_mb}m"),
     ];
+    match reach {
+        Reach::Loopback(port) => {
+            args.push("-p".to_string());
+            args.push(format!("127.0.0.1:{port}:{RIE_PORT}"));
+        }
+        Reach::Network(network) => {
+            args.push("--network".to_string());
+            args.push(network.clone());
+        }
+    }
+    // MemorySize is a real limit here, unlike for local processes.
+    args.push("--memory".to_string());
+    args.push(format!("{memory_mb}m"));
     args.push("--env-file".to_string());
     args.push(env_file.to_string_lossy().into_owned());
     if let Some(entry) = spec.entry_point.first() {
@@ -111,10 +152,10 @@ pub struct Response {
 
 /// True once something answers HTTP on `port` (docker publishes the port
 /// before the RIE inside listens, so a TCP connect alone proves nothing).
-pub async fn probe(port: u16) -> bool {
+pub async fn probe(at: &Endpoint) -> bool {
     let attempt = async {
-        let mut s = TcpStream::connect(("127.0.0.1", port)).await.ok()?;
-        s.write_all(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+        let mut s = TcpStream::connect((at.host.as_str(), at.port)).await.ok()?;
+        s.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
             .await
             .ok()?;
         let mut head = [0u8; 8];
@@ -129,10 +170,10 @@ pub async fn probe(port: u16) -> bool {
 }
 
 /// POSTs one invocation payload to the RIE.
-pub async fn invoke(port: u16, payload: &[u8]) -> std::io::Result<Response> {
-    let mut s = TcpStream::connect(("127.0.0.1", port)).await?;
+pub async fn invoke(at: &Endpoint, payload: &[u8]) -> std::io::Result<Response> {
+    let mut s = TcpStream::connect((at.host.as_str(), at.port)).await?;
     let head = format!(
-        "POST {INVOKE_PATH} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "POST {INVOKE_PATH} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         payload.len()
     );
     s.write_all(head.as_bytes()).await?;
@@ -274,7 +315,7 @@ mod tests {
         let args = run_args(
             &spec,
             "devcloud-lambda-x",
-            45000,
+            &Reach::Loopback(45000),
             512,
             std::path::Path::new("/w/env"),
         );
@@ -304,6 +345,26 @@ mod tests {
             assert!(log.init.is_none(), "{bogus}");
             assert_eq!(log.body, format!("{line}\nhello"), "{bogus}");
         }
+    }
+
+    #[test]
+    fn network_reach_joins_the_network_instead_of_publishing() {
+        let spec = ImageSpec {
+            uri: "img".into(),
+            ..ImageSpec::default()
+        };
+        let reach = Reach::Network("app_default".into());
+        let args = run_args(&spec, "c1", &reach, 128, std::path::Path::new("/e")).join(" ");
+        assert!(args.contains("--network app_default"), "{args}");
+        assert!(!args.contains(" -p "), "{args}");
+        assert_eq!(
+            reach.endpoint("c1"),
+            Endpoint {
+                host: "c1".into(),
+                port: RIE_PORT
+            }
+        );
+        assert_eq!(Reach::Loopback(4000).endpoint("c1").host, "127.0.0.1");
     }
 
     #[test]
