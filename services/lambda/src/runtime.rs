@@ -233,6 +233,9 @@ struct PoolState {
     /// Keys (function revisions) that must never serve again. Revision ids
     /// are never reused, so entries stay valid for the process lifetime.
     retired: HashSet<String>,
+    /// `function/runtime` pairs whose interpreter-version mismatch has
+    /// already been reported on stderr.
+    version_warned: HashSet<String>,
     closed: bool,
 }
 
@@ -252,6 +255,25 @@ impl Pool {
     pub fn idle_count(&self, function: &str) -> usize {
         let st = self.state.lock().unwrap();
         st.idle.get(function).map_or(0, Vec::len)
+    }
+
+    /// Repeats the bootstrap's runtime-version warning (in `init_log`) on
+    /// devcloud's stderr, once per function and runtime: the invocation log
+    /// only carries it on a cold start, where it is easy to miss.
+    fn version_mismatch(&self, inv: &Invocation, init_log: &[u8]) -> Option<String> {
+        const PREFIX: &str = "[WARNING] devcloud: ";
+        let text = String::from_utf8_lossy(init_log);
+        let warning = text
+            .lines()
+            .find_map(|l| l.strip_prefix(PREFIX))
+            .filter(|w| w.starts_with(&format!("runtime {} ", inv.runtime)))?;
+        let key = format!("{}/{}", inv.function_name, inv.runtime);
+        self.state
+            .lock()
+            .unwrap()
+            .version_warned
+            .insert(key)
+            .then(|| format!("function {}: {warning}", inv.function_name))
     }
 
     /// Retires configuration `key` of `function` (updated or deleted): its
@@ -636,6 +658,9 @@ pub async fn run(
             // Init gets its own budget of one function timeout.
             match env.wait(tokio::time::Instant::now() + timeout).await {
                 Wait::Marker { tag, log } if tag == "ready" => {
+                    if let Some(warning) = pool.version_mismatch(inv, &log) {
+                        eprintln!("devcloud-lambda: warning: {warning}");
+                    }
                     (env, Some((started.elapsed(), log)))
                 }
                 other => return Ok(failed_init(inv, other, started.elapsed())),
@@ -1004,9 +1029,13 @@ async fn start_container(
     .kill_on_drop(true);
     #[cfg(unix)]
     cmd.process_group(0);
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| cleanup(format!("start {docker} for image {}: {e}", image.uri)))?;
+    let mut child = cmd.spawn().map_err(|e| {
+        cleanup(docker_start_error(
+            docker,
+            &format!("start {docker} for image {}", image.uri),
+            &e,
+        ))
+    })?;
 
     let (tx, events) = mpsc::unbounded_channel();
     // No bootstrap markers in a container: the scanner only buffers output.
@@ -1117,7 +1146,20 @@ async fn docker_output(
     tokio::time::timeout(deadline.saturating_duration_since(Instant::now()), run)
         .await
         .map_err(|_| format!("docker {}: timed out", args.join(" ")))?
-        .map_err(|e| format!("docker {}: {e}", args.join(" ")))
+        .map_err(|e| docker_start_error(docker, &format!("docker {}", args.join(" ")), &e))
+}
+
+/// Why `docker` could not be started. A missing CLI gets an explanation:
+/// the usual cause is running devcloud-lambda's own Docker image, which has
+/// no Docker inside.
+fn docker_start_error(docker: &str, what: &str, e: &std::io::Error) -> String {
+    if e.kind() == std::io::ErrorKind::NotFound {
+        format!(
+            "{what}: the Docker CLI ({docker}) was not found on devcloud's PATH. Container image functions need it; the devcloud-lambda Docker image does not include Docker, so run devcloud-lambda (or devcloud) on the host to invoke them"
+        )
+    } else {
+        format!("{what}: {e}")
+    }
 }
 
 /// The variables Lambda sets in an image function's environment. The RIE
@@ -1571,6 +1613,50 @@ mod tests {
         assert_eq!(markers.len(), 1);
         assert!(markers[0].1.len() <= LOG_CAPTURE_BYTES + 4);
         assert!(markers[0].1.ends_with(b"TAIL"));
+    }
+
+    #[test]
+    fn version_mismatch_is_reported_once_per_function_and_runtime() {
+        let pool = Pool::new(std::env::temp_dir(), DEFAULT_IDLE_TIMEOUT);
+        let inv = |function: &str, runtime: &str| Invocation {
+            runtime: runtime.into(),
+            handler: "app.handler".into(),
+            code_dir: PathBuf::new(),
+            function_name: function.into(),
+            function_arn: String::new(),
+            memory_size: 128,
+            timeout_seconds: 3,
+            region: "us-east-1".into(),
+            request_id: String::new(),
+            environment: BTreeMap::new(),
+            payload: Vec::new(),
+            opt_dir: PathBuf::new(),
+            credentials: None,
+            env_key: String::new(),
+            image: None,
+        };
+        let log = b"loading\n[WARNING] devcloud: runtime python3.12 is running on Python 3.11.2 (/usr/bin/python3)\n";
+        assert_eq!(
+            pool.version_mismatch(&inv("f", "python3.12"), log)
+                .as_deref(),
+            Some("function f: runtime python3.12 is running on Python 3.11.2 (/usr/bin/python3)")
+        );
+        assert_eq!(
+            pool.version_mismatch(&inv("f", "python3.12"), log),
+            None,
+            "once"
+        );
+        assert!(
+            pool.version_mismatch(&inv("g", "python3.12"), log)
+                .is_some(),
+            "per function"
+        );
+        assert_eq!(
+            pool.version_mismatch(&inv("h", "python3.12"), b"no warning\n"),
+            None
+        );
+        // A handler printing a look-alike line for another runtime is ignored.
+        assert_eq!(pool.version_mismatch(&inv("i", "python3.13"), log), None);
     }
 
     #[test]
