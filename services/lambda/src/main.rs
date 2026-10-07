@@ -15,6 +15,10 @@
 //!                              both the key id and the secret are needed)
 //!   DEVCLOUD_LAMBDA_OPT_DIR    stand-in for Lambda's /opt (layer contents), default /opt
 //!   DEVCLOUD_LAMBDA_DOCKER     true: run PackageType Image functions with the docker CLI
+//!   DEVCLOUD_LAMBDA_DOCKER_NETWORK Docker network this container is on; function
+//!                              containers join it (for devcloud-lambda itself in Docker)
+//!   DEVCLOUD_LAMBDA_URL_AUTH_MODE auth mode for AWS_IAM function URLs, default: AUTH_MODE
+//!   DEVCLOUD_LAMBDA_LOG_INVOCATIONS print invocation logs to stdout, default true
 //!   DEVCLOUD_LAMBDA_IDLE_TIMEOUT_SECONDS how long an idle execution environment stays
 //!                              warm, default 300; 0 = a cold start for every invocation
 
@@ -99,12 +103,19 @@ fn main() {
             region: env_or("DEVCLOUD_LAMBDA_REGION", "us-east-1"),
             account_id: env_or("DEVCLOUD_LAMBDA_ACCOUNT_ID", "000000000000"),
             auth_mode: env("DEVCLOUD_LAMBDA_AUTH_MODE"),
+            url_auth_mode: env("DEVCLOUD_LAMBDA_URL_AUTH_MODE"),
+            log_invocations: !matches!(
+                env("DEVCLOUD_LAMBDA_LOG_INVOCATIONS").as_str(),
+                "false" | "0"
+            ),
             access_key_id: env("DEVCLOUD_LAMBDA_ACCESS_KEY_ID"),
             secret_access_key: env("DEVCLOUD_LAMBDA_SECRET_ACCESS_KEY"),
             storage_path: storage,
             object_store_root: (!s3_storage.is_empty()).then(|| PathBuf::from(s3_storage)),
             interpreters: devcloud_lambda::runtime::Interpreters {
                 docker,
+                docker_network: Some(env("DEVCLOUD_LAMBDA_DOCKER_NETWORK"))
+                    .filter(|n| !n.is_empty()),
                 ..Default::default()
             },
             function_credentials,

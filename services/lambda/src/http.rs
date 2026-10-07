@@ -172,8 +172,8 @@ pub async fn process(server: &Arc<Server>, req: &Request) -> Reply {
     // Function URLs are meant to be called from anywhere, browsers included:
     // they bypass the API's CSRF guard and SigV4 check and apply the URL's
     // own AuthType instead.
-    if let Some((url_id, path)) = crate::function_url::route(req) {
-        return server.serve_function_url(req, &url_id, &path).await;
+    if let Some((target, path)) = crate::function_url::route(req) {
+        return server.serve_function_url(req, &target, &path).await;
     }
     let segments: Vec<String> = match req
         .raw_path

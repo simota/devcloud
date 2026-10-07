@@ -28,6 +28,26 @@ use crate::sigv4::{verify_signature, Credentials, SignedRequest};
 const HOST_MARKER: &str = ".lambda-url.";
 const HOST_SUFFIX: &str = ".localhost";
 const PATH_PREFIX: &str = "/_url/";
+/// Stable path form: `/urls/<function name>/...` survives the URL being
+/// recreated and needs no `*.localhost` name resolution.
+const NAME_PATH_PREFIX: &str = "/urls/";
+
+/// Which function URL a request addresses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum UrlTarget {
+    /// By URL id (host name or `/_url/<id>/`).
+    Id(String),
+    /// By function name (`/urls/<name>/`).
+    Function(String),
+}
+
+/// The URL id devcloud gives a function's URL: derived from the account,
+/// region, and function name, so it stays the same when the URL (or the
+/// function, or the whole data volume) is recreated.
+pub(crate) fn url_id_for(account_id: &str, region: &str, function: &str) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(&Sha256::digest(format!("{account_id}:{region}:{function}").as_bytes())[..16])
+}
 
 /// A function's URL configuration. Field names are the persisted
 /// `state.json` keys.
@@ -176,7 +196,7 @@ pub(crate) fn function_url(endpoint: &str, url_id: &str, region: &str) -> String
 
 /// The URL id a request is addressed to and the function-relative raw path,
 /// when the request targets a function URL rather than the Lambda API.
-pub(crate) fn route(req: &Request) -> Option<(String, String)> {
+pub(crate) fn route(req: &Request) -> Option<(UrlTarget, String)> {
     let host = req
         .headers
         .get("host")
@@ -191,18 +211,22 @@ pub(crate) fn route(req: &Request) -> Option<(String, String)> {
                 } else {
                     req.raw_path.clone()
                 };
-                return Some((id.to_string(), path));
+                return Some((UrlTarget::Id(id.to_string()), path));
             }
         }
     }
-    let rest = req.raw_path.strip_prefix(PATH_PREFIX)?;
-    let (id, path) = match rest.find('/') {
-        Some(i) => (&rest[..i], rest[i..].to_string()),
-        None => (rest, "/".to_string()),
+    let split = |rest: &str| match rest.find('/') {
+        Some(i) => (rest[..i].to_string(), rest[i..].to_string()),
+        None => (rest.to_string(), "/".to_string()),
     };
+    if let Some(rest) = req.raw_path.strip_prefix(NAME_PATH_PREFIX) {
+        let (name, path) = split(rest);
+        return Some((UrlTarget::Function(name), path));
+    }
+    let (id, path) = split(req.raw_path.strip_prefix(PATH_PREFIX)?);
     // A malformed id is still a URL request (answered 403 like AWS), never a
     // Lambda API call.
-    Some((id.to_ascii_lowercase(), path))
+    Some((UrlTarget::Id(id.to_ascii_lowercase()), path))
 }
 
 fn is_url_id(id: &str) -> bool {
@@ -235,7 +259,14 @@ pub(crate) fn verify_iam(req: &Request, cfg: &crate::server::Config) -> Result<S
         header: &header_fn,
         body: &req.body,
     };
-    let strict = cfg.auth_mode.eq_ignore_ascii_case("strict");
+    // The URL auth mode, when set, overrides the API's: signatures can be
+    // verified on URLs while the API stays relaxed.
+    let mode = if cfg.url_auth_mode.is_empty() {
+        &cfg.auth_mode
+    } else {
+        &cfg.url_auth_mode
+    };
+    let strict = mode.eq_ignore_ascii_case("strict");
     let creds = Credentials {
         auth_mode: if strict { "strict" } else { "signed-relaxed" },
         access_key_id: &cfg.access_key_id,
@@ -687,15 +718,23 @@ mod tests {
         let host = format!("{ID}.lambda-url.us-east-1.localhost:19010");
         assert_eq!(
             route(&req("/a/b", &host)),
-            Some((ID.to_string(), "/a/b".to_string()))
+            Some((UrlTarget::Id(ID.to_string()), "/a/b".to_string()))
         );
         assert_eq!(
             route(&req(&format!("/_url/{ID}/x%20y"), "127.0.0.1:19010")),
-            Some((ID.to_string(), "/x%20y".to_string()))
+            Some((UrlTarget::Id(ID.to_string()), "/x%20y".to_string()))
         );
         assert_eq!(
             route(&req(&format!("/_url/{ID}"), "127.0.0.1")),
-            Some((ID.to_string(), "/".to_string()))
+            Some((UrlTarget::Id(ID.to_string()), "/".to_string()))
+        );
+        assert_eq!(
+            route(&req("/urls/my-fn/a/b", "127.0.0.1")),
+            Some((UrlTarget::Function("my-fn".to_string()), "/a/b".to_string()))
+        );
+        assert_eq!(
+            route(&req("/urls/my-fn", "127.0.0.1")),
+            Some((UrlTarget::Function("my-fn".to_string()), "/".to_string()))
         );
         assert_eq!(
             route(&req("/2015-03-31/functions", "127.0.0.1:19010")),
@@ -705,6 +744,15 @@ mod tests {
             route(&req("/", "short.lambda-url.us-east-1.localhost")),
             None
         );
+    }
+
+    #[test]
+    fn url_ids_are_stable_per_account_region_and_function() {
+        let id = url_id_for("000000000000", "us-east-1", "fn");
+        assert_eq!(id, url_id_for("000000000000", "us-east-1", "fn"));
+        assert!(is_url_id(&id), "{id}");
+        assert_ne!(id, url_id_for("000000000000", "us-east-1", "fn2"));
+        assert_ne!(id, url_id_for("000000000000", "eu-west-1", "fn"));
     }
 
     #[test]

@@ -88,6 +88,10 @@ pub struct Interpreters {
     pub node: String,
     /// Docker CLI for container image functions; `None` disables them.
     pub docker: Option<String>,
+    /// Docker network devcloud runs on, when devcloud itself is a container
+    /// sharing the Docker daemon: function containers join it and are
+    /// reached by name instead of through a loopback port.
+    pub docker_network: Option<String>,
 }
 
 const DEFAULT_PYTHON: &str = "python3";
@@ -98,6 +102,7 @@ impl Default for Interpreters {
             python: DEFAULT_PYTHON.to_string(),
             node: "node".to_string(),
             docker: None,
+            docker_network: None,
         }
     }
 }
@@ -596,8 +601,8 @@ impl Drop for Environment {
 struct Container {
     docker: String,
     name: String,
-    /// Loopback port published for the RIE.
-    port: u16,
+    /// Where the RIE answers.
+    endpoint: container::Endpoint,
     removals: Removals,
 }
 
@@ -679,6 +684,12 @@ pub async fn run(
     let mut line = serde_json::to_vec(&request).unwrap_or_default();
     line.push(b'\n');
 
+    let pid = env.child.id();
+    // Max Memory Used is per invocation in a warm environment; a cold start
+    // keeps what init used.
+    if let (Some(pid), None) = (pid, &init) {
+        reset_peak_rss(pid);
+    }
     let started = Instant::now();
     let deadline = tokio::time::Instant::now() + timeout;
     // A dead environment fails the write; `wait` then reports how it ended.
@@ -689,9 +700,11 @@ pub async fn run(
     let duration = started.elapsed();
 
     let mut reusable = false;
+    let mut max_memory_mb = None;
     let (outcome, body, timed_out) = match waited {
         Wait::Marker { tag, log } => {
             reusable = tag == "done";
+            max_memory_mb = pid.and_then(peak_rss_mb);
             (read_result(&result_path), log, false)
         }
         Wait::Exited {
@@ -722,6 +735,7 @@ pub async fn run(
         &String::from_utf8_lossy(&body),
         duration,
         timed_out,
+        max_memory_mb,
     );
     if reusable {
         pool.give_back(&inv.function_name, env);
@@ -767,6 +781,7 @@ fn failed_init(inv: &Invocation, waited: Wait, init: Duration) -> Completed {
             "",
             Duration::ZERO,
             timed_out,
+            None,
         ),
         duration: Duration::ZERO,
         init_duration: Some(init),
@@ -889,9 +904,23 @@ async fn run_container(
     let timeout = Duration::from_secs(inv.timeout_seconds.max(1) as u64);
     let mut env = match pool.take(&inv.function_name, &inv.env_key) {
         Some(env) => env,
-        None => start_container(docker, image, inv, pool, code).await?,
+        None => {
+            start_container(
+                docker,
+                interpreters.docker_network.as_deref(),
+                image,
+                inv,
+                pool,
+                code,
+            )
+            .await?
+        }
     };
-    let port = env.container.as_ref().map_or(0, |c| c.port);
+    let endpoint = env
+        .container
+        .as_ref()
+        .map(|c| c.endpoint.clone())
+        .expect("container environment");
 
     enum Done {
         Response(std::io::Result<container::Response>),
@@ -901,7 +930,7 @@ async fn run_container(
     let started = Instant::now();
     let deadline = tokio::time::Instant::now() + timeout;
     let done = tokio::select! {
-        r = container::invoke(port, &inv.payload) => Done::Response(r),
+        r = container::invoke(&endpoint, &inv.payload) => Done::Response(r),
         status = env.child.wait() => Done::Exited(match status {
             Ok(s) => s.to_string(),
             Err(e) => e.to_string(),
@@ -954,7 +983,7 @@ async fn run_container(
         Done::TimedOut => (timed_out_error(inv), false, true),
     };
     let init_duration = log.init.as_ref().map(|(d, _)| *d);
-    let framed = frame_log(inv, log.init, &log.body, duration, timed_out);
+    let framed = frame_log(inv, log.init, &log.body, duration, timed_out, None);
     if reusable {
         pool.give_back(&inv.function_name, env);
     } else if let Some(c) = env.container.take() {
@@ -972,6 +1001,7 @@ async fn run_container(
 /// Starts `docker run` for `image` and waits until the RIE inside answers.
 async fn start_container(
     docker: &str,
+    network: Option<&str>,
     image: &ImageSpec,
     inv: &Invocation,
     pool: &Pool,
@@ -990,7 +1020,10 @@ async fn start_container(
     let vars: Vec<(String, String)> = vars.into_iter().collect();
     let env_file = work_dir.join("env");
     container::write_env_file(&env_file, &vars).map_err(cleanup)?;
-    let port = free_port().map_err(cleanup)?;
+    let reach = match network {
+        Some(network) => container::Reach::Network(network.to_string()),
+        None => container::Reach::Loopback(free_port().map_err(cleanup)?),
+    };
     // Docker names are daemon-wide: the marker hash keeps devcloud processes
     // (and workspaces) sharing a daemon apart.
     let name = format!(
@@ -1019,7 +1052,7 @@ async fn start_container(
     cmd.args(container::run_args(
         image,
         &name,
-        port,
+        &reach,
         inv.memory_size,
         &env_file,
     ))
@@ -1058,8 +1091,8 @@ async fn start_container(
         control: None,
         container: Some(Container {
             docker: docker.to_string(),
+            endpoint: reach.endpoint(&name),
             name,
-            port,
             removals: Arc::clone(&pool.removals),
         }),
         events,
@@ -1071,8 +1104,9 @@ async fn start_container(
         _code: code,
     };
 
+    let endpoint = reach.endpoint(&env.container.as_ref().expect("container").name);
     loop {
-        if container::probe(port).await {
+        if container::probe(&endpoint).await {
             return Ok(env);
         }
         if let Ok(Some(status)) = env.child.try_wait() {
@@ -1484,6 +1518,7 @@ fn frame_log(
     body: &str,
     duration: Duration,
     timed_out: bool,
+    max_memory_mb: Option<u64>,
 ) -> String {
     let ms = duration.as_secs_f64() * 1000.0;
     let billed = (ms.ceil() as u64).max(1);
@@ -1511,11 +1546,20 @@ fn frame_log(
             inv.timeout_seconds.max(1)
         ));
     }
+    if let Some(used) = max_memory_mb.filter(|&m| m > inv.memory_size.max(0) as u64) {
+        log.push_str(&format!(
+            "[WARNING] devcloud: Max Memory Used ({used} MB) exceeds MemorySize ({} MB); Lambda would have stopped this invocation\n",
+            inv.memory_size
+        ));
+    }
     log.push_str(&format!("END RequestId: {}\n", inv.request_id));
     log.push_str(&format!(
         "REPORT RequestId: {}\tDuration: {:.2} ms\tBilled Duration: {} ms\tMemory Size: {} MB",
         inv.request_id, ms, billed, inv.memory_size
     ));
+    if let Some(used) = max_memory_mb {
+        log.push_str(&format!("\tMax Memory Used: {used} MB"));
+    }
     if let Some((init_duration, _)) = init {
         log.push_str(&format!(
             "\tInit Duration: {:.2} ms",
@@ -1524,6 +1568,41 @@ fn frame_log(
     }
     log.push('\n');
     log
+}
+
+/// Resets the peak resident set size of `pid` (Linux `clear_refs`), so the
+/// next [`peak_rss_mb`] covers only what follows. Elsewhere: nothing to do.
+#[cfg(target_os = "linux")]
+fn reset_peak_rss(pid: u32) {
+    let _ = std::fs::write(format!("/proc/{pid}/clear_refs"), "5");
+}
+
+#[cfg(not(target_os = "linux"))]
+fn reset_peak_rss(_pid: u32) {}
+
+/// Peak resident set size of `pid` in MB (Linux `VmHWM`), for REPORT's Max
+/// Memory Used. It covers the interpreter process, not processes it spawned.
+#[cfg(target_os = "linux")]
+fn peak_rss_mb(pid: u32) -> Option<u64> {
+    parse_vm_hwm(&std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn peak_rss_mb(_pid: u32) -> Option<u64> {
+    None
+}
+
+/// `VmHWM:   123456 kB` → MB, rounded up like Lambda's report.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn parse_vm_hwm(status: &str) -> Option<u64> {
+    let kb: u64 = status
+        .lines()
+        .find_map(|l| l.strip_prefix("VmHWM:"))?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()?;
+    Some(kb.div_ceil(1024))
 }
 
 fn now_millis() -> u128 {
@@ -1657,6 +1736,15 @@ mod tests {
         );
         // A handler printing a look-alike line for another runtime is ignored.
         assert_eq!(pool.version_mismatch(&inv("i", "python3.13"), log), None);
+    }
+
+    #[test]
+    fn vm_hwm_is_reported_in_whole_megabytes() {
+        let status =
+            "Name:\tpython3\nVmPeak:\t  999999 kB\nVmHWM:\t   45057 kB\nVmRSS:\t   40000 kB\n";
+        assert_eq!(parse_vm_hwm(status), Some(45), "rounded up");
+        assert_eq!(parse_vm_hwm("VmHWM:\t 1024 kB\n"), Some(1));
+        assert_eq!(parse_vm_hwm("VmRSS:\t 1024 kB\n"), None);
     }
 
     #[test]
