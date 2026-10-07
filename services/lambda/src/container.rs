@@ -14,6 +14,11 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
+/// Label naming the devcloud instance that started a container, so a
+/// restarted instance can remove what a killed predecessor left behind
+/// without touching containers of other instances on the same daemon.
+pub const OWNER_LABEL: &str = "devcloud.lambda.owner";
+
 /// Where the RIE listens inside the container.
 pub const RIE_PORT: u16 = 8080;
 
@@ -73,12 +78,15 @@ pub fn run_args(
     reach: &Reach,
     memory_mb: i64,
     env_file: &std::path::Path,
+    owner: &str,
 ) -> Vec<String> {
     let mut args = vec![
         "run".to_string(),
         "--rm".to_string(),
         "--name".to_string(),
         name.to_string(),
+        "--label".to_string(),
+        format!("{OWNER_LABEL}={owner}"),
     ];
     match reach {
         Reach::Loopback(port) => {
@@ -318,9 +326,10 @@ mod tests {
             &Reach::Loopback(45000),
             512,
             std::path::Path::new("/w/env"),
+            "inst1",
         );
         let joined = args.join(" ");
-        assert!(joined.starts_with("run --rm --name devcloud-lambda-x -p 127.0.0.1:45000:8080 --memory 512m --env-file /w/env --entrypoint /lambda-entrypoint.sh -w /var/task -- my-fn:latest --debug app.handler"), "{joined}");
+        assert!(joined.starts_with("run --rm --name devcloud-lambda-x --label devcloud.lambda.owner=inst1 -p 127.0.0.1:45000:8080 --memory 512m --env-file /w/env --entrypoint /lambda-entrypoint.sh -w /var/task -- my-fn:latest --debug app.handler"), "{joined}");
     }
 
     #[test]
@@ -354,7 +363,7 @@ mod tests {
             ..ImageSpec::default()
         };
         let reach = Reach::Network("app_default".into());
-        let args = run_args(&spec, "c1", &reach, 128, std::path::Path::new("/e")).join(" ");
+        let args = run_args(&spec, "c1", &reach, 128, std::path::Path::new("/e"), "o").join(" ");
         assert!(args.contains("--network app_default"), "{args}");
         assert!(!args.contains(" -p "), "{args}");
         assert_eq!(

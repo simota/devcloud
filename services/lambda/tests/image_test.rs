@@ -29,15 +29,24 @@ args = sys.argv[1:]
 if args[:2] == ["image", "inspect"]:
     print(json.dumps(["default.handler"]))
     sys.exit(0)
+if args[:2] == ["ps", "-aq"]:
+    # Only `--filter label=K=V`: containers carrying that label, not removed.
+    want = args[args.index("--filter") + 1][len("label="):]
+    for f in sorted(os.listdir(STATE)):
+        if f.endswith(".label") and open(os.path.join(STATE, f)).read() == want:
+            name = f[:-len(".label")]
+            if not os.path.exists(os.path.join(STATE, name + ".removed")):
+                print(name)
+    sys.exit(0)
 if args[:2] == ["rm", "-f"]:
-    name = args[2]
     # Slow on purpose: callers must wait for the removal, not just start it.
     time.sleep(0.3)
-    open(os.path.join(STATE, name + ".removed"), "w").close()
-    try:
-        os.kill(int(open(os.path.join(STATE, name + ".pid")).read()), signal.SIGKILL)
-    except Exception:
-        pass
+    for name in args[2:]:
+        open(os.path.join(STATE, name + ".removed"), "w").close()
+        try:
+            os.kill(int(open(os.path.join(STATE, name + ".pid")).read()), signal.SIGKILL)
+        except Exception:
+            pass
     sys.exit(0)
 assert args[0] == "run", args
 sep = args.index("--")
@@ -45,6 +54,7 @@ opts, image, rest = args[1:sep], args[sep + 1], args[sep + 2:]
 get = lambda flag: opts[opts.index(flag) + 1] if flag in opts else None
 port = int(get("-p").split(":")[1])
 name = get("--name")
+open(os.path.join(STATE, name + ".label"), "w").write(get("--label"))
 env = dict(line.rstrip("\n").split("=", 1) for line in open(get("--env-file")) if line.strip())
 mode = oct(os.stat(get("--env-file")).st_mode & 0o777)
 with open(image + ".run.json", "a") as f:
@@ -742,4 +752,58 @@ async fn a_missing_docker_cli_is_explained() {
             "{name}: {msg}"
         );
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restart_removes_containers_a_killed_run_left_behind() {
+    if !has("python3") {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let e = env("orphans", Some("fake"));
+    let image = e.dir.join("my-image");
+    assert_eq!(
+        create_image(&e.server, "img-fn", &image.to_string_lossy(), 5)
+            .await
+            .status,
+        201
+    );
+    assert_eq!(invoke(&e.server, "img-fn", b"{}").await.status, 200);
+    let mine = runs(&image)[0]["name"].as_str().unwrap().to_string();
+    let state = e.dir.join("state");
+    // A container of another devcloud instance on the same daemon.
+    std::fs::write(
+        state.join("devcloud-lambda-other-0.label"),
+        "devcloud.lambda.owner=someone-else",
+    )
+    .unwrap();
+
+    // The first server "dies" without cleaning up (its environment is still
+    // running); a new one starts on the same storage.
+    let docker = e.dir.join("fake-docker").to_string_lossy().into_owned();
+    let restarted = Arc::new(Server::new(Config {
+        storage_path: e.dir.join("lambda").to_string_lossy().into_owned(),
+        interpreters: Interpreters {
+            docker: Some(docker),
+            ..Interpreters::default()
+        },
+        ..Config::default()
+    }));
+    restarted.remove_orphaned_containers().await;
+    assert!(
+        state.join(format!("{mine}.removed")).exists(),
+        "the previous run's container is removed"
+    );
+    assert!(
+        !state.join("devcloud-lambda-other-0.removed").exists(),
+        "another instance's container is left alone"
+    );
+    // Same storage, same instance id: the label matched.
+    assert_eq!(
+        std::fs::read_to_string(state.join(format!("{mine}.label"))).unwrap(),
+        format!(
+            "devcloud.lambda.owner={}",
+            std::fs::read_to_string(e.dir.join("lambda/instance-id")).unwrap()
+        )
+    );
 }

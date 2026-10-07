@@ -52,6 +52,7 @@ pub async fn run(
     if let Some(err) = server.load_err() {
         return Err(format!("lambda: failed to load state: {err}"));
     }
+    server.remove_orphaned_containers().await;
 
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
