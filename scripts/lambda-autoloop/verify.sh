@@ -275,6 +275,25 @@ tag_lifecycle() {
     lambda_call GET "/2017-03-31/tags/${arn}" | json_assert 'data["Tags"] == {}'
 }
 
+function_url_lifecycle() {
+  local url host id
+  url="$(lambda_call POST "/2021-10-31/functions/${FUNCTION_NAME}/url" '{"AuthType":"NONE"}' |
+    python3 -c 'import json,sys; print(json.load(sys.stdin)["FunctionUrl"])')" || return 1
+  host="${url#http://}"
+  host="${host%/}"
+  id="${host%%.*}"
+  # Host form (the FunctionUrl) and the /_url/ path form reach the handler
+  # with a payload 2.0 event.
+  curl -fsS -H "Host: ${host}" "${LAMBDA_ENDPOINT}/hello?x=1" |
+    json_assert 'data["ok"] and data["input"]["version"] == "2.0" and data["input"]["rawPath"] == "/hello" and data["input"]["queryStringParameters"] == {"x": "1"}' &&
+    curl -fsS "${LAMBDA_ENDPOINT}/_url/${id}/path-form" |
+    json_assert 'data["input"]["rawPath"] == "/path-form"' &&
+    lambda_call PUT "/2021-10-31/functions/${FUNCTION_NAME}/url" '{"AuthType":"AWS_IAM"}' >/dev/null &&
+    [[ "$(curl -sS -o /dev/null -w '%{http_code}' "${LAMBDA_ENDPOINT}/_url/${id}/")" == "403" ]] &&
+    curl -fsS -X DELETE "${LAMBDA_ENDPOINT}/2021-10-31/functions/${FUNCTION_NAME}/url" >/dev/null &&
+    lambda_call GET "/2021-10-31/functions/${FUNCTION_NAME}/urls" | json_assert 'data["FunctionUrlConfigs"] == []'
+}
+
 # --- dashboard ----------------------------------------------------------------
 
 dashboard_starts() {
@@ -386,6 +405,7 @@ run_core_checks() {
   run_check "Invoke node handler works" invoke_node
   run_check "UpdateFunctionConfiguration works" update_configuration
   run_check "Tag/Untag lifecycle works" tag_lifecycle
+  run_check "Function URL lifecycle works" function_url_lifecycle
 }
 
 run_dashboard_checks() {

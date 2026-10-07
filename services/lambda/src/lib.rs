@@ -26,6 +26,7 @@ pub(crate) fn event_sink() -> Option<&'static UnboundedSender<String>> {
 pub mod body;
 pub mod code_store;
 pub mod container;
+mod function_url;
 pub mod http;
 pub mod runtime;
 pub mod server;

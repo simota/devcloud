@@ -76,6 +76,24 @@ async fn handle_conn(mut stream: TcpStream, server: Arc<Server>) -> std::io::Res
     write_reply(&mut stream, &request.method, reply).await
 }
 
+/// Records one request header line. A repeated header keeps every value,
+/// combined as HTTP allows: `Cookie` lines with `; `, others with `,` (also
+/// how SigV4 canonicalises them and how Lambda function URL events carry
+/// them). A repeated `Content-Length` thereby stops parsing as one number.
+fn add_header(headers: &mut HashMap<String, String>, name: &str, value: &str) {
+    let name = name.trim().to_ascii_lowercase();
+    let value = value.trim();
+    match headers.get_mut(&name) {
+        Some(existing) => {
+            existing.push_str(if name == "cookie" { "; " } else { "," });
+            existing.push_str(value);
+        }
+        None => {
+            headers.insert(name, value.to_string());
+        }
+    }
+}
+
 async fn read_request(stream: &mut TcpStream) -> std::io::Result<Option<Result<Request, Reply>>> {
     let mut buf = Vec::new();
     let mut tmp = [0u8; 8192];
@@ -101,10 +119,10 @@ async fn read_request(stream: &mut TcpStream) -> std::io::Result<Option<Result<R
         Some((p, q)) => (p.to_string(), q.to_string()),
         None => (target.to_string(), String::new()),
     };
-    let mut headers = HashMap::new();
+    let mut headers: HashMap<String, String> = HashMap::new();
     for line in lines {
         if let Some((k, v)) = line.split_once(':') {
-            headers.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
+            add_header(&mut headers, k, v);
         }
     }
     let leftover = buf[header_end + 4..].to_vec();
@@ -124,10 +142,17 @@ async fn read_request(stream: &mut TcpStream) -> std::io::Result<Option<Result<R
 async fn write_reply(stream: &mut TcpStream, method: &str, reply: Reply) -> std::io::Result<()> {
     let mut head = format!("HTTP/1.1 {} {}\r\n", reply.status, reason(reply.status));
     head.push_str("Server: devcloud-lambda\r\n");
-    if !reply.body.is_empty() {
+    // An empty `content_type` means the reply carries its own Content-Type
+    // header (function URL responses).
+    if !reply.body.is_empty() && !reply.content_type.is_empty() {
         head.push_str(&format!("Content-Type: {}\r\n", reply.content_type));
     }
     for (k, v) in &reply.headers {
+        // Last line of defence against header injection: a line break in a
+        // name or value would end the header early.
+        if k.contains(['\r', '\n', '\0', ':']) || v.contains(['\r', '\n', '\0']) {
+            continue;
+        }
         head.push_str(&format!("{k}: {v}\r\n"));
     }
     head.push_str(&format!("Content-Length: {}\r\n", reply.body.len()));
@@ -143,6 +168,12 @@ async fn write_reply(stream: &mut TcpStream, method: &str, reply: Reply) -> std:
 pub async fn process(server: &Arc<Server>, req: &Request) -> Reply {
     if server.load_err().is_some() {
         return Reply::error(500, "ServiceException", "failed to load lambda state");
+    }
+    // Function URLs are meant to be called from anywhere, browsers included:
+    // they bypass the API's CSRF guard and SigV4 check and apply the URL's
+    // own AuthType instead.
+    if let Some((url_id, path)) = crate::function_url::route(req) {
+        return server.serve_function_url(req, &url_id, &path).await;
     }
     let segments: Vec<String> = match req
         .raw_path
@@ -213,6 +244,17 @@ pub async fn process(server: &Arc<Server>, req: &Request) -> Reply {
                     )
                     .await
             }
+            _ => method_not_allowed(),
+        },
+        ["2021-10-31", "functions", id, "url"] => match m {
+            "POST" => server.create_function_url_config(id, &query, &req.body),
+            "GET" => server.get_function_url_config(id, &query),
+            "PUT" => server.update_function_url_config(id, &query, &req.body),
+            "DELETE" => server.delete_function_url_config(id, &query),
+            _ => method_not_allowed(),
+        },
+        ["2021-10-31", "functions", id, "urls"] => match m {
+            "GET" => server.list_function_url_configs(id),
             _ => method_not_allowed(),
         },
         ["2017-03-31", "tags", arn] => match m {
@@ -365,7 +407,7 @@ fn percent_decode(s: &str) -> Option<String> {
     String::from_utf8(out).ok()
 }
 
-fn decode_query_component(s: &str) -> String {
+pub(crate) fn decode_query_component(s: &str) -> String {
     percent_decode(&s.replace('+', " ")).unwrap_or_else(|| s.to_string())
 }
 
@@ -390,6 +432,21 @@ fn query_all(q: &str, key: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repeated_headers_keep_every_value() {
+        let mut h = HashMap::new();
+        for (k, v) in [
+            ("X-Tag", " a"),
+            ("x-tag", "b"),
+            ("Cookie", "s=1"),
+            ("cookie", "t=2"),
+        ] {
+            add_header(&mut h, k, v);
+        }
+        assert_eq!(h["x-tag"], "a,b");
+        assert_eq!(h["cookie"], "s=1; t=2");
+    }
 
     #[test]
     fn decodes_arn_segments() {

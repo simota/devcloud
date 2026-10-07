@@ -20,6 +20,8 @@ use sha2::{Digest, Sha256};
 
 use crate::code_store::{CodeStore, Lease, StageError};
 use crate::container::ImageSpec;
+use crate::function_url::{self, UrlConfig};
+use crate::http::Request;
 use crate::runtime::{self, FunctionCredentials, Interpreters, Invocation, Outcome, RuntimeError};
 use crate::time_fmt::{now_lambda, now_rfc3339};
 
@@ -169,6 +171,8 @@ struct FunctionRecord {
     architectures: Vec<String>,
     #[serde(default = "default_ephemeral")]
     ephemeral_storage_size: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    function_url: Option<UrlConfig>,
     #[serde(default = "default_package_type")]
     package_type: String,
     /// Image functions only.
@@ -568,6 +572,7 @@ impl Server {
             tags,
             architectures,
             ephemeral_storage_size,
+            function_url: None,
             package_type: package_type.to_string(),
             image_uri,
             image_config,
@@ -898,6 +903,244 @@ impl Server {
         Reply::empty(204)
     }
 
+    // ---- function URLs ------------------------------------------------------
+
+    fn function_url_json(&self, name: &str, url: &UrlConfig, with_last_modified: bool) -> Value {
+        let mut v = json!({
+            "FunctionUrl": function_url::function_url(&self.config.endpoint, &url.url_id, self.region()),
+            "FunctionArn": self.function_arn(name),
+            "AuthType": url.auth_type,
+            "CreationTime": url.creation_time,
+            "InvokeMode": url.invoke_mode,
+        });
+        if let Some(cors) = &url.cors {
+            v["Cors"] = serde_json::to_value(cors).unwrap_or_default();
+        }
+        if with_last_modified {
+            v["LastModifiedTime"] = json!(url.last_modified_time);
+        }
+        v
+    }
+
+    fn url_not_found(&self, name: &str) -> Reply {
+        Reply::error(
+            404,
+            "ResourceNotFoundException",
+            &format!(
+                "The resource you requested does not exist. (Function URL config for {})",
+                self.function_arn(name)
+            ),
+        )
+    }
+
+    /// `POST /2021-10-31/functions/<id>/url`.
+    pub fn create_function_url_config(
+        &self,
+        id: &str,
+        query: &BTreeMap<String, String>,
+        body: &[u8],
+    ) -> Reply {
+        let settings = match parse_json(body).and_then(|req| function_url::parse_settings(&req)) {
+            Ok(s) => s,
+            Err(r) => return r,
+        };
+        let Some(auth_type) = settings.auth_type else {
+            return validation("1 validation error detected: Value null at 'authType' failed to satisfy constraint: Member must not be null");
+        };
+        let name = match self.lookup(id, query.get("Qualifier").map(String::as_str)) {
+            Ok(r) => r.function_name,
+            Err(r) => return r,
+        };
+        let now = now_rfc3339();
+        let url = UrlConfig {
+            url_id: hex::encode(&Sha256::digest(self.new_id().as_bytes())[..16]),
+            auth_type,
+            cors: settings.cors,
+            invoke_mode: settings
+                .invoke_mode
+                .unwrap_or_else(|| "BUFFERED".to_string()),
+            creation_time: now.clone(),
+            last_modified_time: now,
+        };
+        let result = self.commit(|st| {
+            let rec = st
+                .functions
+                .get_mut(&name)
+                .ok_or_else(|| self.not_found(&name))?;
+            if rec.function_url.is_some() {
+                return Err(Reply::error(
+                    409,
+                    "ResourceConflictException",
+                    &format!(
+                        "Failed to create function url config for [functionArn = {}]. Error message:  FunctionUrlConfig exists for this Lambda function",
+                        self.function_arn(&name)
+                    ),
+                ));
+            }
+            rec.function_url = Some(url.clone());
+            Ok(())
+        });
+        match result {
+            Ok(()) => Reply::json(201, &self.function_url_json(&name, &url, false)),
+            Err(r) => r,
+        }
+    }
+
+    /// `GET /2021-10-31/functions/<id>/url`.
+    pub fn get_function_url_config(&self, id: &str, query: &BTreeMap<String, String>) -> Reply {
+        let rec = match self.lookup(id, query.get("Qualifier").map(String::as_str)) {
+            Ok(r) => r,
+            Err(r) => return r,
+        };
+        match &rec.function_url {
+            Some(url) => Reply::json(200, &self.function_url_json(&rec.function_name, url, true)),
+            None => self.url_not_found(&rec.function_name),
+        }
+    }
+
+    /// `PUT /2021-10-31/functions/<id>/url`: only the fields present change.
+    pub fn update_function_url_config(
+        &self,
+        id: &str,
+        query: &BTreeMap<String, String>,
+        body: &[u8],
+    ) -> Reply {
+        let settings = match parse_json(body).and_then(|req| function_url::parse_settings(&req)) {
+            Ok(s) => s,
+            Err(r) => return r,
+        };
+        let name = match self.lookup(id, query.get("Qualifier").map(String::as_str)) {
+            Ok(r) => r.function_name,
+            Err(r) => return r,
+        };
+        let result = self.commit(|st| {
+            let rec = st
+                .functions
+                .get_mut(&name)
+                .ok_or_else(|| self.not_found(&name))?;
+            let url = rec
+                .function_url
+                .as_mut()
+                .ok_or_else(|| self.url_not_found(&name))?;
+            if let Some(a) = settings.auth_type {
+                url.auth_type = a;
+            }
+            if let Some(c) = settings.cors {
+                url.cors = Some(c);
+            }
+            if let Some(m) = settings.invoke_mode {
+                url.invoke_mode = m;
+            }
+            url.last_modified_time = now_rfc3339();
+            Ok(url.clone())
+        });
+        match result {
+            Ok(url) => Reply::json(200, &self.function_url_json(&name, &url, true)),
+            Err(r) => r,
+        }
+    }
+
+    /// `DELETE /2021-10-31/functions/<id>/url`.
+    pub fn delete_function_url_config(&self, id: &str, query: &BTreeMap<String, String>) -> Reply {
+        let name = match self.lookup(id, query.get("Qualifier").map(String::as_str)) {
+            Ok(r) => r.function_name,
+            Err(r) => return r,
+        };
+        let result = self.commit(|st| {
+            let rec = st
+                .functions
+                .get_mut(&name)
+                .ok_or_else(|| self.not_found(&name))?;
+            rec.function_url
+                .take()
+                .map(|_| ())
+                .ok_or_else(|| self.url_not_found(&name))
+        });
+        match result {
+            Ok(()) => Reply::empty(204),
+            Err(r) => r,
+        }
+    }
+
+    /// `GET /2021-10-31/functions/<id>/urls` (at most one: only `$LATEST`).
+    pub fn list_function_url_configs(&self, id: &str) -> Reply {
+        let rec = match self.lookup(id, None) {
+            Ok(r) => r,
+            Err(r) => return r,
+        };
+        let configs: Vec<Value> = rec
+            .function_url
+            .iter()
+            .map(|u| self.function_url_json(&rec.function_name, u, true))
+            .collect();
+        Reply::json(200, &json!({ "FunctionUrlConfigs": configs }))
+    }
+
+    /// Serves one request addressed to a function URL: CORS preflight, the
+    /// URL's AuthType, then a synchronous invoke with a payload 2.0 event.
+    pub async fn serve_function_url(
+        self: &Arc<Self>,
+        req: &Request,
+        url_id: &str,
+        raw_path: &str,
+    ) -> Reply {
+        let target = {
+            let st = self.state.lock().unwrap();
+            st.functions.values().find_map(|r| {
+                r.function_url
+                    .as_ref()
+                    .filter(|u| u.url_id == url_id)
+                    .map(|u| (r.function_name.clone(), u.clone()))
+            })
+        };
+        let Some((name, url)) = target else {
+            return function_url::forbidden();
+        };
+        let origin = req.headers.get("origin").map(String::as_str).unwrap_or("");
+        if let Some(cors) = &url.cors {
+            if req.method == "OPTIONS" && req.headers.contains_key("access-control-request-method")
+            {
+                return function_url::preflight(cors, &req.headers);
+            }
+        }
+        let iam_access_key = if url.auth_type == "AWS_IAM" {
+            match function_url::verify_iam(req, &self.config) {
+                Ok(key) => Some(key),
+                Err(r) => return r,
+            }
+        } else {
+            None
+        };
+        let request_id = self.new_id();
+        let event = function_url::build_event(
+            req,
+            &function_url::EventContext {
+                url_id,
+                raw_path,
+                account_id: self.account_id(),
+                request_id: &request_id,
+                iam_access_key: iam_access_key.as_deref(),
+                domain_name: format!("{url_id}.lambda-url.{}.localhost", self.region()),
+            },
+        );
+        let payload = serde_json::to_vec(&event).unwrap_or_default();
+        let invoked = self
+            .invoke_pinned(
+                &name,
+                &BTreeMap::new(),
+                "RequestResponse",
+                "",
+                &payload,
+                Some(&url),
+            )
+            .await;
+        let reply = function_url::map_response(invoked);
+        match &url.cors {
+            Some(cors) => function_url::apply_cors(reply, cors, origin),
+            None => reply,
+        }
+    }
+
     pub fn list_tags(&self, arn: &str) -> Reply {
         match self.lookup_arn(arn) {
             Ok(rec) => Reply::json(200, &json!({ "Tags": rec.tags })),
@@ -1032,6 +1275,24 @@ impl Server {
         log_type: &str,
         payload: &[u8],
     ) -> Reply {
+        self.invoke_pinned(id, query, invocation_type, log_type, payload, None)
+            .await
+    }
+
+    /// [`Self::invoke`], refused with 403 unless the function being run still
+    /// carries `url` — the function URL configuration the request was
+    /// authorized against. The check and the code lease happen under one
+    /// state lock, so a URL request can never run a function that was
+    /// deleted and recreated (or reconfigured) after its authorization.
+    async fn invoke_pinned(
+        self: &Arc<Self>,
+        id: &str,
+        query: &BTreeMap<String, String>,
+        invocation_type: &str,
+        log_type: &str,
+        payload: &[u8],
+        url: Option<&UrlConfig>,
+    ) -> Reply {
         let invocation_type = if invocation_type.is_empty() {
             "RequestResponse"
         } else {
@@ -1047,6 +1308,11 @@ impl Server {
                 Ok(r) => r,
                 Err(r) => return r,
             };
+        if let Some(url) = url {
+            if record.function_url.as_ref() != Some(url) {
+                return function_url::forbidden();
+            }
+        }
         let limit = if invocation_type == "Event" {
             MAX_ASYNC_PAYLOAD_BYTES
         } else {
@@ -1711,6 +1977,89 @@ fn emit(event_type: &str, payload: Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A URL request authorized against one function must not run another:
+    /// the function deleted and recreated (with or without a new URL) while
+    /// the request was in flight, or its URL reconfigured.
+    #[tokio::test]
+    async fn url_invocations_run_only_the_function_they_were_authorized_for() {
+        let dir = std::env::temp_dir().join(format!(
+            "devcloud-lambda-pinned-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let server = Arc::new(Server::new(Config {
+            storage_path: dir.to_string_lossy().into_owned(),
+            ..Config::default()
+        }));
+        let zip = crate::zip::build_stored(&[("app.py", b"def handler(e, c):\n    return 1\n")]);
+        let create = || {
+            json!({
+                "FunctionName": "pinned", "Runtime": "python3.12", "Role": "r",
+                "Handler": "app.handler",
+                "Code": { "ZipFile": base64::engine::general_purpose::STANDARD.encode(&zip) },
+            })
+            .to_string()
+        };
+        let none = json!({ "AuthType": "NONE" }).to_string();
+        let no_query = BTreeMap::new();
+        let url_of = |server: &Server| {
+            server.state.lock().unwrap().functions["pinned"]
+                .function_url
+                .clone()
+        };
+        let dry_run = |url: UrlConfig| {
+            let server = Arc::clone(&server);
+            async move {
+                server
+                    .invoke_pinned("pinned", &BTreeMap::new(), "DryRun", "", b"{}", Some(&url))
+                    .await
+                    .status
+            }
+        };
+
+        assert_eq!(server.create_function(create().as_bytes()).status, 201);
+        assert_eq!(
+            server
+                .create_function_url_config("pinned", &no_query, none.as_bytes())
+                .status,
+            201
+        );
+        let authorized = url_of(&server).unwrap();
+        assert_eq!(
+            dry_run(authorized.clone()).await,
+            204,
+            "same function, same URL"
+        );
+
+        // Deleted and recreated without a URL.
+        assert_eq!(server.delete_function("pinned", &no_query).status, 204);
+        assert_eq!(server.create_function(create().as_bytes()).status, 201);
+        assert_eq!(dry_run(authorized.clone()).await, 403);
+        // ... or recreated with a URL of its own.
+        assert_eq!(
+            server
+                .create_function_url_config("pinned", &no_query, none.as_bytes())
+                .status,
+            201
+        );
+        assert_eq!(dry_run(authorized).await, 403);
+
+        // The URL reconfigured (NONE -> AWS_IAM) mid-request.
+        let current = url_of(&server).unwrap();
+        let iam = json!({ "AuthType": "AWS_IAM" }).to_string();
+        assert_eq!(
+            server
+                .update_function_url_config("pinned", &no_query, iam.as_bytes())
+                .status,
+            200
+        );
+        assert_eq!(dry_run(current).await, 403);
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn parses_function_identifiers() {
