@@ -15,6 +15,8 @@
 # DEVCLOUD_LAMBDA_IDLE_TIMEOUT_SECONDS (default 300; 0 = always cold).
 # Layer contents: mount them at /opt (e.g. -v ./deps:/opt/python); /opt/python
 # and /opt/nodejs/node_modules are on the default PYTHONPATH / NODE_PATH.
+# PackageType Image functions need the docker CLI and are not supported inside
+# this image (no Docker-in-Docker); run devcloud-lambda on the host for them.
 # Credentials for handlers: DEVCLOUD_LAMBDA_FUNCTION_ACCESS_KEY_ID /
 # DEVCLOUD_LAMBDA_FUNCTION_SECRET_ACCESS_KEY (/ DEVCLOUD_LAMBDA_FUNCTION_SESSION_TOKEN).
 # Auth defaults to relaxed. Strict auth: pass DEVCLOUD_LAMBDA_AUTH_MODE=strict together with

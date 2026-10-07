@@ -30,7 +30,10 @@ pub async fn run(
         storage_path: root.join("lambda").to_string_lossy().into_owned(),
         endpoint: format!("http://{addr}"),
         object_store_root: cfg.services.s3.enabled.then(|| root.join("s3/buckets")),
-        interpreters: Default::default(),
+        interpreters: devcloud_lambda::runtime::Interpreters {
+            docker: cfg.services.lambda.docker.then(|| "docker".to_string()),
+            ..Default::default()
+        },
         function_credentials: function_credentials(&cfg.services.lambda)?,
         opt_dir: (!cfg.services.lambda.opt_dir.is_empty())
             .then(|| PathBuf::from(&cfg.services.lambda.opt_dir)),

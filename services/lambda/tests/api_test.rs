@@ -3269,3 +3269,44 @@ async fn relative_opt_dir_is_resolved_against_devcloud_cwd() {
     assert_eq!(r.body, b"\"rel\"");
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[tokio::test]
+async fn environment_variable_names_follow_the_lambda_pattern() {
+    let e = env("envnames");
+    assert_eq!(create_python(&e.server, "names-fn").await.status, 201);
+    for bad in [
+        "ZZZ=ignored\nAWS_LAMBDA_FUNCTION_NAME",
+        "1BAD",
+        "_X",
+        "WITH-DASH",
+        "with space",
+    ] {
+        let r = call(
+            &e.server,
+            "PUT",
+            "/2015-03-31/functions/names-fn/configuration",
+            &[],
+            json!({ "Environment": { "Variables": { bad: "x" } } })
+                .to_string()
+                .as_bytes(),
+        )
+        .await;
+        assert_eq!(
+            r.status,
+            400,
+            "{bad:?}: {}",
+            String::from_utf8_lossy(&r.body)
+        );
+    }
+    let r = call(
+        &e.server,
+        "PUT",
+        "/2015-03-31/functions/names-fn/configuration",
+        &[],
+        json!({ "Environment": { "Variables": { "Ok_Name2": "x", "A": "1" } } })
+            .to_string()
+            .as_bytes(),
+    )
+    .await;
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+}

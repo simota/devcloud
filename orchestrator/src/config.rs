@@ -335,6 +335,8 @@ pub struct LambdaServiceConfig {
     /// Seconds an idle execution environment stays warm; `None` = the
     /// service default, 0 = every invocation is a cold start.
     pub idle_timeout_seconds: Option<u32>,
+    /// Run `PackageType: Image` functions with `docker run`.
+    pub docker: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -1187,6 +1189,9 @@ pub fn apply_config_value(cfg: &mut Config, path: &[String], value: &str) -> io:
             cfg.services.lambda.function_session_token = value.to_string()
         }
         "services.lambda.optDir" => cfg.services.lambda.opt_dir = value.to_string(),
+        "services.lambda.docker" => {
+            cfg.services.lambda.docker = parse_bool("services.lambda.docker", value)?
+        }
         "services.lambda.idleTimeoutSeconds" => {
             cfg.services.lambda.idle_timeout_seconds =
                 Some(parse_int("services.lambda.idleTimeoutSeconds", value)?);
@@ -1330,12 +1335,14 @@ fn lambda_optional_lines(l: &LambdaServiceConfig) -> String {
         .idle_timeout_seconds
         .map(|s| s.to_string())
         .unwrap_or_default();
+    let docker = if l.docker { "true" } else { "" }.to_string();
     [
         ("functionAccessKeyId", &l.function_access_key_id),
         ("functionSecretAccessKey", &l.function_secret_access_key),
         ("functionSessionToken", &l.function_session_token),
         ("optDir", &l.opt_dir),
         ("idleTimeoutSeconds", &idle),
+        ("docker", &docker),
     ]
     .into_iter()
     .filter(|(_, v)| !v.is_empty())
@@ -2104,9 +2111,10 @@ mod tests {
         cfg.services.lambda.function_secret_access_key = "local-secret".into();
         cfg.services.lambda.opt_dir = "/srv/lambda-opt".into();
         cfg.services.lambda.idle_timeout_seconds = Some(0);
+        cfg.services.lambda.docker = true;
         let yaml = default_config_yaml(&cfg);
         assert!(yaml.contains(
-            "  lambda:\n    enabled: true\n    region: us-east-1\n    functionAccessKeyId: AKIDLOCAL\n    functionSecretAccessKey: local-secret\n    optDir: /srv/lambda-opt\n    idleTimeoutSeconds: 0\n  cloudRun:\n"
+            "  lambda:\n    enabled: true\n    region: us-east-1\n    functionAccessKeyId: AKIDLOCAL\n    functionSecretAccessKey: local-secret\n    optDir: /srv/lambda-opt\n    idleTimeoutSeconds: 0\n    docker: true\n  cloudRun:\n"
         ));
         let parsed = parse_yaml_in_memory(&yaml).expect("parse yaml");
         assert_eq!(parsed.services.lambda, cfg.services.lambda);

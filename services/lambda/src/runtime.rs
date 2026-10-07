@@ -23,6 +23,8 @@ use serde::Deserialize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 
+use crate::container::{self, ImageSpec};
+
 /// Per-stream log bytes kept while an invocation runs (the API tail is 4 KiB).
 const LOG_CAPTURE_BYTES: usize = 64 * 1024;
 
@@ -84,6 +86,8 @@ pub fn version(runtime: &str) -> Option<String> {
 pub struct Interpreters {
     pub python: String,
     pub node: String,
+    /// Docker CLI for container image functions; `None` disables them.
+    pub docker: Option<String>,
 }
 
 const DEFAULT_PYTHON: &str = "python3";
@@ -93,6 +97,7 @@ impl Default for Interpreters {
         Interpreters {
             python: DEFAULT_PYTHON.to_string(),
             node: "node".to_string(),
+            docker: None,
         }
     }
 }
@@ -154,6 +159,9 @@ pub struct Invocation {
     /// The function configuration an environment is started from (its
     /// revision): only an idle environment with the same key is reused.
     pub env_key: String,
+    /// Set for a container image function, which runs under Docker instead
+    /// of a local interpreter (`runtime` and `handler` are then empty).
+    pub image: Option<ImageSpec>,
 }
 
 /// The handler's outcome as Lambda reports it on the wire.
@@ -181,9 +189,18 @@ pub struct Completed {
 pub enum RuntimeError {
     /// The runtime identifier has no local interpreter mapping.
     Unsupported(String),
-    /// The interpreter binary could not be started.
+    /// The interpreter binary (or the function's container) could not be
+    /// started.
     Spawn(String),
 }
+
+/// How long a container image environment may take to start (including an
+/// image pull) before its first invocation fails.
+const CONTAINER_START_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Bound on `docker rm -f` when the pool closes, so an unresponsive daemon
+/// cannot hang shutdown.
+const DOCKER_RM_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Deserialize)]
 struct BootstrapResult {
@@ -203,7 +220,12 @@ pub struct Pool {
     idle_timeout: Duration,
     seq: AtomicU64,
     state: Mutex<PoolState>,
+    /// Container removals started where nothing could await them (an
+    /// environment dropped mid-invocation); [`Pool::close`] waits for them.
+    removals: Removals,
 }
+
+type Removals = Arc<Mutex<Vec<std::thread::JoinHandle<()>>>>;
 
 #[derive(Default)]
 struct PoolState {
@@ -222,6 +244,7 @@ impl Pool {
             idle_timeout,
             seq: AtomicU64::new(0),
             state: Mutex::new(PoolState::default()),
+            removals: Removals::default(),
         })
     }
 
@@ -244,13 +267,28 @@ impl Pool {
     }
 
     /// Stops every idle environment and refuses to keep any from now on.
-    pub fn close(&self) {
+    /// Containers are removed before this returns — idle ones and those of
+    /// environments dropped earlier (e.g. invocations cancelled by shutdown).
+    pub async fn close(&self) {
         let stopped = {
             let mut st = self.state.lock().unwrap();
             st.closed = true;
             std::mem::take(&mut st.idle)
         };
-        drop(stopped);
+        for mut env in stopped.into_values().flatten() {
+            if let Some(c) = env.container.take() {
+                env.kill_group();
+                c.remove().await;
+            }
+        }
+        let pending = std::mem::take(&mut *self.removals.lock().unwrap());
+        // Each removal is bounded by DOCKER_RM_TIMEOUT.
+        let _ = tokio::task::spawn_blocking(move || {
+            for handle in pending {
+                let _ = handle.join();
+            }
+        })
+        .await;
     }
 
     /// An idle environment of `function` started from `key`, if one is still
@@ -398,7 +436,10 @@ struct Environment {
     key: String,
     child: tokio::process::Child,
     pgid: Option<u32>,
-    control: ControlWriter,
+    /// Requests to the bootstrap; `None` for a container (invoked over HTTP).
+    control: Option<ControlWriter>,
+    /// Set when the process is a `docker run` of an image function.
+    container: Option<Container>,
     events: mpsc::UnboundedReceiver<StreamEvent>,
     stdout: Arc<Mutex<Scanner>>,
     stderr: Arc<Mutex<Vec<u8>>>,
@@ -516,6 +557,58 @@ impl Drop for Environment {
             task.abort();
         }
         let _ = std::fs::remove_dir_all(&self.work_dir);
+        if let Some(c) = self.container.take() {
+            // Killing the CLI leaves the container running: remove it from a
+            // thread (no runtime to await on here), tracked so the pool's
+            // close waits for it.
+            let removals = Arc::clone(&c.removals);
+            let handle = std::thread::spawn(move || c.remove_blocking());
+            let mut pending = removals.lock().unwrap();
+            pending.retain(|h| !h.is_finished());
+            pending.push(handle);
+        }
+    }
+}
+
+/// The Docker side of a container environment.
+struct Container {
+    docker: String,
+    name: String,
+    /// Loopback port published for the RIE.
+    port: u16,
+    removals: Removals,
+}
+
+impl Container {
+    /// `docker rm -f`, bounded by [`DOCKER_RM_TIMEOUT`].
+    fn remove_blocking(self) {
+        let Ok(mut rm) = std::process::Command::new(&self.docker)
+            .args(["rm", "-f", &self.name])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        else {
+            return;
+        };
+        let deadline = Instant::now() + DOCKER_RM_TIMEOUT;
+        while Instant::now() < deadline {
+            if !matches!(rm.try_wait(), Ok(None)) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let _ = rm.kill();
+        let _ = rm.wait();
+    }
+
+    async fn remove(self) {
+        let rm = tokio::process::Command::new(&self.docker)
+            .args(["rm", "-f", &self.name])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .status();
+        let _ = tokio::time::timeout(DOCKER_RM_TIMEOUT, rm).await;
     }
 }
 
@@ -528,6 +621,9 @@ pub async fn run(
     pool: &Arc<Pool>,
     code: Box<dyn Send>,
 ) -> Result<Completed, RuntimeError> {
+    if let Some(image) = &inv.image {
+        return run_container(inv, image, interpreters, pool, code).await;
+    }
     let family =
         family(&inv.runtime).ok_or_else(|| RuntimeError::Unsupported(inv.runtime.clone()))?;
     let timeout = Duration::from_secs(inv.timeout_seconds.max(1) as u64);
@@ -561,7 +657,9 @@ pub async fn run(
     let started = Instant::now();
     let deadline = tokio::time::Instant::now() + timeout;
     // A dead environment fails the write; `wait` then reports how it ended.
-    let _ = tokio::time::timeout_at(deadline, env.control.write_all(&line)).await;
+    if let Some(control) = env.control.as_mut() {
+        let _ = tokio::time::timeout_at(deadline, control.write_all(&line)).await;
+    }
     let waited = env.wait(deadline).await;
     let duration = started.elapsed();
 
@@ -739,7 +837,8 @@ fn spawn(
         key: inv.env_key.clone(),
         pgid: child.id(),
         child,
-        control,
+        control: Some(control),
+        container: None,
         events,
         stdout,
         stderr,
@@ -748,6 +847,323 @@ fn spawn(
         idle_since: Instant::now(),
         _code: code,
     })
+}
+
+/// [`run`] for a container image function: the environment is a `docker run`
+/// of the image, invoked through the RIE inside it.
+async fn run_container(
+    inv: &Invocation,
+    image: &ImageSpec,
+    interpreters: &Interpreters,
+    pool: &Arc<Pool>,
+    code: Box<dyn Send>,
+) -> Result<Completed, RuntimeError> {
+    let docker = interpreters.docker.as_deref().ok_or_else(|| {
+        RuntimeError::Spawn("container image functions need Docker, which is disabled".into())
+    })?;
+    let timeout = Duration::from_secs(inv.timeout_seconds.max(1) as u64);
+    let mut env = match pool.take(&inv.function_name, &inv.env_key) {
+        Some(env) => env,
+        None => start_container(docker, image, inv, pool, code).await?,
+    };
+    let port = env.container.as_ref().map_or(0, |c| c.port);
+
+    enum Done {
+        Response(std::io::Result<container::Response>),
+        Exited(String),
+        TimedOut,
+    }
+    let started = Instant::now();
+    let deadline = tokio::time::Instant::now() + timeout;
+    let done = tokio::select! {
+        r = container::invoke(port, &inv.payload) => Done::Response(r),
+        status = env.child.wait() => Done::Exited(match status {
+            Ok(s) => s.to_string(),
+            Err(e) => e.to_string(),
+        }),
+        _ = tokio::time::sleep_until(deadline) => Done::TimedOut,
+    };
+    let duration = started.elapsed();
+    if matches!(done, Done::Response(Ok(_))) {
+        // The response can overtake the container's output: wait (briefly)
+        // for the RIE to log the end of the invocation.
+        let grace = tokio::time::Instant::now() + LOG_DRAIN_GRACE;
+        while !container::invocation_logged(&env.stdout.lock().unwrap().buf)
+            && tokio::time::Instant::now() < grace
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+    let mut raw = env.stdout.lock().unwrap().take_rest();
+    raw.extend(env.take_stderr());
+    let log = container::split_log(&String::from_utf8_lossy(&raw));
+
+    let exit_error = |status: &str| {
+        Outcome::FunctionError(error_doc(
+            &format!(
+                "RequestId: {} Error: Runtime exited with error: {status}",
+                inv.request_id
+            ),
+            "Runtime.ExitError",
+        ))
+    };
+    let (outcome, reusable, timed_out) = match done {
+        Done::Response(Ok(r)) if r.status == 200 => {
+            if container::is_error_document(&r.body) {
+                (Outcome::FunctionError(r.body), true, false)
+            } else {
+                (Outcome::Success(r.body), true, false)
+            }
+        }
+        Done::Response(Ok(r)) => (
+            exit_error(&format!(
+                "runtime interface emulator answered HTTP {}: {}",
+                r.status,
+                String::from_utf8_lossy(&r.body).trim()
+            )),
+            false,
+            false,
+        ),
+        Done::Response(Err(e)) => (exit_error(&e.to_string()), false, false),
+        Done::Exited(status) => (exit_error(&status), false, false),
+        Done::TimedOut => (timed_out_error(inv), false, true),
+    };
+    let init_duration = log.init.as_ref().map(|(d, _)| *d);
+    let framed = frame_log(inv, log.init, &log.body, duration, timed_out);
+    if reusable {
+        pool.give_back(&inv.function_name, env);
+    } else if let Some(c) = env.container.take() {
+        env.kill_group();
+        c.remove().await;
+    }
+    Ok(Completed {
+        outcome,
+        log: framed,
+        duration,
+        init_duration,
+    })
+}
+
+/// Starts `docker run` for `image` and waits until the RIE inside answers.
+async fn start_container(
+    docker: &str,
+    image: &ImageSpec,
+    inv: &Invocation,
+    pool: &Pool,
+    code: Box<dyn Send>,
+) -> Result<Environment, RuntimeError> {
+    let id = pool.seq.fetch_add(1, Ordering::Relaxed);
+    let work_dir = pool.work_root.join(format!("env-{id}"));
+    std::fs::create_dir_all(&work_dir).map_err(|e| RuntimeError::Spawn(e.to_string()))?;
+    let cleanup = |msg: String| {
+        let _ = std::fs::remove_dir_all(&work_dir);
+        RuntimeError::Spawn(msg)
+    };
+    // Function variables first, Lambda's own last (later lines win).
+    let mut vars: BTreeMap<String, String> = inv.environment.clone();
+    vars.extend(container_env(inv, id));
+    let vars: Vec<(String, String)> = vars.into_iter().collect();
+    let env_file = work_dir.join("env");
+    container::write_env_file(&env_file, &vars).map_err(cleanup)?;
+    let port = free_port().map_err(cleanup)?;
+    // Docker names are daemon-wide: the marker hash keeps devcloud processes
+    // (and workspaces) sharing a daemon apart.
+    let name = format!(
+        "devcloud-lambda-{}-{id}",
+        &new_marker(id)["devcloud-".len()..][..12]
+    );
+    // One budget for the whole start: image inspect/pull and the RIE coming up.
+    let deadline = Instant::now() + CONTAINER_START_TIMEOUT;
+
+    // `--entrypoint` also clears the image's CMD; Lambda overrides the two
+    // independently, so an EntryPoint-only override keeps the image's CMD.
+    let resolved;
+    let image = if !image.entry_point.is_empty() && image.command.is_empty() {
+        let command = image_cmd(docker, &image.uri, deadline)
+            .await
+            .map_err(cleanup)?;
+        resolved = ImageSpec {
+            command,
+            ..image.clone()
+        };
+        &resolved
+    } else {
+        image
+    };
+    let mut cmd = tokio::process::Command::new(docker);
+    cmd.args(container::run_args(
+        image,
+        &name,
+        port,
+        inv.memory_size,
+        &env_file,
+    ))
+    .stdin(Stdio::null())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .kill_on_drop(true);
+    #[cfg(unix)]
+    cmd.process_group(0);
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| cleanup(format!("start {docker} for image {}: {e}", image.uri)))?;
+
+    let (tx, events) = mpsc::unbounded_channel();
+    // No bootstrap markers in a container: the scanner only buffers output.
+    let stdout = Arc::new(Mutex::new(Scanner::new(new_marker(id).into_bytes())));
+    let stderr = Arc::new(Mutex::new(Vec::new()));
+    let out_task = tokio::spawn(scan(
+        child.stdout.take().expect("piped stdout"),
+        Arc::clone(&stdout),
+        tx,
+    ));
+    let err_task = tokio::spawn(collect(
+        child.stderr.take().expect("piped stderr"),
+        Arc::clone(&stderr),
+    ));
+    let mut env = Environment {
+        id,
+        key: inv.env_key.clone(),
+        pgid: child.id(),
+        child,
+        control: None,
+        container: Some(Container {
+            docker: docker.to_string(),
+            name,
+            port,
+            removals: Arc::clone(&pool.removals),
+        }),
+        events,
+        stdout,
+        stderr,
+        tasks: vec![out_task.abort_handle(), err_task.abort_handle()],
+        work_dir,
+        idle_since: Instant::now(),
+        _code: code,
+    };
+
+    loop {
+        if container::probe(port).await {
+            return Ok(env);
+        }
+        if let Ok(Some(status)) = env.child.try_wait() {
+            let mut out = env.stdout.lock().unwrap().take_rest();
+            out.extend(env.take_stderr());
+            return Err(RuntimeError::Spawn(format!(
+                "docker run {} exited ({status}): {}",
+                image.uri,
+                String::from_utf8_lossy(&out).trim()
+            )));
+        }
+        if Instant::now() >= deadline {
+            if let Some(c) = env.container.take() {
+                env.kill_group();
+                c.remove().await;
+            }
+            return Err(RuntimeError::Spawn(format!(
+                "container for image {} did not start within {} s",
+                image.uri,
+                CONTAINER_START_TIMEOUT.as_secs()
+            )));
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// The image's default CMD, pulling the image first if it is not local.
+async fn image_cmd(docker: &str, uri: &str, deadline: Instant) -> Result<Vec<String>, String> {
+    let inspect = [
+        "image",
+        "inspect",
+        "--format",
+        "{{json .Config.Cmd}}",
+        "--",
+        uri,
+    ];
+    let mut out = docker_output(docker, &inspect, deadline).await?;
+    if !out.status.success() {
+        let pulled = docker_output(docker, &["pull", "--", uri], deadline).await?;
+        if !pulled.status.success() {
+            return Err(format!(
+                "docker pull {uri}: {}",
+                String::from_utf8_lossy(&pulled.stderr).trim()
+            ));
+        }
+        out = docker_output(docker, &inspect, deadline).await?;
+        if !out.status.success() {
+            return Err(format!(
+                "docker image inspect {uri}: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+    }
+    // `null` when the image has no CMD.
+    serde_json::from_slice::<Option<Vec<String>>>(&out.stdout)
+        .map(Option::unwrap_or_default)
+        .map_err(|e| format!("docker image inspect {uri}: unexpected output: {e}"))
+}
+
+/// Runs a docker CLI command to completion, bounded by `deadline`.
+async fn docker_output(
+    docker: &str,
+    args: &[&str],
+    deadline: Instant,
+) -> Result<std::process::Output, String> {
+    let run = tokio::process::Command::new(docker)
+        .args(args)
+        .stdin(Stdio::null())
+        .kill_on_drop(true)
+        .output();
+    tokio::time::timeout(deadline.saturating_duration_since(Instant::now()), run)
+        .await
+        .map_err(|_| format!("docker {}: timed out", args.join(" ")))?
+        .map_err(|e| format!("docker {}: {e}", args.join(" ")))
+}
+
+/// The variables Lambda sets in an image function's environment. The RIE
+/// reads `AWS_LAMBDA_FUNCTION_TIMEOUT` and the memory size for its REPORT.
+fn container_env(inv: &Invocation, env_id: u64) -> Vec<(String, String)> {
+    let mut env: Vec<(String, String)> = vec![
+        ("AWS_LAMBDA_FUNCTION_NAME".into(), inv.function_name.clone()),
+        ("AWS_LAMBDA_FUNCTION_VERSION".into(), "$LATEST".into()),
+        (
+            "AWS_LAMBDA_FUNCTION_MEMORY_SIZE".into(),
+            inv.memory_size.to_string(),
+        ),
+        (
+            "AWS_LAMBDA_FUNCTION_TIMEOUT".into(),
+            inv.timeout_seconds.max(1).to_string(),
+        ),
+        (
+            "AWS_LAMBDA_LOG_GROUP_NAME".into(),
+            format!("/aws/lambda/{}", inv.function_name),
+        ),
+        (
+            "AWS_LAMBDA_LOG_STREAM_NAME".into(),
+            format!("devcloud/[$LATEST]env-{env_id}"),
+        ),
+        ("AWS_REGION".into(), inv.region.clone()),
+        ("AWS_DEFAULT_REGION".into(), inv.region.clone()),
+        ("AWS_LAMBDA_INITIALIZATION_TYPE".into(), "on-demand".into()),
+    ];
+    if let Some(creds) = &inv.credentials {
+        env.push(("AWS_ACCESS_KEY_ID".into(), creds.access_key_id.clone()));
+        env.push((
+            "AWS_SECRET_ACCESS_KEY".into(),
+            creds.secret_access_key.clone(),
+        ));
+        if !creds.session_token.is_empty() {
+            env.push(("AWS_SESSION_TOKEN".into(), creds.session_token.clone()));
+        }
+    }
+    env
+}
+
+fn free_port() -> Result<u16, String> {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .and_then(|l| l.local_addr())
+        .map(|a| a.port())
+        .map_err(|e| format!("allocate a port for the container: {e}"))
 }
 
 /// Where devcloud writes invocation requests to a bootstrap.

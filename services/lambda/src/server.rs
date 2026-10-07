@@ -19,6 +19,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use crate::code_store::{CodeStore, Lease, StageError};
+use crate::container::ImageSpec;
 use crate::runtime::{self, FunctionCredentials, Interpreters, Invocation, Outcome, RuntimeError};
 use crate::time_fmt::{now_lambda, now_rfc3339};
 
@@ -168,6 +169,42 @@ struct FunctionRecord {
     architectures: Vec<String>,
     #[serde(default = "default_ephemeral")]
     ephemeral_storage_size: i64,
+    #[serde(default = "default_package_type")]
+    package_type: String,
+    /// Image functions only.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    image_uri: String,
+    #[serde(default, skip_serializing_if = "ImageConfig::is_empty")]
+    image_config: ImageConfig,
+}
+
+impl FunctionRecord {
+    fn is_image(&self) -> bool {
+        self.package_type == "Image"
+    }
+}
+
+/// `ImageConfig`: overrides of the image's entrypoint, command, and working
+/// directory.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "PascalCase", deny_unknown_fields)]
+struct ImageConfig {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    entry_point: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    command: Vec<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    working_directory: String,
+}
+
+impl ImageConfig {
+    fn is_empty(&self) -> bool {
+        *self == ImageConfig::default()
+    }
+}
+
+fn default_package_type() -> String {
+    "Zip".to_string()
 }
 
 fn default_architectures() -> Vec<String> {
@@ -302,8 +339,9 @@ impl Server {
             Err(e) => return Err(e.to_string()),
         };
         let persisted: PersistedState = serde_json::from_slice(&data).map_err(|e| e.to_string())?;
-        // Re-extract any package whose extracted tree went missing.
-        for record in persisted.functions.values() {
+        // Re-extract any package whose extracted tree went missing (image
+        // functions have no package).
+        for record in persisted.functions.values().filter(|r| !r.is_image()) {
             self.code
                 .ensure_tree(&record.function_name, &record.code_sha256)?;
         }
@@ -423,22 +461,40 @@ impl Server {
         if let Err(r) = validate_function_name(&name) {
             return r;
         }
-        let package_type = str_field(&req, "PackageType");
-        if !package_type.is_empty() && package_type != "Zip" {
-            return invalid_param("devcloud lambda supports only PackageType Zip");
-        }
+        let package_type = match str_field(&req, "PackageType").as_str() {
+            "" | "Zip" => "Zip",
+            "Image" => "Image",
+            other => {
+                return validation(&format!(
+                    "1 validation error detected: Value '{other}' at 'packageType' failed to satisfy constraint: Member must satisfy enum value set: [Image, Zip]"
+                ))
+            }
+        };
+        let is_image = package_type == "Image";
         let role = str_field(&req, "Role");
         if role.is_empty() {
             return validation("1 validation error detected: Value null at 'role' failed to satisfy constraint: Member must not be null");
         }
         let runtime_id = str_field(&req, "Runtime");
-        if let Err(r) = validate_runtime(&runtime_id) {
-            return r;
-        }
         let handler = str_field(&req, "Handler");
-        if handler.is_empty() {
-            return invalid_param("Handler is required for Zip package type");
+        if is_image {
+            if !runtime_id.is_empty() || !handler.is_empty() {
+                return invalid_param(
+                    "Runtime and Handler are not supported for the Image package type",
+                );
+            }
+        } else {
+            if let Err(r) = validate_runtime(&runtime_id) {
+                return r;
+            }
+            if handler.is_empty() {
+                return invalid_param("Handler is required for Zip package type");
+            }
         }
+        let image_config = match image_config(&req, is_image) {
+            Ok(c) => c.unwrap_or_default(),
+            Err(r) => return r,
+        };
         let timeout = match int_field(&req, "Timeout", 3, 1, 900, "timeout") {
             Ok(v) => v,
             Err(r) => return r,
@@ -455,9 +511,16 @@ impl Server {
             Ok(v) => v.unwrap_or_else(default_ephemeral),
             Err(r) => return r,
         };
-        let zip = match self.package_bytes(req.get("Code")) {
-            Ok(z) => z,
-            Err(r) => return r,
+        let (zip, image_uri) = if is_image {
+            match image_uri(req.get("Code")) {
+                Ok(u) => (Vec::new(), u),
+                Err(r) => return r,
+            }
+        } else {
+            match self.package_bytes(req.get("Code")) {
+                Ok(z) => (z, String::new()),
+                Err(r) => return r,
+            }
         };
         let tags = match string_map(req.get("Tags"), "tags") {
             Ok(t) => t,
@@ -478,10 +541,16 @@ impl Server {
             );
         }
 
-        let sha = code_sha256(&zip);
-        if let Err(r) = self.stage_package(&name, &zip, &sha) {
-            self.code.retire(&name, &sha);
-            return r;
+        let sha = if is_image {
+            code_sha256(image_uri.as_bytes())
+        } else {
+            code_sha256(&zip)
+        };
+        if !is_image {
+            if let Err(r) = self.stage_package(&name, &zip, &sha) {
+                self.code.retire(&name, &sha);
+                return r;
+            }
         }
         let record = FunctionRecord {
             function_name: name.clone(),
@@ -499,6 +568,9 @@ impl Server {
             tags,
             architectures,
             ephemeral_storage_size,
+            package_type: package_type.to_string(),
+            image_uri,
+            image_config,
         };
         let result = self.commit(|st| {
             if st.functions.contains_key(&name) {
@@ -563,20 +635,29 @@ impl Server {
         } else {
             self.config.endpoint.trim_end_matches('/').to_string()
         };
+        let code = if record.is_image() {
+            json!({
+                "RepositoryType": "ECR",
+                "ImageUri": record.image_uri,
+                "ResolvedImageUri": record.image_uri,
+            })
+        } else {
+            json!({
+                "RepositoryType": "S3",
+                // Pinned to this code version: after an update the link
+                // expires instead of silently serving different code.
+                "Location": format!(
+                    "{base}/_devcloud/functions/{}/code.zip?CodeSha256={}",
+                    record.function_name,
+                    query_encode(&record.code_sha256)
+                ),
+            })
+        };
         Reply::json(
             200,
             &json!({
                 "Configuration": self.configuration_json(&record),
-                "Code": {
-                    "RepositoryType": "S3",
-                    // Pinned to this code version: after an update the link
-                    // expires instead of silently serving different code.
-                    "Location": format!(
-                        "{base}/_devcloud/functions/{}/code.zip?CodeSha256={}",
-                        record.function_name,
-                        query_encode(&record.code_sha256)
-                    ),
-                },
+                "Code": code,
                 "Tags": record.tags,
             }),
         )
@@ -620,6 +701,10 @@ impl Server {
             Ok(v) => v,
             Err(r) => return r,
         };
+        let new_image_config = match image_config(&req, true) {
+            Ok(c) => c,
+            Err(r) => return r,
+        };
         let revision = str_field(&req, "RevisionId");
         let new_revision = self.new_id();
         let result = self.commit(|st| {
@@ -629,6 +714,20 @@ impl Server {
                 .ok_or_else(|| self.not_found(&name))?;
             if !revision.is_empty() && revision != rec.revision_id {
                 return Err(revision_mismatch());
+            }
+            if rec.is_image() {
+                if !runtime_id.is_empty() || !str_field(&req, "Handler").is_empty() {
+                    return Err(invalid_param(
+                        "Runtime and Handler are not supported for the Image package type",
+                    ));
+                }
+                if let Some(c) = new_image_config.clone() {
+                    rec.image_config = c;
+                }
+            } else if new_image_config.is_some() {
+                return Err(invalid_param(
+                    "ImageConfig is supported only for the Image package type",
+                ));
             }
             if !runtime_id.is_empty() {
                 rec.runtime = runtime_id.clone();
@@ -674,15 +773,27 @@ impl Server {
             Ok(v) => v,
             Err(r) => return r,
         };
-        let name = match self.lookup(id, None) {
-            Ok(r) => r.function_name,
+        let (name, is_image) = match self.lookup(id, None) {
+            Ok(r) => (r.function_name.clone(), r.is_image()),
             Err(r) => return r,
         };
-        let zip = match self.package_bytes(Some(&req)) {
-            Ok(z) => z,
-            Err(r) => return r,
+        // The package type is fixed at creation, as on AWS.
+        let (zip, image_uri) = if is_image {
+            match image_uri(Some(&req)) {
+                Ok(u) => (Vec::new(), u),
+                Err(r) => return r,
+            }
+        } else {
+            match self.package_bytes(Some(&req)) {
+                Ok(z) => (z, String::new()),
+                Err(r) => return r,
+            }
         };
-        let sha = code_sha256(&zip);
+        let sha = if is_image {
+            code_sha256(image_uri.as_bytes())
+        } else {
+            code_sha256(&zip)
+        };
         let revision = str_field(&req, "RevisionId");
         let architectures = match architectures(&req) {
             Ok(a) => a,
@@ -704,6 +815,9 @@ impl Server {
             let mut preview = current;
             preview.code_sha256 = sha;
             preview.code_size = zip.len() as i64;
+            if is_image {
+                preview.image_uri = image_uri;
+            }
             if let Some(a) = architectures {
                 preview.architectures = a;
             }
@@ -711,11 +825,13 @@ impl Server {
         }
         // The new version gets its own files; the committed one stays intact
         // until the configuration switch below is persisted.
-        if let Err(r) = self.stage_package(&name, &zip, &sha) {
-            if sha != current.code_sha256 {
-                self.code.retire(&name, &sha);
+        if !is_image {
+            if let Err(r) = self.stage_package(&name, &zip, &sha) {
+                if sha != current.code_sha256 {
+                    self.code.retire(&name, &sha);
+                }
+                return r;
             }
-            return r;
         }
         let new_revision = self.new_id();
         let result = self.commit(|st| {
@@ -728,6 +844,9 @@ impl Server {
             }
             let previous = std::mem::replace(&mut rec.code_sha256, sha.clone());
             rec.code_size = zip.len() as i64;
+            if is_image {
+                rec.image_uri = image_uri.clone();
+            }
             // Architectures travel with the code (UpdateFunctionCode), and are
             // committed together with it.
             if let Some(a) = architectures.clone() {
@@ -958,7 +1077,20 @@ impl Server {
         if invocation_type == "DryRun" {
             return Reply::empty(204);
         }
-        if runtime::family(&record.runtime).is_none() {
+        let image = record.is_image().then(|| ImageSpec {
+            uri: record.image_uri.clone(),
+            entry_point: record.image_config.entry_point.clone(),
+            command: record.image_config.command.clone(),
+            working_directory: record.image_config.working_directory.clone(),
+        });
+        if image.is_some() && self.config.interpreters.docker.is_none() {
+            return Reply::error(
+                502,
+                "ServiceException",
+                "devcloud runs container image functions with Docker: enable services.lambda.docker (DEVCLOUD_LAMBDA_DOCKER=true for devcloud-lambda)",
+            );
+        }
+        if image.is_none() && runtime::family(&record.runtime).is_none() {
             return Reply::error(
                 502,
                 "InvalidRuntimeException",
@@ -989,6 +1121,7 @@ impl Server {
                 .unwrap_or_else(|| PathBuf::from("/opt")),
             credentials: self.config.function_credentials.clone(),
             env_key: record.revision_id.clone(),
+            image,
         };
 
         if invocation_type == "Event" {
@@ -1100,7 +1233,7 @@ impl Server {
         };
         tasks.abort_all();
         while tasks.join_next().await.is_some() {}
-        self.pool.close();
+        self.pool.close().await;
     }
 
     /// Warm execution environments currently idle for `function`.
@@ -1226,7 +1359,7 @@ impl Server {
             }
         } else if code.get("ImageUri").is_some() {
             return Err(invalid_param(
-                "devcloud lambda supports only Zip packages (ImageUri given)",
+                "ImageUri is supported only for the Image package type",
             ));
         } else {
             return Err(invalid_param("Please provide a source for function code."));
@@ -1263,7 +1396,7 @@ impl Server {
             "RevisionId": r.revision_id,
             "State": "Active",
             "LastUpdateStatus": "Successful",
-            "PackageType": "Zip",
+            "PackageType": r.package_type,
             "Architectures": r.architectures,
             "EphemeralStorage": { "Size": r.ephemeral_storage_size },
             "LoggingConfig": {
@@ -1273,6 +1406,15 @@ impl Server {
         });
         if !r.environment.is_empty() {
             v["Environment"] = json!({ "Variables": r.environment });
+        }
+        if r.is_image() {
+            if let Some(obj) = v.as_object_mut() {
+                obj.remove("Runtime");
+                obj.remove("Handler");
+            }
+            if !r.image_config.is_empty() {
+                v["ImageConfigResponse"] = json!({ "ImageConfig": r.image_config });
+            }
         }
         v
     }
@@ -1432,6 +1574,14 @@ fn env_vars(req: &Value) -> Result<Option<BTreeMap<String, String>>, Reply> {
         return Err(invalid_param("Environment must be an object"));
     }
     let vars = string_map(env.get("Variables"), "Environment.Variables")?;
+    // Lambda's key pattern (single letters allowed, as devcloud always did).
+    // It also keeps names from smuggling extra lines (or `=`) into a
+    // container's env-file.
+    if let Some(bad) = vars.keys().find(|k| !valid_env_key(k)) {
+        return Err(validation(&format!(
+            "1 validation error detected: Value '{bad}' at 'environment.variables' failed to satisfy constraint: Map keys must satisfy constraint: [Member must satisfy regular expression pattern: [a-zA-Z]([a-zA-Z0-9_])+]"
+        )));
+    }
     let reserved: Vec<&str> = vars
         .keys()
         .map(String::as_str)
@@ -1444,6 +1594,14 @@ fn env_vars(req: &Value) -> Result<Option<BTreeMap<String, String>>, Reply> {
         )));
     }
     Ok(Some(vars))
+}
+
+/// `[a-zA-Z][a-zA-Z0-9_]*`: Lambda's environment variable key pattern, minus
+/// its two-character minimum.
+fn valid_env_key(key: &str) -> bool {
+    let mut chars = key.chars();
+    chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// `EphemeralStorage.Size` (MiB, 512–10240). `Ok(None)` when absent.
@@ -1489,6 +1647,39 @@ fn validate_function_name(name: &str) -> Result<(), Reply> {
         )));
     }
     Ok(())
+}
+
+/// `Code.ImageUri` of an Image function; zip sources are refused.
+fn image_uri(code: Option<&Value>) -> Result<String, Reply> {
+    let code = code.ok_or_else(|| {
+        validation("1 validation error detected: Value null at 'code' failed to satisfy constraint: Member must not be null")
+    })?;
+    if code.get("ZipFile").is_some() || code.get("S3Bucket").is_some() {
+        return Err(invalid_param(
+            "ZipFile and S3Bucket are not supported for the Image package type",
+        ));
+    }
+    match code.get("ImageUri").and_then(Value::as_str).map(str::trim) {
+        Some(uri) if !uri.is_empty() => Ok(uri.to_string()),
+        _ => Err(invalid_param(
+            "ImageUri is required for the Image package type",
+        )),
+    }
+}
+
+/// `ImageConfig`, if the request has one; only Image functions take it.
+fn image_config(req: &Value, is_image: bool) -> Result<Option<ImageConfig>, Reply> {
+    let Some(value) = req.get("ImageConfig").filter(|v| !v.is_null()) else {
+        return Ok(None);
+    };
+    if !is_image {
+        return Err(invalid_param(
+            "ImageConfig is supported only for the Image package type",
+        ));
+    }
+    serde_json::from_value(value.clone())
+        .map(Some)
+        .map_err(|e| invalid_param(&format!("Invalid ImageConfig: {e}")))
 }
 
 fn validate_runtime(runtime_id: &str) -> Result<(), Reply> {

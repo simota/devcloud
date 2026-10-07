@@ -14,6 +14,7 @@
 //!   DEVCLOUD_LAMBDA_FUNCTION_SESSION_TOKEN credentials passed to every handler (optional;
 //!                              both the key id and the secret are needed)
 //!   DEVCLOUD_LAMBDA_OPT_DIR    stand-in for Lambda's /opt (layer contents), default /opt
+//!   DEVCLOUD_LAMBDA_DOCKER     true: run PackageType Image functions with the docker CLI
 //!   DEVCLOUD_LAMBDA_IDLE_TIMEOUT_SECONDS how long an idle execution environment stays
 //!                              warm, default 300; 0 = a cold start for every invocation
 
@@ -95,7 +96,10 @@ fn main() {
             secret_access_key: env("DEVCLOUD_LAMBDA_SECRET_ACCESS_KEY"),
             storage_path: storage,
             object_store_root: (!s3_storage.is_empty()).then(|| PathBuf::from(s3_storage)),
-            interpreters: Default::default(),
+            interpreters: devcloud_lambda::runtime::Interpreters {
+                docker: (env("DEVCLOUD_LAMBDA_DOCKER") == "true").then(|| "docker".to_string()),
+                ..Default::default()
+            },
             function_credentials,
             opt_dir: (!opt_dir.is_empty()).then(|| PathBuf::from(opt_dir)),
             idle_timeout,
