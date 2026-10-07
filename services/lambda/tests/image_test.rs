@@ -29,6 +29,12 @@ args = sys.argv[1:]
 if args[:2] == ["image", "inspect"]:
     print(json.dumps(["default.handler"]))
     sys.exit(0)
+if args[0] == "exec":
+    # `exec <name> cat <cgroup file>`: a 150 MB peak, cgroup v2 only.
+    if args[2:] == ["cat", "/sys/fs/cgroup/memory.peak"]:
+        print(150 * 1024 * 1024)
+        sys.exit(0)
+    sys.exit(1)
 if args[:2] == ["ps", "-aq"]:
     # Only `--filter label=K=V`: containers carrying that label, not removed.
     want = args[args.index("--filter") + 1][len("label="):]
@@ -412,7 +418,15 @@ async fn image_functions_run_warm_in_their_container() {
     assert_eq!(a["env"]["AWS_LAMBDA_FUNCTION_TIMEOUT"], "2");
     assert_eq!(a["env"]["AWS_ACCESS_KEY_ID"], "AKIDLOCAL");
     let log = first.log();
-    assert!(log.starts_with("INIT_START"), "{log}");
+    assert!(
+        log.starts_with(&format!("INIT_START Image: {image_uri}\n")),
+        "an image function names its image: {log}"
+    );
+    assert!(log.contains("\tMax Memory Used: 150 MB"), "{log}");
+    assert!(
+        !log.contains("exceeds MemorySize"),
+        "150 MB is within 512 MB: {log}"
+    );
     assert!(log.contains("loading model"), "{log}");
     assert!(log.contains("Init Duration: 1234.50 ms"), "{log}");
     assert!(log.contains("handling 1"), "{log}");
@@ -637,6 +651,16 @@ done
     );
     assert!(first.log().contains("init pid="), "{}", first.log());
     assert!(first.log().contains("Init Duration: "), "{}", first.log());
+    assert!(
+        first.log().contains("\tMax Memory Used: "),
+        "{}",
+        first.log()
+    );
+    assert!(
+        first.log().starts_with(&format!("INIT_START Image: {tag}")),
+        "{}",
+        first.log()
+    );
     let second = invoke(&e.server, "real-fn", b"{}").await.json();
     assert_eq!(
         (second["pid"].clone(), second["count"].clone()),

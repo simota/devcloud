@@ -947,15 +947,26 @@ async fn run_container(
         _ = tokio::time::sleep_until(deadline) => Done::TimedOut,
     };
     let duration = started.elapsed();
+    let mut max_memory_mb = None;
     if matches!(done, Done::Response(Ok(_))) {
         // The response can overtake the container's output: wait (briefly)
-        // for the RIE to log the end of the invocation.
-        let grace = tokio::time::Instant::now() + LOG_DRAIN_GRACE;
-        while !container::invocation_logged(&env.stdout.lock().unwrap().buf)
-            && tokio::time::Instant::now() < grace
-        {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        // for the RIE to log the end of the invocation, while reading the
+        // container's memory peak.
+        let peak = async {
+            match env.container.as_ref() {
+                Some(c) => container_peak_mb(&c.docker, &c.name).await,
+                None => None,
+            }
+        };
+        let logged = async {
+            let grace = tokio::time::Instant::now() + LOG_DRAIN_GRACE;
+            while !container::invocation_logged(&env.stdout.lock().unwrap().buf)
+                && tokio::time::Instant::now() < grace
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        };
+        (max_memory_mb, ()) = tokio::join!(peak, logged);
     }
     let mut raw = env.stdout.lock().unwrap().take_rest();
     raw.extend(env.take_stderr());
@@ -992,7 +1003,7 @@ async fn run_container(
         Done::TimedOut => (timed_out_error(inv), false, true),
     };
     let init_duration = log.init.as_ref().map(|(d, _)| *d);
-    let framed = frame_log(inv, log.init, &log.body, duration, timed_out, None);
+    let framed = frame_log(inv, log.init, &log.body, duration, timed_out, max_memory_mb);
     if reusable {
         pool.give_back(&inv.function_name, env);
     } else if let Some(c) = env.container.take() {
@@ -1173,6 +1184,33 @@ pub async fn remove_orphaned_containers(docker: &str, owner: &str) -> Result<usi
         ));
     }
     Ok(ids.len())
+}
+
+/// Peak memory of a function's container in MB, for REPORT's Max Memory
+/// Used: the cgroup's high-water mark since the container started (cgroup v2
+/// `memory.peak`, else v1 `memory.max_usage_in_bytes`), page cache included.
+/// `None` when it cannot be read (e.g. an image without `cat`).
+async fn container_peak_mb(docker: &str, name: &str) -> Option<u64> {
+    const PEAK_FILES: [&str; 2] = [
+        "/sys/fs/cgroup/memory.peak",
+        "/sys/fs/cgroup/memory/memory.max_usage_in_bytes",
+    ];
+    let deadline = Instant::now() + Duration::from_secs(2);
+    for file in PEAK_FILES {
+        let Ok(out) = docker_output(docker, &["exec", name, "cat", file], deadline).await else {
+            return None;
+        };
+        if out.status.success() {
+            return parse_bytes_as_mb(&String::from_utf8_lossy(&out.stdout));
+        }
+    }
+    None
+}
+
+/// A byte count (as cgroup files print it) in whole MB, rounded up.
+fn parse_bytes_as_mb(text: &str) -> Option<u64> {
+    let bytes: u64 = text.trim().parse().ok()?;
+    Some(bytes.div_ceil(1024 * 1024))
 }
 
 /// The image's default CMD, pulling the image first if it is not local.
@@ -1572,7 +1610,11 @@ fn frame_log(
         }
     };
     if let Some((_, init_log)) = &init {
-        log.push_str(&format!("INIT_START Runtime Version: {}\n", inv.runtime));
+        // An image function has no managed runtime: name its image instead.
+        match &inv.image {
+            Some(image) => log.push_str(&format!("INIT_START Image: {}\n", image.uri)),
+            None => log.push_str(&format!("INIT_START Runtime Version: {}\n", inv.runtime)),
+        }
         push_block(&mut log, init_log);
     }
     log.push_str(&format!(
@@ -1778,6 +1820,13 @@ mod tests {
         );
         // A handler printing a look-alike line for another runtime is ignored.
         assert_eq!(pool.version_mismatch(&inv("i", "python3.13"), log), None);
+    }
+
+    #[test]
+    fn cgroup_byte_counts_are_reported_in_whole_megabytes() {
+        assert_eq!(parse_bytes_as_mb("157286400\n"), Some(150));
+        assert_eq!(parse_bytes_as_mb("157286401"), Some(151));
+        assert_eq!(parse_bytes_as_mb("max"), None);
     }
 
     #[test]
