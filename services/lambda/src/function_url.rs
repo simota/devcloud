@@ -296,8 +296,7 @@ pub(crate) fn caller_access_key(authorization: &str) -> String {
     params
         .split(',')
         .filter_map(|part| part.trim().split_once('='))
-        .filter(|(k, _)| *k == "Credential")
-        .last()
+        .rfind(|(k, _)| *k == "Credential")
         .and_then(|(_, v)| v.split('/').next())
         .unwrap_or("")
         .trim()

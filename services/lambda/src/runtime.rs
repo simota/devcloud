@@ -313,14 +313,20 @@ impl Pool {
                 c.remove().await;
             }
         }
-        let pending = std::mem::take(&mut *self.removals.lock().unwrap());
-        // Each removal is bounded by DOCKER_RM_TIMEOUT.
-        let _ = tokio::task::spawn_blocking(move || {
-            for handle in pending {
-                let _ = handle.join();
+        // Each removal is bounded by DOCKER_RM_TIMEOUT. Removals started
+        // while waiting (environments dropped meanwhile) are waited for too.
+        loop {
+            let pending = std::mem::take(&mut *self.removals.lock().unwrap());
+            if pending.is_empty() {
+                break;
             }
-        })
-        .await;
+            let _ = tokio::task::spawn_blocking(move || {
+                for handle in pending {
+                    let _ = handle.join();
+                }
+            })
+            .await;
+        }
     }
 
     /// An idle environment of `function` started from `key`, if one is still
@@ -599,11 +605,7 @@ impl Drop for Environment {
             // Killing the CLI leaves the container running: remove it from a
             // thread (no runtime to await on here), tracked so the pool's
             // close waits for it.
-            let removals = Arc::clone(&c.removals);
-            let handle = std::thread::spawn(move || c.remove_blocking());
-            let mut pending = removals.lock().unwrap();
-            pending.retain(|h| !h.is_finished());
-            pending.push(handle);
+            drop(c.spawn_removal());
         }
     }
 }
@@ -639,14 +641,26 @@ impl Container {
         let _ = rm.wait();
     }
 
+    /// Starts `docker rm -f` on a thread tracked in `removals` (so the
+    /// pool's close waits for it); the receiver fires once it is done.
+    fn spawn_removal(self) -> tokio::sync::oneshot::Receiver<()> {
+        let (done, finished) = tokio::sync::oneshot::channel();
+        let removals = Arc::clone(&self.removals);
+        let handle = std::thread::spawn(move || {
+            self.remove_blocking();
+            let _ = done.send(());
+        });
+        let mut pending = removals.lock().unwrap();
+        pending.retain(|h| !h.is_finished());
+        pending.push(handle);
+        finished
+    }
+
+    /// Removes the container and waits for it. Cancellation-safe: if this
+    /// future is dropped (shutdown aborting an invocation, a client hanging
+    /// up), the removal still completes and the pool's close still waits.
     async fn remove(self) {
-        let rm = tokio::process::Command::new(&self.docker)
-            .args(["rm", "-f", &self.name])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .kill_on_drop(true)
-            .status();
-        let _ = tokio::time::timeout(DOCKER_RM_TIMEOUT, rm).await;
+        let _ = self.spawn_removal().await;
     }
 }
 
