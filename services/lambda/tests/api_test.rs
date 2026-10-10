@@ -3637,3 +3637,39 @@ async fn output_written_straight_to_fd_2_lands_in_its_own_invocation_log() {
     assert!(log.contains("raw-fd2"), "{log}");
     assert!(log.contains("child-stderr"), "{log}");
 }
+
+#[tokio::test]
+async fn strict_mode_signs_invocation_introspection() {
+    let dir = temp_dir("sigv4introspect");
+    let server = Arc::new(Server::new(Config {
+        auth_mode: "strict".into(),
+        access_key_id: "dev".into(),
+        secret_access_key: "dev".into(),
+        ..config_for(&dir)
+    }));
+    let unsigned = call(&server, "GET", "/_introspect/invocations", &[], b"").await;
+    assert_eq!(unsigned.status, 403);
+    let headers =
+        sign_without_hash_header("GET", "/_introspect/invocations", b"", "127.0.0.1:19010");
+    let refs: Vec<(&str, &str)> = headers
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    let signed = call(&server, "GET", "/_introspect/invocations", &refs, b"").await;
+    assert_eq!(
+        signed.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&signed.body)
+    );
+    // Rebinding hosts are refused before anything else.
+    let rebound = call(
+        &server,
+        "GET",
+        "/2015-03-31/functions/",
+        &[("host", "evil.example.com:19010")],
+        b"",
+    )
+    .await;
+    assert_eq!(rebound.status, 403);
+}

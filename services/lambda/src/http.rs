@@ -204,9 +204,9 @@ pub async fn process(server: &Arc<Server>, req: &Request) -> Reply {
     let seg: Vec<&str> = segments.iter().map(String::as_str).collect();
     let query = parse_query(&req.query);
 
-    // devcloud-only surfaces: unsigned, read-only.
+    // devcloud-only surface: unsigned and read-only, like the presigned URL
+    // AWS hands out as `Code.Location`.
     match (req.method.as_str(), seg.as_slice()) {
-        ("GET", ["_introspect", "invocations"]) => return server.introspect_invocations(),
         ("GET", ["_devcloud", "functions", name, "code.zip"]) => {
             let (name, sha) = (name.to_string(), query.get("CodeSha256").cloned());
             return blocking(server, move |s| s.code_package(&name, sha.as_deref())).await;
@@ -226,6 +226,12 @@ pub async fn process(server: &Arc<Server>, req: &Request) -> Reply {
 
     if let Err(reply) = check_signature(server, req) {
         return reply;
+    }
+
+    // Invocation log tails are handler output: signed like the API (the
+    // dashboard signs its requests in strict mode).
+    if let ("GET", ["_introspect", "invocations"]) = (req.method.as_str(), seg.as_slice()) {
+        return server.introspect_invocations();
     }
 
     let m = req.method.as_str();

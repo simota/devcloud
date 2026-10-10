@@ -352,21 +352,47 @@ async fn proxy(
         "{} {} {}\r\n",
         head.method, route.upstream_target, head.version
     );
+    let upgrade = is_upgrade(&head);
+    // Hop-by-hop headers stop here, including any the client listed in
+    // `Connection`; the forwarding headers are the platform's to set.
+    let listed: Vec<String> = head
+        .headers
+        .get("connection")
+        .map(|c| {
+            c.split(',')
+                .map(|t| t.trim().to_ascii_lowercase())
+                .filter(|t| t != "upgrade")
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut forwarded_for = Vec::new();
     for (k, v) in &head.raw_headers {
         let lower = k.to_ascii_lowercase();
-        if matches!(
+        let hop_by_hop = matches!(
             lower.as_str(),
-            "connection" | "keep-alive" | "proxy-connection"
-        ) {
+            "connection" | "keep-alive" | "proxy-connection" | "te" | "proxy-authorization"
+        ) || (lower == "upgrade" && !upgrade)
+            || listed.contains(&lower);
+        if hop_by_hop || lower == "x-forwarded-proto" {
+            continue;
+        }
+        if lower == "x-forwarded-for" {
+            forwarded_for.push(v.trim().to_string());
             continue;
         }
         out.push_str(&format!("{k}: {v}\r\n"));
     }
     out.push_str("X-Forwarded-Proto: http\r\n");
-    out.push_str("X-Forwarded-For: 127.0.0.1\r\n");
+    // Like Cloud Run's front end: the client's own chain, then its address,
+    // as one header.
+    forwarded_for.push("127.0.0.1".to_string());
+    out.push_str(&format!(
+        "X-Forwarded-For: {}\r\n",
+        forwarded_for.join(", ")
+    ));
     // An upgrade (WebSocket) handshake needs `Connection: Upgrade` next to
     // `Upgrade:`; plain requests are one-shot.
-    if is_upgrade(&head) {
+    if upgrade {
         out.push_str("Connection: Upgrade\r\n\r\n");
     } else {
         out.push_str("Connection: close\r\n\r\n");
@@ -556,6 +582,15 @@ pub async fn process(server: &Arc<Server>, req: &Request) -> Reply {
     let m = req.method.as_str();
 
     if let Some(rest) = req.path.strip_prefix("/_introspect/") {
+        // Service resources carry env values and logs carry app output: in
+        // strict mode they need the same token as the Admin API.
+        if !server.authorized(req.header("authorization")) {
+            return Reply::error(
+                401,
+                "UNAUTHENTICATED",
+                "Request had invalid authentication credentials. Expected OAuth 2 access token.",
+            );
+        }
         if m != "GET" {
             return Reply::error(405, "INVALID_ARGUMENT", "method not allowed");
         }

@@ -8,7 +8,7 @@
 //! execution is enabled. Either way the instance listens on a free loopback
 //! port passed in `PORT`, which the HTTP layer reverse-proxies to.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::net::TcpListener as StdListener;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
@@ -156,7 +156,13 @@ struct TeardownGuard {
     pgid: Option<u32>,
     /// `(docker binary, container name)`.
     container: Option<(String, String)>,
+    /// Where a container removal started from `drop` is tracked, so
+    /// `stop_all` waits for it before devcloud exits.
+    removals: Removals,
 }
+
+/// Container removals running on their own threads.
+type Removals = Arc<Mutex<Vec<std::thread::JoinHandle<()>>>>;
 
 impl TeardownGuard {
     fn disarm(&mut self) {
@@ -172,15 +178,36 @@ impl Drop for TeardownGuard {
         }
         if let Some((docker, name)) = self.container.take() {
             // No runtime to await on here: remove the container from a
-            // detached thread (bounded by the CLI itself).
-            std::thread::spawn(move || {
+            // thread (bounded by the CLI itself), tracked so shutdown waits
+            // for it — killing the CLI alone leaves the container running.
+            let handle = std::thread::spawn(move || {
                 let _ = std::process::Command::new(docker)
                     .args(["rm", "-f", &name])
                     .stdout(Stdio::null())
                     .stderr(Stdio::null())
                     .status();
             });
+            let mut pending = self.removals.lock().unwrap();
+            pending.retain(|h| !h.is_finished());
+            pending.push(handle);
         }
+    }
+}
+
+impl Instance {
+    /// Whether the instance's process is still running. Reaping the leader
+    /// also kills what is left of its group at once and forgets the group:
+    /// once empty, its id can be reused, and a later signal to it would hit
+    /// an unrelated process group.
+    fn alive(&mut self) -> bool {
+        if matches!(self.child.try_wait(), Ok(None)) {
+            return true;
+        }
+        if let Some(pid) = self.pid.take() {
+            signal_group(pid, Signal::Kill);
+        }
+        self.guard.pgid = None;
+        false
     }
 }
 
@@ -221,6 +248,10 @@ pub struct Manager {
     /// Short critical sections only — never held across an `.await`.
     slots: Mutex<Slots>,
     logs: Arc<Mutex<HashMap<String, VecDeque<String>>>>,
+    /// Ports handed to instances that are starting or running, so two cold
+    /// starts never get the same one (`free_port` releases its listener).
+    ports: Mutex<HashSet<u16>>,
+    removals: Removals,
 }
 
 impl Manager {
@@ -230,6 +261,8 @@ impl Manager {
             run_id: new_run_id(),
             slots: Mutex::new(Slots::default()),
             logs: Arc::new(Mutex::new(HashMap::new())),
+            ports: Mutex::new(HashSet::new()),
+            removals: Removals::default(),
         }
     }
 
@@ -269,7 +302,7 @@ impl Manager {
             return Err(StartError::Gone);
         };
         if let Some(inst) = guard.instance.as_mut() {
-            if matches!(inst.child.try_wait(), Ok(None)) && inst.spec == spec {
+            if inst.alive() && inst.spec == spec {
                 inst.requests += 1;
                 return Ok(inst.port);
             }
@@ -312,6 +345,35 @@ impl Manager {
         for slot in drained {
             self.retire(slot).await;
         }
+        // Removals started by dropped instances (connections cancelled by
+        // shutdown mid-start or mid-delete) finish before devcloud exits.
+        loop {
+            let pending = std::mem::take(&mut *self.removals.lock().unwrap());
+            if pending.is_empty() {
+                break;
+            }
+            let _ = tokio::task::spawn_blocking(move || {
+                for handle in pending {
+                    let _ = handle.join();
+                }
+            })
+            .await;
+        }
+    }
+
+    /// A port no other instance of this manager holds.
+    fn reserve_port(&self) -> Result<u16, String> {
+        for _ in 0..32 {
+            let port = free_port()?;
+            if self.ports.lock().unwrap().insert(port) {
+                return Ok(port);
+            }
+        }
+        Err("allocate port: no free port".to_string())
+    }
+
+    fn release_port(&self, port: u16) {
+        self.ports.lock().unwrap().remove(&port);
     }
 
     async fn retire(&self, slot: Arc<tokio::sync::Mutex<Slot>>) {
@@ -334,7 +396,7 @@ impl Manager {
             let Some(i) = guard.instance.as_mut() else {
                 continue;
             };
-            if !matches!(i.child.try_wait(), Ok(None)) {
+            if !i.alive() {
                 continue;
             }
             out.push(InstanceInfo {
@@ -373,7 +435,15 @@ impl Manager {
         if spec.command.is_empty() && self.docker_bin.is_none() {
             return Err(not_runnable(spec));
         }
-        let port = free_port().map_err(StartError::Spawn)?;
+        let port = self.reserve_port().map_err(StartError::Spawn)?;
+        let started = self.start_on(spec, port).await;
+        if started.is_err() {
+            self.release_port(port);
+        }
+        started
+    }
+
+    async fn start_on(&self, spec: &LaunchSpec, port: u16) -> Result<Instance, StartError> {
         let (mut cmd, docker_name) = self.command_for(spec, port)?;
         cmd.stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -383,6 +453,18 @@ impl Manager {
         // command forked (`sh -c 'server & wait'`, npm scripts, ...).
         #[cfg(unix)]
         cmd.process_group(0);
+        // If devcloud itself dies (SIGKILL, OOM, abort), its own group leaves
+        // with it; the instance would not, since it has a group of its own.
+        #[cfg(target_os = "linux")]
+        // SAFETY: prctl is async-signal-safe and only touches this child.
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
         let mut child = cmd.spawn().map_err(|e| {
             StartError::Spawn(format!("start {}: {e}", describe(spec, &docker_name)))
         })?;
@@ -390,6 +472,7 @@ impl Manager {
         let mut guard = TeardownGuard {
             pgid: pid,
             container: self.docker_bin.clone().zip(docker_name.clone()),
+            removals: Arc::clone(&self.removals),
         };
         if let Some(out) = child.stdout.take() {
             self.pump_logs(&spec.service, out);
@@ -400,12 +483,12 @@ impl Manager {
 
         let deadline = tokio::time::Instant::now() + STARTUP_TIMEOUT;
         loop {
-            if tokio::net::TcpStream::connect(("127.0.0.1", port))
+            let listening = tokio::net::TcpStream::connect(("127.0.0.1", port))
                 .await
-                .is_ok()
-            {
-                break;
-            }
+                .is_ok();
+            // Checked after the connect: a child that already exited (say it
+            // lost the port to another program) must not be taken as ready
+            // because something else answered.
             if let Ok(Some(status)) = child.try_wait() {
                 if let Some(pid) = pid {
                     signal_group(pid, Signal::Kill);
@@ -419,6 +502,9 @@ impl Manager {
                 return Err(StartError::Unhealthy(format!(
                     "The user-provided container failed to start and listen on the port defined provided by the PORT={port} environment variable (exited with {status})"
                 )));
+            }
+            if listening {
+                break;
             }
             if tokio::time::Instant::now() >= deadline {
                 let inst = Instance {
@@ -521,6 +607,7 @@ impl Manager {
     }
 
     async fn terminate(&self, mut inst: Instance) {
+        self.release_port(inst.port);
         if let Some(name) = &inst.docker_name {
             self.remove_container(name).await;
         }
@@ -873,6 +960,7 @@ mod tests {
             guard: TeardownGuard {
                 pgid: pid,
                 container: None,
+                removals: Removals::default(),
             },
         };
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -889,6 +977,43 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         assert!(gone, "process group survived a cancelled terminate");
+    }
+
+    #[test]
+    fn reserved_ports_are_never_handed_out_twice() {
+        let m = Manager::new(None);
+        let ports: HashSet<u16> = (0..20).map(|_| m.reserve_port().unwrap()).collect();
+        assert_eq!(ports.len(), 20);
+        let p = *ports.iter().next().unwrap();
+        m.release_port(p);
+        assert!(!m.ports.lock().unwrap().contains(&p));
+    }
+
+    #[tokio::test]
+    async fn a_reaped_instance_forgets_its_process_group() {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "exit 0"]).process_group(0);
+        let mut child = cmd.spawn().unwrap();
+        let pid = child.id();
+        let _ = child.wait().await;
+        let mut inst = Instance {
+            spec: LaunchSpec::from_service(&service()).unwrap(),
+            port: 0,
+            pid,
+            child,
+            docker_name: None,
+            started_at: String::new(),
+            requests: 0,
+            guard: TeardownGuard {
+                pgid: pid,
+                container: None,
+                removals: Removals::default(),
+            },
+        };
+        assert!(!inst.alive());
+        // Nothing left to signal later, by `terminate` or the drop guard.
+        assert_eq!(inst.pid, None);
+        assert_eq!(inst.guard.pgid, None);
     }
 
     #[tokio::test]
@@ -919,6 +1044,7 @@ mod tests {
             guard: TeardownGuard {
                 pgid: None,
                 container: None,
+                removals: Removals::default(),
             },
         };
         let started = std::time::Instant::now();
