@@ -882,6 +882,23 @@ fn spawn(
     // handler spawned along with the interpreter.
     #[cfg(unix)]
     cmd.process_group(0);
+    // fd 2 shares the stdout pipe, so output written straight to it (native
+    // code, subprocesses, warnings) stays ordered before the invocation's
+    // marker instead of racing it through a second pipe into the next log.
+    #[cfg(unix)]
+    {
+        cmd.stderr(Stdio::null());
+        // SAFETY: dup2 is async-signal-safe; std has already installed the
+        // piped stdout on fd 1 when pre_exec runs.
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::dup2(1, 2) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
     let control = attach_control_pipe(&mut cmd).map_err(|e| {
         let _ = std::fs::remove_dir_all(&work_dir);
         RuntimeError::Spawn(format!("start {bin} for runtime {}: {e}", inv.runtime))
@@ -901,10 +918,10 @@ fn spawn(
         Arc::clone(&stdout),
         tx,
     ));
-    let err_task = tokio::spawn(collect(
-        child.stderr.take().expect("piped stderr"),
-        Arc::clone(&stderr),
-    ));
+    let mut tasks = vec![out_task.abort_handle()];
+    if let Some(err) = child.stderr.take() {
+        tasks.push(tokio::spawn(collect(err, Arc::clone(&stderr))).abort_handle());
+    }
     Ok(Environment {
         id,
         key: inv.env_key.clone(),
@@ -915,7 +932,7 @@ fn spawn(
         events,
         stdout,
         stderr,
-        tasks: vec![out_task.abort_handle(), err_task.abort_handle()],
+        tasks,
         work_dir,
         idle_since: Instant::now(),
         _code: code,

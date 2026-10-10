@@ -3575,3 +3575,40 @@ async fn a_lost_package_does_not_take_down_the_whole_api() {
     .await;
     assert_eq!(deleted.status, 204);
 }
+
+#[tokio::test]
+async fn output_written_straight_to_fd_2_lands_in_its_own_invocation_log() {
+    if !has("python3") || !has("node") {
+        eprintln!("skipping: python3 or node not available");
+        return;
+    }
+    let e = env("fd2");
+    let (r, log) = deploy_and_invoke(
+        &e.server,
+        "fd2-py",
+        "python3.12",
+        "app.handler",
+        (
+            "app.py",
+            b"import os, subprocess\ndef handler(event, context):\n    os.write(2, b'raw-fd2\\n')\n    subprocess.run(['sh', '-c', 'echo child-stderr >&2'])\n    return 'ok'\n",
+        ),
+    )
+    .await;
+    assert_eq!(r.json(), json!("ok"));
+    assert!(log.contains("raw-fd2"), "{log}");
+    assert!(log.contains("child-stderr"), "{log}");
+    let (r, log) = deploy_and_invoke(
+        &e.server,
+        "fd2-node",
+        "nodejs20.x",
+        "index.handler",
+        (
+            "index.js",
+            b"const { execSync } = require('child_process');\nexports.handler = async () => { require('fs').writeSync(2, 'raw-fd2\\n'); execSync('echo child-stderr >&2', { stdio: 'inherit' }); return 'ok'; };\n",
+        ),
+    )
+    .await;
+    assert_eq!(r.json(), json!("ok"));
+    assert!(log.contains("raw-fd2"), "{log}");
+    assert!(log.contains("child-stderr"), "{log}");
+}
