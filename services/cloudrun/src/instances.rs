@@ -453,18 +453,6 @@ impl Manager {
         // command forked (`sh -c 'server & wait'`, npm scripts, ...).
         #[cfg(unix)]
         cmd.process_group(0);
-        // If devcloud itself dies (SIGKILL, OOM, abort), its own group leaves
-        // with it; the instance would not, since it has a group of its own.
-        #[cfg(target_os = "linux")]
-        // SAFETY: prctl is async-signal-safe and only touches this child.
-        unsafe {
-            cmd.pre_exec(|| {
-                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
         let mut child = cmd.spawn().map_err(|e| {
             StartError::Spawn(format!("start {}: {e}", describe(spec, &docker_name)))
         })?;
