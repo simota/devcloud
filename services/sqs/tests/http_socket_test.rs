@@ -300,3 +300,105 @@ async fn long_poll_does_not_follow_delete_and_recreate_of_same_queue_name() {
 fn urlencoding_lite(s: &str) -> String {
     s.replace(':', "%3A").replace('/', "%2F")
 }
+
+/// A JSON request signed with the crate's own SigV4 signer (no
+/// `x-amz-content-sha256` header, as the AWS SDKs send it for SQS).
+fn signed_json_request(target: &str, body: &str, secret: &str) -> Vec<u8> {
+    use devcloud_sqs::sigv4::{sha256_hex, signature_for_request, Credentials, SignedRequest};
+    let host = "127.0.0.1:9324";
+    let amz_date = "20260430T100000Z";
+    let header = |name: &str| (name == "x-amz-date").then(|| amz_date.to_string());
+    let req = SignedRequest {
+        method: "POST",
+        path: "/",
+        query: "",
+        host,
+        authorization: "",
+        amz_date,
+        content_sha256: "",
+        header: &header,
+        body: body.as_bytes(),
+    };
+    let creds = Credentials {
+        auth_mode: "strict",
+        access_key_id: "dev",
+        secret_access_key: secret,
+        region: "us-east-1",
+    };
+    let signature = signature_for_request(
+        &req,
+        "20260430",
+        "us-east-1",
+        "host;x-amz-date",
+        &sha256_hex(body.as_bytes()),
+        &creds,
+    );
+    format!(
+        "POST / HTTP/1.1\r\nHost: {host}\r\nX-Amz-Date: {amz_date}\r\n\
+         Authorization: AWS4-HMAC-SHA256 Credential=dev/20260430/us-east-1/sqs/aws4_request, \
+         SignedHeaders=host;x-amz-date, Signature={signature}\r\n\
+         Content-Type: application/x-amz-json-1.0\r\nX-Amz-Target: {target}\r\n\
+         Content-Length: {}\r\n\r\n{body}",
+        body.len()
+    )
+    .into_bytes()
+}
+
+async fn roundtrip(addr: std::net::SocketAddr, request: &[u8]) -> (u16, Vec<u8>) {
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    stream.write_all(request).await.unwrap();
+    read_http_response(&mut stream).await
+}
+
+/// Strict auth mode must reject unsigned or mis-signed requests on every
+/// path, including both ReceiveMessage long-poll fast paths, and accept a
+/// correctly signed one.
+#[tokio::test]
+async fn strict_mode_requires_valid_sigv4_signature() {
+    let mut server = Server::new(Config {
+        auth_mode: "strict".to_string(),
+        access_key_id: "dev".to_string(),
+        secret_access_key: "dev-secret".to_string(),
+        ..cfg()
+    });
+    let url = server
+        .create_queue("Locked", &Default::default(), &Default::default())
+        .unwrap()
+        .url;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(devcloud_sqs::http::serve(
+        listener,
+        Arc::new(Mutex::new(server)),
+        std::future::pending(),
+    ));
+
+    let (status, body) = roundtrip(addr, &json_request("AmazonSQS.ListQueues", "{}")).await;
+    assert_eq!(status, 403);
+    assert!(String::from_utf8_lossy(&body).contains("AccessDenied"));
+
+    let receive = format!(r#"{{"QueueUrl":"{url}"}}"#);
+    let (status, _) = roundtrip(addr, &json_request("AmazonSQS.ReceiveMessage", &receive)).await;
+    assert_eq!(status, 403, "JSON long-poll fast path must be signed");
+
+    let form = format!("Action=ReceiveMessage&QueueUrl={}", urlencoding_lite(&url));
+    let (status, body) = roundtrip(addr, &query_form_request(&form)).await;
+    assert_eq!(status, 403, "Query long-poll fast path must be signed");
+    assert!(String::from_utf8_lossy(&body).contains("<Code>AccessDenied</Code>"));
+
+    let (status, body) = roundtrip(
+        addr,
+        &signed_json_request("AmazonSQS.ListQueues", "{}", "wrong-secret"),
+    )
+    .await;
+    assert_eq!(status, 403);
+    assert!(String::from_utf8_lossy(&body).contains("SignatureDoesNotMatch"));
+
+    let (status, body) = roundtrip(
+        addr,
+        &signed_json_request("AmazonSQS.ListQueues", "{}", "dev-secret"),
+    )
+    .await;
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    assert!(String::from_utf8_lossy(&body).contains("Locked"));
+}

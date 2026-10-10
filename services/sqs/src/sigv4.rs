@@ -87,7 +87,9 @@ pub fn verify_signature(req: &SignedRequest, creds: &Credentials) -> Result<(), 
         return Err(err("AuthorizationHeaderMalformed", 400));
     }
     let payload_hash = if req.content_sha256.is_empty() {
-        "UNSIGNED-PAYLOAD".to_string()
+        // SDKs sign the body hash without sending `x-amz-content-sha256` for
+        // SQS, so the canonical request uses the hash of what arrived.
+        sha256_hex(req.body)
     } else {
         verify_payload_hash(req, req.content_sha256)?;
         req.content_sha256.to_string()

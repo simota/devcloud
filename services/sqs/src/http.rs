@@ -108,6 +108,11 @@ async fn handle_conn(
             .write_all(&devcloud_hostguard::cross_site_response())
             .await;
     }
+    // Strict auth: every request must carry a valid SigV4 signature before it
+    // reaches any handler (relaxed mode accepts everything).
+    if let Err(denied) = verify_request_signature(&server, &request) {
+        return write_signature_error(&mut stream, &request, denied).await;
+    }
     // ReceiveMessage's long poll is handled separately from the generic
     // dispatch below: it must not hold the server lock for the whole wait
     // (see `long_poll_receive_message`).
@@ -131,6 +136,57 @@ async fn handle_conn(
         Outcome::Json(outcome) => write_json_response(&mut stream, outcome).await,
         Outcome::Introspect(outcome) => write_introspect_response(&mut stream, outcome).await,
         Outcome::Query(outcome) => write_query_response(&mut stream, outcome).await,
+    }
+}
+
+/// Checks the request's SigV4 signature against the configured credentials.
+/// A no-op in relaxed mode (`sigv4::verify_signature` accepts everything).
+fn verify_request_signature(
+    server: &Mutex<Server>,
+    req: &Request,
+) -> Result<(), crate::sigv4::SignatureError> {
+    let config = server.lock().unwrap().config().clone();
+    let header = |name: &str| req.headers.get(name).cloned();
+    crate::sigv4::verify_signature(
+        &crate::sigv4::SignedRequest {
+            method: &req.method,
+            path: &req.path,
+            query: &req.query,
+            host: req.header("host"),
+            authorization: req.header("authorization"),
+            amz_date: req.header("x-amz-date"),
+            content_sha256: req.header("x-amz-content-sha256"),
+            header: &header,
+            body: &req.body,
+        },
+        &crate::sigv4::Credentials {
+            auth_mode: &config.auth_mode,
+            access_key_id: &config.access_key_id,
+            secret_access_key: &config.secret_access_key,
+            region: &config.region,
+        },
+    )
+}
+
+/// Renders a signature failure in the protocol the request used: JSON for an
+/// `AmazonSQS.` target or a JSON content type, Query/XML otherwise. The message
+/// never echoes the Authorization header or the signature.
+async fn write_signature_error(
+    stream: &mut TcpStream,
+    req: &Request,
+    denied: crate::sigv4::SignatureError,
+) -> std::io::Result<()> {
+    let message = "the request signature could not be verified";
+    if req.header("x-amz-target").starts_with("AmazonSQS.")
+        || req
+            .header("content-type")
+            .contains("application/x-amz-json-1.0")
+    {
+        let outcome = JsonOutcome::error(denied.status, denied.code, message);
+        write_json_response(stream, outcome).await
+    } else {
+        let outcome = QueryOutcome::error(denied.status, denied.code, message);
+        write_query_response(stream, outcome).await
     }
 }
 
