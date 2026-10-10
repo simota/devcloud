@@ -20,7 +20,9 @@ use crate::attribute::{
     attribute_values_equal, item_key, project_item, validate_item_attribute_values,
 };
 use crate::errors::ApiError;
-use crate::expression::{check_condition, match_filter, match_key_condition};
+use crate::expression::{
+    check_condition, key_condition_has_equality_on, match_filter, match_key_condition,
+};
 use crate::model::{
     AttributeDefinition, BackupDescription, BackupDetails, BackupSummary, BillingModeSummary,
     ContinuousBackupsDescription, GlobalSecondaryIndexDescription, IndexProjection, Item,
@@ -957,30 +959,54 @@ impl Server {
         {
             return Err(ApiError::validation("index not found"));
         }
+        let names = &request.expression_attribute_names;
+        let values = &request.expression_attribute_values;
+        let key_expr = &request.key_condition_expression;
+        let partition_key = query_partition_key(&state.description, &request.index_name);
+        if !key_condition_has_equality_on(key_expr, names, partition_key)
+            .map_err(ApiError::validation)?
+        {
+            return Err(ApiError::validation(format!(
+                "Query condition missed key schema element: {partition_key}"
+            )));
+        }
+        let descending = request.scan_index_forward == Some(false);
         let mut items = crate::query::sorted_items_for_query(
             &state.items,
             &state.description,
             &request.index_name,
         );
-        if request.scan_index_forward == Some(false) {
+        if descending {
             crate::query::reverse_items(&mut items);
         }
-        let start_key =
-            crate::query::start_key_string(&state.description, &request.exclusive_start_key)
-                .map_err(ApiError::validation)?;
-        let names = &request.expression_attribute_names;
-        let values = &request.expression_attribute_values;
-        let key_expr = &request.key_condition_expression;
+        let start = crate::query::StartKey::new(
+            &state.description,
+            &request.exclusive_start_key,
+            descending,
+        )
+        .map_err(ApiError::validation)?;
+        // Only key-condition matches are read (they count toward Limit and
+        // ScannedCount); the FilterExpression then decides which of them are
+        // returned (Count), exactly like Scan does over the whole table.
+        let mut key_matches = Vec::with_capacity(items.len());
+        for candidate in items {
+            if match_key_condition(key_expr, names, values, &candidate.value)
+                .map_err(ApiError::validation)?
+            {
+                key_matches.push(candidate);
+            }
+        }
+        let filter = &request.filter_expression;
         let mut response = crate::query::collect_items(
             &state.description,
             &request.index_name,
-            &items,
+            &key_matches,
             request.limit,
-            &start_key,
+            &start,
             &request.projection_expression,
             names,
-            false,
-            |candidate| match_key_condition(key_expr, names, values, candidate),
+            true,
+            |candidate| match_filter(filter, names, values, candidate),
         )
         .map_err(ApiError::validation)?;
         crate::query::apply_select(&mut response, &request.select);
@@ -1013,8 +1039,8 @@ impl Server {
         {
             return Err(ApiError::validation("index not found"));
         }
-        let start_key =
-            crate::query::start_key_string(&state.description, &request.exclusive_start_key)
+        let start =
+            crate::query::StartKey::new(&state.description, &request.exclusive_start_key, false)
                 .map_err(ApiError::validation)?;
         let items = crate::query::sorted_items_for_scan(
             &state.items,
@@ -1029,7 +1055,7 @@ impl Server {
             &request.index_name,
             &items,
             request.limit,
-            &start_key,
+            &start,
             &request.projection_expression,
             names,
             true,
@@ -2857,6 +2883,15 @@ fn lsi_descriptions(
             projection: projection_from_request(&index.projection),
         })
         .collect()
+}
+
+/// The partition (HASH) key attribute of the table or the named index.
+fn query_partition_key<'a>(description: &'a TableDescription, index_name: &str) -> &'a str {
+    crate::query::query_key_schema(description, index_name)
+        .iter()
+        .find(|element| element.key_type == "HASH")
+        .map(|element| element.attribute_name.as_str())
+        .unwrap_or_default()
 }
 
 fn table_has_index(description: &TableDescription, index_name: &str) -> bool {

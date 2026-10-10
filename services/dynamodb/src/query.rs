@@ -72,7 +72,7 @@ fn item_has_all_keys(value: &Item, schema: &[KeySchemaElement]) -> bool {
 
 /// Returns the key schema for an index (or the table when `index_name` is empty
 /// or unknown). Mirrors `queryKeySchema`.
-fn query_key_schema<'a>(
+pub fn query_key_schema<'a>(
     description: &'a TableDescription,
     index_name: &str,
 ) -> &'a [KeySchemaElement] {
@@ -129,6 +129,56 @@ pub fn start_key_string(description: &TableDescription, start: &Item) -> Result<
     item_key(description, start)
 }
 
+/// An `ExclusiveStartKey` resolved for a walk over sorted items: the table
+/// item-key string (the sort tie-breaker), the key attributes themselves, and
+/// the walk direction.
+pub struct StartKey {
+    key: String,
+    item: Item,
+    descending: bool,
+}
+
+impl StartKey {
+    /// Validates and resolves `start` (an empty item means "from the
+    /// beginning"). `descending` is true when the source was reversed.
+    pub fn new(
+        description: &TableDescription,
+        start: &Item,
+        descending: bool,
+    ) -> Result<Self, String> {
+        Ok(StartKey {
+            key: start_key_string(description, start)?,
+            item: start.clone(),
+            descending,
+        })
+    }
+
+    /// Whether the start key carries every attribute of `schema`, so its
+    /// position can be computed without the start item still existing. A key
+    /// lacking the index key attributes falls back to an exact item match.
+    fn is_positional(&self, schema: &[KeySchemaElement]) -> bool {
+        item_has_all_keys(&self.item, schema)
+    }
+
+    /// True when `candidate` sorts strictly after the start key in walk
+    /// order. The comparison is positional (key schema, then the table key
+    /// string — the same order `sorted_items_for_query` uses), so pagination
+    /// resumes correctly even when the start item itself was deleted.
+    fn is_after(&self, candidate: &KeyedItem, schema: &[KeySchemaElement]) -> bool {
+        let ord = compare_items_by_schema(&candidate.value, &self.item, schema)
+            .then_with(|| candidate.key.as_str().cmp(self.key.as_str()));
+        if self.descending {
+            ord == Ordering::Less
+        } else {
+            ord == Ordering::Greater
+        }
+    }
+
+    fn is_exact(&self, candidate: &KeyedItem) -> bool {
+        candidate.key == self.key
+    }
+}
+
 /// Walks the (already-sorted) source collecting matches, mirroring
 /// `collectItems`. Returns the response object (`Items`/`Count`/`ScannedCount`
 /// and optionally `LastEvaluatedKey`).
@@ -138,7 +188,7 @@ pub fn collect_items(
     index_name: &str,
     source: &[KeyedItem],
     limit: i64,
-    start_key: &str,
+    start: &StartKey,
     projection: &str,
     names: &BTreeMap<String, String>,
     limit_counts_unmatched: bool,
@@ -146,11 +196,19 @@ pub fn collect_items(
 ) -> Result<Map<String, Value>, String> {
     let mut response_items: Vec<Item> = Vec::new();
     let mut scanned: i64 = 0;
-    let mut started = start_key.is_empty();
+    let schema = query_key_schema(description, index_name);
+    let mut started = start.key.is_empty();
+    let positional = start.is_positional(schema);
     for candidate in source {
         if !started {
-            started = candidate.key == start_key;
-            continue;
+            if !positional {
+                started = start.is_exact(candidate);
+                continue;
+            }
+            if !start.is_after(candidate, schema) {
+                continue;
+            }
+            started = true;
         }
         let matched = matcher(&candidate.value)?;
         if matched || limit_counts_unmatched {
@@ -160,6 +218,7 @@ pub fn collect_items(
             if limit_counts_unmatched && limit > 0 && scanned == limit {
                 return Ok(limited_items_response(
                     description,
+                    index_name,
                     candidate,
                     response_items,
                     scanned,
@@ -183,6 +242,7 @@ pub fn collect_items(
             };
             return Ok(limited_items_response(
                 description,
+                index_name,
                 candidate,
                 response_items,
                 scanned,
@@ -204,6 +264,7 @@ fn items_response(items: Vec<Item>, scanned: i64) -> Map<String, Value> {
 
 fn limited_items_response(
     description: &TableDescription,
+    index_name: &str,
     candidate: &KeyedItem,
     items: Vec<Item>,
     scanned: i64,
@@ -211,7 +272,15 @@ fn limited_items_response(
 ) -> Map<String, Value> {
     let mut response = items_response(items, scanned);
     if has_more {
-        if let Ok(last_key) = extract_key(description, &candidate.value) {
+        if let Ok(mut last_key) = extract_key(description, &candidate.value) {
+            // An index walk also needs the index key to resume positionally.
+            if !index_name.is_empty() {
+                for element in query_key_schema(description, index_name) {
+                    if let Some(attr) = candidate.value.get(&element.attribute_name) {
+                        last_key.insert(element.attribute_name.clone(), attr.clone());
+                    }
+                }
+            }
             response.insert(
                 "LastEvaluatedKey".to_string(),
                 serde_json::to_value(last_key).unwrap(),

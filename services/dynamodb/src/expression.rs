@@ -70,6 +70,23 @@ pub fn match_key_condition(
     Ok(true)
 }
 
+/// True when the KeyConditionExpression contains an equality predicate on
+/// `attribute` (DynamoDB requires one on the partition key).
+pub fn key_condition_has_equality_on(
+    expression: &str,
+    names: &Names,
+    attribute: &str,
+) -> Result<bool, String> {
+    for part in split_conjunctive_predicates(expression)? {
+        if let Some((name_token, operator, _)) = split_comparison_expression(part.trim()) {
+            if operator == "=" && resolve_attribute_name(name_token.trim(), names) == attribute {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
 fn match_conjunctive_expression(
     expression: &str,
     names: &Names,

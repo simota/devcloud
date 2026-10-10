@@ -532,6 +532,8 @@ pub struct QueryRequest {
     pub index_name: String,
     #[serde(rename = "KeyConditionExpression")]
     pub key_condition_expression: String,
+    #[serde(rename = "FilterExpression")]
+    pub filter_expression: String,
     #[serde(rename = "ExpressionAttributeNames")]
     pub expression_attribute_names: BTreeMap<String, String>,
     #[serde(rename = "ExpressionAttributeValues")]

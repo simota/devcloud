@@ -6,8 +6,8 @@ use std::collections::BTreeMap;
 
 use devcloud_dynamodb::model::{AttributeDefinition, Item, KeySchemaElement};
 use devcloud_dynamodb::requests::{
-    CreateTableRequest, GlobalSecondaryIndexRequest, IndexProjectionRequest, PutItemRequest,
-    QueryRequest, ScanRequest,
+    CreateTableRequest, DeleteItemRequest, GlobalSecondaryIndexRequest, IndexProjectionRequest,
+    PutItemRequest, QueryRequest, ScanRequest,
 };
 use devcloud_dynamodb::server::{Config, Server};
 use serde_json::{json, Value};
@@ -381,6 +381,175 @@ fn query_pagination_continues_from_last_key() {
     assert_eq!(second["Count"], 1);
     assert_eq!(second["Items"][0]["sk"], json!({"N": "3"}));
     assert!(second.get("LastEvaluatedKey").is_none());
+}
+
+fn qv(s: &Server, r: QueryRequest) -> Value {
+    serde_json::from_slice(&q(s, r)).unwrap()
+}
+
+fn delete(s: &mut Server, key: Item) {
+    s.delete_item(&DeleteItemRequest {
+        table_name: "T".to_string(),
+        key,
+        ..Default::default()
+    })
+    .expect("delete");
+}
+
+#[test]
+fn query_applies_filter_expression() {
+    let dir = tempdir();
+    let s = seeded(&dir);
+    let got = qv(
+        &s,
+        QueryRequest {
+            filter_expression: "begins_with(#n, :pre)".to_string(),
+            expression_attribute_names: names(&[("#n", "name")]),
+            expression_attribute_values: vals(&[
+                (":p", json!({"S": "u1"})),
+                (":pre", json!({"S": "B"})),
+            ]),
+            ..base_query()
+        },
+    );
+    // All three key matches are read; only Bob passes the filter.
+    assert_eq!(got["ScannedCount"], 3);
+    assert_eq!(got["Count"], 1);
+    assert_eq!(got["Items"][0]["name"], json!({"S": "Bob"}));
+}
+
+#[test]
+fn query_filter_counts_key_matches_toward_limit() {
+    let dir = tempdir();
+    let s = seeded(&dir);
+    let got = qv(
+        &s,
+        QueryRequest {
+            limit: 2,
+            filter_expression: "#n = :cy".to_string(),
+            expression_attribute_names: names(&[("#n", "name")]),
+            expression_attribute_values: vals(&[
+                (":p", json!({"S": "u1"})),
+                (":cy", json!({"S": "Cy"})),
+            ]),
+            ..base_query()
+        },
+    );
+    // Limit bounds the items read (sk 1, 2), not the items returned.
+    assert_eq!(got["ScannedCount"], 2);
+    assert_eq!(got["Count"], 0);
+    assert_eq!(
+        got["LastEvaluatedKey"],
+        json!({"pk": {"S": "u1"}, "sk": {"N": "2"}})
+    );
+}
+
+#[test]
+fn query_requires_partition_key_equality() {
+    let dir = tempdir();
+    let s = seeded(&dir);
+    for expression in ["sk > :s", "pk > :p", "pk = :p OR sk = :s"] {
+        let err = s
+            .query(&QueryRequest {
+                key_condition_expression: expression.to_string(),
+                expression_attribute_values: vals(&[
+                    (":p", json!({"S": "u1"})),
+                    (":s", json!({"N": "1"})),
+                ]),
+                ..base_query()
+            })
+            .expect_err(expression);
+        assert_eq!(err.name, "ValidationException", "{expression}");
+    }
+}
+
+#[test]
+fn query_pagination_survives_deleted_start_item() {
+    let dir = tempdir();
+    let mut s = seeded(&dir);
+    let first = qv(
+        &s,
+        QueryRequest {
+            limit: 1,
+            ..base_query()
+        },
+    );
+    let start: Item = serde_json::from_value(first["LastEvaluatedKey"].clone()).unwrap();
+    delete(&mut s, start.clone());
+    let second = qv(
+        &s,
+        QueryRequest {
+            exclusive_start_key: start,
+            ..base_query()
+        },
+    );
+    assert_eq!(second["Count"], 2);
+    assert_eq!(second["Items"][0]["sk"], json!({"N": "2"}));
+    assert_eq!(second["Items"][1]["sk"], json!({"N": "3"}));
+}
+
+#[test]
+fn query_descending_pagination_survives_deleted_start_item() {
+    let dir = tempdir();
+    let mut s = seeded(&dir);
+    let first = qv(
+        &s,
+        QueryRequest {
+            limit: 1,
+            scan_index_forward: Some(false),
+            ..base_query()
+        },
+    );
+    let start: Item = serde_json::from_value(first["LastEvaluatedKey"].clone()).unwrap();
+    assert_eq!(start["sk"], json!({"N": "3"}));
+    delete(&mut s, start.clone());
+    let second = qv(
+        &s,
+        QueryRequest {
+            exclusive_start_key: start,
+            scan_index_forward: Some(false),
+            ..base_query()
+        },
+    );
+    assert_eq!(second["Count"], 2);
+    assert_eq!(second["Items"][0]["sk"], json!({"N": "2"}));
+    assert_eq!(second["Items"][1]["sk"], json!({"N": "1"}));
+}
+
+#[test]
+fn index_pagination_survives_deleted_start_item() {
+    let dir = tempdir();
+    let mut s = seeded(&dir);
+    let gsi_query = || QueryRequest {
+        table_name: "T".to_string(),
+        index_name: "byGsi".to_string(),
+        key_condition_expression: "gsiPk = :g".to_string(),
+        expression_attribute_values: vals(&[(":g", json!({"S": "g1"}))]),
+        ..Default::default()
+    };
+    let first = qv(
+        &s,
+        QueryRequest {
+            limit: 1,
+            ..gsi_query()
+        },
+    );
+    let start: Item = serde_json::from_value(first["LastEvaluatedKey"].clone()).unwrap();
+    // The index LastEvaluatedKey carries the index key as well as the table key.
+    assert_eq!(start["gsiPk"], json!({"S": "g1"}));
+    let first_sk = first["Items"][0]["sk"].clone();
+    let mut table_key = start.clone();
+    table_key.remove("gsiPk");
+    delete(&mut s, table_key);
+    let second = qv(
+        &s,
+        QueryRequest {
+            exclusive_start_key: start,
+            ..gsi_query()
+        },
+    );
+    assert_eq!(second["Count"], 1);
+    assert_ne!(second["Items"][0]["sk"], first_sk);
 }
 
 // --- minimal tempdir -------------------------------------------------------
