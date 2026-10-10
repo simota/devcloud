@@ -152,6 +152,19 @@ async fn handle_conn(mut stream: TcpStream, config: Arc<Config>) -> std::io::Res
     // `/api/events` is a WebSocket upgrade, not a request/response route: hijack
     // the stream and hand it to the events proxy (it never returns a Response).
     if events::is_events_upgrade(&request) {
+        // WebSockets are not subject to CORS, and the events carry mail
+        // metadata and resource activity: the same Host guard as `route`,
+        // plus the Origin check every cross-site page would otherwise pass.
+        let host = request.header("host");
+        let origin = request.header("origin");
+        let allowed = trusted_host(host)
+            && (trusted_origin(origin, request.header("sec-fetch-site"))
+                || same_origin(origin, host));
+        if !allowed {
+            let refused =
+                Response::text_error(403, "cross-site WebSocket connections are not allowed");
+            return write_response(&mut stream, refused).await;
+        }
         events::handle(stream, &request, Arc::clone(&config)).await;
         return Ok(());
     }
