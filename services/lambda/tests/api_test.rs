@@ -1163,6 +1163,19 @@ fn sign_without_hash_header(
     body: &[u8],
     host: &str,
 ) -> Vec<(String, String)> {
+    sign_at(method, path, body, host, "20261005T000000Z", "20261005")
+}
+
+/// [`sign_without_hash_header`] with an explicit `X-Amz-Date` and scope
+/// date (`path` is the canonical path the signature covers).
+fn sign_at(
+    method: &str,
+    path: &str,
+    body: &[u8],
+    host: &str,
+    amz_date: &str,
+    date: &str,
+) -> Vec<(String, String)> {
     use hmac::{Hmac, Mac};
     use sha2::{Digest, Sha256};
     type H = Hmac<Sha256>;
@@ -1171,8 +1184,6 @@ fn sign_without_hash_header(
         m.update(data.as_bytes());
         m.finalize().into_bytes().to_vec()
     }
-    let amz_date = "20261005T000000Z";
-    let date = &amz_date[..8];
     let canonical = format!(
         "{method}\n{path}\n\nhost:{host}\nx-amz-date:{amz_date}\n\nhost;x-amz-date\n{}",
         hex::encode(Sha256::digest(body))
@@ -3492,4 +3503,36 @@ async fn node_null_module_exports_is_handler_not_found() {
     .await;
     assert_eq!(r.header("X-Amz-Function-Error"), Some("Unhandled"));
     assert_eq!(r.json()["errorType"], "Runtime.HandlerNotFound");
+}
+
+#[tokio::test]
+async fn strict_mode_checks_scope_date_and_normalizes_the_signed_path() {
+    let dir = temp_dir("sigv4scope");
+    let server = Arc::new(Server::new(Config {
+        auth_mode: "strict".into(),
+        access_key_id: "dev".into(),
+        secret_access_key: "dev".into(),
+        ..config_for(&dir)
+    }));
+    let send = |headers: Vec<(String, String)>, path: &'static str| {
+        let server = server.clone();
+        async move {
+            let refs: Vec<(&str, &str)> = headers
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.as_str()))
+                .collect();
+            call(&server, "GET", path, &refs, b"").await
+        }
+    };
+    let host = "127.0.0.1:19010";
+    let path = "/2015-03-31/functions/";
+    // A key derived for another day does not sign this request.
+    let other_day = sign_at("GET", path, b"", host, "20261005T000000Z", "20261004");
+    assert_eq!(send(other_day, path).await.status, 403);
+    let malformed = sign_at("GET", path, b"", host, "2026-10-05", "2026-10-");
+    assert_eq!(send(malformed, path).await.status, 403);
+    // SDKs sign `//x` and `/a/../x` as their normalized form.
+    let signed = sign_at("GET", path, b"", host, "20261005T000000Z", "20261005");
+    let r = send(signed, "//2015-03-31/functions/").await;
+    assert_ne!(r.status, 403, "{}", String::from_utf8_lossy(&r.body));
 }
