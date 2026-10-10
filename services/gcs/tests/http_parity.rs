@@ -879,6 +879,36 @@ fn object_paths_keep_plus_literal() {
     assert_eq!(json_body(&compose)["name"], "e+f.txt");
 }
 
+/// PATCH merges `metadata` into the stored map; a `null` value deletes a key.
+#[test]
+fn object_patch_merges_metadata_and_null_deletes_key() {
+    let mut s = server();
+    create_bucket(&mut s, "demo-bucket");
+    upload_with(
+        &mut s,
+        "demo-bucket",
+        "docs/meta.txt",
+        "body",
+        &[
+            ("Content-Type", "text/plain"),
+            ("x-goog-meta-keep", "1"),
+            ("x-goog-meta-drop", "2"),
+        ],
+    );
+
+    let patch = perform(
+        &mut s,
+        "PATCH",
+        "/storage/v1/b/demo-bucket/o/docs%2Fmeta.txt",
+        r#"{"metadata":{"drop":null,"added":"3"}}"#,
+    );
+    assert_eq!(patch.status, 200, "{}", body_str(&patch));
+    assert_eq!(
+        json_body(&patch)["metadata"],
+        serde_json::json!({"keep": "1", "added": "3"})
+    );
+}
+
 // ---------------------------------------------------------------------------
 // preconditions_test.rs
 // ---------------------------------------------------------------------------

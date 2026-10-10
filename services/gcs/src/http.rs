@@ -340,6 +340,22 @@ struct ObjectMetadataRequest {
     metadata: Option<BTreeMap<String, String>>,
 }
 
+/// PATCH object body. Unlike the shared shape above, `metadata` is a patch:
+/// listed keys are merged into the stored map and a `null` value deletes one.
+#[derive(Debug, Default, Deserialize)]
+struct ObjectPatchRequest {
+    #[serde(rename = "contentType", default)]
+    content_type: String,
+    #[serde(rename = "contentEncoding", default)]
+    content_encoding: String,
+    #[serde(rename = "cacheControl", default)]
+    cache_control: String,
+    #[serde(rename = "contentDisposition", default)]
+    content_disposition: String,
+    #[serde(default)]
+    metadata: Option<BTreeMap<String, Option<String>>>,
+}
+
 #[derive(Debug, Default, Deserialize)]
 struct ComposeRequest {
     #[serde(rename = "sourceObjects", default)]
@@ -908,14 +924,27 @@ fn handle_object(server: &mut Server, req: &Request, bucket: &str, key: &str) ->
             }
         }
         "PATCH" => {
-            if let Err(r) = read_object(server, req, bucket, key) {
-                return r;
-            }
-            let parsed: ObjectMetadataRequest = match serde_json::from_slice(&req.body) {
+            let current = match read_object(server, req, bucket, key) {
+                Ok((object, _)) => object,
+                Err(r) => return r,
+            };
+            let parsed: ObjectPatchRequest = match serde_json::from_slice(&req.body) {
                 Ok(v) => v,
-                Err(_) if req.body.is_empty() => ObjectMetadataRequest::default(),
+                Err(_) if req.body.is_empty() => ObjectPatchRequest::default(),
                 Err(_) => return json_error(400, "invalid", "invalid json request"),
             };
+            let metadata = parsed.metadata.map(|patch| {
+                let mut merged = current.metadata;
+                for (name, value) in patch {
+                    // Stored keys are lowercased, so match deletes the same way.
+                    let name = name.to_lowercase();
+                    match value {
+                        Some(value) => merged.insert(name, value),
+                        None => merged.remove(&name),
+                    };
+                }
+                merged
+            });
             match server
                 .store
                 .update_object_metadata(UpdateObjectMetadataInput {
@@ -925,7 +954,7 @@ fn handle_object(server: &mut Server, req: &Request, bucket: &str, key: &str) ->
                     content_encoding: parsed.content_encoding,
                     cache_control: parsed.cache_control,
                     content_disposition: parsed.content_disposition,
-                    metadata: parsed.metadata,
+                    metadata,
                 }) {
                 Ok(Some(object)) => Response::json(200, &object_resource(&object)),
                 Ok(None) => json_error(404, "notFound", "object not found"),
