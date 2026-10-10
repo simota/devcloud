@@ -538,7 +538,13 @@ pub async fn run(
             accepted = listener.accept() => {
                 let (stream, _): (tokio::net::TcpStream, SocketAddr) = match accepted {
                     Ok(p) => p,
-                    Err(_) => break,
+                    // Out of descriptors, or a peer gone before the accept:
+                    // back off and keep serving instead of stopping (which
+                    // would take every devcloud service down with it).
+                    Err(_) => {
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        continue;
+                    }
                 };
 
                 // Capture the topics query param during the WS handshake via the

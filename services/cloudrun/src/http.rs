@@ -63,7 +63,13 @@ pub async fn serve(
             accepted = listener.accept() => {
                 let (stream, _) = match accepted {
                     Ok(a) => a,
-                    Err(e) => break Err(e),
+                    // Out of descriptors, or a peer gone before the accept:
+                    // back off and keep serving instead of stopping (which
+                    // would take every devcloud service down with it).
+                    Err(_) => {
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        continue;
+                    }
                 };
                 while connections.try_join_next().is_some() {}
                 let server = Arc::clone(&server);

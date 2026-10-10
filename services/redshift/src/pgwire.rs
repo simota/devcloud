@@ -34,7 +34,15 @@ impl Server {
     /// the future / close the listener), matching legacy ctx-driven close.
     pub async fn serve_sql(self: Arc<Self>, listener: TcpListener) -> std::io::Result<()> {
         loop {
-            let (conn, _) = listener.accept().await?;
+            let (conn, _) = match listener.accept().await {
+                Ok(a) => a,
+                // Out of descriptors, or a peer gone before the accept: back
+                // off and keep serving instead of stopping the listener.
+                Err(_) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    continue;
+                }
+            };
             let server = Arc::clone(&self);
             tokio::spawn(async move { server.handle_sql_conn(conn).await });
         }

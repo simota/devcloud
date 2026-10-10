@@ -152,7 +152,16 @@ pub async fn serve_http(
         tokio::select! {
             _ = &mut shutdown => return Ok(()),
             accepted = listener.accept() => {
-                let (stream, _) = accepted.map_err(|e| format!("mail http accept: {e}"))?;
+                let (stream, _) = match accepted {
+                    Ok(a) => a,
+                    // Out of descriptors, or a peer gone before the accept:
+                    // back off and keep serving instead of stopping (which
+                    // would take every devcloud service down with it).
+                    Err(_) => {
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        continue;
+                    }
+                };
                 let service = Arc::clone(&service);
                 let auth = auth.clone();
                 tokio::spawn(async move {
