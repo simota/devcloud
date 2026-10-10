@@ -26,7 +26,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use devcloud_pubsub::grpc::PubSubGrpc;
+use devcloud_pubsub::grpc::{AuthInterceptor, PubSubGrpc};
 use devcloud_pubsub::proto::pubsub::{
     publisher_client::PublisherClient, publisher_server::PublisherServer,
     schema_service_client::SchemaServiceClient, schema_service_server::SchemaServiceServer,
@@ -55,6 +55,8 @@ struct EngineConfig {
     default_ack_deadline: i64,
     message_retention_seconds: i64,
     streaming_pull_disabled: bool,
+    auth_mode: String,
+    bearer_token: String,
 }
 
 /// A connected set of tonic clients plus the project the engine serves —
@@ -77,6 +79,8 @@ async fn dial(cfg: EngineConfig) -> Engine {
         default_ack_deadline_seconds: cfg.default_ack_deadline,
         message_retention_seconds: cfg.message_retention_seconds,
         streaming_pull_disabled: cfg.streaming_pull_disabled,
+        auth_mode: cfg.auth_mode,
+        bearer_token: cfg.bearer_token,
         ..Default::default()
     });
 
@@ -87,12 +91,20 @@ async fn dial(cfg: EngineConfig) -> Engine {
         .expect("bind loopback");
     let addr: SocketAddr = listener.local_addr().expect("local addr");
 
-    let adapter = PubSubGrpc::new(Arc::new(Mutex::new(server)));
+    let shared = Arc::new(Mutex::new(server));
+    let adapter = PubSubGrpc::new(shared.clone());
+    let auth = AuthInterceptor::new(shared);
     tokio::spawn(async move {
         tonic::transport::Server::builder()
-            .add_service(PublisherServer::new(adapter.clone()))
-            .add_service(SubscriberServer::new(adapter.clone()))
-            .add_service(SchemaServiceServer::new(adapter))
+            .add_service(PublisherServer::with_interceptor(
+                adapter.clone(),
+                auth.clone(),
+            ))
+            .add_service(SubscriberServer::with_interceptor(
+                adapter.clone(),
+                auth.clone(),
+            ))
+            .add_service(SchemaServiceServer::with_interceptor(adapter, auth))
             .serve_with_incoming(TcpListenerStream::new(listener))
             .await
             .expect("serve");
@@ -171,6 +183,43 @@ fn default_cfg() -> EngineConfig {
         default_ack_deadline: 30,
         ..Default::default()
     }
+}
+
+#[tokio::test]
+async fn strict_auth_requires_bearer_token() {
+    let mut e = dial(EngineConfig {
+        auth_mode: "strict".to_string(),
+        bearer_token: "secret-token".to_string(),
+        ..default_cfg()
+    })
+    .await;
+    let topic = || Topic {
+        name: topic_name(&e.project, "auth-topic"),
+        ..Default::default()
+    };
+
+    let missing = e
+        .publisher
+        .create_topic(topic())
+        .await
+        .expect_err("no token");
+    assert_eq!(missing.code(), Code::Unauthenticated);
+
+    let mut wrong = tonic::Request::new(topic());
+    wrong
+        .metadata_mut()
+        .insert("authorization", "Bearer nope".parse().unwrap());
+    let wrong = e
+        .publisher
+        .create_topic(wrong)
+        .await
+        .expect_err("bad token");
+    assert_eq!(wrong.code(), Code::Unauthenticated);
+
+    let mut ok = tonic::Request::new(topic());
+    ok.metadata_mut()
+        .insert("authorization", "Bearer secret-token".parse().unwrap());
+    e.publisher.create_topic(ok).await.expect("valid token");
 }
 
 #[tokio::test]

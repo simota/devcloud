@@ -7,7 +7,7 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
-use devcloud_pubsub::grpc::PubSubGrpc;
+use devcloud_pubsub::grpc::{AuthInterceptor, PubSubGrpc};
 use devcloud_pubsub::proto::pubsub::{
     publisher_server::PublisherServer, schema_service_server::SchemaServiceServer,
     subscriber_server::SubscriberServer,
@@ -77,12 +77,19 @@ pub async fn run(
         .parse()
         .map_err(|e| format!("pubsub: parse gRPC addr: {e}"))?;
     let adapter = PubSubGrpc::new(shared.clone());
+    let auth = AuthInterceptor::new(shared.clone());
     let sd = shutdown_future(rx.clone());
     let grpc = tokio::spawn(async move {
         tonic::transport::Server::builder()
-            .add_service(PublisherServer::new(adapter.clone()))
-            .add_service(SubscriberServer::new(adapter.clone()))
-            .add_service(SchemaServiceServer::new(adapter))
+            .add_service(PublisherServer::with_interceptor(
+                adapter.clone(),
+                auth.clone(),
+            ))
+            .add_service(SubscriberServer::with_interceptor(
+                adapter.clone(),
+                auth.clone(),
+            ))
+            .add_service(SchemaServiceServer::with_interceptor(adapter, auth))
             .serve_with_shutdown(grpc_addr, sd)
             .await
             .map_err(|e| format!("pubsub gRPC serve error: {e}"))

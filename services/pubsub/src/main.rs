@@ -18,7 +18,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use devcloud_pubsub::grpc::PubSubGrpc;
+use devcloud_pubsub::grpc::{AuthInterceptor, PubSubGrpc};
 use devcloud_pubsub::proto::pubsub::{
     publisher_server::PublisherServer, schema_service_server::SchemaServiceServer,
     subscriber_server::SubscriberServer,
@@ -104,11 +104,18 @@ fn main() {
                 }
             };
             let adapter = PubSubGrpc::new(shared.clone());
+            let auth = AuthInterceptor::new(shared.clone());
             Some(tokio::spawn(async move {
                 tonic::transport::Server::builder()
-                    .add_service(PublisherServer::new(adapter.clone()))
-                    .add_service(SubscriberServer::new(adapter.clone()))
-                    .add_service(SchemaServiceServer::new(adapter))
+                    .add_service(PublisherServer::with_interceptor(
+                        adapter.clone(),
+                        auth.clone(),
+                    ))
+                    .add_service(SubscriberServer::with_interceptor(
+                        adapter.clone(),
+                        auth.clone(),
+                    ))
+                    .add_service(SchemaServiceServer::with_interceptor(adapter, auth))
                     .serve_with_shutdown(addr, wait_for_signal())
                     .await
                     .map_err(|e| format!("gRPC serve error: {e}"))

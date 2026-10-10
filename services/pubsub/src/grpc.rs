@@ -43,6 +43,46 @@ impl PubSubGrpc {
     }
 }
 
+/// Applies the REST bearer-token check (`Server::authorized`) to every gRPC
+/// call. Relaxed modes let every call through; strict modes require
+/// `authorization: Bearer <token>` metadata and answer `UNAUTHENTICATED`
+/// otherwise.
+#[derive(Clone)]
+pub struct AuthInterceptor {
+    server: SharedServer,
+}
+
+impl AuthInterceptor {
+    pub fn new(server: SharedServer) -> Self {
+        AuthInterceptor { server }
+    }
+}
+
+impl tonic::service::Interceptor for AuthInterceptor {
+    fn call(&mut self, request: Request<()>) -> Result<Request<()>, Status> {
+        let token = request
+            .metadata()
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().split_once(' '))
+            .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer"))
+            .map(|(_, token)| token.trim().to_string())
+            .unwrap_or_default();
+        let authorized = self
+            .server
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .authorized(&token);
+        if authorized {
+            Ok(request)
+        } else {
+            Err(Status::unauthenticated(
+                "invalid authentication credentials",
+            ))
+        }
+    }
+}
+
 // --- error mapping ---------------------------------------------------------
 
 fn to_status(err: ApiError) -> Status {
@@ -483,7 +523,10 @@ impl pb::publisher_server::Publisher for PubSubGrpc {
         request: Request<pb::Topic>,
     ) -> Result<Response<pb::Topic>, Status> {
         let topic = topic_from_proto(&request.into_inner());
-        let mut server = self.server.lock().unwrap();
+        let mut server = self
+            .server
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let created = server.grpc_create_topic(&topic).map_err(to_status)?;
         Ok(Response::new(topic_to_proto(&created)))
     }
@@ -498,7 +541,10 @@ impl pb::publisher_server::Publisher for PubSubGrpc {
         };
         let paths = req.update_mask.map(|m| m.paths).unwrap_or_default();
         let model = topic_from_proto(&topic);
-        let mut server = self.server.lock().unwrap();
+        let mut server = self
+            .server
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let updated = server
             .grpc_update_topic(&model, &paths)
             .map_err(to_status)?;
@@ -510,7 +556,10 @@ impl pb::publisher_server::Publisher for PubSubGrpc {
         request: Request<pb::GetTopicRequest>,
     ) -> Result<Response<pb::Topic>, Status> {
         let topic = request.into_inner().topic;
-        let server = self.server.lock().unwrap();
+        let server = self
+            .server
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let found = server.grpc_get_topic(&topic).map_err(to_status)?;
         Ok(Response::new(topic_to_proto(&found)))
     }
@@ -521,7 +570,10 @@ impl pb::publisher_server::Publisher for PubSubGrpc {
     ) -> Result<Response<pb::ListTopicsResponse>, Status> {
         let req = request.into_inner();
         let project = grpc_project_id(&req.project)?;
-        let server = self.server.lock().unwrap();
+        let server = self
+            .server
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (topics, next) = server
             .grpc_list_topics(&project, req.page_size, &req.page_token)
             .map_err(to_status)?;
@@ -536,7 +588,10 @@ impl pb::publisher_server::Publisher for PubSubGrpc {
         request: Request<pb::ListTopicSubscriptionsRequest>,
     ) -> Result<Response<pb::ListTopicSubscriptionsResponse>, Status> {
         let req = request.into_inner();
-        let server = self.server.lock().unwrap();
+        let server = self
+            .server
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (subs, next) = server
             .grpc_list_topic_subscriptions(&req.topic, req.page_size, &req.page_token)
             .map_err(to_status)?;
@@ -551,7 +606,10 @@ impl pb::publisher_server::Publisher for PubSubGrpc {
         request: Request<pb::ListTopicSnapshotsRequest>,
     ) -> Result<Response<pb::ListTopicSnapshotsResponse>, Status> {
         let req = request.into_inner();
-        let server = self.server.lock().unwrap();
+        let server = self
+            .server
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (snaps, next) = server
             .grpc_list_topic_snapshots(&req.topic, req.page_size, &req.page_token)
             .map_err(to_status)?;
@@ -575,7 +633,10 @@ impl pb::publisher_server::Publisher for PubSubGrpc {
             let data = base64_std(&m.data);
             messages.push((data, copy_map(&m.attributes), m.ordering_key.clone()));
         }
-        let mut server = self.server.lock().unwrap();
+        let mut server = self
+            .server
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let ids = server
             .grpc_publish(&req.topic, &messages)
             .map_err(to_status)?;
@@ -587,7 +648,10 @@ impl pb::publisher_server::Publisher for PubSubGrpc {
         request: Request<pb::DeleteTopicRequest>,
     ) -> Result<Response<()>, Status> {
         let topic = request.into_inner().topic;
-        let mut server = self.server.lock().unwrap();
+        let mut server = self
+            .server
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         server.grpc_delete_topic(&topic).map_err(to_status)?;
         Ok(Response::new(()))
     }
@@ -597,7 +661,10 @@ impl pb::publisher_server::Publisher for PubSubGrpc {
         request: Request<pb::DetachSubscriptionRequest>,
     ) -> Result<Response<pb::DetachSubscriptionResponse>, Status> {
         let subscription = request.into_inner().subscription;
-        let mut server = self.server.lock().unwrap();
+        let mut server = self
+            .server
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         server
             .grpc_detach_subscription(&subscription)
             .map_err(to_status)?;
@@ -614,7 +681,10 @@ impl pb::subscriber_server::Subscriber for PubSubGrpc {
         request: Request<pb::Subscription>,
     ) -> Result<Response<pb::Subscription>, Status> {
         let model = sub_from_proto(&request.into_inner());
-        let mut server = self.server.lock().unwrap();
+        let mut server = self
+            .server
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let created = server.grpc_create_subscription(model).map_err(to_status)?;
         Ok(Response::new(sub_to_proto(&created)))
     }
@@ -624,7 +694,10 @@ impl pb::subscriber_server::Subscriber for PubSubGrpc {
         request: Request<pb::GetSubscriptionRequest>,
     ) -> Result<Response<pb::Subscription>, Status> {
         let subscription = request.into_inner().subscription;
-        let server = self.server.lock().unwrap();
+        let server = self
+            .server
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let found = server
             .grpc_get_subscription(&subscription)
             .map_err(to_status)?;
@@ -641,7 +714,10 @@ impl pb::subscriber_server::Subscriber for PubSubGrpc {
         };
         let paths = req.update_mask.map(|m| m.paths).unwrap_or_default();
         let model = sub_from_proto(&sub);
-        let mut server = self.server.lock().unwrap();
+        let mut server = self
+            .server
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let updated = server
             .grpc_update_subscription(&model, &paths)
             .map_err(to_status)?;
@@ -654,7 +730,10 @@ impl pb::subscriber_server::Subscriber for PubSubGrpc {
     ) -> Result<Response<pb::ListSubscriptionsResponse>, Status> {
         let req = request.into_inner();
         let project = grpc_project_id(&req.project)?;
-        let server = self.server.lock().unwrap();
+        let server = self
+            .server
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (subs, next) = server
             .grpc_list_subscriptions(&project, req.page_size, &req.page_token)
             .map_err(to_status)?;
@@ -669,7 +748,10 @@ impl pb::subscriber_server::Subscriber for PubSubGrpc {
         request: Request<pb::DeleteSubscriptionRequest>,
     ) -> Result<Response<()>, Status> {
         let subscription = request.into_inner().subscription;
-        let mut server = self.server.lock().unwrap();
+        let mut server = self
+            .server
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         server
             .grpc_delete_subscription(&subscription)
             .map_err(to_status)?;
@@ -681,7 +763,10 @@ impl pb::subscriber_server::Subscriber for PubSubGrpc {
         request: Request<pb::ModifyAckDeadlineRequest>,
     ) -> Result<Response<()>, Status> {
         let req = request.into_inner();
-        let mut server = self.server.lock().unwrap();
+        let mut server = self
+            .server
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         server
             .grpc_modify_ack_deadline(&req.subscription, &req.ack_ids, req.ack_deadline_seconds)
             .map_err(to_status)?;
@@ -693,7 +778,10 @@ impl pb::subscriber_server::Subscriber for PubSubGrpc {
         request: Request<pb::AcknowledgeRequest>,
     ) -> Result<Response<()>, Status> {
         let req = request.into_inner();
-        let mut server = self.server.lock().unwrap();
+        let mut server = self
+            .server
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         server
             .grpc_acknowledge(&req.subscription, &req.ack_ids)
             .map_err(to_status)?;
@@ -713,7 +801,10 @@ impl pb::subscriber_server::Subscriber for PubSubGrpc {
         if !req.return_immediately {
             self.wait_for_pull(&req.subscription).await;
         }
-        let mut server = self.server.lock().unwrap();
+        let mut server = self
+            .server
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let received = server
             .grpc_pull(&req.subscription, req.max_messages)
             .map_err(to_status)?;
@@ -744,7 +835,10 @@ impl pb::subscriber_server::Subscriber for PubSubGrpc {
     ) -> Result<Response<Self::StreamingPullStream>, Status> {
         // Mirrors streaming_pull_grpc.rs:StreamingPull.
         {
-            let server = self.server.lock().unwrap();
+            let server = self
+                .server
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if server.streaming_pull_disabled() {
                 return Err(Status::unimplemented("streaming pull is disabled"));
             }
@@ -769,7 +863,10 @@ impl pb::subscriber_server::Subscriber for PubSubGrpc {
 
         // Per-stream ack deadline + subscription validation (locked).
         let mut stream_ack_deadline = {
-            let server = self.server.lock().unwrap();
+            let server = self
+                .server
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let deadline = server
                 .grpc_stream_ack_deadline(initial.stream_ack_deadline_seconds)
                 .map_err(to_status)?;
@@ -784,7 +881,10 @@ impl pb::subscriber_server::Subscriber for PubSubGrpc {
         // Apply the initial request (acks/modacks carried on it), locked.
         {
             let mut outstanding: BTreeMap<String, i64> = BTreeMap::new();
-            let mut server = self.server.lock().unwrap();
+            let mut server = self
+                .server
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             apply_streaming_pull_request(
                 &mut server,
                 &subscription,
@@ -820,7 +920,7 @@ impl pb::subscriber_server::Subscriber for PubSubGrpc {
                     msg = incoming.message() => {
                         match msg {
                             Ok(Some(request)) => {
-                                let mut s = server.lock().unwrap();
+                                let mut s = server.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                                 match apply_streaming_pull_request(
                                     &mut s,
                                     &subscription,
@@ -838,7 +938,7 @@ impl pb::subscriber_server::Subscriber for PubSubGrpc {
                         }
                     }
                     _ = ticker.tick() => {
-                        let mut s = server.lock().unwrap();
+                        let mut s = server.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                         s.grpc_prune_outstanding(&subscription, &mut outstanding);
                         if !streaming_has_capacity(&outstanding, max_outstanding_messages, max_outstanding_bytes) {
                             None
@@ -896,7 +996,9 @@ impl pb::subscriber_server::Subscriber for PubSubGrpc {
             }
             // Teardown: release any still-outstanding unacked deliveries.
             {
-                let mut s = server.lock().unwrap();
+                let mut s = server
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 s.grpc_release_outstanding(&subscription, &outstanding);
             }
         });
@@ -912,7 +1014,10 @@ impl pb::subscriber_server::Subscriber for PubSubGrpc {
     ) -> Result<Response<()>, Status> {
         let req = request.into_inner();
         let push = push_config_from_proto(req.push_config.as_ref());
-        let mut server = self.server.lock().unwrap();
+        let mut server = self
+            .server
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         server
             .grpc_modify_push_config(&req.subscription, push.as_ref())
             .map_err(to_status)?;
@@ -924,7 +1029,10 @@ impl pb::subscriber_server::Subscriber for PubSubGrpc {
         request: Request<pb::GetSnapshotRequest>,
     ) -> Result<Response<pb::Snapshot>, Status> {
         let snapshot = request.into_inner().snapshot;
-        let server = self.server.lock().unwrap();
+        let server = self
+            .server
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let found = server.grpc_get_snapshot(&snapshot).map_err(to_status)?;
         Ok(Response::new(snapshot_to_proto(&found)))
     }
@@ -935,7 +1043,10 @@ impl pb::subscriber_server::Subscriber for PubSubGrpc {
     ) -> Result<Response<pb::ListSnapshotsResponse>, Status> {
         let req = request.into_inner();
         let project = grpc_project_id(&req.project)?;
-        let server = self.server.lock().unwrap();
+        let server = self
+            .server
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (snaps, next) = server
             .grpc_list_snapshots(&project, req.page_size, &req.page_token)
             .map_err(to_status)?;
@@ -951,7 +1062,10 @@ impl pb::subscriber_server::Subscriber for PubSubGrpc {
     ) -> Result<Response<pb::Snapshot>, Status> {
         let req = request.into_inner();
         let labels = copy_map(&req.labels);
-        let mut server = self.server.lock().unwrap();
+        let mut server = self
+            .server
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let created = server
             .grpc_create_snapshot(&req.name, &req.subscription, &labels)
             .map_err(to_status)?;
@@ -979,7 +1093,10 @@ impl pb::subscriber_server::Subscriber for PubSubGrpc {
             labels: copy_map(&snapshot.labels),
             deliveries: Vec::new(),
         };
-        let mut server = self.server.lock().unwrap();
+        let mut server = self
+            .server
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let updated = server
             .grpc_update_snapshot(&model, &paths)
             .map_err(to_status)?;
@@ -991,7 +1108,10 @@ impl pb::subscriber_server::Subscriber for PubSubGrpc {
         request: Request<pb::DeleteSnapshotRequest>,
     ) -> Result<Response<()>, Status> {
         let snapshot = request.into_inner().snapshot;
-        let mut server = self.server.lock().unwrap();
+        let mut server = self
+            .server
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         server.grpc_delete_snapshot(&snapshot).map_err(to_status)?;
         Ok(Response::new(()))
     }
@@ -1018,7 +1138,10 @@ impl pb::subscriber_server::Subscriber for PubSubGrpc {
             }
             pb::seek_request::Target::Snapshot(name) => (Some(name), None),
         };
-        let mut server = self.server.lock().unwrap();
+        let mut server = self
+            .server
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         server
             .grpc_seek(&req.subscription, snapshot.as_deref(), time_secs)
             .map_err(to_status)?;
@@ -1034,7 +1157,10 @@ impl PubSubGrpc {
         let deadline = tokio::time::Instant::now() + StdDuration::from_secs(1);
         loop {
             {
-                let mut server = self.server.lock().unwrap();
+                let mut server = self
+                    .server
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 if server.grpc_pull_may_return(subscription) {
                     return;
                 }
@@ -1064,7 +1190,10 @@ impl pb::schema_service_server::SchemaService for PubSubGrpc {
             return Err(Status::invalid_argument("schema is required"));
         };
         let model = schema_from_proto(&schema);
-        let mut server = self.server.lock().unwrap();
+        let mut server = self
+            .server
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let created = server
             .grpc_create_schema(&project, &req.schema_id, &model)
             .map_err(to_status)?;
@@ -1077,7 +1206,10 @@ impl pb::schema_service_server::SchemaService for PubSubGrpc {
     ) -> Result<Response<pb::Schema>, Status> {
         let req = request.into_inner();
         let view = schema_view_string(req.view);
-        let server = self.server.lock().unwrap();
+        let server = self
+            .server
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let found = server
             .grpc_get_schema(&req.name, &view)
             .map_err(to_status)?;
@@ -1091,7 +1223,10 @@ impl pb::schema_service_server::SchemaService for PubSubGrpc {
         let req = request.into_inner();
         let project = grpc_project_id(&req.parent)?;
         let view = schema_view_string(req.view);
-        let server = self.server.lock().unwrap();
+        let server = self
+            .server
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (schemas, next) = server
             .grpc_list_schemas(&project, &view, req.page_size, &req.page_token)
             .map_err(to_status)?;
@@ -1107,7 +1242,10 @@ impl pb::schema_service_server::SchemaService for PubSubGrpc {
     ) -> Result<Response<pb::ListSchemaRevisionsResponse>, Status> {
         let req = request.into_inner();
         let view = schema_view_string(req.view);
-        let server = self.server.lock().unwrap();
+        let server = self
+            .server
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (schemas, next) = server
             .grpc_list_schema_revisions(&req.name, &view, req.page_size, &req.page_token)
             .map_err(to_status)?;
@@ -1126,7 +1264,10 @@ impl pb::schema_service_server::SchemaService for PubSubGrpc {
             return Err(Status::invalid_argument("schema is required"));
         };
         let model = schema_from_proto(&schema);
-        let mut server = self.server.lock().unwrap();
+        let mut server = self
+            .server
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let committed = server
             .grpc_commit_schema(&req.name, &model)
             .map_err(to_status)?;
@@ -1138,7 +1279,10 @@ impl pb::schema_service_server::SchemaService for PubSubGrpc {
         request: Request<pb::RollbackSchemaRequest>,
     ) -> Result<Response<pb::Schema>, Status> {
         let req = request.into_inner();
-        let mut server = self.server.lock().unwrap();
+        let mut server = self
+            .server
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let rolled = server
             .grpc_rollback_schema(&req.name, &req.revision_id)
             .map_err(to_status)?;
@@ -1162,7 +1306,10 @@ impl pb::schema_service_server::SchemaService for PubSubGrpc {
         if !crate::paths::valid_full_schema_name(&name) || revision_id.is_empty() {
             return Err(Status::invalid_argument("invalid schema revision name"));
         }
-        let mut server = self.server.lock().unwrap();
+        let mut server = self
+            .server
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let updated = server
             .grpc_delete_schema_revision(&name, &revision_id)
             .map_err(to_status)?;
@@ -1174,7 +1321,10 @@ impl pb::schema_service_server::SchemaService for PubSubGrpc {
         request: Request<pb::DeleteSchemaRequest>,
     ) -> Result<Response<()>, Status> {
         let name = request.into_inner().name;
-        let mut server = self.server.lock().unwrap();
+        let mut server = self
+            .server
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         server.grpc_delete_schema(&name).map_err(to_status)?;
         Ok(Response::new(()))
     }
@@ -1191,7 +1341,10 @@ impl pb::schema_service_server::SchemaService for PubSubGrpc {
             return Err(Status::invalid_argument("schema is required"));
         };
         let model = schema_from_proto(&schema);
-        let server = self.server.lock().unwrap();
+        let server = self
+            .server
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         server.grpc_validate_schema(&model).map_err(to_status)?;
         Ok(Response::new(pb::ValidateSchemaResponse {}))
     }
@@ -1210,7 +1363,10 @@ impl pb::schema_service_server::SchemaService for PubSubGrpc {
             None => (String::new(), None),
         };
         let encoding = encoding_string(req.encoding);
-        let server = self.server.lock().unwrap();
+        let server = self
+            .server
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         server
             .grpc_validate_message(&project, &name, inline.as_ref(), &req.message, &encoding)
             .map_err(to_status)?;

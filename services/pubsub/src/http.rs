@@ -482,7 +482,9 @@ async fn handle_conn(
             .await;
     }
     let response = {
-        let mut guard = server.lock().unwrap();
+        let mut guard = server
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         route(&mut guard, &request)
     };
     write_response(&mut stream, response).await
