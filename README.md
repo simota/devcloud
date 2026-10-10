@@ -289,7 +289,7 @@ Legend:
 
 | Feature | Status | Notes |
 | --- | --- | --- |
-| SMTP receive | Yes | Supports local inbound SMTP for development. A line may be up to 1 MiB and a message may have up to 1000 recipients. Once a client has sent CRLF, only `<CRLF>.<CRLF>` ends DATA (a bare-LF `.` cannot smuggle a second message in); clients that only send bare LF may end with `.<LF>`. |
+| SMTP receive | Yes | Supports local inbound SMTP for development. A line may be up to 1 MiB, a message may have up to 1000 recipients, and each line must arrive within 5 minutes. Once a client has sent CRLF, only `<CRLF>.<CRLF>` ends DATA (a bare-LF `.` cannot smuggle a second message in); clients that only send bare LF may end with `.<LF>`. |
 | `HELO` / `EHLO`, `MAIL FROM`, `RCPT TO`, `DATA`, `RSET`, `NOOP`, `QUIT` | Yes | Core SMTP smoke path. |
 | Message parsing | Yes | Parses headers, text body, HTML body, and attachments. |
 | Raw RFC 5322 source | Yes | Available through the dashboard API. |
