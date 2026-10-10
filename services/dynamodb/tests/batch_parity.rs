@@ -305,6 +305,67 @@ fn transact_write_condition_failure_is_cancelled() {
 }
 
 #[test]
+fn batch_write_rejects_too_many_requests_and_duplicate_keys() {
+    let dir = tempdir();
+    let mut s = seeded(&dir);
+    let put = |k: String| WriteRequest {
+        put_request: Some(PutRequest {
+            item: item(&[("pk", json!({ "S": k }))]),
+        }),
+        ..Default::default()
+    };
+    let mut too_many = BTreeMap::new();
+    too_many.insert(
+        "T".to_string(),
+        (0..26).map(|n| put(format!("n{n}"))).collect::<Vec<_>>(),
+    );
+    let err = s
+        .batch_write_item(&BatchWriteItemRequest {
+            request_items: too_many,
+            ..Default::default()
+        })
+        .expect_err("26 requests");
+    assert_eq!(err.name, "ValidationException");
+
+    let mut duplicates = BTreeMap::new();
+    duplicates.insert(
+        "T".to_string(),
+        vec![
+            put("a".to_string()),
+            WriteRequest {
+                delete_request: Some(DeleteRequest {
+                    key: item(&[("pk", json!({"S": "a"}))]),
+                }),
+                ..Default::default()
+            },
+        ],
+    );
+    let err = s
+        .batch_write_item(&BatchWriteItemRequest {
+            request_items: duplicates,
+            ..Default::default()
+        })
+        .expect_err("duplicate keys");
+    assert_eq!(err.name, "ValidationException");
+    assert_eq!(
+        err.message,
+        "Provided list of item keys contains duplicates"
+    );
+
+    // 25 distinct requests are fine.
+    let mut max = BTreeMap::new();
+    max.insert(
+        "T".to_string(),
+        (0..25).map(|n| put(format!("n{n}"))).collect::<Vec<_>>(),
+    );
+    s.batch_write_item(&BatchWriteItemRequest {
+        request_items: max,
+        ..Default::default()
+    })
+    .expect("25 requests");
+}
+
+#[test]
 fn transact_write_unevaluable_condition_is_a_validation_error() {
     let dir = tempdir();
     let mut s = seeded(&dir);

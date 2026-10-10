@@ -62,6 +62,9 @@ const DEFAULT_REGION: &str = "us-east-1";
 const ACCOUNT_ID: &str = "000000000000";
 /// The DynamoDB item size limit (400 KB).
 const MAX_ITEM_BYTES: i64 = 409_600;
+/// Stream records retained per table; older records are trimmed after each
+/// successful persist so `state.json` does not grow without bound.
+const MAX_STREAM_RECORDS: usize = 10_000;
 
 /// Configuration mirroring the table-management subset of legacy `Config`.
 #[derive(Clone, Debug, Default)]
@@ -142,6 +145,8 @@ pub struct Server {
     /// stream labels so success bodies are byte-reproducible.
     fixed_now_unix: Option<i64>,
     fixed_now_millis: Option<i64>,
+    /// Stream records retained per table (see [`MAX_STREAM_RECORDS`]).
+    max_stream_records: usize,
 }
 
 impl Server {
@@ -158,6 +163,7 @@ impl Server {
             dirty_tables: std::collections::BTreeSet::new(),
             fixed_now_unix: None,
             fixed_now_millis: None,
+            max_stream_records: MAX_STREAM_RECORDS,
         };
         if !server.config.storage_path.is_empty() {
             if let Err(err) = server.load() {
@@ -177,6 +183,11 @@ impl Server {
     /// with a non-zero millisecond fraction).
     pub fn set_fixed_now_millis(&mut self, unix_millis: i64) {
         self.fixed_now_millis = Some(unix_millis);
+    }
+
+    /// Overrides how many stream records each table retains (test hook).
+    pub fn set_max_stream_records(&mut self, max: usize) {
+        self.max_stream_records = max.max(1);
     }
 
     pub fn load_err(&self) -> Option<&str> {
@@ -223,7 +234,7 @@ impl Server {
         if let Some(record) = crate::streams::build_stream_record(
             &state.description,
             &region,
-            state.stream_records.len(),
+            stream_end_position(&state.stream_records) as usize,
             event_name,
             old_item,
             new_item,
@@ -278,6 +289,7 @@ impl Server {
     /// rather than reusing anything derived from the failed attempt.
     fn persist(&mut self) -> Result<(), ApiError> {
         if self.config.storage_path.is_empty() {
+            self.trim_stream_records();
             return Ok(());
         }
         let dir = std::path::Path::new(&self.config.storage_path);
@@ -337,7 +349,23 @@ impl Server {
         self.dirty_tables.clear();
         self.table_cache
             .retain(|name, _| self.tables.contains_key(name));
+        self.trim_stream_records();
         Ok(())
+    }
+
+    /// Drops the oldest stream records beyond the retention cap. Runs only
+    /// after a successful persist, so callers' rollback (which truncates back
+    /// to a pre-write length) never sees a trimmed vector; a trimmed table is
+    /// marked dirty and written trimmed by the next persist.
+    fn trim_stream_records(&mut self) {
+        let max = self.max_stream_records;
+        for (name, state) in self.tables.iter_mut() {
+            let excess = state.stream_records.len().saturating_sub(max);
+            if excess > 0 {
+                state.stream_records.drain(..excess);
+                self.dirty_tables.insert(name.clone());
+            }
+        }
     }
 
     fn table_arn(&self, table_name: &str) -> String {
@@ -1130,8 +1158,16 @@ impl Server {
                 "return consumed capacity must be NONE, TOTAL, or INDEXES",
             ));
         }
+        let request_count: usize = request.request_items.values().map(Vec::len).sum();
+        if request_count > 25 {
+            return Err(ApiError::validation(
+                "Too many items requested for the BatchWriteItem call",
+            ));
+        }
         // Validate everything first, planning (table, key, put-or-delete) writes.
         let mut plan: Vec<PlannedWrite> = Vec::new();
+        let mut seen_keys: std::collections::HashSet<(String, String)> =
+            std::collections::HashSet::new();
         let mut consumed: Vec<Value> = Vec::new();
         for (table_name, writes) in &request.request_items {
             let state = self
@@ -1155,6 +1191,9 @@ impl Server {
                         .map_err(ApiError::validation)?;
                     let key =
                         item_key(&state.description, &put.item).map_err(ApiError::validation)?;
+                    if !seen_keys.insert((table_name.clone(), key.clone())) {
+                        return Err(duplicate_batch_keys());
+                    }
                     plan.push(PlannedWrite {
                         table: table_name.clone(),
                         key,
@@ -1164,6 +1203,9 @@ impl Server {
                 if let Some(del) = &write.delete_request {
                     let key =
                         item_key(&state.description, &del.key).map_err(ApiError::validation)?;
+                    if !seen_keys.insert((table_name.clone(), key.clone())) {
+                        return Err(duplicate_batch_keys());
+                    }
                     plan.push(PlannedWrite {
                         table: table_name.clone(),
                         key,
@@ -1294,17 +1336,25 @@ impl Server {
                 ));
             }
         }
+        let mut stream_lens: BTreeMap<String, usize> = BTreeMap::new();
         for write in plan {
             let state = self.tables.get_mut(&write.table).unwrap();
-            match &write.put {
-                Some(item) => {
-                    state.items.insert(write.key.clone(), item.clone());
-                }
-                None => {
-                    state.items.remove(&write.key);
-                }
-            }
+            stream_lens
+                .entry(write.table.clone())
+                .or_insert(state.stream_records.len());
+            let old_item = match &write.put {
+                Some(item) => state.items.insert(write.key.clone(), item.clone()),
+                None => state.items.remove(&write.key),
+            };
             touched.insert(write.table.clone());
+            let event_name =
+                crate::streams::stream_event_name(old_item.is_some(), write.put.is_none());
+            self.append_stream_record(
+                &write.table,
+                event_name,
+                old_item.as_ref(),
+                write.put.as_ref(),
+            );
         }
         for table in &touched {
             let state = self.tables.get_mut(table).unwrap();
@@ -1315,6 +1365,11 @@ impl Server {
             self.dirty_tables.insert(table.clone());
         }
         if let Err(err) = self.persist() {
+            for (table, len) in &stream_lens {
+                if let Some(state) = self.tables.get_mut(table) {
+                    state.stream_records.truncate(*len);
+                }
+            }
             for (table, key, prev) in backups.into_iter().rev() {
                 if let Some(state) = self.tables.get_mut(&table) {
                     match prev {
@@ -1765,12 +1820,15 @@ impl Server {
         if !self.stream_shard_exists(&request.stream_arn, &request.shard_id) {
             return Err(ApiError::not_found("stream shard not found"));
         }
-        let mut position = 0i64;
+        // Positions are absolute (records ever appended), so iterators stay
+        // valid when old records are trimmed.
+        let records = self
+            .table_for_stream(&request.stream_arn)
+            .map(|s| s.stream_records.as_slice())
+            .unwrap_or_default();
+        let mut position = stream_base_position(records);
         if request.shard_iterator_type == "LATEST" {
-            position = self
-                .table_for_stream(&request.stream_arn)
-                .map(|s| s.stream_records.len() as i64)
-                .unwrap_or(0);
+            position = stream_end_position(records);
         }
         if needs_seq {
             match self.stream_position_for_sequence(
@@ -1816,7 +1874,15 @@ impl Server {
         if !self.stream_shard_exists(&iterator.stream_arn, &iterator.shard_id) {
             return Err(ApiError::not_found("stream shard not found"));
         }
-        let records = self.stream_records(&iterator.stream_arn, iterator.position, request.limit);
+        let records = self
+            .stream_records(&iterator.stream_arn, iterator.position, request.limit)
+            .ok_or_else(|| {
+                ApiError::new(
+                    400,
+                    "TrimmedDataAccessException",
+                    "shard iterator points at trimmed stream records",
+                )
+            })?;
         let next = encode_iterator(&StreamIterator {
             stream_arn: iterator.stream_arn.clone(),
             shard_id: iterator.shard_id.clone(),
@@ -1841,27 +1907,34 @@ impl Server {
         self.table_for_stream(stream_arn).is_some() && shard_id == "shardId-000000000000"
     }
 
+    /// Records from absolute `position`, or `None` when that position has
+    /// already been trimmed.
     fn stream_records(
         &self,
         stream_arn: &str,
         position: i64,
         limit: i64,
-    ) -> Vec<crate::model::StreamRecord> {
+    ) -> Option<Vec<crate::model::StreamRecord>> {
         let Some(state) = self.table_for_stream(stream_arn) else {
-            return Vec::new();
+            return Some(Vec::new());
         };
+        let base = stream_base_position(&state.stream_records);
+        if position < base {
+            return None;
+        }
+        let position = position - base;
         let len = state.stream_records.len() as i64;
         if position >= len {
-            return Vec::new();
+            return Some(Vec::new());
         }
-        let start = position.max(0) as usize;
+        let start = position as usize;
         let effective_limit = if limit <= 0 || limit > 1000 {
             1000
         } else {
             limit
         };
         let end = ((start as i64 + effective_limit).min(len)) as usize;
-        state.stream_records[start..end].to_vec()
+        Some(state.stream_records[start..end].to_vec())
     }
 
     fn stream_position_for_sequence(
@@ -1871,9 +1944,11 @@ impl Server {
         after: bool,
     ) -> Option<i64> {
         let state = self.table_for_stream(stream_arn)?;
+        let base = stream_base_position(&state.stream_records);
         for (i, record) in state.stream_records.iter().enumerate() {
             if record.dynamodb.sequence_number == sequence_number {
-                return Some(if after { i as i64 + 1 } else { i as i64 });
+                let position = base + i as i64;
+                return Some(if after { position + 1 } else { position });
             }
         }
         None
@@ -1961,20 +2036,34 @@ impl Server {
         }
         // Back up for rollback.
         let mut backups: Vec<(String, String, Item)> = Vec::new();
+        let mut stream_lens: Vec<(String, usize)> = Vec::new();
         for (table, keys) in &changed_tables {
             let state = self.tables.get_mut(table).unwrap();
+            stream_lens.push((table.clone(), state.stream_records.len()));
+            let mut removed: Vec<Item> = Vec::new();
             for key in keys {
                 if let Some(item) = state.items.remove(key) {
-                    backups.push((table.clone(), key.clone(), item));
+                    backups.push((table.clone(), key.clone(), item.clone()));
+                    removed.push(item);
                 }
             }
             state.description.item_count = state.items.len() as i64;
             update_index_item_counts(state);
+            // TTL deletions surface on the stream as REMOVE records (the
+            // model carries no userIdentity, so they are plain REMOVEs).
+            for item in &removed {
+                self.append_stream_record(table, "REMOVE", Some(item), None);
+            }
         }
         for (table, _) in &changed_tables {
             self.dirty_tables.insert(table.clone());
         }
         if let Err(err) = self.persist() {
+            for (table, len) in &stream_lens {
+                if let Some(state) = self.tables.get_mut(table) {
+                    state.stream_records.truncate(*len);
+                }
+            }
             for (table, key, item) in backups {
                 if let Some(state) = self.tables.get_mut(&table) {
                     state.items.insert(key, item);
@@ -2915,6 +3004,10 @@ fn reject_key_attribute_updates(
     Ok(())
 }
 
+fn duplicate_batch_keys() -> ApiError {
+    ApiError::validation("Provided list of item keys contains duplicates")
+}
+
 /// Maps a ConditionExpression outcome to the wire error: a false condition is
 /// a ConditionalCheckFailedException, an unevaluable one a ValidationException.
 fn condition_error(err: ConditionError, return_values: &str, old_item: Option<&Item>) -> ApiError {
@@ -2933,6 +3026,22 @@ fn transact_condition_error(err: ConditionError) -> ApiError {
         ConditionError::Failed => transaction_cancelled(),
         ConditionError::Invalid(message) => ApiError::validation(message),
     }
+}
+
+/// The absolute position of the first retained stream record: records are
+/// numbered from 1 by sequence number, so this is the number of records
+/// appended (and since trimmed) before it.
+fn stream_base_position(records: &[crate::model::StreamRecord]) -> i64 {
+    records
+        .first()
+        .and_then(|record| record.dynamodb.sequence_number.parse::<i64>().ok())
+        .map_or(0, |sequence| sequence - 1)
+}
+
+/// The absolute position just past the last retained stream record (the
+/// number of records ever appended).
+fn stream_end_position(records: &[crate::model::StreamRecord]) -> i64 {
+    stream_base_position(records) + records.len() as i64
 }
 
 /// Re-derives every item's map key from its key attributes, so state written

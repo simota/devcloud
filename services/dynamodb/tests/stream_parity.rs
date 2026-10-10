@@ -6,8 +6,11 @@ use std::collections::BTreeMap;
 
 use devcloud_dynamodb::model::{AttributeDefinition, Item, KeySchemaElement, StreamSpecification};
 use devcloud_dynamodb::requests::{
-    CreateTableRequest, DeleteItemRequest, DescribeStreamRequest, GetRecordsRequest,
-    GetShardIteratorRequest, ListStreamsRequest, PutItemRequest, UpdateItemRequest,
+    BatchWriteItemRequest, CreateTableRequest, DeleteItemRequest, DeleteRequest,
+    DescribeStreamRequest, GetRecordsRequest, GetShardIteratorRequest, ListStreamsRequest,
+    PutItemRequest, PutRequest, TimeToLiveSpecification, TransactDelete, TransactUpdate,
+    TransactWriteItem, TransactWriteItemsRequest, UpdateItemRequest, UpdateTimeToLiveRequest,
+    WriteRequest,
 };
 use devcloud_dynamodb::server::{Config, Server};
 use serde_json::{json, Value};
@@ -272,6 +275,192 @@ fn at_sequence_number_iterator() {
     // From position 1: records 2 and 3.
     assert_eq!(recs["Records"].as_array().unwrap().len(), 2);
     assert_eq!(recs["Records"][0]["dynamodb"]["SequenceNumber"], "2");
+}
+
+fn shard_iterator(s: &Server, kind: &str) -> String {
+    let body = s
+        .get_shard_iterator(&GetShardIteratorRequest {
+            stream_arn: ARN.to_string(),
+            shard_id: "shardId-000000000000".to_string(),
+            shard_iterator_type: kind.to_string(),
+            ..Default::default()
+        })
+        .expect("shard iterator");
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    body["ShardIterator"].as_str().unwrap().to_string()
+}
+
+fn records_from(s: &Server, iterator: &str) -> Vec<Value> {
+    let body = s
+        .get_records(&GetRecordsRequest {
+            shard_iterator: iterator.to_string(),
+            ..Default::default()
+        })
+        .expect("records");
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    body["Records"].as_array().unwrap().clone()
+}
+
+fn event_names(records: &[Value]) -> Vec<String> {
+    records
+        .iter()
+        .map(|r| r["eventName"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[test]
+fn batch_and_transact_writes_emit_stream_records() {
+    let dir = tempdir();
+    let mut s = seeded(&dir);
+    let latest = shard_iterator(&s, "LATEST");
+    let mut request_items = BTreeMap::new();
+    request_items.insert(
+        "T".to_string(),
+        vec![
+            WriteRequest {
+                put_request: Some(PutRequest {
+                    item: item(&[("pk", json!({"S": "b"})), ("v", json!({"N": "1"}))]),
+                }),
+                ..Default::default()
+            },
+            WriteRequest {
+                put_request: Some(PutRequest {
+                    item: item(&[("pk", json!({"S": "c"})), ("v", json!({"N": "1"}))]),
+                }),
+                ..Default::default()
+            },
+        ],
+    );
+    s.batch_write_item(&BatchWriteItemRequest {
+        request_items,
+        ..Default::default()
+    })
+    .expect("batch put");
+    let mut request_items = BTreeMap::new();
+    request_items.insert(
+        "T".to_string(),
+        vec![WriteRequest {
+            delete_request: Some(DeleteRequest {
+                key: item(&[("pk", json!({"S": "c"}))]),
+            }),
+            ..Default::default()
+        }],
+    );
+    s.batch_write_item(&BatchWriteItemRequest {
+        request_items,
+        ..Default::default()
+    })
+    .expect("batch delete");
+    s.transact_write_items(&TransactWriteItemsRequest {
+        transact_items: vec![
+            TransactWriteItem {
+                update: Some(TransactUpdate {
+                    table_name: "T".to_string(),
+                    key: item(&[("pk", json!({"S": "b"}))]),
+                    update_expression: "SET v = :v".to_string(),
+                    expression_attribute_values: {
+                        let mut m = BTreeMap::new();
+                        m.insert(":v".to_string(), json!({"N": "2"}));
+                        m
+                    },
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            TransactWriteItem {
+                delete: Some(TransactDelete {
+                    table_name: "T".to_string(),
+                    key: item(&[("pk", json!({"S": "missing"}))]),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        ],
+    })
+    .expect("transact");
+    let records = records_from(&s, &latest);
+    assert_eq!(
+        event_names(&records),
+        ["INSERT", "INSERT", "REMOVE", "MODIFY"]
+    );
+    assert_eq!(records[3]["dynamodb"]["OldImage"]["v"], json!({"N": "1"}));
+    assert_eq!(records[3]["dynamodb"]["NewImage"]["v"], json!({"N": "2"}));
+    // Sequence numbers keep counting after the seeded records 1..=3.
+    assert_eq!(records[0]["dynamodb"]["SequenceNumber"], "4");
+}
+
+#[test]
+fn ttl_expiry_emits_remove_records() {
+    let dir = tempdir();
+    let mut s = seeded(&dir);
+    s.update_time_to_live(&UpdateTimeToLiveRequest {
+        table_name: "T".to_string(),
+        time_to_live_specification: TimeToLiveSpecification {
+            attribute_name: "exp".to_string(),
+            enabled: true,
+        },
+    })
+    .expect("ttl");
+    s.put_item(&PutItemRequest {
+        table_name: "T".to_string(),
+        item: item(&[("pk", json!({"S": "old"})), ("exp", json!({"N": "1"}))]),
+        ..Default::default()
+    })
+    .expect("put");
+    let latest = shard_iterator(&s, "LATEST");
+    s.expire_ttl_items(ORACLE_SECS).expect("expire");
+    let records = records_from(&s, &latest);
+    assert_eq!(event_names(&records), ["REMOVE"]);
+    assert_eq!(records[0]["dynamodb"]["Keys"]["pk"], json!({"S": "old"}));
+    assert_eq!(records[0]["dynamodb"]["OldImage"]["exp"], json!({"N": "1"}));
+}
+
+#[test]
+fn stream_records_are_trimmed_and_iterators_survive() {
+    let dir = tempdir();
+    let mut s = seeded(&dir); // sequence numbers 1..=3
+    s.set_max_stream_records(3);
+    let horizon = shard_iterator(&s, "TRIM_HORIZON");
+    let latest = shard_iterator(&s, "LATEST");
+    for n in 0..2 {
+        s.put_item(&PutItemRequest {
+            table_name: "T".to_string(),
+            item: item(&[("pk", json!({"S": format!("k{n}")}))]),
+            ..Default::default()
+        })
+        .expect("put");
+    }
+    // Only the newest three records (3, 4, 5) are retained, on disk too.
+    let state = std::fs::read_to_string(dir.join("state.json")).expect("state");
+    let state: Value = serde_json::from_str(&state).unwrap();
+    let persisted = state["tables"]["T"]["streamRecords"].as_array().unwrap();
+    assert!(persisted.len() <= 4, "{}", persisted.len());
+    let records = records_from(&s, &shard_iterator(&s, "TRIM_HORIZON"));
+    let sequences: Vec<&str> = records
+        .iter()
+        .map(|r| r["dynamodb"]["SequenceNumber"].as_str().unwrap())
+        .collect();
+    assert_eq!(sequences, ["3", "4", "5"]);
+    // An iterator taken before the trim still resumes at the right record.
+    let resumed = records_from(&s, &latest);
+    assert_eq!(resumed[0]["dynamodb"]["SequenceNumber"], "4");
+    // One pointing at trimmed records is rejected, as in DynamoDB.
+    let err = s
+        .get_records(&GetRecordsRequest {
+            shard_iterator: horizon,
+            ..Default::default()
+        })
+        .expect_err("trimmed");
+    assert_eq!(err.name, "TrimmedDataAccessException");
+    // New records keep counting from the last sequence number.
+    s.put_item(&PutItemRequest {
+        table_name: "T".to_string(),
+        item: item(&[("pk", json!({"S": "k9"}))]),
+        ..Default::default()
+    })
+    .expect("put");
+    let records = records_from(&s, &shard_iterator(&s, "TRIM_HORIZON"));
+    assert_eq!(records[2]["dynamodb"]["SequenceNumber"], "6");
 }
 
 // --- minimal tempdir -------------------------------------------------------
