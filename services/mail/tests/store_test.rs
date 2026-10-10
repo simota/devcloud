@@ -305,3 +305,60 @@ fn receive_from_persists_optional_fields_without_changing_receive_serialization(
     assert_eq!(old.envelope_from, None);
     assert!(old.helo.is_empty());
 }
+
+#[test]
+fn a_torn_append_neither_breaks_reads_nor_corrupts_the_next_record() {
+    let (store, _) = new_store("torn");
+    store
+        .append(
+            fixed_msg("msg_ok", "a@example.com", "Kept", "2026-04-30T10:00:00Z"),
+            b"Subject: Kept\r\n\r\nBody",
+        )
+        .expect("append");
+    // A crash mid-append leaves a record without its newline.
+    let mut data = std::fs::read(store.messages_path()).unwrap();
+    data.extend_from_slice(br#"{"id":"msg_torn","from":"x"#);
+    std::fs::write(store.messages_path(), &data).unwrap();
+
+    let (reopened, _) = (
+        FileStore::new(
+            store.messages_path().parent().unwrap(),
+            Arc::new(FileBlobStore::new(temp_dir("torn-blob2"))) as Arc<dyn BlobStore>,
+        ),
+        (),
+    );
+    let listed = reopened.list(ListMessagesInput::default()).expect("list");
+    assert_eq!(listed.messages.len(), 1);
+    reopened
+        .append(
+            fixed_msg("msg_next", "b@example.com", "Next", "2026-04-30T10:01:00Z"),
+            b"Subject: Next\r\n\r\nBody",
+        )
+        .expect("append after torn record");
+    let fresh = FileStore::new(
+        store.messages_path().parent().unwrap(),
+        Arc::new(FileBlobStore::new(temp_dir("torn-blob3"))) as Arc<dyn BlobStore>,
+    );
+    let ids: Vec<String> = fresh
+        .list(ListMessagesInput::default())
+        .expect("list after append")
+        .messages
+        .into_iter()
+        .map(|m| m.id)
+        .collect();
+    assert_eq!(ids, vec!["msg_next".to_string(), "msg_ok".to_string()]);
+    fresh.delete_all().expect("delete_all");
+}
+
+#[test]
+fn tombstones_do_not_keep_message_contents() {
+    let (store, _) = new_store("tombbody");
+    let mut m = fixed_msg("msg_big", "a@example.com", "Big", "2026-04-30T10:00:00Z");
+    m.text_body = "x".repeat(100_000);
+    store
+        .append(m, b"Subject: Big\r\n\r\nBody")
+        .expect("append");
+    store.delete_all().expect("delete_all");
+    let size = std::fs::metadata(store.messages_path()).unwrap().len();
+    assert!(size < 10_000, "log still holds the body: {size} bytes");
+}

@@ -136,7 +136,14 @@ impl FileStore {
             Err(e) => return Err(format!("open messages log: {e}")),
         };
         let mut messages = Vec::new();
-        for line in data.split(|&b| b == b'\n') {
+        // A last line without its newline is a torn append (a crash or a full
+        // disk mid-write): an incomplete record, never acknowledged, so it is
+        // ignored rather than making the whole mailbox unreadable.
+        let complete = match data.iter().rposition(|&b| b == b'\n') {
+            Some(i) => &data[..=i],
+            None => &[][..],
+        };
+        for line in complete.split(|&b| b == b'\n') {
             if line.is_empty() {
                 continue;
             }
@@ -172,7 +179,14 @@ impl FileStore {
         let mut buf = Vec::new();
         let mut mutated = Vec::with_capacity(messages.len());
         for message in messages {
-            let m = mutate(message);
+            let mut m = mutate(message);
+            if m.deleted_at.is_some() {
+                // The tombstone stays (legacy parity); its contents need not.
+                m.text_body.clear();
+                m.html_body.clear();
+                m.headers.clear();
+                m.attachments.clear();
+            }
             let line =
                 serde_json::to_vec(&m).map_err(|e| format!("write messages temp log: {e}"))?;
             buf.extend_from_slice(&line);
@@ -204,8 +218,13 @@ impl Store for FileStore {
             .append(true)
             .open(self.messages_path())
             .map_err(|e| format!("open messages log: {e}"))?;
-        f.write_all(&line)
-            .map_err(|e| format!("append message metadata: {e}"))?;
+        let original_len = drop_torn_tail(&self.messages_path(), &f)
+            .map_err(|e| format!("open messages log: {e}"))?;
+        if let Err(e) = f.write_all(&line) {
+            // Leave no partial record behind for the next append to extend.
+            let _ = f.set_len(original_len);
+            return Err(format!("append message metadata: {e}"));
+        }
         // Only keep the index in sync if it is already loaded — do not force a
         // load here, since a load failure (e.g. a pre-existing corrupt line)
         // must not fail an append that would otherwise have succeeded.
@@ -301,6 +320,33 @@ fn now_nanos() -> u128 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0)
+}
+
+/// Truncates an incomplete last record (no trailing newline) left by an
+/// earlier interrupted append, so the next record starts on its own line.
+/// Returns the resulting length.
+fn drop_torn_tail(path: &Path, file: &fs::File) -> io::Result<u64> {
+    use std::io::{Read, Seek, SeekFrom};
+    let len = file.metadata()?.len();
+    if len == 0 {
+        return Ok(0);
+    }
+    let mut reader = fs::File::open(path)?;
+    reader.seek(SeekFrom::Start(len - 1))?;
+    let mut last = [0u8; 1];
+    reader.read_exact(&mut last)?;
+    if last[0] == b'\n' {
+        return Ok(len);
+    }
+    reader.seek(SeekFrom::Start(0))?;
+    let mut data = Vec::new();
+    reader.read_to_end(&mut data)?;
+    let keep = data
+        .iter()
+        .rposition(|&b| b == b'\n')
+        .map_or(0, |i| i as u64 + 1);
+    file.set_len(keep)?;
+    Ok(keep)
 }
 
 /// Writes `data` to `path` via a temp file + atomic rename.

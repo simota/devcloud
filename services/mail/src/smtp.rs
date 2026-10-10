@@ -59,13 +59,28 @@ pub struct SmtpLimits {
     pub max_recipients: usize,
 }
 
+impl SmtpLimits {
+    /// What a server gets unless `with_limits` says otherwise: a line (a
+    /// command, or one line of DATA) can no longer grow memory without bound,
+    /// nor can an endless RCPT loop. Both are far above what real mail uses
+    /// (RFC 5321 caps a text line at 1000 octets and requires only 100
+    /// recipients).
+    pub fn standard() -> Self {
+        SmtpLimits {
+            max_line_bytes: 1024 * 1024,
+            idle_timeout: None,
+            max_recipients: 1000,
+        }
+    }
+}
+
 impl SmtpServer {
     pub fn new(config: SmtpConfig, service: Arc<Service>) -> Self {
         Self {
             config,
             service,
             envelope_capture: false,
-            limits: SmtpLimits::default(),
+            limits: SmtpLimits::standard(),
         }
     }
 
@@ -85,7 +100,15 @@ impl SmtpServer {
     pub async fn run(&self) -> std::io::Result<()> {
         let listener = TcpListener::bind(&self.config.addr).await?;
         loop {
-            let (sock, _) = listener.accept().await?;
+            let sock = match listener.accept().await {
+                Ok((sock, _)) => sock,
+                // Out of descriptors, or a peer that went away before the
+                // accept: wait and keep serving rather than stop the service.
+                Err(_) => {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+            };
             let server = SmtpServer {
                 config: self.config.clone(),
                 service: Arc::clone(&self.service),
@@ -114,6 +137,7 @@ impl SmtpServer {
             greeted: false,
             has_mail_from: false,
             authenticated: false,
+            crlf_seen: false,
             envelope: Envelope::default(),
             helo: String::new(),
             envelope_capture: self.envelope_capture,
@@ -147,6 +171,10 @@ where
     greeted: bool,
     has_mail_from: bool,
     authenticated: bool,
+    /// Whether the client has ended a line with CRLF. Once it has, a bare-LF
+    /// `.` line inside DATA is content, not the end of the message: treating
+    /// `\n.\n` as the terminator lets one message smuggle in another.
+    crlf_seen: bool,
     envelope: Envelope,
     helo: String,
     envelope_capture: bool,
@@ -157,55 +185,59 @@ impl<S> Session<S>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    /// One line with its terminator kept, bounded by `max_line_bytes`; with
+    /// an idle timeout the whole line must arrive in time (a client trickling
+    /// a byte at a time cannot hold the session forever). `None` on EOF/error.
+    async fn read_line_raw(&mut self) -> Option<Vec<u8>> {
+        let mut buf = Vec::new();
+        let limit = self.limits.max_line_bytes;
+        let deadline = self
+            .limits
+            .idle_timeout
+            .map(|t| tokio::time::Instant::now() + t);
+        loop {
+            let available = if let Some(deadline) = deadline {
+                match tokio::time::timeout_at(deadline, self.reader.fill_buf()).await {
+                    Ok(Ok(bytes)) => bytes,
+                    Ok(Err(_)) => return None,
+                    Err(_) => {
+                        self.reply(421, "idle timeout").await;
+                        return None;
+                    }
+                }
+            } else {
+                self.reader.fill_buf().await.ok()?
+            };
+            if available.is_empty() {
+                break;
+            }
+            let take = available
+                .iter()
+                .position(|&b| b == b'\n')
+                .map_or(available.len(), |i| i + 1);
+            if limit > 0 && buf.len().saturating_add(take) > limit {
+                self.reply(500, "line exceeds limit").await;
+                return None;
+            }
+            let finished = available[take - 1] == b'\n';
+            buf.extend_from_slice(&available[..take]);
+            self.reader.consume(take);
+            if finished {
+                break;
+            }
+        }
+        if buf.is_empty() {
+            return None;
+        }
+        Some(buf)
+    }
+
     /// Mirrors `textproto.Reader.ReadLine`: read up to '\n', strip a trailing
     /// '\r\n' or '\n'. `None` on EOF/error.
     async fn read_line_bytes(&mut self) -> Option<Vec<u8>> {
-        let mut buf = Vec::new();
-        let limit = self.limits.max_line_bytes;
-        let idle = self.limits.idle_timeout;
-        let n = if limit == 0 && idle.is_none() {
-            self.reader.read_until(b'\n', &mut buf).await.ok()?
-        } else {
-            loop {
-                let available = if let Some(timeout) = idle {
-                    match tokio::time::timeout(timeout, self.reader.fill_buf()).await {
-                        Ok(Ok(bytes)) => bytes,
-                        Ok(Err(_)) => return None,
-                        Err(_) => {
-                            self.reply(421, "idle timeout").await;
-                            return None;
-                        }
-                    }
-                } else {
-                    self.reader.fill_buf().await.ok()?
-                };
-                if available.is_empty() {
-                    break buf.len();
-                }
-                let take = available
-                    .iter()
-                    .position(|&b| b == b'\n')
-                    .map_or(available.len(), |i| i + 1);
-                if limit > 0 && buf.len().saturating_add(take) > limit {
-                    self.reply(500, "line exceeds limit").await;
-                    return None;
-                }
-                let finished = available[take - 1] == b'\n';
-                buf.extend_from_slice(&available[..take]);
-                self.reader.consume(take);
-                if finished {
-                    break buf.len();
-                }
-            }
-        };
-        if n == 0 {
-            return None;
-        }
-        if buf.last() == Some(&b'\n') {
-            buf.pop();
-            if buf.last() == Some(&b'\r') {
-                buf.pop();
-            }
+        let mut buf = self.read_line_raw().await?;
+        if strip_line_end(&mut buf) {
+            self.crlf_seen = true;
         }
         Some(buf)
     }
@@ -295,7 +327,9 @@ where
                 if self.config.auth_mode_normalized() == SMTP_AUTH_OFF {
                     return self.reply(502, "command not implemented").await;
                 }
-                if self.authenticated {
+                // RFC 4954: no AUTH once authenticated or during a mail
+                // transaction.
+                if self.authenticated || self.has_mail_from {
                     return self.reply(503, "bad sequence of commands").await;
                 }
                 self.handle_auth(&arg).await
@@ -327,11 +361,15 @@ where
         let mut oversized = false;
         let max = self.config.max_message_bytes;
         loop {
-            let mut line = match self.read_line_bytes().await {
+            let mut line = match self.read_line_raw().await {
                 None => return false,
                 Some(l) => l,
             };
-            if line == b"." {
+            let crlf = strip_line_end(&mut line);
+            self.crlf_seen |= crlf;
+            // Only `<CRLF>.<CRLF>` ends a CRLF client's message; a client that
+            // has only ever sent bare LF may end it with `.<LF>`.
+            if line == b"." && (crlf || !self.crlf_seen) {
                 break;
             }
             if line.starts_with(b"..") {
@@ -361,6 +399,9 @@ where
         };
         match received {
             Err(_) => {
+                // The transaction is over either way: a following RCPT or
+                // DATA must not reuse this envelope.
+                self.reset_envelope();
                 self.reply(451, "requested action aborted: local error in processing")
                     .await
             }
@@ -477,14 +518,36 @@ where
     }
 
     async fn complete_auth(&mut self, username: &str, password: &str) -> bool {
-        if self.config.auth_mode_normalized() == SMTP_AUTH_STRICT
-            && (username != self.config.username || password != self.config.password)
-        {
+        // Both compared in full, in constant time, so timing reveals neither.
+        let user_ok = constant_time_eq(username.as_bytes(), self.config.username.as_bytes());
+        let pass_ok = constant_time_eq(password.as_bytes(), self.config.password.as_bytes());
+        if self.config.auth_mode_normalized() == SMTP_AUTH_STRICT && !(user_ok & pass_ok) {
             return self.reply(535, "authentication failed").await;
         }
         self.authenticated = true;
         self.reply(235, "authentication succeeded").await
     }
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    let mut diff = a.len() ^ b.len();
+    for i in 0..a.len().max(b.len()) {
+        diff |= usize::from(a.get(i).copied().unwrap_or(0) ^ b.get(i).copied().unwrap_or(0));
+    }
+    diff == 0
+}
+
+/// Strips a trailing `\r\n` or `\n`; `true` when it was `\r\n`.
+fn strip_line_end(buf: &mut Vec<u8>) -> bool {
+    if buf.last() != Some(&b'\n') {
+        return false;
+    }
+    buf.pop();
+    if buf.last() == Some(&b'\r') {
+        buf.pop();
+        return true;
+    }
+    false
 }
 
 /// Mirrors `splitSMTPCommand`.
@@ -568,11 +631,18 @@ fn parse_path_arg(arg: &str, prefix: &str, allow_empty: bool) -> Option<(String,
 fn parse_mail_from_arg(arg: &str) -> Option<(String, i64, bool)> {
     let (address, rest) = parse_path_arg(arg, "FROM:", true)?;
     for field in rest.split_whitespace() {
-        let (name, value) = field.split_once('=')?;
+        // Keyword-only parameters (`SMTPUTF8`, `BODY` forms) carry no value.
+        let Some((name, value)) = field.split_once('=') else {
+            continue;
+        };
         if !name.eq_ignore_ascii_case("SIZE") {
             continue;
         }
-        let parsed: i64 = value.parse().ok().filter(|&v| v >= 0)?;
+        if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        // A declared size too large for i64 is still a (very) large size.
+        let parsed: i64 = value.parse().unwrap_or(i64::MAX);
         return Some((address, parsed, true));
     }
     Some((address, 0, false))
