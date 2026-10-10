@@ -1652,3 +1652,39 @@ fn object_multipart_upload_uses_metadata_and_media_parts() {
     assert_eq!(download.status, 200, "{}", body_str(&download));
     assert_eq!(download.body, b"hello multipart");
 }
+
+/// Multipart media parts are binary: non-UTF-8 bytes must round-trip intact.
+#[test]
+fn object_multipart_upload_preserves_binary_media() {
+    let mut s = server();
+    create_bucket(&mut s, "demo-bucket");
+
+    let media: &[u8] = &[0x00, 0xFF, 0xC3, 0x28, b'\r', b'\n'];
+    let mut body = b"--b\r\nContent-Type: application/json\r\n\r\n{\"name\":\"bin.dat\"}\r\n--b\r\nContent-Type: application/octet-stream\r\n\r\n".to_vec();
+    body.extend_from_slice(media);
+    body.extend_from_slice(b"\r\n--b--\r\n");
+    let mut request = Request::new(
+        "POST",
+        "/upload/storage/v1/b/demo-bucket/o?uploadType=multipart",
+        body,
+    );
+    request.headers.insert(
+        "content-type".to_string(),
+        "multipart/related; boundary=b".to_string(),
+    );
+    let upload = route(&mut s, &request);
+    assert_eq!(upload.status, 200, "{}", body_str(&upload));
+    assert_eq!(
+        json_body(&upload)["contentType"],
+        "application/octet-stream"
+    );
+
+    let download = perform(
+        &mut s,
+        "GET",
+        "/download/storage/v1/b/demo-bucket/o/bin.dat?alt=media",
+        "",
+    );
+    assert_eq!(download.status, 200, "{}", body_str(&download));
+    assert_eq!(download.body, media);
+}

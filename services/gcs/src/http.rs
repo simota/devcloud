@@ -1433,23 +1433,43 @@ fn parse_multipart_upload(
         return Err("Content-Type must be multipart/related".to_string());
     }
     let boundary = multipart_boundary(content_type).ok_or("multipart boundary is required")?;
-    let marker = format!("--{boundary}");
-    let raw = String::from_utf8_lossy(&req.body);
+    // Parse on bytes: the media part is arbitrary binary data, so only the
+    // header blocks are ever decoded as text. A leading CRLF lets the first
+    // delimiter (which may open the body) match the same `\r\n--boundary` form.
+    let delimiter = format!("\r\n--{boundary}").into_bytes();
+    let mut raw = Vec::with_capacity(req.body.len() + 2);
+    raw.extend_from_slice(b"\r\n");
+    raw.extend_from_slice(&req.body);
+    let Some(first) = find_subslice(&raw, &delimiter) else {
+        return Err("metadata part is required".to_string());
+    };
+    let mut rest = &raw[first + delimiter.len()..];
     let mut parts = Vec::new();
-    for section in raw.split(marker.as_str()).skip(1) {
-        if section.starts_with("--") {
-            break;
-        }
-        let section = section.strip_prefix("\r\n").unwrap_or(section);
-        let section = section.strip_suffix("\r\n").unwrap_or(section);
-        let (head, body) = match section.split_once("\r\n\r\n") {
-            Some(v) => v,
-            None => match section.strip_prefix("\r\n") {
-                Some(rest) => ("", rest),
-                None => return Err("multipart part is malformed".to_string()),
-            },
+    while !rest.starts_with(b"--") {
+        // An unterminated last part (no closing delimiter) runs to the end of
+        // the body, minus one trailing CRLF.
+        let section = match find_subslice(rest, &delimiter) {
+            Some(end) => {
+                let section = &rest[..end];
+                rest = &rest[end + delimiter.len()..];
+                section
+            }
+            None => {
+                let section = rest.strip_suffix(b"\r\n").unwrap_or(rest);
+                rest = b"--";
+                section
+            }
         };
-        parts.push((head.to_string(), body.as_bytes().to_vec()));
+        let section = section.strip_prefix(b"\r\n").unwrap_or(section);
+        let (head, body) = if let Some(body) = section.strip_prefix(b"\r\n") {
+            (&[][..], body)
+        } else {
+            match find_subslice(section, b"\r\n\r\n") {
+                Some(i) => (&section[..i], &section[i + 4..]),
+                None => return Err("multipart part is malformed".to_string()),
+            }
+        };
+        parts.push((String::from_utf8_lossy(head).into_owned(), body.to_vec()));
     }
     if parts.is_empty() {
         return Err("metadata part is required".to_string());
