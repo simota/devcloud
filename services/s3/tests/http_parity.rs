@@ -2,6 +2,7 @@ use devcloud_s3::http::{route, route_with_auth, AuthConfig, Request};
 use devcloud_s3::store::FileBucketStore;
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
+use std::sync::{Arc, Mutex};
 
 fn tempdir() -> std::path::PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -69,11 +70,23 @@ fn strict_auth() -> AuthConfig {
 }
 
 fn signed_req(method: &str, target: &str, body: &[u8]) -> Request {
+    signed_req_at(method, target, body, "20260430T120000Z", "20260430")
+}
+
+/// Signs `target` (whose path is already URI-encoded, as S3 canonicalizes it)
+/// with `amz_date` and a credential scope for `date_stamp`.
+fn signed_req_at(
+    method: &str,
+    target: &str,
+    body: &[u8],
+    amz_date: &str,
+    date_stamp: &str,
+) -> Request {
     let mut req = Request::new(method, target, body.to_vec());
     req.headers
         .insert("host".to_string(), "example.com".to_string());
     req.headers
-        .insert("x-amz-date".to_string(), "20260430T120000Z".to_string());
+        .insert("x-amz-date".to_string(), amz_date.to_string());
     let body_hash = sha256_hex(body);
     req.headers
         .insert("x-amz-content-sha256".to_string(), body_hash.clone());
@@ -82,23 +95,21 @@ fn signed_req(method: &str, target: &str, body: &[u8]) -> Request {
         method.to_string(),
         target.to_string(),
         String::new(),
-        format!(
-            "host:example.com\nx-amz-content-sha256:{body_hash}\nx-amz-date:20260430T120000Z\n"
-        ),
+        format!("host:example.com\nx-amz-content-sha256:{body_hash}\nx-amz-date:{amz_date}\n"),
         signed_headers.to_string(),
         body_hash,
     ]
     .join("\n");
-    let scope = "20260430/us-east-1/s3/aws4_request";
+    let scope = format!("{date_stamp}/us-east-1/s3/aws4_request");
     let string_to_sign = [
         "AWS4-HMAC-SHA256".to_string(),
-        "20260430T120000Z".to_string(),
-        scope.to_string(),
+        amz_date.to_string(),
+        scope.clone(),
         sha256_hex(canonical_request.as_bytes()),
     ]
     .join("\n");
     let signature = hex::encode(hmac_sha256(
-        &test_signing_key("dev", "20260430", "us-east-1"),
+        &test_signing_key("dev", date_stamp, "us-east-1"),
         string_to_sign.as_bytes(),
     ));
     req.headers.insert(
@@ -1433,7 +1444,7 @@ fn multipart_upload_flow() {
     assert!(body.contains("<Key>big.bin</Key>"));
     assert!(body.contains("<UploadId>0123456789abcdef0123456789abcdef</UploadId>"));
 
-    let complete_body = br#"<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>"x"</ETag></Part><Part><PartNumber>2</PartNumber><ETag>"y"</ETag></Part></CompleteMultipartUpload>"#;
+    let complete_body = br#"<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>"5d41402abc4b2a76b9719d911017c592"</ETag></Part><Part><PartNumber>2</PartNumber><ETag>"5289492cf082446ca4a6eec9f72f1ec3"</ETag></Part></CompleteMultipartUpload>"#;
     let complete = Request::new(
         "POST",
         &format!("/data/big.bin?uploadId={upload_id}"),
@@ -1633,7 +1644,7 @@ fn complete_multipart_upload_if_none_match_keeps_upload_on_conflict() {
         200
     );
 
-    let complete_body = br#"<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>"x"</ETag></Part></CompleteMultipartUpload>"#;
+    let complete_body = br#"<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>"5d41402abc4b2a76b9719d911017c592"</ETag></Part></CompleteMultipartUpload>"#;
     let mut complete = Request::new(
         "POST",
         &format!("/data/big.bin?uploadId={upload_id}"),
@@ -1850,4 +1861,430 @@ fn copy_object_if_none_match_guards_destination_and_source() {
     );
     assert_eq!(source_changed.status, 200);
     assert_eq!(route(&store, &req("GET", "/data/dst3")).body, b"changed");
+}
+
+fn put_versioning(store: &FileBucketStore, bucket: &str, status: &str) {
+    let body =
+        format!("<VersioningConfiguration><Status>{status}</Status></VersioningConfiguration>");
+    let target = format!("/{bucket}?versioning");
+    assert_eq!(
+        route(store, &Request::new("PUT", &target, body.into_bytes())).status,
+        200
+    );
+}
+
+#[test]
+fn presigned_non_ascii_amz_date_is_rejected_without_panicking() {
+    let root = tempdir();
+    let store = FileBucketStore::new(&root);
+    // "202é0101T00000Z": 16 bytes ending in Z, but not ASCII.
+    let target = "/demo-bucket/x?X-Amz-Algorithm=AWS4-HMAC-SHA256\
+        &X-Amz-Credential=dev%2F20260430%2Fus-east-1%2Fs3%2Faws4_request\
+        &X-Amz-Date=202%C3%A90101T00000Z&X-Amz-Expires=60\
+        &X-Amz-SignedHeaders=host&X-Amz-Signature=00";
+    let rejected = route_with_auth(&store, &req("GET", target), &strict_auth());
+    assert_eq!(rejected.status, 403);
+}
+
+#[test]
+fn sigv4_canonical_uri_encodes_an_escaped_key_once() {
+    let root = tempdir();
+    let store = FileBucketStore::new(&root);
+    let auth = strict_auth();
+    assert_eq!(
+        route_with_auth(&store, &signed_req("PUT", "/demo-bucket", b""), &auth).status,
+        200
+    );
+
+    let put = signed_req("PUT", "/demo-bucket/docs/my%20file.txt", b"spaced");
+    assert_eq!(route_with_auth(&store, &put, &auth).status, 200);
+    let get = signed_req("GET", "/demo-bucket/docs/my%20file.txt", b"");
+    let got = route_with_auth(&store, &get, &auth);
+    assert_eq!(got.status, 200);
+    assert_eq!(got.body, b"spaced");
+    assert!(store
+        .get_object("demo-bucket", "docs/my file.txt")
+        .unwrap()
+        .is_some());
+}
+
+#[test]
+fn sigv4_rejects_amz_date_outside_the_credential_scope_day() {
+    let root = tempdir();
+    let store = FileBucketStore::new(&root);
+    let auth = strict_auth();
+    // Consistently signed, but the scope says 2026-04-30 and X-Amz-Date says
+    // 2026-05-01.
+    let skewed = signed_req_at("PUT", "/demo-bucket", b"", "20260501T000000Z", "20260430");
+    let rejected = route_with_auth(&store, &skewed, &auth);
+    assert_eq!(rejected.status, 400);
+    assert!(String::from_utf8(rejected.body)
+        .unwrap()
+        .contains("<Code>AuthorizationHeaderMalformed</Code>"));
+    assert!(store.get_bucket("demo-bucket").unwrap().is_none());
+
+    let same_day = signed_req_at("PUT", "/demo-bucket", b"", "20260501T235959Z", "20260501");
+    assert_eq!(route_with_auth(&store, &same_day, &auth).status, 200);
+}
+
+#[test]
+fn enabling_versioning_keeps_the_pre_versioning_object_as_null_version() {
+    let root = tempdir();
+    let store = FileBucketStore::new(&root);
+    store.create_bucket("data").unwrap();
+    for key in ["doc", "gone"] {
+        let put = Request::new("PUT", &format!("/data/{key}"), b"original".to_vec());
+        assert_eq!(route(&store, &put).status, 200);
+    }
+    put_versioning(&store, "data", "Enabled");
+
+    let second = route(
+        &store,
+        &Request::new("PUT", "/data/doc", b"second".to_vec()),
+    );
+    assert_eq!(second.status, 200);
+    assert_ne!(second.headers.get("x-amz-version-id").unwrap(), "null");
+    assert_eq!(route(&store, &req("GET", "/data/doc")).body, b"second");
+    let null = route(&store, &req("GET", "/data/doc?versionId=null"));
+    assert_eq!(null.status, 200);
+    assert_eq!(null.body, b"original");
+
+    let deleted = route(&store, &req("DELETE", "/data/gone"));
+    assert_eq!(deleted.status, 204);
+    assert_eq!(
+        deleted
+            .headers
+            .get("x-amz-delete-marker")
+            .map(String::as_str),
+        Some("true")
+    );
+    let null = route(&store, &req("GET", "/data/gone?versionId=null"));
+    assert_eq!(null.status, 200);
+    assert_eq!(null.body, b"original");
+
+    let listed = String::from_utf8(route(&store, &req("GET", "/data?versions")).body).unwrap();
+    assert_eq!(listed.matches("<VersionId>null</VersionId>").count(), 2);
+    assert_eq!(listed.matches("<Version>").count(), 3);
+}
+
+fn chunked_put(target: &str, body: &[u8], encoding: &str, decoded_length: &str) -> Request {
+    let mut put = Request::new("PUT", target, body.to_vec());
+    put.headers.insert(
+        "x-amz-content-sha256".to_string(),
+        "STREAMING-AWS4-HMAC-SHA256-PAYLOAD".to_string(),
+    );
+    put.headers
+        .insert("content-encoding".to_string(), encoding.to_string());
+    put.headers.insert(
+        "x-amz-decoded-content-length".to_string(),
+        decoded_length.to_string(),
+    );
+    put
+}
+
+#[test]
+fn aws_chunked_put_object_and_upload_part_store_the_decoded_payload() {
+    let root = tempdir();
+    let store = FileBucketStore::new(&root);
+    store.create_bucket("data").unwrap();
+    let signed = b"5;chunk-signature=aaaa\r\nhello\r\n6;chunk-signature=bbbb\r\n world\r\n0;chunk-signature=cccc\r\n\r\n";
+
+    let put = chunked_put("/data/plain.txt", signed, "aws-chunked", "11");
+    let stored = route(&store, &put);
+    assert_eq!(stored.status, 200);
+    assert_eq!(
+        stored.headers.get("ETag").unwrap(),
+        "\"5eb63bbbe01eeed093cb22bb8f5acdc3\""
+    );
+    let got = route(&store, &req("GET", "/data/plain.txt"));
+    assert_eq!(got.body, b"hello world");
+    assert!(!got.headers.contains_key("Content-Encoding"));
+
+    let put = chunked_put("/data/zipped", signed, "gzip,aws-chunked", "11");
+    assert_eq!(route(&store, &put).status, 200);
+    let got = route(&store, &req("GET", "/data/zipped"));
+    assert_eq!(got.body, b"hello world");
+    assert_eq!(got.headers.get("Content-Encoding").unwrap(), "gzip");
+
+    // Unsigned streaming with a trailing checksum.
+    let mut trailer = chunked_put(
+        "/data/trailer",
+        b"b\r\nhello world\r\n0\r\nx-amz-checksum-crc32:DUoRhQ==\r\n\r\n",
+        "aws-chunked",
+        "11",
+    );
+    trailer.headers.insert(
+        "x-amz-content-sha256".to_string(),
+        "STREAMING-UNSIGNED-PAYLOAD-TRAILER".to_string(),
+    );
+    assert_eq!(route(&store, &trailer).status, 200);
+    assert_eq!(
+        route(&store, &req("GET", "/data/trailer")).body,
+        b"hello world"
+    );
+
+    let wrong_length = chunked_put("/data/bad", signed, "aws-chunked", "12");
+    assert_eq!(route(&store, &wrong_length).status, 400);
+    let truncated = chunked_put(
+        "/data/bad",
+        b"5;chunk-signature=aaaa\r\nhel",
+        "aws-chunked",
+        "",
+    );
+    assert_eq!(route(&store, &truncated).status, 400);
+    assert_eq!(route(&store, &req("GET", "/data/bad")).status, 404);
+
+    store.push_version_ids(&["0123456789abcdef0123456789abcdef"]);
+    assert_eq!(
+        route(&store, &req("POST", "/data/big.bin?uploads")).status,
+        200
+    );
+    let part = chunked_put(
+        "/data/big.bin?uploadId=0123456789abcdef0123456789abcdef&partNumber=1",
+        signed,
+        "aws-chunked",
+        "11",
+    );
+    let uploaded = route(&store, &part);
+    assert_eq!(uploaded.status, 200);
+    assert_eq!(
+        uploaded.headers.get("ETag").unwrap(),
+        "\"5eb63bbbe01eeed093cb22bb8f5acdc3\""
+    );
+}
+
+#[test]
+fn upload_part_copy_copies_source_ranges_and_complete_checks_part_etags() {
+    let root = tempdir();
+    let store = FileBucketStore::new(&root);
+    store.create_bucket("data").unwrap();
+    store.push_version_ids(&["0123456789abcdef0123456789abcdef"]);
+    let upload_id = "0123456789abcdef0123456789abcdef";
+    assert_eq!(
+        route(
+            &store,
+            &Request::new("PUT", "/data/source", b"0123456789".to_vec())
+        )
+        .status,
+        200
+    );
+    assert_eq!(
+        route(&store, &req("POST", "/data/big.bin?uploads")).status,
+        200
+    );
+
+    let part_target = |n: u32| format!("/data/big.bin?uploadId={upload_id}&partNumber={n}");
+    let ranged = with_header(
+        with_header(
+            req("PUT", &part_target(1)),
+            "x-amz-copy-source",
+            "/data/source",
+        ),
+        "x-amz-copy-source-range",
+        "bytes=2-5",
+    );
+    let copied = route(&store, &ranged);
+    assert_eq!(copied.status, 200);
+    let body = String::from_utf8(copied.body).unwrap();
+    assert!(body.contains("<CopyPartResult>"));
+    let etag1 = body
+        .split("<ETag>")
+        .nth(1)
+        .and_then(|rest| rest.split("</ETag>").next())
+        .unwrap()
+        .to_string();
+    assert!(body.contains("<LastModified>"));
+
+    let whole = with_header(
+        req("PUT", &part_target(2)),
+        "x-amz-copy-source",
+        "data/source",
+    );
+    assert_eq!(route(&store, &whole).status, 200);
+
+    let out_of_range = with_header(
+        with_header(
+            req("PUT", &part_target(3)),
+            "x-amz-copy-source",
+            "/data/source",
+        ),
+        "x-amz-copy-source-range",
+        "bytes=5-10",
+    );
+    assert_eq!(route(&store, &out_of_range).status, 400);
+
+    let complete = |etag1: &str, etag2: &str| {
+        Request::new(
+            "POST",
+            &format!("/data/big.bin?uploadId={upload_id}"),
+            format!(
+                "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{etag1}</ETag></Part>\
+                 <Part><PartNumber>2</PartNumber><ETag>{etag2}</ETag></Part></CompleteMultipartUpload>"
+            )
+            .into_bytes(),
+        )
+    };
+    let wrong = route(
+        &store,
+        &complete(&etag1, "\"00000000000000000000000000000000\""),
+    );
+    assert_eq!(wrong.status, 400);
+    assert!(String::from_utf8(wrong.body)
+        .unwrap()
+        .contains("<Code>InvalidPart</Code>"));
+    assert_eq!(route(&store, &req("GET", "/data/big.bin")).status, 404);
+
+    // ETags match with or without quotes (and XML-escaped quotes).
+    let etag2 = "&quot;781e5e245d69b566979b86e28d23f2c7&quot;"; // md5("0123456789")
+    let completed = route(&store, &complete(etag1.trim_matches('"'), etag2));
+    assert_eq!(completed.status, 200);
+    assert_eq!(
+        route(&store, &req("GET", "/data/big.bin")).body,
+        b"23450123456789"
+    );
+}
+
+#[test]
+fn malformed_range_headers_are_ignored_and_unsatisfiable_ranges_are_416() {
+    let root = tempdir();
+    let store = FileBucketStore::new(&root);
+    store.create_bucket("data").unwrap();
+    assert_eq!(
+        route(
+            &store,
+            &Request::new("PUT", "/data/digits", b"0123456789".to_vec())
+        )
+        .status,
+        200
+    );
+    let get = |range: &str| {
+        route(
+            &store,
+            &with_header(req("GET", "/data/digits"), "range", range),
+        )
+    };
+
+    for ignored in [
+        "bytes=0-1,3-4",
+        "items=0-1",
+        "bytes=abc",
+        "bytes=5-2",
+        "bytes=-",
+        "0-1",
+    ] {
+        let full = get(ignored);
+        assert_eq!(full.status, 200, "{ignored}");
+        assert_eq!(full.body, b"0123456789", "{ignored}");
+    }
+    for unsatisfiable in ["bytes=10-", "bytes=20-30", "bytes=-0"] {
+        assert_eq!(get(unsatisfiable).status, 416, "{unsatisfiable}");
+    }
+    let partial = get("bytes=2-4");
+    assert_eq!(partial.status, 206);
+    assert_eq!(partial.body, b"234");
+    let suffix = get("bytes=-3");
+    assert_eq!(suffix.status, 206);
+    assert_eq!(suffix.body, b"789");
+}
+
+#[test]
+fn object_keys_over_1024_bytes_are_rejected() {
+    let root = tempdir();
+    let store = FileBucketStore::new(&root);
+    store.create_bucket("data").unwrap();
+    // 1025 bytes: one multi-byte character past the limit.
+    let too_long = format!("/data/{}%C3%A9", "k".repeat(1023));
+    for method in ["PUT", "GET"] {
+        let rejected = route(&store, &Request::new(method, &too_long, b"no".to_vec()));
+        assert_eq!(rejected.status, 400);
+        assert!(String::from_utf8(rejected.body)
+            .unwrap()
+            .contains("<Code>KeyTooLongError</Code>"));
+    }
+}
+
+/// Sends `raw` to a live server over TCP (closing the write side) and returns
+/// whatever the server answered.
+async fn raw_exchange(store: Arc<Mutex<FileBucketStore>>, raw: &[u8]) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(devcloud_s3::http::serve(listener, store, async {
+        let _ = stopped.await;
+    }));
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    stream.write_all(raw).await.unwrap();
+    stream.shutdown().await.unwrap();
+    let mut out = Vec::new();
+    let _ = stream.read_to_end(&mut out).await;
+    let _ = stop.send(());
+    server.await.unwrap().unwrap();
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn shared_store_with_bucket() -> Arc<Mutex<FileBucketStore>> {
+    let store = FileBucketStore::new(tempdir());
+    store.create_bucket("data").unwrap();
+    Arc::new(Mutex::new(store))
+}
+
+#[tokio::test]
+async fn server_rejects_truncated_bad_and_oversized_content_lengths() {
+    let store = shared_store_with_bucket();
+
+    let truncated = raw_exchange(
+        Arc::clone(&store),
+        b"PUT /data/short HTTP/1.1\r\nHost: localhost\r\nContent-Length: 10\r\n\r\nabc",
+    )
+    .await;
+    assert!(truncated.starts_with("HTTP/1.1 400 "), "{truncated}");
+    assert!(truncated.contains("<Code>IncompleteBody</Code>"));
+    assert!(store
+        .lock()
+        .unwrap()
+        .get_object("data", "short")
+        .unwrap()
+        .is_none());
+
+    let bad = raw_exchange(
+        Arc::clone(&store),
+        b"PUT /data/bad HTTP/1.1\r\nHost: localhost\r\nContent-Length: ten\r\n\r\n",
+    )
+    .await;
+    assert!(bad.starts_with("HTTP/1.1 400 "), "{bad}");
+
+    let oversized = raw_exchange(
+        Arc::clone(&store),
+        b"PUT /data/big HTTP/1.1\r\nHost: localhost\r\nContent-Length: 999999999999\r\n\r\n",
+    )
+    .await;
+    assert!(oversized.starts_with("HTTP/1.1 413 "), "{oversized}");
+    assert!(oversized.contains("<Code>EntityTooLarge</Code>"));
+
+    let complete = raw_exchange(
+        Arc::clone(&store),
+        b"PUT /data/full HTTP/1.1\r\nHost: localhost\r\nContent-Length: 3\r\n\r\nabc",
+    )
+    .await;
+    assert!(complete.starts_with("HTTP/1.1 200 "), "{complete}");
+}
+
+#[tokio::test]
+async fn server_keeps_serving_after_the_store_mutex_is_poisoned() {
+    let store = shared_store_with_bucket();
+    let poisoner = Arc::clone(&store);
+    let _ = std::thread::spawn(move || {
+        let _guard = poisoner.lock().unwrap();
+        panic!("poison the store mutex");
+    })
+    .join();
+    assert!(store.is_poisoned());
+
+    let listed = raw_exchange(
+        Arc::clone(&store),
+        b"GET /data HTTP/1.1\r\nHost: localhost\r\n\r\n",
+    )
+    .await;
+    assert!(listed.starts_with("HTTP/1.1 200 "), "{listed}");
 }

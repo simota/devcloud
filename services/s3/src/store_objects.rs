@@ -121,6 +121,9 @@ impl FileBucketStore {
         }
 
         let path = self.object_path(&input.bucket, &input.key);
+        if bucket.versioning == "Enabled" {
+            self.preserve_null_version(&path)?;
+        }
         fs::create_dir_all(&path)?;
         write_atomic(&path.join("body"), &input.body)?;
         Self::write_json(&path.join("object.json"), &object)?;
@@ -291,6 +294,7 @@ impl FileBucketStore {
             let version_id = if existing_bucket.versioning == "Suspended" {
                 NULL_VERSION_ID.to_string()
             } else {
+                self.preserve_null_version(&path)?;
                 self.new_version_id()
             };
             let marker = Object {
@@ -466,6 +470,29 @@ impl FileBucketStore {
 
     fn read_current_object_metadata(&self, bucket: &str, key: &str) -> Result<Option<Object>> {
         read_object(&self.object_path(bucket, key).join("object.json"))
+    }
+
+    /// Before a new version or delete marker replaces the current object, keeps
+    /// a current object written without versioning (empty or `null` version
+    /// id) as the `null` version, as S3 does, instead of overwriting it.
+    fn preserve_null_version(&self, object_path: &Path) -> Result<()> {
+        if Self::version_path(object_path, NULL_VERSION_ID)?.exists() {
+            return Ok(());
+        }
+        let mut current = match read_object(&object_path.join("object.json"))? {
+            Some(o) => o,
+            None => return Ok(()),
+        };
+        if !current.version_id.is_empty() && current.version_id != NULL_VERSION_ID {
+            return Ok(());
+        }
+        current.version_id = NULL_VERSION_ID.to_string();
+        let body = if current.delete_marker {
+            Vec::new()
+        } else {
+            fs::read(object_path.join("body"))?
+        };
+        self.write_object_version(object_path, &current, &body)
     }
 
     pub(crate) fn write_object_version(

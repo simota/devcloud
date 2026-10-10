@@ -6,8 +6,14 @@
 use std::fmt::Write;
 
 pub fn aws_percent_encode(value: &str, safe: &str) -> String {
+    aws_percent_encode_bytes(value.as_bytes(), safe)
+}
+
+/// `aws_percent_encode` over raw bytes (e.g. a percent-decoded path segment
+/// that need not be UTF-8).
+pub fn aws_percent_encode_bytes(value: &[u8], safe: &str) -> String {
     let mut out = String::with_capacity(value.len());
-    for &c in value.as_bytes() {
+    for &c in value {
         let ch = c as char;
         if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '~') || safe.contains(ch) {
             out.push(ch);

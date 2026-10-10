@@ -245,7 +245,7 @@ PY
 }
 
 multipart_flow() {
-  local create_xml upload_id complete_xml
+  local create_xml upload_id complete_xml etag1 etag2
   create_xml="$(curl -fsS -X POST "${S3_ENDPOINT}/${BUCKET}/large.bin?uploads")"
   upload_id="$(printf '%s' "${create_xml}" | python3 -c 'import re,sys; m=re.search(r"<UploadId>([^<]+)</UploadId>", sys.stdin.read()); print(m.group(1) if m else "")')"
   if [[ -z "${upload_id}" ]]; then
@@ -253,11 +253,12 @@ multipart_flow() {
     return 1
   fi
 
-  printf 'part-one-' | curl -fsS -X PUT --data-binary @- "${S3_ENDPOINT}/${BUCKET}/large.bin?partNumber=1&uploadId=${upload_id}" >/dev/null
-  printf 'part-two' | curl -fsS -X PUT --data-binary @- "${S3_ENDPOINT}/${BUCKET}/large.bin?partNumber=2&uploadId=${upload_id}" >/dev/null
+  etag1="$(printf 'part-one-' | curl -fsS -D - -o /dev/null -X PUT --data-binary @- "${S3_ENDPOINT}/${BUCKET}/large.bin?partNumber=1&uploadId=${upload_id}" | header_value 'etag')"
+  etag2="$(printf 'part-two' | curl -fsS -D - -o /dev/null -X PUT --data-binary @- "${S3_ENDPOINT}/${BUCKET}/large.bin?partNumber=2&uploadId=${upload_id}" | header_value 'etag')"
+  [[ -n "${etag1}" && -n "${etag2}" ]]
   curl -fsS "${S3_ENDPOINT}/${BUCKET}/large.bin?uploadId=${upload_id}" | grep -q '<PartNumber>1</PartNumber>'
 
-  complete_xml='<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>ignored</ETag></Part><Part><PartNumber>2</PartNumber><ETag>ignored</ETag></Part></CompleteMultipartUpload>'
+  complete_xml="<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>${etag1}</ETag></Part><Part><PartNumber>2</PartNumber><ETag>${etag2}</ETag></Part></CompleteMultipartUpload>"
   printf '%s' "${complete_xml}" | curl -fsS -X POST --data-binary @- "${S3_ENDPOINT}/${BUCKET}/large.bin?uploadId=${upload_id}" >/dev/null
   curl -fsS "${S3_ENDPOINT}/${BUCKET}/large.bin" | grep -q 'part-one-part-two'
 

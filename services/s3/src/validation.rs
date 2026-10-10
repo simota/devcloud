@@ -35,9 +35,12 @@ fn is_ipv4_like(name: &str) -> bool {
         .all(|part| !part.is_empty() && part.len() <= 3 && part.chars().all(|c| c.is_ascii_digit()))
 }
 
-/// Reports whether `key` is a valid object key (non-empty, no NUL byte).
+/// The longest object key S3 accepts, in UTF-8 bytes.
+pub const MAX_OBJECT_KEY_BYTES: usize = 1024;
+
+/// Reports whether `key` is a valid object key (1..=1024 bytes, no NUL byte).
 pub fn valid_object_key(key: &str) -> bool {
-    !key.is_empty() && !key.contains('\0')
+    !key.is_empty() && key.len() <= MAX_OBJECT_KEY_BYTES && !key.contains('\0')
 }
 
 /// Version IDs are opaque single path components, including legacy IDs and `null`.
@@ -81,6 +84,8 @@ mod tests {
         assert!(valid_object_key("path/to/object"));
         assert!(!valid_object_key(""));
         assert!(!valid_object_key("has\0null"));
+        assert!(valid_object_key(&"k".repeat(1024)));
+        assert!(!valid_object_key(&"k".repeat(1025))); // too long
     }
 
     #[test]

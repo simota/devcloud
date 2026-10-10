@@ -5,7 +5,7 @@
 //! `If-None-Match` (GET/HEAD 304, conditional PUT/Copy/CompleteMultipartUpload).
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use hmac::{Hmac, Mac};
@@ -25,22 +25,22 @@ use crate::model::{
     ServerSideEncryption, StorageClassAnalysis,
 };
 use crate::objops::{CreateMultipartUploadInput, PutObjectInput};
-use crate::percent::aws_percent_encode;
+use crate::percent::{aws_percent_encode, aws_percent_encode_bytes};
 use crate::responses::{
     access_control_policy, analytics_configuration, build_object_listing, build_version_listing,
-    complete_multipart_upload_result, copy_object_result, decode_continuation_token,
-    encode_list_value, error_xml, initiate_multipart_upload_result, inventory_configuration,
-    latest_object_version_ids, lifecycle_configuration, list_all_my_buckets,
-    list_analytics_configurations_result, list_inventory_configurations_result,
-    list_multipart_uploads_result, list_parts_result, location_constraint,
-    notification_configuration, object_legal_hold, object_lock_configuration, object_retention,
-    object_version_id, paginate_parts, parse_max_keys, parse_max_parts, parse_part_number_marker,
-    replication_configuration, versioning_configuration, DeleteMarkerElement, ListBucketResult,
-    ListVersionsResult, ObjectElement, VersionElement,
+    complete_multipart_upload_result, copy_object_result, copy_part_result,
+    decode_continuation_token, encode_list_value, error_xml, initiate_multipart_upload_result,
+    inventory_configuration, latest_object_version_ids, lifecycle_configuration,
+    list_all_my_buckets, list_analytics_configurations_result,
+    list_inventory_configurations_result, list_multipart_uploads_result, list_parts_result,
+    location_constraint, notification_configuration, object_legal_hold, object_lock_configuration,
+    object_retention, object_version_id, paginate_parts, parse_max_keys, parse_max_parts,
+    parse_part_number_marker, replication_configuration, versioning_configuration,
+    DeleteMarkerElement, ListBucketResult, ListVersionsResult, ObjectElement, VersionElement,
 };
 use crate::store::{FileBucketStore, StoreError};
 use crate::time_fmt::{parse_lifecycle_date, parse_rfc3339, rfc3339_seconds_from_unix};
-use crate::validation::valid_bucket_name;
+use crate::validation::{valid_bucket_name, MAX_OBJECT_KEY_BYTES};
 
 const MAX_HEADER_BYTES: usize = 64 * 1024;
 const MAX_BODY_BYTES: usize = 128 * 1024 * 1024;
@@ -191,7 +191,8 @@ async fn handle_conn(
     auth: Arc<AuthConfig>,
 ) -> std::io::Result<()> {
     let request = match read_request(&mut stream).await {
-        Ok(Some(req)) => req,
+        Ok(Some(Ok(req))) => req,
+        Ok(Some(Err(rejected))) => return write_response(&mut stream, rejected).await,
         _ => return Ok(()),
     };
     // DNS rebinding: a page whose own domain resolves to 127.0.0.1 reaches
@@ -214,13 +215,20 @@ async fn handle_conn(
             .await;
     }
     let response = {
-        let store = store.lock().unwrap();
+        // A panicking request must not wedge every later one: the store holds
+        // no in-memory state that a half-finished request could corrupt.
+        let store = store.lock().unwrap_or_else(PoisonError::into_inner);
         route_with_auth(&store, &request, &auth)
     };
     write_response(&mut stream, response).await
 }
 
-async fn read_request(stream: &mut TcpStream) -> std::io::Result<Option<Request>> {
+/// Reads one request. `Some(Err(_))` is an error response to send without
+/// routing (bad or oversized Content-Length, body cut short); `None` drops the
+/// connection.
+async fn read_request(
+    stream: &mut TcpStream,
+) -> std::io::Result<Option<Result<Request, Response>>> {
     let mut buf = Vec::new();
     let mut tmp = [0u8; 4096];
     let header_end = loop {
@@ -252,31 +260,49 @@ async fn read_request(stream: &mut TcpStream) -> std::io::Result<Option<Request>
         }
     }
 
-    let content_length: usize = headers
-        .get("content-length")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
+    let content_length: usize = match headers.get("content-length") {
+        None => 0,
+        Some(v) => match v.parse() {
+            Ok(n) => n,
+            Err(_) => {
+                return Ok(Some(Err(xml_error(
+                    400,
+                    "BadRequest",
+                    "Content-Length is not a valid number",
+                ))))
+            }
+        },
+    };
     if content_length > MAX_BODY_BYTES {
-        return Ok(None);
+        return Ok(Some(Err(xml_error(
+            413,
+            "EntityTooLarge",
+            "your proposed upload exceeds the maximum allowed size",
+        ))));
     }
 
     let mut body = buf[header_end + 4..].to_vec();
     while body.len() < content_length {
         let n = stream.read(&mut tmp).await?;
         if n == 0 {
-            break;
+            // Never route (and store) a body cut short.
+            return Ok(Some(Err(xml_error(
+                400,
+                "IncompleteBody",
+                "you did not provide the number of bytes specified by the Content-Length header",
+            ))));
         }
         body.extend_from_slice(&tmp[..n]);
     }
     body.truncate(content_length);
 
-    Ok(Some(Request {
+    Ok(Some(Ok(Request {
         method,
         path,
         query,
         headers,
         body,
-    }))
+    })))
 }
 
 /// Routes a parsed request to the S3 store.
@@ -461,6 +487,9 @@ fn handle_bucket(store: &FileBucketStore, req: &Request, bucket: &str) -> Respon
 }
 
 fn handle_object(store: &FileBucketStore, req: &Request, bucket: &str, key: &str) -> Response {
+    if key.len() > MAX_OBJECT_KEY_BYTES {
+        return xml_error(400, "KeyTooLongError", "your key is too long");
+    }
     match req.method.as_str() {
         "POST" => {
             if req.query.contains_key("select") {
@@ -485,6 +514,9 @@ fn handle_object(store: &FileBucketStore, req: &Request, bucket: &str, key: &str
                 return put_object_legal_hold(store, req, bucket, key);
             }
             if let Some(upload_id) = req.query.get("uploadId") {
+                if !req.header("x-amz-copy-source").is_empty() {
+                    return upload_part_copy(store, req, bucket, key, upload_id);
+                }
                 return upload_part(store, req, bucket, key, upload_id);
             }
             if !req.header("x-amz-copy-source").is_empty() {
@@ -1264,20 +1296,19 @@ fn upload_part(
     key: &str,
     upload_id: &str,
 ) -> Response {
-    let part_number = match req
-        .query
-        .get("partNumber")
-        .and_then(|v| v.parse::<i64>().ok())
-    {
-        Some(n) if (1..=10000).contains(&n) => n,
-        _ => return xml_error(400, "InvalidArgument", "invalid part number"),
+    let Some(part_number) = part_number_from_query(req) else {
+        return xml_error(400, "InvalidArgument", "invalid part number");
+    };
+    let payload = match request_payload(req) {
+        Ok(payload) => payload,
+        Err(r) => return r,
     };
     match store.upload_part(
         bucket,
         key,
         upload_id,
         part_number,
-        &req.body,
+        &payload,
         req.header("content-md5"),
     ) {
         Ok(part) => {
@@ -1285,24 +1316,107 @@ fn upload_part(
             r.headers.insert("ETag".to_string(), part.etag);
             r
         }
-        Err(StoreError::InvalidContentMd5) => xml_error(
+        Err(err) => upload_part_error(err),
+    }
+}
+
+/// UploadPartCopy: the part's bytes come from an existing object (or the
+/// `x-amz-copy-source-range` slice of it) instead of the request body.
+fn upload_part_copy(
+    store: &FileBucketStore,
+    req: &Request,
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+) -> Response {
+    let Some(part_number) = part_number_from_query(req) else {
+        return xml_error(400, "InvalidArgument", "invalid part number");
+    };
+    let Some((source_bucket, source_key, source_version_id)) =
+        parse_copy_source(req.header("x-amz-copy-source"))
+    else {
+        return xml_error(400, "InvalidArgument", "invalid copy source");
+    };
+    let (source_object, body) =
+        match store.get_object_version(&source_bucket, &source_key, &source_version_id) {
+            Ok(Some(found)) => found,
+            Ok(None) => return xml_error(404, "NoSuchKey", "source object does not exist"),
+            Err(StoreError::BucketNotExist) => {
+                return xml_error(404, "NoSuchBucket", "source bucket does not exist");
+            }
+            Err(StoreError::InvalidVersionId) => {
+                return xml_error(400, "InvalidArgument", "invalid version id");
+            }
+            Err(StoreError::InvalidBucketName) | Err(StoreError::InvalidObjectKey) => {
+                return xml_error(400, "InvalidArgument", "invalid copy source");
+            }
+            Err(_) => return xml_error(500, "InternalError", "internal error"),
+        };
+    if source_object.delete_marker {
+        return xml_error(400, "InvalidRequest", "the copy source is a delete marker");
+    }
+    if etag_list_matches(
+        req.header("x-amz-copy-source-if-none-match"),
+        &source_object.etag,
+    ) {
+        return precondition_failed();
+    }
+    let range = req.header("x-amz-copy-source-range");
+    let part_body = if range.is_empty() {
+        &body[..]
+    } else {
+        match parse_copy_source_range(range, body.len()) {
+            Some((first, last)) => &body[first..=last],
+            None => {
+                return xml_error(
+                    400,
+                    "InvalidArgument",
+                    "the x-amz-copy-source-range is not valid for the source object",
+                )
+            }
+        }
+    };
+    match store.upload_part(bucket, key, upload_id, part_number, part_body, "") {
+        Ok(part) => Response::xml(
+            200,
+            copy_part_result(&to_rfc3339_seconds(&part.last_modified), &part.etag),
+        ),
+        Err(err) => upload_part_error(err),
+    }
+}
+
+fn part_number_from_query(req: &Request) -> Option<i64> {
+    req.query
+        .get("partNumber")
+        .and_then(|v| v.parse::<i64>().ok())
+        .filter(|n| (1..=10000).contains(n))
+}
+
+/// `bytes=first-last` (both required) within an object of `size` bytes.
+fn parse_copy_source_range(header: &str, size: usize) -> Option<(usize, usize)> {
+    let (first, last) = header.strip_prefix("bytes=")?.split_once('-')?;
+    let (first, last): (usize, usize) = (first.parse().ok()?, last.parse().ok()?);
+    (first <= last && last < size).then_some((first, last))
+}
+
+fn upload_part_error(err: StoreError) -> Response {
+    match err {
+        StoreError::InvalidContentMd5 => xml_error(
             400,
             "InvalidDigest",
             "the Content-MD5 you specified was invalid",
         ),
-        Err(StoreError::ContentMd5Mismatch) => xml_error(
+        StoreError::ContentMd5Mismatch => xml_error(
             400,
             "BadDigest",
             "the Content-MD5 you specified did not match what was received",
         ),
-        Err(StoreError::InvalidPartNumber) => {
-            xml_error(400, "InvalidArgument", "invalid part number")
-        }
-        Err(StoreError::BucketNotExist) => xml_error(404, "NoSuchBucket", "bucket does not exist"),
-        Err(StoreError::MultipartUploadNotExist) | Err(StoreError::InvalidUploadId) => {
+        StoreError::InvalidPartNumber => xml_error(400, "InvalidArgument", "invalid part number"),
+        StoreError::BucketNotExist => xml_error(404, "NoSuchBucket", "bucket does not exist"),
+        StoreError::MultipartUploadNotExist | StoreError::InvalidUploadId => {
             xml_error(404, "NoSuchUpload", "multipart upload does not exist")
         }
-        Err(_) => xml_error(500, "InternalError", "internal error"),
+        _ => xml_error(500, "InternalError", "internal error"),
     }
 }
 
@@ -1363,12 +1477,13 @@ fn complete_multipart_upload(
         Ok(v) => v,
         Err(r) => return r,
     };
-    let Some(part_numbers) = parse_complete_multipart_parts(&req.body) else {
+    let Some(listed_parts) = parse_complete_multipart_parts(&req.body) else {
         return xml_error(400, "MalformedXML", "request body is malformed");
     };
-    if part_numbers.is_empty() {
+    if listed_parts.is_empty() {
         return xml_error(400, "MalformedXML", "request body is malformed");
     }
+    let part_numbers: Vec<i64> = listed_parts.iter().map(|(n, _)| *n).collect();
     let mut previous = 0;
     for part_number in &part_numbers {
         if *part_number <= 0 {
@@ -1382,6 +1497,18 @@ fn complete_multipart_upload(
             );
         }
         previous = *part_number;
+    }
+    // A listed ETag must name the stored part (missing parts and absent uploads
+    // are reported by the store below).
+    if let Ok(Some((_, stored_parts))) = store.list_parts(bucket, key, upload_id) {
+        for (part_number, etag) in &listed_parts {
+            let stored = stored_parts.iter().find(|p| p.part_number == *part_number);
+            if let Some(stored) = stored.filter(|_| !etag.is_empty()) {
+                if !etag.eq_ignore_ascii_case(stored.etag.trim_matches('"')) {
+                    return xml_error(400, "InvalidPart", "multipart part ETag does not match");
+                }
+            }
+        }
     }
     let completed = if if_none_match {
         store.complete_multipart_upload_if_absent(bucket, key, upload_id, &part_numbers)
@@ -1477,13 +1604,17 @@ fn put_object(store: &FileBucketStore, req: &Request, bucket: &str, key: &str) -
     let Some((retention, legal_hold)) = object_lock_from_headers(req) else {
         return xml_error(400, "InvalidArgument", "object lock headers are invalid");
     };
+    let body = match request_payload(req) {
+        Ok(payload) => payload.into_owned(),
+        Err(r) => return r,
+    };
     let input = PutObjectInput {
         bucket: bucket.to_string(),
         key: key.to_string(),
-        body: req.body.clone(),
+        body,
         content_md5: req.header("content-md5").to_string(),
         content_type: req.header("content-type").to_string(),
-        content_encoding: req.header("content-encoding").to_string(),
+        content_encoding: stored_content_encoding(req),
         cache_control: req.header("cache-control").to_string(),
         content_disposition: req.header("content-disposition").to_string(),
         metadata: user_metadata(&req.headers),
@@ -1535,6 +1666,80 @@ fn put_object(store: &FileBucketStore, req: &Request, bucket: &str, key: &str) -
         }
         Err(_) => xml_error(500, "InternalError", "internal error"),
     }
+}
+
+/// Whether the body carries `aws-chunked` framing (SigV4 streaming uploads).
+fn is_aws_chunked(req: &Request) -> bool {
+    req.header("x-amz-content-sha256").starts_with("STREAMING-")
+        || req
+            .header("content-encoding")
+            .split(',')
+            .any(|e| e.trim().eq_ignore_ascii_case("aws-chunked"))
+}
+
+/// The PutObject/UploadPart payload: the body with any `aws-chunked` framing
+/// (chunk sizes, chunk signatures, trailers) removed. Chunk signatures are not
+/// verified; strict mode rejects header-signed `STREAMING-` payloads (501)
+/// before routing.
+fn request_payload(req: &Request) -> Result<std::borrow::Cow<'_, [u8]>, Response> {
+    if !is_aws_chunked(req) {
+        return Ok(std::borrow::Cow::Borrowed(&req.body));
+    }
+    let Some(decoded) = decode_aws_chunked(&req.body) else {
+        return Err(xml_error(
+            400,
+            "IncompleteBody",
+            "the aws-chunked request body is malformed",
+        ));
+    };
+    let declared = req.header("x-amz-decoded-content-length");
+    if !declared.is_empty() && declared.parse::<usize>().ok() != Some(decoded.len()) {
+        return Err(xml_error(
+            400,
+            "IncompleteBody",
+            "the decoded body length does not match x-amz-decoded-content-length",
+        ));
+    }
+    Ok(std::borrow::Cow::Owned(decoded))
+}
+
+/// Decodes `<hex-size>[;chunk-signature=...]\r\n<data>\r\n` chunks up to the
+/// final zero-size chunk; trailers after it are ignored. `None` if malformed.
+fn decode_aws_chunked(mut body: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    loop {
+        let line_end = find_subslice(body, b"\r\n")?;
+        let line = std::str::from_utf8(&body[..line_end]).ok()?;
+        let size_hex = line.split(';').next()?.trim();
+        if size_hex.is_empty() || !size_hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        let size = usize::from_str_radix(size_hex, 16).ok()?;
+        body = &body[line_end + 2..];
+        if size == 0 {
+            return Some(out);
+        }
+        if body.len() < size.checked_add(2)? || &body[size..size + 2] != b"\r\n" {
+            return None;
+        }
+        out.extend_from_slice(&body[..size]);
+        body = &body[size + 2..];
+    }
+}
+
+/// The `Content-Encoding` to store: `aws-chunked` only describes the upload.
+fn stored_content_encoding(req: &Request) -> String {
+    let header = req.header("content-encoding");
+    let is_chunked = |e: &str| e.trim().eq_ignore_ascii_case("aws-chunked");
+    if !header.split(',').any(is_chunked) {
+        return header.to_string();
+    }
+    header
+        .split(',')
+        .filter(|e| !e.trim().is_empty() && !is_chunked(e))
+        .map(str::trim)
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn copy_object(store: &FileBucketStore, req: &Request, bucket: &str, key: &str) -> Response {
@@ -1988,6 +2193,12 @@ fn verify_presigned_url(req: &Request, auth: &AuthConfig) -> Result<(), Signatur
             status: 403,
         });
     }
+    if !amz_date_matches_scope(amz_date, date_stamp) {
+        return Err(SignatureError {
+            code: "AuthorizationHeaderMalformed",
+            status: 400,
+        });
+    }
     if let Some(signed_at) = parse_sigv4_time(amz_date) {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -2061,7 +2272,7 @@ fn verify_authorization_header(req: &Request, auth: &AuthConfig) -> Result<(), S
             status: 403,
         });
     }
-    if req.header("x-amz-date").is_empty() {
+    if !amz_date_matches_scope(req.header("x-amz-date"), date_stamp) {
         return Err(SignatureError {
             code: "AuthorizationHeaderMalformed",
             status: 400,
@@ -2139,7 +2350,7 @@ fn signature_for_request(
 ) -> String {
     let canonical_request = [
         req.method.clone(),
-        aws_percent_encode(&req.path, "/~"),
+        canonical_uri(&req.path),
         canonical_query_string(&req.query, ignored_query_key),
         canonical_headers(req, signed_headers),
         signed_headers.to_ascii_lowercase(),
@@ -2164,6 +2375,23 @@ fn signature_for_request(
         &derive_signing_key(&auth.secret_access_key, date_stamp, region),
         string_to_sign.as_bytes(),
     ))
+}
+
+/// S3 signs the URI-encoded path once (unlike other services' double
+/// encoding): decode each raw segment, then re-encode it.
+fn canonical_uri(raw_path: &str) -> String {
+    raw_path
+        .split('/')
+        .map(|segment| aws_percent_encode_bytes(&percent_decode_bytes(segment), "~"))
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// Whether a SigV4 timestamp is well formed and falls on the credential
+/// scope's day. There is no clock-skew check: local tests sign with fixed
+/// timestamps.
+fn amz_date_matches_scope(amz_date: &str, date_stamp: &str) -> bool {
+    parse_sigv4_time(amz_date).is_some() && amz_date.get(..8) == Some(date_stamp)
 }
 
 fn parse_credential_scope(credential: &str) -> Option<(&str, &str, &str, &str)> {
@@ -2252,7 +2480,8 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 }
 
 fn parse_sigv4_time(value: &str) -> Option<i64> {
-    if value.len() != 16 || !value.ends_with('Z') {
+    // ASCII only: the fixed-offset slices below would panic mid-character.
+    if value.len() != 16 || !value.is_ascii() || !value.ends_with('Z') {
         return None;
     }
     let year = value[0..4].parse::<i32>().ok()?;
@@ -2778,21 +3007,26 @@ fn write_server_side_encryption_headers(response: &mut Response, object: &Object
     }
 }
 
-fn parse_complete_multipart_parts(body: &[u8]) -> Option<Vec<i64>> {
+/// The `(PartNumber, ETag)` list of a CompleteMultipartUpload body. The ETag
+/// is unquoted (and XML-unescaped); empty when the part omits it.
+fn parse_complete_multipart_parts(body: &[u8]) -> Option<Vec<(i64, String)>> {
     let xml = std::str::from_utf8(body).ok()?;
     if !xml.contains("<CompleteMultipartUpload") {
         return None;
     }
-    let mut out = Vec::new();
-    let mut rest = xml;
-    while let Some(start) = rest.find("<PartNumber>") {
-        rest = &rest[start + "<PartNumber>".len()..];
-        let end = rest.find("</PartNumber>")?;
-        let n = rest[..end].trim().parse::<i64>().ok()?;
-        out.push(n);
-        rest = &rest[end + "</PartNumber>".len()..];
-    }
-    Some(out)
+    tag_blocks(xml, "Part")
+        .iter()
+        .map(|part| {
+            let number = tag_text_in(part, "PartNumber")?.parse::<i64>().ok()?;
+            let etag = tag_text_in(part, "ETag")
+                .unwrap_or_default()
+                .replace("&quot;", "\"")
+                .replace("&#34;", "\"")
+                .trim_matches('"')
+                .to_string();
+            Some((number, etag))
+        })
+        .collect()
 }
 
 fn acl_from_request(req: &Request) -> Option<String> {
@@ -3545,6 +3779,10 @@ fn parse_target(target: &str) -> (String, BTreeMap<String, String>) {
 }
 
 fn percent_decode(value: &str) -> String {
+    String::from_utf8_lossy(&percent_decode_bytes(value)).into_owned()
+}
+
+fn percent_decode_bytes(value: &str) -> Vec<u8> {
     let bytes = value.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
@@ -3559,7 +3797,7 @@ fn percent_decode(value: &str) -> String {
         out.push(bytes[i]);
         i += 1;
     }
-    String::from_utf8_lossy(&out).into_owned()
+    out
 }
 
 fn hex_val(b: u8) -> Option<u8> {
@@ -3571,39 +3809,47 @@ fn hex_val(b: u8) -> Option<u8> {
     }
 }
 
+/// Resolves a `Range` header to `(start, end, partial)`. Like S3 (and RFC 9110
+/// section 14.2), a header that is not a single well-formed `bytes=` range is
+/// ignored and the whole object is served; only a well-formed range the
+/// object cannot satisfy is an error.
 fn parse_range(header: &str, size: usize) -> Result<(usize, usize, bool), ()> {
-    if header.is_empty() {
-        if size == 0 {
-            return Ok((0, 0, false));
-        }
-        return Ok((0, size - 1, false));
-    }
-    if size == 0 || !header.starts_with("bytes=") {
-        return Err(());
-    }
-    let spec = &header["bytes=".len()..];
-    let (left, right) = spec.split_once('-').ok_or(())?;
-    if left.is_empty() {
-        let suffix: usize = right.parse().map_err(|_| ())?;
-        if suffix == 0 {
-            return Err(());
-        }
-        let take = suffix.min(size);
-        return Ok((size - take, size - 1, true));
-    }
-    let start: usize = left.parse().map_err(|_| ())?;
-    if start >= size {
-        return Err(());
-    }
-    let end = if right.is_empty() {
-        size - 1
-    } else {
-        right.parse::<usize>().map_err(|_| ())?.min(size - 1)
+    let full = Ok((0, size.saturating_sub(1), false));
+    let Some((first, last)) = parse_single_byte_range(header) else {
+        return full;
     };
-    if end < start {
-        return Err(());
-    }
+    let (start, end) = match (first, last) {
+        (None, Some(0)) => return Err(()),
+        (None, Some(suffix)) if size > 0 => (size - suffix.min(size), size - 1),
+        (Some(start), last) if start < size => (start, last.unwrap_or(usize::MAX).min(size - 1)),
+        _ => return Err(()),
+    };
     Ok((start, end, true))
+}
+
+/// Parses `bytes=first-last`, `bytes=first-`, or `bytes=-suffix`; `None` for
+/// anything else (other units, multiple ranges, `last < first`, junk).
+fn parse_single_byte_range(header: &str) -> Option<(Option<usize>, Option<usize>)> {
+    let unit = header.get(..6)?;
+    if !unit.eq_ignore_ascii_case("bytes=") {
+        return None;
+    }
+    let (left, right) = header[6..].trim().split_once('-')?;
+    let number = |v: &str| -> Option<Option<usize>> {
+        if v.is_empty() {
+            Some(None)
+        } else if v.bytes().all(|b| b.is_ascii_digit()) {
+            // An overflowing position is still well formed: saturate it.
+            Some(Some(v.parse().unwrap_or(usize::MAX)))
+        } else {
+            None
+        }
+    };
+    match (number(left)?, number(right)?) {
+        (None, None) => None,
+        (Some(first), Some(last)) if last < first => None,
+        range => Some(range),
+    }
 }
 
 fn method_not_allowed(allow: &str) -> Response {
@@ -3714,6 +3960,7 @@ fn reason_phrase(status: u16) -> &'static str {
         405 => "Method Not Allowed",
         409 => "Conflict",
         412 => "Precondition Failed",
+        413 => "Content Too Large",
         416 => "Requested Range Not Satisfiable",
         500 => "Internal Server Error",
         501 => "Not Implemented",

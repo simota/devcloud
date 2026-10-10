@@ -415,6 +415,15 @@ pub fn copy_object_result(last_modified: &str, etag: &str) -> Vec<u8> {
     )
 }
 
+/// `<CopyPartResult>` (UploadPartCopy).
+pub fn copy_part_result(last_modified: &str, etag: &str) -> Vec<u8> {
+    encode(
+        &Element::new("CopyPartResult")
+            .text_child("LastModified", last_modified)
+            .text_child("ETag", etag),
+    )
+}
+
 /// `<InitiateMultipartUploadResult>`.
 pub fn initiate_multipart_upload_result(bucket: &str, key: &str, upload_id: &str) -> Vec<u8> {
     encode(
