@@ -65,6 +65,12 @@ impl<R: AsyncRead + Unpin> Input<'_, R> {
     /// Ensures at least `n` unread bytes are buffered; `false` on EOF.
     async fn fill(&mut self, n: usize) -> std::io::Result<bool> {
         let mut tmp = [0u8; 8192];
+        if self.buf.len() - self.pos < n && self.pos > 0 {
+            // Drop consumed bytes so the buffer never holds more than the
+            // unread tail plus one read.
+            self.buf.drain(..self.pos);
+            self.pos = 0;
+        }
         while self.buf.len() - self.pos < n {
             let read = self.stream.read(&mut tmp).await?;
             if read == 0 {
@@ -103,10 +109,36 @@ impl<R: AsyncRead + Unpin> Input<'_, R> {
         }
     }
 
+    /// [`Self::line`], charging its bytes to `framing` and failing once the
+    /// framing exceeds the decoded body by more than `allowance`.
+    async fn framing_line(
+        &mut self,
+        framing: &mut usize,
+        body_len: usize,
+        allowance: usize,
+    ) -> std::io::Result<Result<String, BodyError>> {
+        let line = self.line().await?;
+        if let Ok(l) = &line {
+            *framing = framing.saturating_add(l.len() + 2);
+            if *framing > body_len.saturating_add(allowance) {
+                return Ok(Err(BodyError::Malformed("chunk framing too large")));
+            }
+        }
+        Ok(line)
+    }
+
     async fn chunked(&mut self, max: usize) -> std::io::Result<Result<Vec<u8>, BodyError>> {
+        /// Framing bytes (chunk-size lines, extensions, trailers) allowed on
+        /// top of the decoded body size. Honest encoders stay far below the
+        /// body itself; this stops a peer from streaming unbounded framing.
+        const FRAMING_ALLOWANCE: usize = 64 * 1024;
         let mut body = Vec::new();
+        let mut framing = 0usize;
         loop {
-            let line = match self.line().await? {
+            let line = match self
+                .framing_line(&mut framing, body.len(), FRAMING_ALLOWANCE)
+                .await?
+            {
                 Ok(l) => l,
                 Err(e) => return Ok(Err(e)),
             };
@@ -120,7 +152,10 @@ impl<R: AsyncRead + Unpin> Input<'_, R> {
             if size == 0 {
                 // Trailer section: header lines until an empty one.
                 loop {
-                    match self.line().await? {
+                    match self
+                        .framing_line(&mut framing, body.len(), FRAMING_ALLOWANCE)
+                        .await?
+                    {
                         Ok(l) if l.is_empty() => return Ok(Ok(body)),
                         Ok(_) => {}
                         Err(e) => return Ok(Err(e)),
@@ -215,6 +250,12 @@ mod tests {
             Err(BodyError::Truncated)
         );
         assert_eq!(read(b"b\r\n", b"", &te, 10).await, Err(BodyError::TooLarge));
+        // Endless trailers (or chunk extensions) cannot grow without bound.
+        let trailers = format!("0\r\n{}", "X: aaaaaaaa\r\n".repeat(10_000));
+        assert_eq!(
+            read(trailers.as_bytes(), b"", &te, 10).await,
+            Err(BodyError::Malformed("chunk framing too large"))
+        );
         // Transfer-Encoding wins over a conflicting Content-Length.
         let both = [("transfer-encoding", "chunked"), ("content-length", "1")];
         assert_eq!(

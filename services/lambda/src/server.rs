@@ -889,10 +889,18 @@ impl Server {
     }
 
     pub fn delete_function(&self, id: &str, query: &BTreeMap<String, String>) -> Reply {
-        let name = match self.lookup(id, query.get("Qualifier").map(String::as_str)) {
+        let qualifier = query.get("Qualifier").map(String::as_str);
+        let name = match self.lookup(id, qualifier) {
             Ok(r) => r.function_name,
             Err(r) => return r,
         };
+        // Only `$LATEST` resolves, and AWS refuses to delete it on its own:
+        // a qualified delete must not silently remove the whole function.
+        if qualifier.is_some_and(|q| !q.is_empty()) || parse_function_id(id).1.is_some() {
+            return invalid_param(
+                "$LATEST version cannot be deleted without deleting the function.",
+            );
+        }
         let lock = self.function_lock(&name);
         let _serialized = lock.lock().unwrap();
         let result = self.commit(|st| {
@@ -1622,6 +1630,12 @@ impl Server {
                 "1 validation error detected: Value '{arn}' at 'resource' failed to satisfy constraint: Member must satisfy regular expression pattern: arn:(aws[a-zA-Z-]*):lambda:.*"
             )));
         }
+        // Tags belong to the function, not to a version or alias.
+        if parse_function_id(arn).1.is_some() {
+            return Err(invalid_param(
+                "Tags on function aliases and versions are not supported. Please specify a function ARN.",
+            ));
+        }
         self.lookup(arn, None)
     }
 
@@ -1648,7 +1662,8 @@ impl Server {
                 .unwrap_or("");
             let store = devcloud_s3::store::FileBucketStore::new(root.clone());
             match store.get_object_version(bucket, key, version) {
-                Ok(Some((_, data))) => data,
+                // A delete marker has no package: report it as missing.
+                Ok(Some((object, data))) if !object.delete_marker => data,
                 _ if !version.is_empty() => {
                     return Err(invalid_param(&format!(
                         "Error occurred while GetObject. S3 Error Code: NoSuchVersion. S3 Error Message: The specified version does not exist. (bucket={bucket}, key={key}, version={version})"

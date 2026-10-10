@@ -239,6 +239,21 @@ async fn function_crud_lifecycle() {
     .await;
     assert_eq!(qualified.status, 404);
 
+    // `$LATEST` cannot be deleted on its own; the function must survive.
+    for target in [
+        "/2015-03-31/functions/crud-fn?Qualifier=%24LATEST",
+        "/2015-03-31/functions/crud-fn%3A%24LATEST",
+    ] {
+        let latest = call(&e.server, "DELETE", target, &[], b"").await;
+        assert_eq!(latest.status, 400, "{target}");
+        assert_eq!(
+            latest.header("X-Amzn-ErrorType"),
+            Some("InvalidParameterValueException")
+        );
+    }
+    let still = call(&e.server, "GET", "/2015-03-31/functions/crud-fn", &[], b"").await;
+    assert_eq!(still.status, 200);
+
     let deleted = call(
         &e.server,
         "DELETE",
@@ -674,6 +689,55 @@ async fn tags_and_s3_code_source() {
     )
     .await;
     assert_eq!(list.json()["Tags"], json!({ "b": "2" }));
+
+    // Tags belong to the function: a qualified ARN is rejected, not
+    // silently applied to the unqualified function.
+    let qualified = call(
+        &e.server,
+        "POST",
+        &format!("/2017-03-31/tags/{arn}%3A%24LATEST"),
+        &[],
+        br#"{"Tags":{"c":"3"}}"#,
+    )
+    .await;
+    assert_eq!(qualified.status, 400);
+    assert_eq!(
+        qualified.header("X-Amzn-ErrorType"),
+        Some("InvalidParameterValueException")
+    );
+
+    // A delete marker version has no package: it is a missing version, not
+    // a corrupt zip.
+    store.put_bucket_versioning("artifacts", "Enabled").unwrap();
+    let (marker, _) = store
+        .delete_object_with_result("artifacts", "fn.zip", false)
+        .unwrap();
+    assert!(marker.delete_marker);
+    let from_marker = json!({
+        "FunctionName": "s3-marker",
+        "Runtime": "python3.12",
+        "Role": "r",
+        "Handler": "app.handler",
+        "Code": {
+            "S3Bucket": "artifacts",
+            "S3Key": "fn.zip",
+            "S3ObjectVersion": marker.version_id,
+        },
+    });
+    let r = call(
+        &e.server,
+        "POST",
+        "/2015-03-31/functions",
+        &[],
+        from_marker.to_string().as_bytes(),
+    )
+    .await;
+    assert_eq!(r.status, 400);
+    assert!(
+        String::from_utf8_lossy(&r.body).contains("NoSuchVersion"),
+        "{}",
+        String::from_utf8_lossy(&r.body)
+    );
 
     let settings = call(&e.server, "GET", "/2016-08-19/account-settings/", &[], b"").await;
     assert_eq!(settings.json()["AccountUsage"]["FunctionCount"], 1);
