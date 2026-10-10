@@ -92,7 +92,7 @@ impl CodeStore {
         let zip_path = self.zip_path(name, sha);
         if !zip_path.is_file() {
             let tmp = zip_path.with_extension("zip.tmp");
-            std::fs::write(&tmp, zip).map_err(|e| StageError::Io(e.to_string()))?;
+            write_synced(&tmp, zip).map_err(|e| StageError::Io(e.to_string()))?;
             std::fs::rename(&tmp, &zip_path).map_err(|e| StageError::Io(e.to_string()))?;
         }
         Ok(())
@@ -151,6 +151,15 @@ pub enum StageError {
 /// Filesystem-safe name derived from the (base64) code hash.
 fn suffix(sha: &str) -> String {
     hex::encode(Sha256::digest(sha.as_bytes()))[..16].to_string()
+}
+
+/// Writes `data` and flushes it to disk, so a rename that follows never
+/// publishes a truncated file after a crash or power loss.
+pub(crate) fn write_synced(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut file = std::fs::File::create(path)?;
+    file.write_all(data)?;
+    file.sync_all()
 }
 
 fn extract_into(zip: &[u8], tree: &Path) -> Result<(), String> {

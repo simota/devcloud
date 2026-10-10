@@ -3536,3 +3536,42 @@ async fn strict_mode_checks_scope_date_and_normalizes_the_signed_path() {
     let r = send(signed, "//2015-03-31/functions/").await;
     assert_ne!(r.status, 403, "{}", String::from_utf8_lossy(&r.body));
 }
+
+#[tokio::test]
+async fn a_lost_package_does_not_take_down_the_whole_api() {
+    let e = env("lostpkg");
+    assert_eq!(create_python(&e.server, "keep-fn").await.status, 201);
+    assert_eq!(create_python(&e.server, "lost-fn").await.status, 201);
+    std::fs::remove_dir_all(e.dir.join("lambda/functions/lost-fn")).unwrap();
+
+    let restarted = Arc::new(Server::new(config_for(&e.dir)));
+    assert!(restarted.load_err().is_none());
+    let list = call(&restarted, "GET", "/2015-03-31/functions/", &[], b"").await;
+    assert_eq!(list.json()["Functions"].as_array().unwrap().len(), 2);
+    let keep = call(&restarted, "GET", "/2015-03-31/functions/keep-fn", &[], b"").await;
+    assert_eq!(keep.status, 200);
+    let invoked = call(
+        &restarted,
+        "POST",
+        "/2015-03-31/functions/lost-fn/invocations",
+        &[],
+        b"{}",
+    )
+    .await;
+    assert_eq!(invoked.status, 502);
+    assert!(
+        String::from_utf8_lossy(&invoked.body).contains("deployment package is missing"),
+        "{}",
+        String::from_utf8_lossy(&invoked.body)
+    );
+    // The broken function can still be removed through the API.
+    let deleted = call(
+        &restarted,
+        "DELETE",
+        "/2015-03-31/functions/lost-fn",
+        &[],
+        b"",
+    )
+    .await;
+    assert_eq!(deleted.status, 204);
+}

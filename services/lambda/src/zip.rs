@@ -21,7 +21,12 @@ pub struct Entry {
     /// Unix permission bits from the external attributes, when present.
     pub mode: Option<u32>,
     pub is_dir: bool,
+    /// A Unix symlink (`zip -y`): `data` is the link target.
+    pub is_symlink: bool,
 }
+
+const S_IFMT: u32 = 0o170000;
+const S_IFLNK: u32 = 0o120000;
 
 fn u16_at(b: &[u8], off: usize) -> Result<u16, String> {
     b.get(off..off + 2)
@@ -138,16 +143,14 @@ fn read_entries_with_limit(archive: &[u8], limit: usize) -> Result<Vec<Entry>, S
 
         // Upper byte 3 == Unix: the high 16 bits of the external attributes
         // carry st_mode.
-        let mode = if version_made_by >> 8 == 3 {
-            Some((external_attrs >> 16) & 0o7777)
-        } else {
-            None
-        };
+        let unix_mode = (version_made_by >> 8 == 3).then_some(external_attrs >> 16);
+        let is_symlink = unix_mode.is_some_and(|m| m & S_IFMT == S_IFLNK);
         entries.push(Entry {
             is_dir: name.ends_with('/'),
             name,
             data,
-            mode,
+            mode: unix_mode.map(|m| m & 0o7777),
+            is_symlink,
         });
     }
     Ok(entries)
@@ -168,11 +171,59 @@ fn safe_join(root: &Path, name: &str) -> Result<PathBuf, String> {
     Ok(out)
 }
 
+/// Checks a symlink entry's target: relative, every `..` before any normal
+/// component, and never climbing above the package root from the link's
+/// directory. Since nothing is extracted beneath a symlink, the `..` steps
+/// walk real directories, and the rest descends from there.
+fn check_symlink_target(name: &str, target: &str) -> Result<(), String> {
+    let escapes = || format!("zip entry {name:?} links outside the package root");
+    let link_parent_depth = Path::new(name)
+        .components()
+        .filter(|c| matches!(c, Component::Normal(_)))
+        .count()
+        .saturating_sub(1);
+    let mut ups = 0usize;
+    let mut descended = false;
+    for component in Path::new(target).components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir if !descended => ups += 1,
+            Component::Normal(_) => descended = true,
+            _ => return Err(escapes()),
+        }
+    }
+    if target.is_empty() || ups > link_parent_depth {
+        return Err(escapes());
+    }
+    Ok(())
+}
+
 /// Extracts `archive` into `root` (which must already exist and be empty).
 pub fn extract(archive: &[u8], root: &Path) -> Result<(), String> {
     let entries = read_entries(archive)?;
+    // Symlinks are created last, and no other entry may live beneath one:
+    // writes then never pass through a link.
+    let links: Vec<PathBuf> = entries
+        .iter()
+        .filter(|e| e.is_symlink)
+        .map(|e| safe_join(root, &e.name))
+        .collect::<Result<_, _>>()?;
+    let mut deferred = Vec::new();
     for entry in entries {
         let path = safe_join(root, &entry.name)?;
+        if links.iter().any(|l| path != *l && path.starts_with(l)) {
+            return Err(format!(
+                "zip entry {:?} is inside a symlinked directory",
+                entry.name
+            ));
+        }
+        if entry.is_symlink {
+            let target = String::from_utf8(entry.data)
+                .map_err(|_| format!("zip entry {:?} has a non-UTF-8 link target", entry.name))?;
+            check_symlink_target(&entry.name, &target)?;
+            deferred.push((path, target));
+            continue;
+        }
         if entry.is_dir {
             std::fs::create_dir_all(&path).map_err(|e| e.to_string())?;
             continue;
@@ -188,15 +239,32 @@ pub fn extract(archive: &[u8], root: &Path) -> Result<(), String> {
                 .map_err(|e| e.to_string())?;
         }
     }
+    for (path, target) in deferred {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, &path).map_err(|e| e.to_string())?;
+        #[cfg(not(unix))]
+        std::fs::write(&path, target.as_bytes()).map_err(|e| e.to_string())?;
+    }
     Ok(())
 }
 
 /// Builds a stored (uncompressed) zip archive. Used by tests and by tooling that
 /// needs a deterministic package without an external `zip` binary.
 pub fn build_stored(files: &[(&str, &[u8])]) -> Vec<u8> {
+    let with_modes: Vec<(&str, &[u8], u32)> =
+        files.iter().map(|(n, d)| (*n, *d, 0o100644)).collect();
+    build_stored_with_modes(&with_modes)
+}
+
+/// [`build_stored`] with an explicit Unix `st_mode` per entry (`0o120777`
+/// makes a symlink whose data is the target).
+pub fn build_stored_with_modes(files: &[(&str, &[u8], u32)]) -> Vec<u8> {
     let mut out = Vec::new();
     let mut central = Vec::new();
-    for (name, data) in files {
+    for (name, data, mode) in files {
         let offset = out.len() as u32;
         let crc = crc32(data);
         let size = data.len() as u32;
@@ -227,7 +295,7 @@ pub fn build_stored(files: &[(&str, &[u8])]) -> Vec<u8> {
         central.extend_from_slice(&0u16.to_le_bytes()); // comment
         central.extend_from_slice(&0u16.to_le_bytes()); // disk
         central.extend_from_slice(&0u16.to_le_bytes()); // internal attrs
-        central.extend_from_slice(&(0o100644u32 << 16).to_le_bytes());
+        central.extend_from_slice(&(mode << 16).to_le_bytes());
         central.extend_from_slice(&offset.to_le_bytes());
         central.extend_from_slice(name.as_bytes());
     }
@@ -391,6 +459,62 @@ mod tests {
         let err = extract(&archive, &dir).unwrap_err();
         assert!(err.contains("escapes"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn temp_root(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "devcloud-lambda-zip-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinks_inside_the_package_are_kept() {
+        let archive = build_stored_with_modes(&[
+            ("node_modules/typescript/bin/tsc", b"#!/bin/sh\n", 0o100755),
+            ("node_modules/.bin/tsc", b"../typescript/bin/tsc", 0o120777),
+            ("lib", b"node_modules/typescript", 0o120777),
+        ]);
+        let dir = temp_root("links");
+        extract(&archive, &dir).unwrap();
+        let link = dir.join("node_modules/.bin/tsc");
+        assert!(std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(std::fs::read(&link).unwrap(), b"#!/bin/sh\n");
+        assert!(dir.join("lib/bin/tsc").is_file());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn symlinks_cannot_escape_or_be_written_through() {
+        for (entries, why) in [
+            (
+                vec![("a/l", &b"../../etc"[..], 0o120777)],
+                "climbs above root",
+            ),
+            (vec![("l", &b"/etc/passwd"[..], 0o120777)], "absolute"),
+            (vec![("l", &b"a/../../x"[..], 0o120777)], "up after down"),
+            (vec![("l", &b""[..], 0o120777)], "empty"),
+            (
+                vec![
+                    ("l", &b"sub"[..], 0o120777),
+                    ("l/x.py", &b"x"[..], 0o100644),
+                ],
+                "entry beneath a link",
+            ),
+        ] {
+            let dir = temp_root("badlinks");
+            let err = extract(&build_stored_with_modes(&entries), &dir).unwrap_err();
+            assert!(err.contains("zip entry"), "{why}: {err}");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     #[test]

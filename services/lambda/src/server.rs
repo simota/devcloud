@@ -352,10 +352,19 @@ impl Server {
         };
         let persisted: PersistedState = serde_json::from_slice(&data).map_err(|e| e.to_string())?;
         // Re-extract any package whose extracted tree went missing (image
-        // functions have no package).
+        // functions have no package). One unrecoverable package fails only
+        // that function's invocations: the rest of the API stays usable, and
+        // the function can still be updated or deleted.
         for record in persisted.functions.values().filter(|r| !r.is_image()) {
-            self.code
-                .ensure_tree(&record.function_name, &record.code_sha256)?;
+            if let Err(e) = self
+                .code
+                .ensure_tree(&record.function_name, &record.code_sha256)
+            {
+                eprintln!(
+                    "devcloud-lambda: function {} has no usable package: {e}",
+                    record.function_name
+                );
+            }
         }
         *self.state.get_mut().unwrap() = persisted;
         Ok(())
@@ -370,7 +379,7 @@ impl Server {
         let data = serde_json::to_vec_pretty(st).map_err(|e| e.to_string())?;
         let path = root.join("state.json");
         let tmp = root.join("state.json.tmp");
-        std::fs::write(&tmp, &data).map_err(|e| e.to_string())?;
+        crate::code_store::write_synced(&tmp, &data).map_err(|e| e.to_string())?;
         std::fs::rename(&tmp, &path).map_err(|e| e.to_string())
     }
 
@@ -1384,6 +1393,18 @@ impl Server {
                     "devcloud cannot execute runtime {} locally (supported: python3.x, nodejs*.x)",
                     record.runtime
                 ),
+            );
+        }
+        if image.is_none()
+            && !self
+                .code
+                .tree_path(&record.function_name, &record.code_sha256)
+                .is_dir()
+        {
+            return Reply::error(
+                502,
+                "ServiceException",
+                "the function's deployment package is missing from local storage: update the function code to restore it",
             );
         }
 
