@@ -60,16 +60,12 @@ pub fn family(runtime: &str) -> Option<Family> {
 /// it: `python3.12` → `3.12`, `nodejs20.x` → `20`. `None` when the identifier
 /// carries no usable version.
 pub fn version(runtime: &str) -> Option<String> {
-    let (rest, family) = if let Some(rest) = runtime.strip_prefix("python") {
-        (rest, Family::Python)
-    } else if let Some(rest) = runtime.strip_prefix("nodejs") {
-        (rest, Family::Node)
-    } else {
-        return None;
-    };
-    let v = match family {
-        Family::Python => rest,
-        Family::Node => rest.strip_suffix(".x").unwrap_or(rest),
+    let v = match runtime.strip_prefix("python") {
+        Some(rest) => rest,
+        None => {
+            let rest = runtime.strip_prefix("nodejs")?;
+            rest.strip_suffix(".x").unwrap_or(rest)
+        }
     };
     let numeric = !v.is_empty()
         && v.split('.')
@@ -317,14 +313,20 @@ impl Pool {
                 c.remove().await;
             }
         }
-        let pending = std::mem::take(&mut *self.removals.lock().unwrap());
-        // Each removal is bounded by DOCKER_RM_TIMEOUT.
-        let _ = tokio::task::spawn_blocking(move || {
-            for handle in pending {
-                let _ = handle.join();
+        // Each removal is bounded by DOCKER_RM_TIMEOUT. Removals started
+        // while waiting (environments dropped meanwhile) are waited for too.
+        loop {
+            let pending = std::mem::take(&mut *self.removals.lock().unwrap());
+            if pending.is_empty() {
+                break;
             }
-        })
-        .await;
+            let _ = tokio::task::spawn_blocking(move || {
+                for handle in pending {
+                    let _ = handle.join();
+                }
+            })
+            .await;
+        }
     }
 
     /// An idle environment of `function` started from `key`, if one is still
@@ -499,6 +501,8 @@ enum Wait {
     },
     TimedOut {
         log: Vec<u8>,
+        /// Peak memory, read before the process group was killed.
+        max_memory_mb: Option<u64>,
     },
 }
 
@@ -529,23 +533,27 @@ impl Environment {
             Woke::Event(_) => match tokio::time::timeout_at(deadline, self.child.wait()).await {
                 Ok(status) => status,
                 Err(_) => {
+                    let max_memory_mb = self.child.id().and_then(peak_rss_mb);
                     self.kill_group();
                     return Wait::TimedOut {
                         log: self.drain().await,
+                        max_memory_mb,
                     };
                 }
             },
             Woke::Exit(status) => status,
             Woke::Deadline => {
+                let max_memory_mb = self.child.id().and_then(peak_rss_mb);
                 self.kill_group();
                 return Wait::TimedOut {
                     log: self.drain().await,
+                    max_memory_mb,
                 };
             }
         };
         let crashed = match status {
             Ok(s) if s.success() => None,
-            Ok(s) => Some(s.to_string()),
+            Ok(s) => Some(exit_status_text(s)),
             Err(e) => Some(e.to_string()),
         };
         // Descendants still holding the log pipes go down with the group.
@@ -597,11 +605,7 @@ impl Drop for Environment {
             // Killing the CLI leaves the container running: remove it from a
             // thread (no runtime to await on here), tracked so the pool's
             // close waits for it.
-            let removals = Arc::clone(&c.removals);
-            let handle = std::thread::spawn(move || c.remove_blocking());
-            let mut pending = removals.lock().unwrap();
-            pending.retain(|h| !h.is_finished());
-            pending.push(handle);
+            drop(c.spawn_removal());
         }
     }
 }
@@ -637,14 +641,26 @@ impl Container {
         let _ = rm.wait();
     }
 
+    /// Starts `docker rm -f` on a thread tracked in `removals` (so the
+    /// pool's close waits for it); the receiver fires once it is done.
+    fn spawn_removal(self) -> tokio::sync::oneshot::Receiver<()> {
+        let (done, finished) = tokio::sync::oneshot::channel();
+        let removals = Arc::clone(&self.removals);
+        let handle = std::thread::spawn(move || {
+            self.remove_blocking();
+            let _ = done.send(());
+        });
+        let mut pending = removals.lock().unwrap();
+        pending.retain(|h| !h.is_finished());
+        pending.push(handle);
+        finished
+    }
+
+    /// Removes the container and waits for it. Cancellation-safe: if this
+    /// future is dropped (shutdown aborting an invocation, a client hanging
+    /// up), the removal still completes and the pool's close still waits.
     async fn remove(self) {
-        let rm = tokio::process::Command::new(&self.docker)
-            .args(["rm", "-f", &self.name])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .kill_on_drop(true)
-            .status();
-        let _ = tokio::time::timeout(DOCKER_RM_TIMEOUT, rm).await;
+        let _ = self.spawn_removal().await;
     }
 }
 
@@ -714,7 +730,7 @@ pub async fn run(
         Wait::Marker { tag, log } => {
             reusable = tag == "done";
             max_memory_mb = pid.and_then(peak_rss_mb);
-            (read_result(&result_path), log, false)
+            (read_result(&result_path, &inv.request_id), log, false)
         }
         Wait::Exited {
             crashed: Some(status),
@@ -732,8 +748,16 @@ pub async fn run(
         ),
         // A clean exit can still have recorded the result (a Node callback
         // whose event loop had already drained).
-        Wait::Exited { crashed: None, log } => (read_result(&result_path), log, false),
-        Wait::TimedOut { log } => (timed_out_error(inv), log, true),
+        Wait::Exited { crashed: None, log } => {
+            (read_result(&result_path, &inv.request_id), log, false)
+        }
+        Wait::TimedOut {
+            log,
+            max_memory_mb: peak,
+        } => {
+            max_memory_mb = peak;
+            (timed_out_error(inv), log, true)
+        }
     };
     let _ = std::fs::remove_file(&result_path);
 
@@ -760,7 +784,7 @@ pub async fn run(
 /// The invocation's result when the environment never became ready.
 fn failed_init(inv: &Invocation, waited: Wait, init: Duration) -> Completed {
     let (outcome, log, timed_out) = match waited {
-        Wait::TimedOut { log } => (timed_out_error(inv), log, true),
+        Wait::TimedOut { log, .. } => (timed_out_error(inv), log, true),
         Wait::Exited { crashed, log } => (
             Outcome::FunctionError(error_doc(
                 &format!(
@@ -858,6 +882,23 @@ fn spawn(
     // handler spawned along with the interpreter.
     #[cfg(unix)]
     cmd.process_group(0);
+    // fd 2 shares the stdout pipe, so output written straight to it (native
+    // code, subprocesses, warnings) stays ordered before the invocation's
+    // marker instead of racing it through a second pipe into the next log.
+    #[cfg(unix)]
+    {
+        cmd.stderr(Stdio::null());
+        // SAFETY: dup2 is async-signal-safe; std has already installed the
+        // piped stdout on fd 1 when pre_exec runs.
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::dup2(1, 2) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
     let control = attach_control_pipe(&mut cmd).map_err(|e| {
         let _ = std::fs::remove_dir_all(&work_dir);
         RuntimeError::Spawn(format!("start {bin} for runtime {}: {e}", inv.runtime))
@@ -877,10 +918,10 @@ fn spawn(
         Arc::clone(&stdout),
         tx,
     ));
-    let err_task = tokio::spawn(collect(
-        child.stderr.take().expect("piped stderr"),
-        Arc::clone(&stderr),
-    ));
+    let mut tasks = vec![out_task.abort_handle()];
+    if let Some(err) = child.stderr.take() {
+        tasks.push(tokio::spawn(collect(err, Arc::clone(&stderr))).abort_handle());
+    }
     Ok(Environment {
         id,
         key: inv.env_key.clone(),
@@ -891,7 +932,7 @@ fn spawn(
         events,
         stdout,
         stderr,
-        tasks: vec![out_task.abort_handle(), err_task.abort_handle()],
+        tasks,
         work_dir,
         idle_since: Instant::now(),
         _code: code,
@@ -1340,14 +1381,20 @@ fn attach_control_pipe(cmd: &mut tokio::process::Command) -> std::io::Result<Con
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     let mut fds = [0 as libc::c_int; 2];
     // SAFETY: `fds` is a valid two-element buffer; on success both
-    // descriptors are new and owned here. FD_CLOEXEC (set right after; macOS
-    // has no pipe2) keeps them out of other children; the dup2 below gives
-    // only this child its copy.
-    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+    // descriptors are new and owned here. FD_CLOEXEC keeps them out of other
+    // children; the dup2 below gives only this child its copy. Linux sets it
+    // atomically, so a concurrent spawn on another thread cannot inherit the
+    // pipe; macOS has no pipe2 and sets it right after.
+    #[cfg(target_os = "linux")]
+    let created = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
+    #[cfg(not(target_os = "linux"))]
+    let created = unsafe { libc::pipe(fds.as_mut_ptr()) };
+    if created != 0 {
         return Err(std::io::Error::last_os_error());
     }
     // SAFETY: both descriptors were just created and are owned by nobody else.
     let (read, write) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+    #[cfg(not(target_os = "linux"))]
     for fd in [&read, &write] {
         // SAFETY: plain fcntl on a descriptor we own.
         unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) };
@@ -1558,12 +1605,44 @@ fn reserved_env(inv: &Invocation, env_id: u64) -> Vec<(String, String)> {
     env
 }
 
-fn read_result(path: &Path) -> Outcome {
+/// An exit status the way the Lambda runtime reports it (Go's
+/// `ProcessState.String`): `exit status 1`, `signal: killed`.
+fn exit_status_text(status: std::process::ExitStatus) -> String {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(sig) = status.signal() {
+            let name = match sig {
+                libc::SIGHUP => "hangup",
+                libc::SIGINT => "interrupt",
+                libc::SIGQUIT => "quit",
+                libc::SIGILL => "illegal instruction",
+                libc::SIGABRT => "aborted",
+                libc::SIGBUS => "bus error",
+                libc::SIGFPE => "floating point exception",
+                libc::SIGKILL => "killed",
+                libc::SIGSEGV => "segmentation fault",
+                libc::SIGPIPE => "broken pipe",
+                libc::SIGTERM => "terminated",
+                _ => return format!("signal: {sig}"),
+            };
+            return format!("signal: {name}");
+        }
+    }
+    match status.code() {
+        Some(code) => format!("exit status {code}"),
+        None => status.to_string(),
+    }
+}
+
+fn read_result(path: &Path, request_id: &str) -> Outcome {
     let data = match std::fs::read(path) {
         Ok(d) => d,
         Err(_) => {
             return Outcome::FunctionError(error_doc(
-                "RequestId: runtime exited without providing a reason",
+                &format!(
+                    "RequestId: {request_id} Error: Runtime exited without providing a reason"
+                ),
                 "Runtime.ExitError",
             ))
         }
@@ -1905,11 +1984,15 @@ mod tests {
 
     #[test]
     fn missing_result_is_exit_error() {
-        let out = read_result(Path::new("/nonexistent/devcloud/result.json"));
+        let out = read_result(Path::new("/nonexistent/devcloud/result.json"), "req-1");
         match out {
             Outcome::FunctionError(body) => {
                 let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
                 assert_eq!(v["errorType"], "Runtime.ExitError");
+                assert_eq!(
+                    v["errorMessage"],
+                    "RequestId: req-1 Error: Runtime exited without providing a reason"
+                );
             }
             other => panic!("unexpected {other:?}"),
         }

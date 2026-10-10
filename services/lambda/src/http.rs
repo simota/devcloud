@@ -9,7 +9,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::server::{Reply, Server};
@@ -139,7 +139,11 @@ async fn read_request(stream: &mut TcpStream) -> std::io::Result<Option<Result<R
     })))
 }
 
-async fn write_reply(stream: &mut TcpStream, method: &str, reply: Reply) -> std::io::Result<()> {
+async fn write_reply<W: AsyncWrite + Unpin>(
+    stream: &mut W,
+    method: &str,
+    reply: Reply,
+) -> std::io::Result<()> {
     let mut head = format!("HTTP/1.1 {} {}\r\n", reply.status, reason(reply.status));
     head.push_str("Server: devcloud-lambda\r\n");
     // An empty `content_type` means the reply carries its own Content-Type
@@ -155,10 +159,13 @@ async fn write_reply(stream: &mut TcpStream, method: &str, reply: Reply) -> std:
         }
         head.push_str(&format!("{k}: {v}\r\n"));
     }
-    head.push_str(&format!("Content-Length: {}\r\n", reply.body.len()));
+    // A 204 carries no body and must not declare one (RFC 9110 §8.6).
+    if reply.status != 204 {
+        head.push_str(&format!("Content-Length: {}\r\n", reply.body.len()));
+    }
     head.push_str("Connection: close\r\n\r\n");
     stream.write_all(head.as_bytes()).await?;
-    if method != "HEAD" {
+    if method != "HEAD" && reply.status != 204 {
         stream.write_all(&reply.body).await?;
     }
     stream.flush().await
@@ -192,7 +199,8 @@ pub async fn process(server: &Arc<Server>, req: &Request) -> Reply {
     match (req.method.as_str(), seg.as_slice()) {
         ("GET", ["_introspect", "invocations"]) => return server.introspect_invocations(),
         ("GET", ["_devcloud", "functions", name, "code.zip"]) => {
-            return server.code_package(name, query.get("CodeSha256").map(String::as_str))
+            let (name, sha) = (name.to_string(), query.get("CodeSha256").cloned());
+            return blocking(server, move |s| s.code_package(&name, sha.as_deref())).await;
         }
         _ => {}
     }
@@ -215,7 +223,10 @@ pub async fn process(server: &Arc<Server>, req: &Request) -> Reply {
     match seg.as_slice() {
         ["2015-03-31", "functions"] | ["2015-03-31", "functions", ""] => match m {
             "GET" => server.list_functions(&query),
-            "POST" => server.create_function(&req.body),
+            "POST" => {
+                let body = req.body.clone();
+                blocking(server, move |s| s.create_function(&body)).await
+            }
             _ => method_not_allowed(),
         },
         ["2015-03-31", "functions", id] => match m {
@@ -229,7 +240,10 @@ pub async fn process(server: &Arc<Server>, req: &Request) -> Reply {
             _ => method_not_allowed(),
         },
         ["2015-03-31", "functions", id, "code"] => match m {
-            "PUT" => server.update_function_code(id, &req.body),
+            "PUT" => {
+                let (id, body) = (id.to_string(), req.body.clone());
+                blocking(server, move |s| s.update_function_code(&id, &body)).await
+            }
             _ => method_not_allowed(),
         },
         ["2015-03-31", "functions", id, "invocations"] => match m {
@@ -276,6 +290,16 @@ pub async fn process(server: &Arc<Server>, req: &Request) -> Reply {
             &format!("devcloud lambda does not implement {m} {}", req.raw_path),
         ),
     }
+}
+
+/// Runs a handler that unzips, extracts or reads whole packages (and holds
+/// the function's lock meanwhile) off the async workers, so it cannot stall
+/// other connections or running invocations. Shutdown waits for it.
+async fn blocking(
+    server: &Arc<Server>,
+    handler: impl FnOnce(&Server) -> Reply + Send + 'static,
+) -> Reply {
+    server.run_blocking(handler).await
 }
 
 /// SigV4 verification per auth mode. Kept synchronous so the borrowed header
@@ -446,6 +470,29 @@ mod tests {
         }
         assert_eq!(h["x-tag"], "a,b");
         assert_eq!(h["cookie"], "s=1; t=2");
+    }
+
+    #[tokio::test]
+    async fn no_content_replies_declare_no_body() {
+        let mut out = Vec::new();
+        let mut reply = Reply::empty(204);
+        reply.body = b"ignored".to_vec();
+        write_reply(&mut out, "DELETE", reply).await.unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.starts_with("HTTP/1.1 204 "), "{text}");
+        assert!(
+            !text.to_ascii_lowercase().contains("content-length"),
+            "{text}"
+        );
+        assert!(text.ends_with("\r\n\r\n"), "{text}");
+
+        let mut out = Vec::new();
+        write_reply(&mut out, "GET", Reply::empty(200))
+            .await
+            .unwrap();
+        assert!(String::from_utf8(out)
+            .unwrap()
+            .contains("Content-Length: 0\r\n"));
     }
 
     #[test]

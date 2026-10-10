@@ -286,11 +286,18 @@ fn message_reply(status: u16, message: &str) -> Reply {
 }
 
 /// The caller's access key from a SigV4 `Authorization` header.
+/// Parsed the way the verifier parses it, so `XCredential=` cannot name a
+/// different key than the one whose signature was checked.
 pub(crate) fn caller_access_key(authorization: &str) -> String {
-    authorization
-        .split("Credential=")
-        .nth(1)
-        .and_then(|c| c.split('/').next())
+    let params = authorization
+        .trim()
+        .strip_prefix("AWS4-HMAC-SHA256 ")
+        .unwrap_or("");
+    params
+        .split(',')
+        .filter_map(|part| part.trim().split_once('='))
+        .rfind(|(k, _)| *k == "Credential")
+        .and_then(|(_, v)| v.split('/').next())
         .unwrap_or("")
         .trim()
         .to_string()
@@ -481,7 +488,8 @@ pub(crate) fn map_response(invoke: Reply) -> Reply {
         };
     };
     let status = match obj.get("statusCode").and_then(Value::as_u64) {
-        Some(s) if (100..=599).contains(&s) => s as u16,
+        // 1xx is interim, never a final response.
+        Some(s) if (200..=599).contains(&s) => s as u16,
         _ => return message_reply(502, "Internal Server Error"),
     };
     let mut headers = Vec::new();
@@ -494,7 +502,11 @@ pub(crate) fn map_response(invoke: Reply) -> Reply {
         };
         // Header names/values reach the raw response head: refuse anything
         // that could split it.
-        if k.is_empty() || k.contains([':', '\r', '\n', ' ']) || value.contains(['\r', '\n']) {
+        // Names must be HTTP tokens, or strict clients reject the response.
+        let token = !k.is_empty()
+            && k.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b));
+        if !token || value.contains(['\r', '\n', '\0']) {
             return;
         }
         // devcloud frames the body itself (always with Content-Length).
@@ -779,6 +791,11 @@ mod tests {
             "AKID"
         );
         assert_eq!(caller_access_key(""), "");
+        // Only the exact `Credential` parameter counts, as for the verifier.
+        assert_eq!(
+            caller_access_key("AWS4-HMAC-SHA256 XCredential=SPOOF/x, Credential=dev/20260101/us-east-1/lambda/aws4_request, SignedHeaders=host, Signature=ab"),
+            "dev"
+        );
     }
 
     #[test]
@@ -789,5 +806,22 @@ mod tests {
         );
         let out = map_response(invoke);
         assert_eq!(out.headers, vec![("x-ok".to_string(), "1".to_string())]);
+        // Names that are not HTTP tokens would break strict clients.
+        let invoke = Reply::json(
+            200,
+            &json!({"statusCode": 200, "headers": {"x\tbad": "1", "x(y)": "1", "ü": "1", "x-ok": "1"}}),
+        );
+        let out = map_response(invoke);
+        assert_eq!(out.headers, vec![("x-ok".to_string(), "1".to_string())]);
+    }
+
+    #[test]
+    fn interim_status_codes_are_not_final_responses() {
+        for code in [100, 101, 199] {
+            let out = map_response(Reply::json(200, &json!({"statusCode": code})));
+            assert_eq!(out.status, 502, "{code}");
+        }
+        let out = map_response(Reply::json(200, &json!({"statusCode": 204})));
+        assert_eq!(out.status, 204);
     }
 }

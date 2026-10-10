@@ -89,6 +89,12 @@ fn verify_full(req: &SignedRequest, auth: &str, creds: &Credentials) -> Result<(
     if req.amz_date.is_empty() {
         return Err(err("IncompleteSignatureException", 400));
     }
+    // The scope's date is the request's: a key derived for another day must
+    // not sign this request. (No clock-skew check: local tests may sign with
+    // fixed timestamps.)
+    if !valid_amz_date(req.amz_date) || req.amz_date[..8] != date_stamp {
+        return Err(err("InvalidSignatureException", 403));
+    }
     // Without `x-amz-content-sha256` the SDK still signs the body's SHA-256
     // (only S3 uses the header-driven `UNSIGNED-PAYLOAD` convention).
     let payload_hash = if req.content_sha256.is_empty() {
@@ -97,15 +103,28 @@ fn verify_full(req: &SignedRequest, auth: &str, creds: &Credentials) -> Result<(
         verify_payload_hash(req, req.content_sha256)?;
         req.content_sha256.to_string()
     };
-    let expected = signature_for_request(
-        req,
-        &date_stamp,
-        &region,
-        &signed_headers,
-        &payload_hash,
-        creds,
-    );
-    if !constant_time_eq(signature.as_bytes(), expected.as_bytes()) {
+    // Most SDKs sign the normalized path; some signers (aws-sdk-go,
+    // hand-rolled ones) sign it exactly as sent. Either is accepted.
+    let normalized = canonical_uri(req.path);
+    let as_sent = raw_canonical_uri(req.path);
+    let mut paths = vec![normalized.as_str()];
+    if as_sent != normalized {
+        paths.push(&as_sent);
+    }
+    let mut matched = false;
+    for path in paths {
+        let expected = signature_for_request(
+            req,
+            path,
+            &date_stamp,
+            &region,
+            &signed_headers,
+            &payload_hash,
+            creds,
+        );
+        matched |= constant_time_eq(signature.as_bytes(), expected.as_bytes());
+    }
+    if !matched {
         return Err(err("InvalidSignatureException", 403));
     }
     Ok(())
@@ -168,6 +187,7 @@ fn verify_payload_hash(req: &SignedRequest, payload_hash: &str) -> Result<(), Si
 
 fn signature_for_request(
     req: &SignedRequest,
+    canonical_path: &str,
     date_stamp: &str,
     region: &str,
     signed_headers: &str,
@@ -176,7 +196,7 @@ fn signature_for_request(
 ) -> String {
     let canonical_request = [
         req.method,
-        &canonical_uri(req.path),
+        canonical_path,
         &canonical_query_string(req.query),
         &canonical_headers(req, signed_headers),
         &signed_headers.to_ascii_lowercase(),
@@ -218,11 +238,43 @@ fn parse_auth_params(value: &str) -> std::collections::HashMap<String, String> {
     result
 }
 
-fn canonical_uri(path: &str) -> String {
+/// `YYYYMMDDTHHMMSSZ`, all digits where digits belong.
+fn valid_amz_date(value: &str) -> bool {
+    let b = value.as_bytes();
+    b.len() == 16
+        && b[8] == b'T'
+        && b[15] == b'Z'
+        && b[..8].iter().chain(&b[9..15]).all(u8::is_ascii_digit)
+}
+
+/// The path exactly as sent, encoded again.
+fn raw_canonical_uri(path: &str) -> String {
     if path.is_empty() {
         return "/".to_string();
     }
     aws_percent_encode(path, "/~")
+}
+
+/// The path as the AWS SDKs sign it for every service but S3: empty and `.`
+/// segments dropped, `..` resolved, leading and trailing slashes kept, then
+/// encoded again (`FunctionUrl + "/items"` is signed as `/items`).
+fn canonical_uri(path: &str) -> String {
+    let mut segments: Vec<&str> = Vec::new();
+    for segment in path.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                segments.pop();
+            }
+            s => segments.push(s),
+        }
+    }
+    let mut normalized = String::from("/");
+    normalized.push_str(&segments.join("/"));
+    if !segments.is_empty() && path.ends_with('/') {
+        normalized.push('/');
+    }
+    aws_percent_encode(&normalized, "/~")
 }
 
 fn canonical_query_string(query: &str) -> String {
@@ -365,6 +417,29 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canonical_uri_is_normalized_like_the_sdks() {
+        assert_eq!(canonical_uri(""), "/");
+        assert_eq!(canonical_uri("/"), "/");
+        assert_eq!(canonical_uri("//items"), "/items");
+        assert_eq!(canonical_uri("/a/./b/../c/"), "/a/c/");
+        assert_eq!(canonical_uri("/a//"), "/a/");
+        assert_eq!(canonical_uri("/../.."), "/");
+        // Already-encoded paths are encoded again (non-S3 services).
+        assert_eq!(
+            canonical_uri("/2015-03-31/functions/arn%3Aaws"),
+            "/2015-03-31/functions/arn%253Aaws"
+        );
+    }
+
+    #[test]
+    fn amz_date_shape() {
+        assert!(valid_amz_date("20261005T000000Z"));
+        assert!(!valid_amz_date("20261005"));
+        assert!(!valid_amz_date("2026100XT000000Z"));
+        assert!(!valid_amz_date("20261005T000000ZZ"));
+    }
 
     #[test]
     fn malformed_percent_escapes_never_panic() {

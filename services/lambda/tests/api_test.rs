@@ -239,6 +239,21 @@ async fn function_crud_lifecycle() {
     .await;
     assert_eq!(qualified.status, 404);
 
+    // `$LATEST` cannot be deleted on its own; the function must survive.
+    for target in [
+        "/2015-03-31/functions/crud-fn?Qualifier=%24LATEST",
+        "/2015-03-31/functions/crud-fn%3A%24LATEST",
+    ] {
+        let latest = call(&e.server, "DELETE", target, &[], b"").await;
+        assert_eq!(latest.status, 400, "{target}");
+        assert_eq!(
+            latest.header("X-Amzn-ErrorType"),
+            Some("InvalidParameterValueException")
+        );
+    }
+    let still = call(&e.server, "GET", "/2015-03-31/functions/crud-fn", &[], b"").await;
+    assert_eq!(still.status, 200);
+
     let deleted = call(
         &e.server,
         "DELETE",
@@ -675,6 +690,55 @@ async fn tags_and_s3_code_source() {
     .await;
     assert_eq!(list.json()["Tags"], json!({ "b": "2" }));
 
+    // Tags belong to the function: a qualified ARN is rejected, not
+    // silently applied to the unqualified function.
+    let qualified = call(
+        &e.server,
+        "POST",
+        &format!("/2017-03-31/tags/{arn}%3A%24LATEST"),
+        &[],
+        br#"{"Tags":{"c":"3"}}"#,
+    )
+    .await;
+    assert_eq!(qualified.status, 400);
+    assert_eq!(
+        qualified.header("X-Amzn-ErrorType"),
+        Some("InvalidParameterValueException")
+    );
+
+    // A delete marker version has no package: it is a missing version, not
+    // a corrupt zip.
+    store.put_bucket_versioning("artifacts", "Enabled").unwrap();
+    let (marker, _) = store
+        .delete_object_with_result("artifacts", "fn.zip", false)
+        .unwrap();
+    assert!(marker.delete_marker);
+    let from_marker = json!({
+        "FunctionName": "s3-marker",
+        "Runtime": "python3.12",
+        "Role": "r",
+        "Handler": "app.handler",
+        "Code": {
+            "S3Bucket": "artifacts",
+            "S3Key": "fn.zip",
+            "S3ObjectVersion": marker.version_id,
+        },
+    });
+    let r = call(
+        &e.server,
+        "POST",
+        "/2015-03-31/functions",
+        &[],
+        from_marker.to_string().as_bytes(),
+    )
+    .await;
+    assert_eq!(r.status, 400);
+    assert!(
+        String::from_utf8_lossy(&r.body).contains("NoSuchVersion"),
+        "{}",
+        String::from_utf8_lossy(&r.body)
+    );
+
     let settings = call(&e.server, "GET", "/2016-08-19/account-settings/", &[], b"").await;
     assert_eq!(settings.json()["AccountUsage"]["FunctionCount"], 1);
 }
@@ -1099,6 +1163,19 @@ fn sign_without_hash_header(
     body: &[u8],
     host: &str,
 ) -> Vec<(String, String)> {
+    sign_at(method, path, body, host, "20261005T000000Z", "20261005")
+}
+
+/// [`sign_without_hash_header`] with an explicit `X-Amz-Date` and scope
+/// date (`path` is the canonical path the signature covers).
+fn sign_at(
+    method: &str,
+    path: &str,
+    body: &[u8],
+    host: &str,
+    amz_date: &str,
+    date: &str,
+) -> Vec<(String, String)> {
     use hmac::{Hmac, Mac};
     use sha2::{Digest, Sha256};
     type H = Hmac<Sha256>;
@@ -1107,8 +1184,6 @@ fn sign_without_hash_header(
         m.update(data.as_bytes());
         m.finalize().into_bytes().to_vec()
     }
-    let amz_date = "20261005T000000Z";
-    let date = &amz_date[..8];
     let canonical = format!(
         "{method}\n{path}\n\nhost:{host}\nx-amz-date:{amz_date}\n\nhost;x-amz-date\n{}",
         hex::encode(Sha256::digest(body))
@@ -2836,7 +2911,10 @@ async fn crash_after_success_callback_is_a_function_error() {
         "{}",
         String::from_utf8_lossy(&r.body)
     );
-    assert_eq!(r.json()["errorType"], "Runtime.ExitError");
+    // As in the AWS Node runtime, the uncaught exception fails the
+    // invocation with its own error, not as an anonymous runtime exit.
+    assert_eq!(r.json()["errorType"], "Error");
+    assert_eq!(r.json()["errorMessage"], "late crash");
 }
 
 #[tokio::test]
@@ -3309,4 +3387,253 @@ async fn environment_variable_names_follow_the_lambda_pattern() {
     )
     .await;
     assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+}
+
+// ── runtime bootstrap fidelity ──────────────────────────────────────────────
+
+#[tokio::test]
+async fn python_sys_exit_reports_its_exit_status() {
+    if !has("python3") {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let e = env("pyexit");
+    let (r, _) = deploy_and_invoke(
+        &e.server,
+        "exit-fn",
+        "python3.12",
+        "app.handler",
+        (
+            "app.py",
+            b"import sys\ndef handler(event, context):\n    sys.exit(3)\n",
+        ),
+    )
+    .await;
+    assert_eq!(r.header("X-Amz-Function-Error"), Some("Unhandled"));
+    let doc = r.json();
+    assert_eq!(doc["errorType"], "Runtime.ExitError");
+    let msg = doc["errorMessage"].as_str().unwrap();
+    assert!(msg.starts_with("RequestId: "), "{msg}");
+    assert!(
+        msg.ends_with("Error: Runtime exited with error: exit status 3"),
+        "{msg}"
+    );
+}
+
+#[tokio::test]
+async fn python_decimal_results_marshal_as_numbers() {
+    if !has("python3") {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let e = env("pydecimal");
+    let (r, _) = deploy_and_invoke(
+        &e.server,
+        "decimal-fn",
+        "python3.12",
+        "app.handler",
+        (
+            "app.py",
+            b"from decimal import Decimal\ndef handler(event, context):\n    return {'count': Decimal('3'), 'price': Decimal('1.5'), 'exact': Decimal('2.0'), 'big': Decimal('12345678901234567890.5')}\n",
+        ),
+    )
+    .await;
+    assert_eq!(
+        r.header("X-Amz-Function-Error"),
+        None,
+        "{}",
+        String::from_utf8_lossy(&r.body)
+    );
+    // Written verbatim, like the Lambda runtime: no float rounding.
+    assert_eq!(
+        String::from_utf8_lossy(&r.body),
+        r#"{"count": 3, "price": 1.5, "exact": 2.0, "big": 12345678901234567890.5}"#
+    );
+}
+
+#[tokio::test]
+async fn node_unhandled_rejection_fails_the_invocation_and_recovers() {
+    if !has("node") {
+        eprintln!("skipping: node not available");
+        return;
+    }
+    let e = env("noderej");
+    let (r, _) = deploy_and_invoke(
+        &e.server,
+        "reject-fn",
+        "nodejs20.x",
+        "index.handler",
+        (
+            "index.js",
+            b"exports.handler = async (event) => { if (!event.ok) { Promise.reject(new Error('dangling')); await new Promise((r) => setTimeout(r, 200)); } return 'fine'; };\n",
+        ),
+    )
+    .await;
+    assert_eq!(r.header("X-Amz-Function-Error"), Some("Unhandled"));
+    assert_eq!(r.json()["errorType"], "Runtime.UnhandledPromiseRejection");
+    assert_eq!(r.json()["errorMessage"], "Error: dangling");
+    // The broken environment is replaced; the next invocation succeeds.
+    let ok = call(
+        &e.server,
+        "POST",
+        "/2015-03-31/functions/reject-fn/invocations",
+        &[],
+        br#"{"ok":true}"#,
+    )
+    .await;
+    assert_eq!(
+        ok.header("X-Amz-Function-Error"),
+        None,
+        "{}",
+        String::from_utf8_lossy(&ok.body)
+    );
+    assert_eq!(ok.json(), json!("fine"));
+}
+
+#[tokio::test]
+async fn node_null_module_exports_is_handler_not_found() {
+    if !has("node") {
+        eprintln!("skipping: node not available");
+        return;
+    }
+    let e = env("nodenull");
+    let (r, _) = deploy_and_invoke(
+        &e.server,
+        "null-fn",
+        "nodejs20.x",
+        "index.handler",
+        ("index.js", b"module.exports = null;\n"),
+    )
+    .await;
+    assert_eq!(r.header("X-Amz-Function-Error"), Some("Unhandled"));
+    assert_eq!(r.json()["errorType"], "Runtime.HandlerNotFound");
+}
+
+#[tokio::test]
+async fn strict_mode_checks_scope_date_and_normalizes_the_signed_path() {
+    let dir = temp_dir("sigv4scope");
+    let server = Arc::new(Server::new(Config {
+        auth_mode: "strict".into(),
+        access_key_id: "dev".into(),
+        secret_access_key: "dev".into(),
+        ..config_for(&dir)
+    }));
+    let send = |headers: Vec<(String, String)>, path: &'static str| {
+        let server = server.clone();
+        async move {
+            let refs: Vec<(&str, &str)> = headers
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.as_str()))
+                .collect();
+            call(&server, "GET", path, &refs, b"").await
+        }
+    };
+    let host = "127.0.0.1:19010";
+    let path = "/2015-03-31/functions/";
+    // A key derived for another day does not sign this request.
+    let other_day = sign_at("GET", path, b"", host, "20261005T000000Z", "20261004");
+    assert_eq!(send(other_day, path).await.status, 403);
+    let malformed = sign_at("GET", path, b"", host, "2026-10-05", "2026-10-");
+    assert_eq!(send(malformed, path).await.status, 403);
+    // SDKs sign `//x` and `/a/../x` as their normalized form.
+    let signed = sign_at("GET", path, b"", host, "20261005T000000Z", "20261005");
+    let r = send(signed, "//2015-03-31/functions/").await;
+    assert_ne!(r.status, 403, "{}", String::from_utf8_lossy(&r.body));
+    // Signers that sign the path exactly as sent are accepted too.
+    let as_sent = sign_at(
+        "GET",
+        "//2015-03-31/functions/",
+        b"",
+        host,
+        "20261005T000000Z",
+        "20261005",
+    );
+    let r = send(as_sent, "//2015-03-31/functions/").await;
+    assert_ne!(r.status, 403, "{}", String::from_utf8_lossy(&r.body));
+    // A signature over some other path still fails.
+    let other = sign_at(
+        "GET",
+        "/2015-03-31/other/",
+        b"",
+        host,
+        "20261005T000000Z",
+        "20261005",
+    );
+    assert_eq!(send(other, "//2015-03-31/functions/").await.status, 403);
+}
+
+#[tokio::test]
+async fn a_lost_package_does_not_take_down_the_whole_api() {
+    let e = env("lostpkg");
+    assert_eq!(create_python(&e.server, "keep-fn").await.status, 201);
+    assert_eq!(create_python(&e.server, "lost-fn").await.status, 201);
+    std::fs::remove_dir_all(e.dir.join("lambda/functions/lost-fn")).unwrap();
+
+    let restarted = Arc::new(Server::new(config_for(&e.dir)));
+    assert!(restarted.load_err().is_none());
+    let list = call(&restarted, "GET", "/2015-03-31/functions/", &[], b"").await;
+    assert_eq!(list.json()["Functions"].as_array().unwrap().len(), 2);
+    let keep = call(&restarted, "GET", "/2015-03-31/functions/keep-fn", &[], b"").await;
+    assert_eq!(keep.status, 200);
+    let invoked = call(
+        &restarted,
+        "POST",
+        "/2015-03-31/functions/lost-fn/invocations",
+        &[],
+        b"{}",
+    )
+    .await;
+    assert_eq!(invoked.status, 502);
+    assert!(
+        String::from_utf8_lossy(&invoked.body).contains("deployment package is missing"),
+        "{}",
+        String::from_utf8_lossy(&invoked.body)
+    );
+    // The broken function can still be removed through the API.
+    let deleted = call(
+        &restarted,
+        "DELETE",
+        "/2015-03-31/functions/lost-fn",
+        &[],
+        b"",
+    )
+    .await;
+    assert_eq!(deleted.status, 204);
+}
+
+#[tokio::test]
+async fn output_written_straight_to_fd_2_lands_in_its_own_invocation_log() {
+    if !has("python3") || !has("node") {
+        eprintln!("skipping: python3 or node not available");
+        return;
+    }
+    let e = env("fd2");
+    let (r, log) = deploy_and_invoke(
+        &e.server,
+        "fd2-py",
+        "python3.12",
+        "app.handler",
+        (
+            "app.py",
+            b"import os, subprocess\ndef handler(event, context):\n    os.write(2, b'raw-fd2\\n')\n    subprocess.run(['sh', '-c', 'echo child-stderr >&2'])\n    return 'ok'\n",
+        ),
+    )
+    .await;
+    assert_eq!(r.json(), json!("ok"));
+    assert!(log.contains("raw-fd2"), "{log}");
+    assert!(log.contains("child-stderr"), "{log}");
+    let (r, log) = deploy_and_invoke(
+        &e.server,
+        "fd2-node",
+        "nodejs20.x",
+        "index.handler",
+        (
+            "index.js",
+            b"const { execSync } = require('child_process');\nexports.handler = async () => { require('fs').writeSync(2, 'raw-fd2\\n'); execSync('echo child-stderr >&2', { stdio: 'inherit' }); return 'ok'; };\n",
+        ),
+    )
+    .await;
+    assert_eq!(r.json(), json!("ok"));
+    assert!(log.contains("raw-fd2"), "{log}");
+    assert!(log.contains("child-stderr"), "{log}");
 }

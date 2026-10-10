@@ -21,7 +21,12 @@ pub struct Entry {
     /// Unix permission bits from the external attributes, when present.
     pub mode: Option<u32>,
     pub is_dir: bool,
+    /// A Unix symlink (`zip -y`): `data` is the link target.
+    pub is_symlink: bool,
 }
+
+const S_IFMT: u32 = 0o170000;
+const S_IFLNK: u32 = 0o120000;
 
 fn u16_at(b: &[u8], off: usize) -> Result<u16, String> {
     b.get(off..off + 2)
@@ -138,16 +143,14 @@ fn read_entries_with_limit(archive: &[u8], limit: usize) -> Result<Vec<Entry>, S
 
         // Upper byte 3 == Unix: the high 16 bits of the external attributes
         // carry st_mode.
-        let mode = if version_made_by >> 8 == 3 {
-            Some((external_attrs >> 16) & 0o7777)
-        } else {
-            None
-        };
+        let unix_mode = (version_made_by >> 8 == 3).then_some(external_attrs >> 16);
+        let is_symlink = unix_mode.is_some_and(|m| m & S_IFMT == S_IFLNK);
         entries.push(Entry {
             is_dir: name.ends_with('/'),
             name,
             data,
-            mode,
+            mode: unix_mode.map(|m| m & 0o7777),
+            is_symlink,
         });
     }
     Ok(entries)
@@ -168,11 +171,65 @@ fn safe_join(root: &Path, name: &str) -> Result<PathBuf, String> {
     Ok(out)
 }
 
+/// Fails if any existing directory between `root` and `path` is a symlink:
+/// creating `path` would then land wherever that link points. Checked on the
+/// filesystem itself, so names that differ only in case or Unicode form
+/// (equal on macOS) cannot slip past a name comparison.
+fn no_link_ancestors(root: &Path, path: &Path, name: &str) -> Result<(), String> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    let rel = parent.strip_prefix(root).unwrap_or(Path::new(""));
+    let mut at = root.to_path_buf();
+    for component in rel.components() {
+        at.push(component);
+        match std::fs::symlink_metadata(&at) {
+            Ok(m) if m.file_type().is_symlink() => {
+                return Err(format!(
+                    "zip entry {name:?} is inside a symlinked directory"
+                ))
+            }
+            Ok(_) => {}
+            // Missing from here down: create_dir_all makes real directories.
+            Err(_) => break,
+        }
+    }
+    Ok(())
+}
+
 /// Extracts `archive` into `root` (which must already exist and be empty).
 pub fn extract(archive: &[u8], root: &Path) -> Result<(), String> {
     let entries = read_entries(archive)?;
+    // Symlinks are created last, and no other entry may live beneath one:
+    // extraction never writes through a link, so a link may point anywhere
+    // (`/usr/bin/python3`, `/opt/...`) as on AWS. Regular entries are all
+    // written before the first link exists.
+    let links: Vec<PathBuf> = entries
+        .iter()
+        .filter(|e| e.is_symlink)
+        .map(|e| safe_join(root, &e.name))
+        .collect::<Result<_, _>>()?;
+    let mut deferred = Vec::new();
     for entry in entries {
         let path = safe_join(root, &entry.name)?;
+        if links.iter().any(|l| path != *l && path.starts_with(l)) {
+            return Err(format!(
+                "zip entry {:?} is inside a symlinked directory",
+                entry.name
+            ));
+        }
+        if entry.is_symlink {
+            let target = String::from_utf8(entry.data)
+                .map_err(|_| format!("zip entry {:?} has a non-UTF-8 link target", entry.name))?;
+            if target.is_empty() {
+                return Err(format!(
+                    "zip entry {:?} has an empty link target",
+                    entry.name
+                ));
+            }
+            deferred.push((path, target, entry.name));
+            continue;
+        }
         if entry.is_dir {
             std::fs::create_dir_all(&path).map_err(|e| e.to_string())?;
             continue;
@@ -188,15 +245,33 @@ pub fn extract(archive: &[u8], root: &Path) -> Result<(), String> {
                 .map_err(|e| e.to_string())?;
         }
     }
+    for (path, target, name) in deferred {
+        no_link_ancestors(root, &path, &name)?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, &path).map_err(|e| e.to_string())?;
+        #[cfg(not(unix))]
+        std::fs::write(&path, target.as_bytes()).map_err(|e| e.to_string())?;
+    }
     Ok(())
 }
 
 /// Builds a stored (uncompressed) zip archive. Used by tests and by tooling that
 /// needs a deterministic package without an external `zip` binary.
 pub fn build_stored(files: &[(&str, &[u8])]) -> Vec<u8> {
+    let with_modes: Vec<(&str, &[u8], u32)> =
+        files.iter().map(|(n, d)| (*n, *d, 0o100644)).collect();
+    build_stored_with_modes(&with_modes)
+}
+
+/// [`build_stored`] with an explicit Unix `st_mode` per entry (`0o120777`
+/// makes a symlink whose data is the target).
+pub fn build_stored_with_modes(files: &[(&str, &[u8], u32)]) -> Vec<u8> {
     let mut out = Vec::new();
     let mut central = Vec::new();
-    for (name, data) in files {
+    for (name, data, mode) in files {
         let offset = out.len() as u32;
         let crc = crc32(data);
         let size = data.len() as u32;
@@ -227,7 +302,7 @@ pub fn build_stored(files: &[(&str, &[u8])]) -> Vec<u8> {
         central.extend_from_slice(&0u16.to_le_bytes()); // comment
         central.extend_from_slice(&0u16.to_le_bytes()); // disk
         central.extend_from_slice(&0u16.to_le_bytes()); // internal attrs
-        central.extend_from_slice(&(0o100644u32 << 16).to_le_bytes());
+        central.extend_from_slice(&(mode << 16).to_le_bytes());
         central.extend_from_slice(&offset.to_le_bytes());
         central.extend_from_slice(name.as_bytes());
     }
@@ -391,6 +466,87 @@ mod tests {
         let err = extract(&archive, &dir).unwrap_err();
         assert!(err.contains("escapes"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn temp_root(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "devcloud-lambda-zip-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinks_inside_the_package_are_kept() {
+        let archive = build_stored_with_modes(&[
+            ("node_modules/typescript/bin/tsc", b"#!/bin/sh\n", 0o100755),
+            ("node_modules/.bin/tsc", b"../typescript/bin/tsc", 0o120777),
+            ("lib", b"node_modules/typescript", 0o120777),
+        ]);
+        let dir = temp_root("links");
+        extract(&archive, &dir).unwrap();
+        let link = dir.join("node_modules/.bin/tsc");
+        assert!(std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(std::fs::read(&link).unwrap(), b"#!/bin/sh\n");
+        assert!(dir.join("lib/bin/tsc").is_file());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinks_may_point_anywhere_but_are_never_written_through() {
+        let archive = build_stored_with_modes(&[
+            ("venv/bin/python3", b"/usr/bin/python3", 0o120777),
+            ("up", b"../..", 0o120777),
+        ]);
+        let dir = temp_root("abslinks");
+        extract(&archive, &dir).unwrap();
+        assert_eq!(
+            std::fs::read_link(dir.join("venv/bin/python3")).unwrap(),
+            Path::new("/usr/bin/python3")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // A link placed beneath another link (the case-insensitive macOS
+        // spelling trick, reproduced here with an exact name) is refused
+        // from the filesystem's view, not just by name.
+        let dir = temp_root("linkparent");
+        std::fs::create_dir_all(dir.join("q")).unwrap();
+        std::os::unix::fs::symlink("..", dir.join("q/a")).unwrap();
+        let err = no_link_ancestors(&dir, &dir.join("q/a/B"), "q/a/B").unwrap_err();
+        assert!(err.contains("symlinked directory"), "{err}");
+        assert!(no_link_ancestors(&dir, &dir.join("q/new/B"), "q/new/B").is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn symlinks_cannot_be_written_through() {
+        for (entries, why) in [
+            (vec![("l", &b""[..], 0o120777)], "empty"),
+            (
+                vec![
+                    ("l", &b"sub"[..], 0o120777),
+                    ("l/x.py", &b"x"[..], 0o100644),
+                ],
+                "entry beneath a link",
+            ),
+            (
+                vec![("l", &b"sub"[..], 0o120777), ("l/m", &b"x"[..], 0o120777)],
+                "link beneath a link",
+            ),
+        ] {
+            let dir = temp_root("badlinks");
+            let err = extract(&build_stored_with_modes(&entries), &dir).unwrap_err();
+            assert!(err.contains("zip entry"), "{why}: {err}");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     #[test]
