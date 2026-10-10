@@ -1225,8 +1225,25 @@ fn handle_resumable_upload(server: &mut Server, req: &Request, bucket: &str) -> 
     match req.method.as_str() {
         "POST" => create_resumable_upload(server, req, bucket),
         "PUT" => put_resumable_upload(server, req),
-        _ => method_not_allowed("POST, PUT"),
+        "DELETE" => cancel_resumable_upload(server, req),
+        _ => method_not_allowed("POST, PUT, DELETE"),
     }
+}
+
+/// Cancels a resumable upload: drops the session and its buffered bytes and
+/// answers `499 Client Closed Request`, like GCS.
+fn cancel_resumable_upload(server: &mut Server, req: &Request) -> Response {
+    let id = req.query_value("upload_id").to_string();
+    if id.is_empty() {
+        return json_error(400, "required", "upload_id is required");
+    }
+    if server.sessions.remove(&id).is_none() {
+        return json_error(404, "notFound", "upload session not found");
+    }
+    if server.delete_session(&id).is_err() {
+        return json_error(500, "backendError", "internal error");
+    }
+    Response::empty(499)
 }
 
 fn create_resumable_upload(server: &mut Server, req: &Request, bucket: &str) -> Response {
@@ -1679,7 +1696,13 @@ impl Server {
             return Ok(());
         };
         fs::create_dir_all(&dir)?;
-        fs::write(dir.join("session.json"), wire_json::to_vec_indent(session))
+        // Temp file + rename: a crash mid-write must not leave a truncated
+        // `session.json` that silently drops the session on the next load.
+        let tmp = dir.join("session.json.tmp");
+        fs::write(&tmp, wire_json::to_vec_indent(session))?;
+        fs::rename(&tmp, dir.join("session.json")).inspect_err(|_| {
+            let _ = fs::remove_file(&tmp);
+        })
     }
 
     fn append_session_body(&self, id: &str, payload: &[u8]) -> std::io::Result<()> {
@@ -2409,6 +2432,7 @@ fn reason_phrase(status: u16) -> &'static str {
         404 => "Not Found",
         405 => "Method Not Allowed",
         409 => "Conflict",
+        499 => "Client Closed Request",
         416 => "Requested Range Not Satisfiable",
         500 => "Internal Server Error",
         501 => "Not Implemented",

@@ -1534,6 +1534,65 @@ fn resumable_upload_rejects_malformed_commit_requests() {
     }
 }
 
+/// Starts a resumable session (with an `X-Upload-Content-Type` when given) and
+/// returns its target.
+fn start_resumable(s: &mut Server, name: &str, upload_content_type: &str) -> String {
+    let mut headers = vec![("Host", "example.com")];
+    if !upload_content_type.is_empty() {
+        headers.push(("X-Upload-Content-Type", upload_content_type));
+    }
+    let init = perform_h(
+        s,
+        "POST",
+        &format!("/upload/storage/v1/b/demo-bucket/o?uploadType=resumable&name={name}"),
+        "",
+        &headers,
+    );
+    assert_eq!(init.status, 200, "{}", body_str(&init));
+    session_target(&init)
+}
+
+/// DELETE cancels a resumable session: 499, buffered bytes and session state
+/// removed, and the session no longer accepts chunks.
+#[test]
+fn resumable_upload_delete_cancels_session() {
+    let root = temp_root("resumable-cancel");
+    let sessions = root.join("sessions");
+    let mut s = Server::new(
+        Config {
+            upload_session_path: sessions.to_string_lossy().to_string(),
+            ..Default::default()
+        },
+        FileBucketStore::new(root.join("buckets")),
+    );
+    create_bucket(&mut s, "demo-bucket");
+    let target = start_resumable(&mut s, "docs/cancel.txt", "text/plain");
+    let chunk = perform_h(
+        &mut s,
+        "PUT",
+        &target,
+        "part",
+        &[("Content-Range", "bytes 0-3/8")],
+    );
+    assert_eq!(chunk.status, 308, "{}", body_str(&chunk));
+    assert_eq!(fs::read_dir(&sessions).unwrap().count(), 1);
+
+    let cancel = perform(&mut s, "DELETE", &target, "");
+    assert_eq!(cancel.status, 499, "{}", body_str(&cancel));
+    assert_eq!(fs::read_dir(&sessions).unwrap().count(), 0);
+
+    let after = perform_h(
+        &mut s,
+        "PUT",
+        &target,
+        "rest",
+        &[("Content-Range", "bytes 4-7/8")],
+    );
+    assert_eq!(after.status, 404, "{}", body_str(&after));
+    let again = perform(&mut s, "DELETE", &target, "");
+    assert_eq!(again.status, 404, "{}", body_str(&again));
+}
+
 // ---------------------------------------------------------------------------
 // server_test.rs
 // ---------------------------------------------------------------------------
