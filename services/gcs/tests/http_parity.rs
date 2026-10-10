@@ -815,6 +815,70 @@ fn object_patch_updates_metadata_and_metageneration() {
     assert_eq!(header(&download, "Content-Type"), "text/markdown");
 }
 
+/// A multi-byte character right after `%` in a path must not panic the
+/// decoder (which would also poison the shared server mutex).
+#[test]
+fn object_path_with_multibyte_char_after_percent_is_not_found() {
+    let mut s = server();
+    create_bucket(&mut s, "demo-bucket");
+
+    let resp = perform(&mut s, "GET", "/storage/v1/b/demo-bucket/o/%a\u{e9}", "");
+    assert_eq!(resp.status, 404, "{}", body_str(&resp));
+}
+
+/// Only `%` followed by two hex digits is an escape: `%+5` stays literal
+/// instead of decoding to byte 0x05.
+#[test]
+fn object_path_keeps_malformed_percent_escape_literal() {
+    let mut s = server();
+    create_bucket(&mut s, "demo-bucket");
+    upload_text(&mut s, "demo-bucket", "a%25%2B5", "x");
+
+    let resp = perform(&mut s, "GET", "/storage/v1/b/demo-bucket/o/a%+5", "");
+    assert_eq!(resp.status, 200, "{}", body_str(&resp));
+    assert_eq!(json_body(&resp)["name"], "a%+5");
+}
+
+/// A `+` in a path segment is a literal plus (only query strings use `+` for
+/// a space), across get, download, copy and compose names.
+#[test]
+fn object_paths_keep_plus_literal() {
+    let mut s = server();
+    create_bucket(&mut s, "demo-bucket");
+    upload_text(&mut s, "demo-bucket", "a%2Bb.txt", "plus");
+
+    let get = perform(&mut s, "GET", "/storage/v1/b/demo-bucket/o/a+b.txt", "");
+    assert_eq!(get.status, 200, "{}", body_str(&get));
+    assert_eq!(json_body(&get)["name"], "a+b.txt");
+
+    let download = perform(
+        &mut s,
+        "GET",
+        "/download/storage/v1/b/demo-bucket/o/a+b.txt?alt=media",
+        "",
+    );
+    assert_eq!(download.status, 200, "{}", body_str(&download));
+    assert_eq!(download.body, b"plus");
+
+    let copy = perform(
+        &mut s,
+        "POST",
+        "/storage/v1/b/demo-bucket/o/a+b.txt/copyTo/b/demo-bucket/o/c+d.txt",
+        "",
+    );
+    assert_eq!(copy.status, 200, "{}", body_str(&copy));
+    assert_eq!(json_body(&copy)["name"], "c+d.txt");
+
+    let compose = perform(
+        &mut s,
+        "POST",
+        "/storage/v1/b/demo-bucket/o/e+f.txt/compose",
+        r#"{"sourceObjects":[{"name":"a+b.txt"},{"name":"c+d.txt"}]}"#,
+    );
+    assert_eq!(compose.status, 200, "{}", body_str(&compose));
+    assert_eq!(json_body(&compose)["name"], "e+f.txt");
+}
+
 // ---------------------------------------------------------------------------
 // preconditions_test.rs
 // ---------------------------------------------------------------------------

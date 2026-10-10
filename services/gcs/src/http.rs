@@ -558,7 +558,7 @@ fn handle_introspect(server: &mut Server, req: &Request) -> Response {
     }
     if let Some(after) = rest.strip_prefix("buckets/") {
         let (escaped_bucket, suffix) = after.split_once('/').unwrap_or((after, ""));
-        let bucket = url_decode(escaped_bucket);
+        let bucket = path_decode(escaped_bucket);
         if bucket.is_empty() {
             return introspect_not_found();
         }
@@ -569,7 +569,7 @@ fn handle_introspect(server: &mut Server, req: &Request) -> Response {
             return introspect_objects(server, req, &bucket);
         }
         if let Some(escaped_name) = suffix.strip_prefix("objects/") {
-            let name = url_decode(escaped_name);
+            let name = path_decode(escaped_name);
             if name.is_empty() {
                 return introspect_not_found();
             }
@@ -765,7 +765,7 @@ fn handle_bucket_or_object(server: &mut Server, req: &Request) -> Response {
         if let Some((source, rewrite_suffix)) = object.split_once("/rewriteTo/b/") {
             return handle_rewrite_object(server, req, &bucket, source, rewrite_suffix);
         }
-        let key = url_decode(object);
+        let key = path_decode(object);
         if key.is_empty() {
             return json_error(400, "invalid", "invalid object name");
         }
@@ -1005,7 +1005,7 @@ fn handle_compose_object(
     if req.method != "POST" {
         return method_not_allowed("POST");
     }
-    let dest_key = url_decode(dest_escaped);
+    let dest_key = path_decode(dest_escaped);
     if dest_key.is_empty() {
         return json_error(400, "invalid", "invalid destination object name");
     }
@@ -1084,18 +1084,18 @@ fn copy_object(
         Err(_) if req.body.is_empty() => ObjectMetadataRequest::default(),
         Err(_) => return Err(json_error(400, "invalid", "invalid json request")),
     };
-    let source_key = url_decode(source_escaped);
+    let source_key = path_decode(source_escaped);
     if source_key.is_empty() {
         return Err(json_error(400, "invalid", "invalid source object name"));
     }
     let Some((dest_bucket_escaped, dest_escaped)) = dest_suffix.split_once("/o/") else {
         return Err(json_error(404, "notFound", "not found"));
     };
-    let dest_bucket = url_decode(dest_bucket_escaped);
+    let dest_bucket = path_decode(dest_bucket_escaped);
     if dest_bucket.is_empty() {
         return Err(json_error(400, "invalid", "invalid destination bucket"));
     }
-    let dest_key = url_decode(dest_escaped);
+    let dest_key = path_decode(dest_escaped);
     if dest_key.is_empty() {
         return Err(json_error(
             400,
@@ -1723,7 +1723,7 @@ fn handle_download(server: &mut Server, req: &Request) -> Response {
     let Some(object) = suffix.strip_prefix("o/") else {
         return json_error(404, "notFound", "not found");
     };
-    let key = url_decode(object);
+    let key = path_decode(object);
     if key.is_empty() {
         return json_error(400, "invalid", "invalid object name");
     }
@@ -2048,7 +2048,7 @@ fn bucket_suffix(path: &str, prefix: &str) -> Option<(String, String)> {
         return None;
     }
     let (bucket, suffix) = trimmed.split_once('/').unwrap_or((trimmed, ""));
-    let bucket = url_decode(bucket);
+    let bucket = path_decode(bucket);
     if bucket.is_empty() {
         return None;
     }
@@ -2176,7 +2176,10 @@ async fn handle_conn(mut stream: TcpStream, server: Arc<Mutex<Server>>) -> std::
             .await;
     }
     let response = {
-        let mut guard = server.lock().unwrap();
+        // A panicking handler must not wedge every later request.
+        let mut guard = server
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         route(&mut guard, &request)
     };
     write_response(&mut stream, response).await
@@ -2299,22 +2302,33 @@ fn parse_target(target: &str) -> (String, BTreeMap<String, String>) {
     (path, params)
 }
 
+/// Query-string decoder: `%XX` escapes plus `+` as a space.
 fn url_decode(value: &str) -> String {
+    percent_decode(value, true)
+}
+
+/// Path-segment decoder: `%XX` escapes only; a literal `+` stays a `+` (GCS
+/// object names may contain `+`, and clients send it unescaped in paths).
+fn path_decode(value: &str) -> String {
+    percent_decode(value, false)
+}
+
+/// Decodes on bytes, so a multi-byte character after `%` can never split a
+/// UTF-8 boundary; malformed escapes (`%zz`, `%+5`, trailing `%`) stay literal.
+fn percent_decode(value: &str, plus_as_space: bool) -> String {
     let bytes = value.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
         match bytes[i] {
-            b'%' if i + 2 < bytes.len() => {
-                if let Ok(b) = u8::from_str_radix(&value[i + 1..i + 3], 16) {
-                    out.push(b);
-                    i += 3;
-                    continue;
-                }
-                out.push(bytes[i]);
-                i += 1;
+            b'%' if i + 2 < bytes.len()
+                && bytes[i + 1].is_ascii_hexdigit()
+                && bytes[i + 2].is_ascii_hexdigit() =>
+            {
+                out.push(hex_digit(bytes[i + 1]) << 4 | hex_digit(bytes[i + 2]));
+                i += 3;
             }
-            b'+' => {
+            b'+' if plus_as_space => {
                 out.push(b' ');
                 i += 1;
             }
@@ -2325,6 +2339,14 @@ fn url_decode(value: &str) -> String {
         }
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_digit(b: u8) -> u8 {
+    match b {
+        b'0'..=b'9' => b - b'0',
+        b'a'..=b'f' => b - b'a' + 10,
+        _ => b - b'A' + 10,
+    }
 }
 
 fn url_encode(value: &str) -> String {
