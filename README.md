@@ -402,7 +402,7 @@ DynamoDB dashboard management is available under `/dashboard/dynamodb` and the l
 | Ordering keys | Yes | Local ordered delivery gate is implemented for pull and streaming pull flows. |
 | Snapshots and Seek | Yes | Snapshot CRUD and seek-to-time/snapshot flows are implemented. |
 | Schemas | Yes | Schema CRUD, revisions, rollback/delete revision, and validate message are implemented locally. |
-| Push subscriptions | Partial | Local HTTP push worker, retry policy, and OIDC/no-wrapper metadata are supported when push is enabled. |
+| Push subscriptions | Partial | Push config (endpoint, OIDC/no-wrapper metadata) is accepted and stored, but messages are not delivered to the endpoint — there is no push worker, and `enablePush` has no effect yet. Pull on a push subscription is rejected; to consume locally, create a pull subscription or clear the push config with `modifyPushConfig`. |
 | IAM endpoints | Partial | Local policy shape is supported; no real Google IAM enforcement. |
 | Exactly-once delivery | Partial | Metadata is accepted; no real cloud-grade exactly-once guarantee. |
 | Cloud Monitoring, quotas, billing | No | Not implemented. |
