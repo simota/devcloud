@@ -495,7 +495,7 @@ pub fn default_config() -> Config {
                 enabled: true,
                 region: "us-east-1".to_string(),
                 billing_mode: "PAY_PER_REQUEST".to_string(),
-                max_item_bytes: 400000,
+                max_item_bytes: 409600,
                 max_tables: 256,
                 streams: DynamoDbStreamsConfig { enabled: false },
                 ttl: DynamoDbTtlConfig {

@@ -177,7 +177,7 @@ services:
     enabled: true
     region: us-east-1
     billingMode: PAY_PER_REQUEST
-    maxItemBytes: 400000
+    maxItemBytes: 409600
     maxTables: 256
   bigquery:
     enabled: true

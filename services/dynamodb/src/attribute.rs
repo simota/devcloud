@@ -388,6 +388,62 @@ pub fn compare_attribute_values(left: &Value, right: &Value) -> std::cmp::Orderi
     lj.cmp(&rj).then(Ordering::Equal)
 }
 
+/// The DynamoDB size of an item in bytes: each attribute name's UTF-8 length
+/// plus its value size (see [`attribute_value_size`]). Checked against the
+/// 400 KB item limit.
+pub fn item_size(item: &Item) -> usize {
+    item.iter()
+        .map(|(name, value)| name.len() + attribute_value_size(value))
+        .sum()
+}
+
+/// The DynamoDB size of one attribute value: S as UTF-8 bytes, B as decoded
+/// bytes, N as about one byte per two significant digits plus one, BOOL/NULL
+/// as one byte, sets as the sum of their members, and lists/maps as 3 bytes
+/// of overhead plus one byte per element and the elements (map entries also
+/// count their names).
+pub fn attribute_value_size(value: &Value) -> usize {
+    let Some((kind, raw)) = value.as_object().and_then(single_entry) else {
+        return crate::wire_json::marshal(value).len();
+    };
+    let strings = || {
+        raw.as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+    };
+    match kind.as_str() {
+        "S" => raw.as_str().map_or(0, str::len),
+        "B" => raw.as_str().map_or(0, binary_len),
+        "N" => raw.as_str().map_or(0, number_size),
+        "BOOL" | "NULL" => 1,
+        "SS" => strings().map(str::len).sum(),
+        "BS" => strings().map(binary_len).sum(),
+        "NS" => strings().map(number_size).sum(),
+        "L" => {
+            3 + raw
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|entry| 1 + attribute_value_size(entry))
+                .sum::<usize>()
+        }
+        "M" => {
+            3 + raw
+                .as_object()
+                .into_iter()
+                .flatten()
+                .map(|(name, entry)| 1 + name.len() + attribute_value_size(entry))
+                .sum::<usize>()
+        }
+        _ => crate::wire_json::marshal(value).len(),
+    }
+}
+
+fn number_size(number: &str) -> usize {
+    crate::number::significant_digits(number).map_or(number.len(), |digits| digits.div_ceil(2) + 1)
+}
+
 /// Ordered comparison for the `<`/`<=`/`>`/`>=`/BETWEEN operators: defined
 /// only between two values of the same scalar type (N numerically, S by
 /// UTF-8 bytes, B by decoded bytes). `None` for mismatched or non-scalar
@@ -615,6 +671,19 @@ mod tests {
             &json!({"L": [{"N": "3"}]}),
             &json!({"L": [{"N": "3.00"}]})
         ));
+    }
+
+    #[test]
+    fn item_size_follows_dynamodb_rules() {
+        let mut item = Item::new();
+        item.insert("s".to_string(), json!({"S": "a<é"})); // 1 + 4
+        item.insert("b".to_string(), json!({"B": "AAAA"})); // 1 + 3 decoded
+        item.insert("n".to_string(), json!({"N": "12300"})); // 1 + (3 digits → 3)
+        item.insert("t".to_string(), json!({"BOOL": true})); // 1 + 1
+        item.insert("l".to_string(), json!({"L": [{"S": "xy"}]})); // 1 + 3 + 1 + 2
+        item.insert("m".to_string(), json!({"M": {"k": {"NULL": true}}})); // 1 + 3 + 1 + 1 + 1
+        item.insert("ss".to_string(), json!({"SS": ["ab", "c"]})); // 2 + 3
+        assert_eq!(item_size(&item), 5 + 4 + 4 + 2 + 7 + 7 + 5);
     }
 
     #[test]

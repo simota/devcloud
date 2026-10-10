@@ -248,6 +248,33 @@ fn numerically_equal_keys_address_the_same_item() {
 }
 
 #[test]
+fn item_size_uses_dynamodb_accounting() {
+    let dir = tempdir();
+    let mut s = server(&dir);
+    create_t(&mut s);
+    let key = [("pk", json!({"S": "a"})), ("sk", json!({"N": "1"}))];
+
+    // 300,000 binary bytes are 400,000 base64 characters on the wire, but
+    // count as 300,000 bytes toward the 400 KB limit.
+    let mut big_binary = item(&key);
+    big_binary.insert("b".to_string(), json!({"B": "A".repeat(400_000)}));
+    s.put_item(&put_req(big_binary))
+        .expect("binary within limit");
+
+    // HTML-escaped characters (`<` → `\u003c`) count as their UTF-8 bytes.
+    let mut escaped = item(&key);
+    escaped.insert("s".to_string(), json!({"S": "<".repeat(100_000)}));
+    s.put_item(&put_req(escaped))
+        .expect("escaped string within limit");
+
+    // Over 400 KB (409,600 bytes) of actual data is still rejected.
+    let mut too_big = item(&key);
+    too_big.insert("s".to_string(), json!({"S": "x".repeat(409_600)}));
+    let err = s.put_item(&put_req(too_big)).expect_err("too big");
+    assert_eq!(err.name, "ValidationException");
+}
+
+#[test]
 fn unevaluable_condition_is_a_validation_error() {
     let dir = tempdir();
     let mut s = server(&dir);

@@ -60,6 +60,8 @@ pub type OpResult = Result<Vec<u8>, ApiError>;
 
 const DEFAULT_REGION: &str = "us-east-1";
 const ACCOUNT_ID: &str = "000000000000";
+/// The DynamoDB item size limit (400 KB).
+const MAX_ITEM_BYTES: i64 = 409_600;
 
 /// Configuration mirroring the table-management subset of legacy `Config`.
 #[derive(Clone, Debug, Default)]
@@ -580,16 +582,15 @@ impl Server {
         if self.config.max_item_bytes > 0 {
             self.config.max_item_bytes
         } else {
-            400_000
+            MAX_ITEM_BYTES
         }
     }
 
-    /// Validates attribute values and the encoded item size. Mirrors
-    /// `validateItemSize`.
+    /// Validates attribute values and the DynamoDB item size (names plus
+    /// values, B counted as decoded bytes — not the escaped wire JSON).
     fn validate_item_size(&self, value: &Item) -> Result<(), String> {
         validate_item_attribute_values(value)?;
-        let encoded = crate::wire_json::marshal(value);
-        if encoded.len() as i64 > self.max_item_bytes() {
+        if crate::attribute::item_size(value) as i64 > self.max_item_bytes() {
             return Err(format!(
                 "item size exceeds maximum of {} bytes",
                 self.max_item_bytes()
