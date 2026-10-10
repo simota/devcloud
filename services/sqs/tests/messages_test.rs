@@ -61,6 +61,7 @@ fn receive(s: &mut Server, max: i64, vis: Option<i64>) -> Vec<devcloud_sqs::Rece
         max_number_of_messages: Some(max),
         visibility_timeout: vis,
         wait_time_seconds: Some(0),
+        attribute_names: vec!["All".to_string()],
         ..Default::default()
     })
     .unwrap()
@@ -665,11 +666,84 @@ fn dlq_redrive_after_max_receive_count() {
             queue_url: dlq.to_string(),
             visibility_timeout: Some(0),
             wait_time_seconds: Some(0),
+            message_system_attribute_names: vec!["DeadLetterQueueSourceArn".to_string()],
             ..Default::default()
         })
         .unwrap();
     assert_eq!(dlq_msgs.len(), 1);
     assert_eq!(dlq_msgs[0].body, "poison");
+    assert_eq!(
+        dlq_msgs[0].attributes,
+        map(&[(
+            "DeadLetterQueueSourceArn",
+            "arn:aws:sqs:us-east-1:000000000000:Src"
+        )])
+    );
+}
+
+#[test]
+fn receive_returns_only_requested_system_attributes() {
+    let mut s = server_with_queue();
+    send(&mut s, "m1");
+    let receive_with = |s: &mut Server, attribute_names: &[&str], system_names: &[&str]| {
+        s.receive_messages(&ReceiveMessageRequest {
+            queue_url: URL.to_string(),
+            visibility_timeout: Some(0),
+            wait_time_seconds: Some(0),
+            attribute_names: attribute_names.iter().map(|n| n.to_string()).collect(),
+            message_system_attribute_names: system_names.iter().map(|n| n.to_string()).collect(),
+            ..Default::default()
+        })
+        .unwrap()
+        .remove(0)
+    };
+
+    assert!(receive_with(&mut s, &[], &[]).attributes.is_empty());
+    let got = receive_with(&mut s, &["SentTimestamp"], &[]);
+    assert_eq!(
+        got.attributes.keys().collect::<Vec<_>>(),
+        vec!["SentTimestamp"]
+    );
+    let got = receive_with(&mut s, &[], &["ApproximateReceiveCount"]);
+    assert_eq!(got.attributes, map(&[("ApproximateReceiveCount", "3")]));
+    // FIFO-only attributes never appear on a standard queue.
+    let got = receive_with(&mut s, &["All"], &[]);
+    assert!(!got.attributes.contains_key("MessageGroupId"));
+    assert!(got
+        .attributes
+        .contains_key("ApproximateFirstReceiveTimestamp"));
+}
+
+#[test]
+fn fifo_receive_returns_group_sequence_and_dedup_ids() {
+    let mut s = Server::new(cfg());
+    s.create_queue(
+        "Orders.fifo",
+        &map(&[("FifoQueue", "true")]),
+        &BTreeMap::new(),
+    )
+    .unwrap();
+    let furl = "http://127.0.0.1:9324/000000000000/Orders.fifo";
+    let sent = s
+        .send_message(&SendMessageRequest {
+            queue_url: furl.to_string(),
+            message_body: "x".to_string(),
+            message_group_id: "g1".to_string(),
+            message_deduplication_id: "d1".to_string(),
+            ..Default::default()
+        })
+        .unwrap();
+    let got = s
+        .receive_messages(&ReceiveMessageRequest {
+            queue_url: furl.to_string(),
+            wait_time_seconds: Some(0),
+            message_system_attribute_names: vec!["All".to_string()],
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(got[0].attributes["MessageGroupId"], "g1");
+    assert_eq!(got[0].attributes["MessageDeduplicationId"], "d1");
+    assert_eq!(got[0].attributes["SequenceNumber"], sent.sequence_number);
 }
 
 #[test]

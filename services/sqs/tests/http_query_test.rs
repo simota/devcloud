@@ -257,6 +257,11 @@ fn query_message_system_attributes_return_xml_md5() {
     assert_eq!(receive.status, 200, "{}", receive.body);
     assert!(receive.body.contains("<Name>AWSTraceHeader</Name>"));
     assert!(receive.body.contains(trace));
+    // Only the requested system attribute is returned.
+    assert!(!receive.body.contains("<Name>SentTimestamp</Name>"));
+    assert!(!receive
+        .body
+        .contains("<Name>ApproximateReceiveCount</Name>"));
     assert!(receive.body.contains("<MD5OfMessageSystemAttributes>"));
 }
 

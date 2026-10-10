@@ -141,12 +141,14 @@ fn start_move_task_back_to_original_source() {
             queue_url: url("Src"),
             visibility_timeout: Some(30),
             wait_time_seconds: Some(0),
+            attribute_names: vec!["All".to_string()],
             ..Default::default()
         })
         .unwrap();
     assert_eq!(back.len(), 1);
     assert_eq!(back[0].body, "poison");
     // The dead-letter source ARN was cleared on move-back.
+    assert!(!back[0].attributes.contains_key("DeadLetterQueueSourceArn"));
     assert_eq!(back[0].attributes["ApproximateReceiveCount"], "1");
 }
 

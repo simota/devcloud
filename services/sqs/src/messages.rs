@@ -832,12 +832,15 @@ fn apply_staged_batch(
 
 // --- free helpers (mirror message_core.rs + queue_attributes.rs) ---
 
+/// System attributes requested via `MessageSystemAttributeNames` or the
+/// older `AttributeNames` (AWS honours both).
 fn requested_system_attribute_names(input: &ReceiveMessageRequest) -> Vec<String> {
-    if !input.message_system_attribute_names.is_empty() {
-        input.message_system_attribute_names.clone()
-    } else {
-        input.attribute_names.clone()
-    }
+    input
+        .message_system_attribute_names
+        .iter()
+        .chain(&input.attribute_names)
+        .cloned()
+        .collect()
 }
 
 /// Mirrors `cleanupExpiredMessagesLocked`: drop tombstoned + retention-expired
@@ -879,27 +882,44 @@ fn received_message_from_state(
     message_attribute_names: &[String],
     system_attribute_names: &[String],
 ) -> ReceivedMessage {
+    // Only the system attributes the caller asked for ("All" = every one
+    // that applies to this message).
     let mut attrs = BTreeMap::new();
-    attrs.insert(
-        "ApproximateReceiveCount".to_string(),
-        message.receive_count.to_string(),
-    );
-    attrs.insert(
-        "SentTimestamp".to_string(),
+    let mut put = |name: &str, value: String| {
+        if wants_any(system_attribute_names, name) {
+            attrs.insert(name.to_string(), value);
+        }
+    };
+    put("ApproximateReceiveCount", message.receive_count.to_string());
+    put(
+        "SentTimestamp",
         unix_millis_from_rfc3339(&message.sent_at).to_string(),
     );
     if !is_zero(&message.first_receive_at) {
-        attrs.insert(
-            "ApproximateFirstReceiveTimestamp".to_string(),
+        put(
+            "ApproximateFirstReceiveTimestamp",
             unix_millis_from_rfc3339(&message.first_receive_at).to_string(),
         );
     }
-    if wants_any(system_attribute_names, "AWSTraceHeader") {
-        if let Some(v) = message.system_attributes.get("AWSTraceHeader") {
-            if !v.string_value.is_empty() {
-                attrs.insert("AWSTraceHeader".to_string(), v.string_value.clone());
-            }
+    if let Some(v) = message.system_attributes.get("AWSTraceHeader") {
+        if !v.string_value.is_empty() {
+            put("AWSTraceHeader", v.string_value.clone());
         }
+    }
+    if !message.message_group_id.is_empty() {
+        put("MessageGroupId", message.message_group_id.clone());
+    }
+    if !message.sequence_number.is_empty() {
+        put("SequenceNumber", message.sequence_number.clone());
+    }
+    if !message.deduplication_id.is_empty() {
+        put("MessageDeduplicationId", message.deduplication_id.clone());
+    }
+    if !message.dead_letter_source_arn.is_empty() {
+        put(
+            "DeadLetterQueueSourceArn",
+            message.dead_letter_source_arn.clone(),
+        );
     }
     let mut response = ReceivedMessage {
         message_id: message.id.clone(),

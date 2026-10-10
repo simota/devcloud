@@ -126,7 +126,8 @@ fn send_receive_delete_roundtrip() {
     let (_, _, body) = call(
         &mut s,
         "ReceiveMessage",
-        json!({"QueueUrl": URL, "VisibilityTimeout": 30, "WaitTimeSeconds": 0}),
+        json!({"QueueUrl": URL, "VisibilityTimeout": 30, "WaitTimeSeconds": 0,
+               "MessageSystemAttributeNames": ["ApproximateReceiveCount"]}),
     );
     let msgs = body["Messages"].as_array().unwrap();
     assert_eq!(msgs.len(), 1);
