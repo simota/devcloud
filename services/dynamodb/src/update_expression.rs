@@ -92,6 +92,32 @@ pub fn apply_update_expression(
     Ok(())
 }
 
+/// The top-level attribute names an UpdateExpression writes (SET / REMOVE /
+/// ADD / DELETE targets), in expression order.
+pub fn update_target_attributes(expression: &str, names: &Names) -> Result<Vec<String>, String> {
+    let expression = expression.trim();
+    if expression.is_empty() {
+        return Err("update expression is required".to_string());
+    }
+    let mut targets = Vec::new();
+    for clause in split_update_clauses(expression)? {
+        for part in split_comma_separated(&clause.body) {
+            let token = match clause.keyword.as_str() {
+                "SET" => cut(part.trim(), "=")
+                    .map(|(name, _)| name)
+                    .ok_or_else(|| "invalid SET assignment".to_string())?,
+                _ => part
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or_default()
+                    .to_string(),
+            };
+            targets.push(resolve_attribute_name(token.trim(), names));
+        }
+    }
+    Ok(targets)
+}
+
 fn evaluate_update_value(
     target: &Item,
     expression: &str,
@@ -490,6 +516,16 @@ mod tests {
         apply_update_expression(&mut target, "SET ıı = :é REMOVE ı", &names(), &vals).unwrap();
         assert_eq!(target["ıı"], json!({"S": "v"}));
         assert!(!target.contains_key("ı"));
+    }
+
+    #[test]
+    fn target_attributes_cover_every_clause() {
+        let mut nm = names();
+        nm.insert("#k".to_string(), "pk".to_string());
+        let targets =
+            update_target_attributes("SET a = :v, #k = :w REMOVE b, c ADD d :n DELETE e :s", &nm)
+                .unwrap();
+        assert_eq!(targets, ["a", "pk", "b", "c", "d", "e"]);
     }
 
     #[test]

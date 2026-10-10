@@ -231,6 +231,45 @@ fn update_condition_failure() {
     assert_eq!(err.name, "ConditionalCheckFailedException");
 }
 
+#[test]
+fn update_cannot_modify_key_attributes() {
+    let dir = tempdir();
+    let mut s = server(&dir);
+    create_t(&mut s);
+    put(
+        &mut s,
+        item(&[("pk", json!({"S": "k"})), ("n", json!({"N": "1"}))]),
+    );
+    let mut key_alias = BTreeMap::new();
+    key_alias.insert("#k".to_string(), "pk".to_string());
+    for (expression, names) in [
+        ("SET pk = :v", BTreeMap::new()),
+        ("SET n = :v REMOVE pk", BTreeMap::new()),
+        ("SET #k = :v", key_alias),
+    ] {
+        let err = s
+            .update_item(&UpdateItemRequest {
+                table_name: "T".to_string(),
+                key: item(&[("pk", json!({"S": "k"}))]),
+                update_expression: expression.to_string(),
+                expression_attribute_names: names,
+                expression_attribute_values: vals(&[(":v", json!({"S": "other"}))]),
+                ..Default::default()
+            })
+            .expect_err(expression);
+        assert_eq!(err.name, "ValidationException", "{expression}");
+        assert_eq!(
+            err.message,
+            "One or more parameter values were invalid: Cannot update attribute pk. This attribute is part of the key",
+            "{expression}"
+        );
+    }
+    // The stored item is untouched.
+    let state = std::fs::read_to_string(dir.join("state.json")).expect("state");
+    assert!(state.contains("{\"N\":\"1\"}"));
+    assert!(!state.contains("other"));
+}
+
 // --- minimal tempdir -------------------------------------------------------
 
 fn tempdir() -> std::path::PathBuf {

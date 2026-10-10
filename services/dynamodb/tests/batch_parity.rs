@@ -326,6 +326,27 @@ fn transact_write_unevaluable_condition_is_a_validation_error() {
 }
 
 #[test]
+fn transact_update_cannot_modify_key_attributes() {
+    let dir = tempdir();
+    let mut s = seeded(&dir);
+    let err = s
+        .transact_write_items(&TransactWriteItemsRequest {
+            transact_items: vec![TransactWriteItem {
+                update: Some(TransactUpdate {
+                    table_name: "T".to_string(),
+                    key: item(&[("pk", json!({"S": "a"}))]),
+                    update_expression: "REMOVE pk".to_string(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+        })
+        .expect_err("key update");
+    assert_eq!(err.name, "ValidationException");
+    assert!(err.message.contains("Cannot update attribute pk"));
+}
+
+#[test]
 fn transact_write_duplicate_item_operations_rejected() {
     let dir = tempdir();
     let mut s = seeded(&dir);

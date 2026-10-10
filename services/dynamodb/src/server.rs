@@ -831,6 +831,12 @@ impl Server {
             ));
         }
 
+        reject_key_attribute_updates(
+            &state.description,
+            &request.update_expression,
+            &request.expression_attribute_names,
+        )?;
+
         let old_item = state.items.get(&key).cloned();
         // Working item starts as the existing item, or the key when absent.
         let mut updated = old_item.clone().unwrap_or_else(|| request.key.clone());
@@ -1376,6 +1382,11 @@ impl Server {
             .get(&request.table_name)
             .ok_or_else(|| ApiError::not_found("table not found"))?;
         let key = item_key(&state.description, &request.key).map_err(ApiError::validation)?;
+        reject_key_attribute_updates(
+            &state.description,
+            &request.update_expression,
+            &request.expression_attribute_names,
+        )?;
         let old_item = state.items.get(&key).cloned();
         let mut updated = old_item.clone().unwrap_or_else(|| request.key.clone());
         check_condition(
@@ -2878,6 +2889,29 @@ fn lsi_descriptions(
             projection: projection_from_request(&index.projection),
         })
         .collect()
+}
+
+/// Rejects an UpdateExpression that writes (SET / REMOVE / ADD / DELETE) a
+/// primary-key attribute, as DynamoDB does.
+fn reject_key_attribute_updates(
+    description: &TableDescription,
+    expression: &str,
+    names: &BTreeMap<String, String>,
+) -> Result<(), ApiError> {
+    let targets = crate::update_expression::update_target_attributes(expression, names)
+        .map_err(ApiError::validation)?;
+    for target in targets {
+        if description
+            .key_schema
+            .iter()
+            .any(|element| element.attribute_name == target)
+        {
+            return Err(ApiError::validation(format!(
+                "One or more parameter values were invalid: Cannot update attribute {target}. This attribute is part of the key"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Maps a ConditionExpression outcome to the wire error: a false condition is
