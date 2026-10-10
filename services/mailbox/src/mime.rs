@@ -100,9 +100,10 @@ pub fn headers<'a>(raw: &'a [u8], warnings: &mut Vec<String>) -> (Headers, &'a [
     (out, &raw[raw.len()..])
 }
 
-/// `alternative`: the part is one rendering among siblings of a
-/// `multipart/alternative`, so only the first text/plain one counts.
-fn walk(raw: &[u8], depth: usize, count: &mut usize, mail: &mut ParsedMail, alternative: bool) {
+/// `suppress_text`: an earlier branch of an enclosing `multipart/alternative`
+/// already produced the body text, so this part (at any depth) is another
+/// rendering of it and adds none.
+fn walk(raw: &[u8], depth: usize, count: &mut usize, mail: &mut ParsedMail, suppress_text: bool) {
     if *count >= MAX_PARTS {
         warn(&mut mail.warnings, "MIME part limit reached");
         return;
@@ -132,9 +133,15 @@ fn walk(raw: &[u8], depth: usize, count: &mut usize, mail: &mut ParsedMail, alte
             if capped {
                 warn(&mut mail.warnings, "MIME part limit reached");
             }
-            let alternatives = kind == "multipart/alternative";
+            let alternative = kind == "multipart/alternative";
+            let mut suppress = suppress_text;
             for part in parts {
-                walk(part, depth + 1, count, mail, alternatives);
+                let before = mail.text.len();
+                walk(part, depth + 1, count, mail, suppress);
+                // The first branch with text wins; its siblings are renderings.
+                if alternative && mail.text.len() != before {
+                    suppress = true;
+                }
             }
             return;
         } else {
@@ -171,9 +178,11 @@ fn walk(raw: &[u8], depth: usize, count: &mut usize, mail: &mut ParsedMail, alte
             if mail.html.is_none() {
                 mail.html = Some(text);
             }
+        } else if suppress_text {
+            // Another rendering of a body an alternative already provided.
         } else if mail.text.is_empty() {
             mail.text = text;
-        } else if !alternative {
+        } else {
             // Several inline text parts (e.g. text, image, text from Apple
             // Mail) are all body text.
             mail.text.push_str("\n\n");

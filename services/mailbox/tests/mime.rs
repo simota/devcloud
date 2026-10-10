@@ -199,6 +199,14 @@ fn soft_breaks_split_words_and_inline_text_parts_follow_rfc_practice() {
     // ...but alternatives are one body rendered several ways.
     let alt = b"Content-Type: multipart/alternative; boundary=a\r\n\r\n--a\r\nContent-Type: text/plain\r\n\r\nfirst\r\n--a\r\nContent-Type: text/plain\r\n\r\nsecond\r\n--a--\r\n";
     assert_eq!(mime::parse(alt).text.trim(), "first");
+    // Alternatives whose branches are containers: still one rendering.
+    let nested = b"Content-Type: multipart/alternative; boundary=a\r\n\r\n--a\r\nContent-Type: multipart/mixed; boundary=m1\r\n\r\n--m1\r\nContent-Type: text/plain\r\n\r\nplain one\r\n--m1\r\nContent-Type: image/png\r\nContent-Transfer-Encoding: base64\r\n\r\nAAEC\r\n--m1\r\nContent-Type: text/plain\r\n\r\nplain two\r\n--m1--\r\n--a\r\nContent-Type: multipart/mixed; boundary=m2\r\n\r\n--m2\r\nContent-Type: text/plain\r\n\r\nother rendering\r\n--m2--\r\n--a--\r\n";
+    let text = mime::parse(nested).text;
+    assert!(
+        text.contains("plain one") && text.contains("plain two"),
+        "{text:?}"
+    );
+    assert!(!text.contains("other rendering"), "{text:?}");
 }
 
 #[test]
