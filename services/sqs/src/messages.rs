@@ -532,7 +532,9 @@ impl Server {
         if name.is_empty() || !self.queues.contains_key(&name) {
             return Err("queue does not exist".into());
         }
-        self.apply_to_receipted_message(&name, receipt_handle, |m, _now| {
+        // AWS deletes a message with its latest receipt handle even after the
+        // visibility timeout lapsed, as long as nobody received it again.
+        self.apply_to_receipted_message(&name, receipt_handle, false, |m, _now| {
             m.deleted = true;
             m.receipt_handle = String::new();
         })
@@ -562,7 +564,7 @@ impl Server {
         if name.is_empty() || !self.queues.contains_key(&name) {
             return Err("queue does not exist".into());
         }
-        self.apply_to_receipted_message(&name, receipt_handle, |m, now| {
+        self.apply_to_receipted_message(&name, receipt_handle, true, |m, now| {
             m.invisible_until = add_seconds(now, visibility_seconds);
         })
     }
@@ -574,9 +576,10 @@ impl Server {
         &mut self,
         name: &str,
         receipt_handle: &str,
+        reject_expired: bool,
         mutate: impl FnOnce(&mut MessageState, &str),
     ) -> Result<(), String> {
-        match self.stage_receipted_mutation(name, receipt_handle, mutate) {
+        match self.stage_receipted_mutation(name, receipt_handle, reject_expired, mutate) {
             StagedMutation::Rejected(e) => Err(e),
             StagedMutation::Applied {
                 idx,
@@ -596,8 +599,9 @@ impl Server {
     }
 
     /// Locates the non-deleted message with receipt handle `receipt_handle`
-    /// in queue `name` and, unless its visibility has already expired,
-    /// applies `mutate` in memory (does not persist). An expired handle is
+    /// in queue `name` and applies `mutate` in memory (does not persist).
+    /// With `reject_expired` (ChangeMessageVisibility), a handle whose
+    /// visibility has already expired is refused instead: it is
     /// tombstoned (receipt handle cleared) same as legacy, but reported via
     /// `pending_err` rather than persisted immediately, so callers — single
     /// item or batch — can persist once for however many entries they stage.
@@ -605,6 +609,7 @@ impl Server {
         &mut self,
         name: &str,
         receipt_handle: &str,
+        reject_expired: bool,
         mutate: impl FnOnce(&mut MessageState, &str),
     ) -> StagedMutation {
         if receipt_handle.is_empty() {
@@ -623,7 +628,7 @@ impl Server {
             Some(i) => i,
         };
         let previous = self.queues.get(name).unwrap().messages[idx].clone();
-        let expired = !before(&now, &previous.invisible_until);
+        let expired = reject_expired && !before(&now, &previous.invisible_until);
         if expired {
             self.queues.get_mut(name).unwrap().messages[idx].receipt_handle = String::new();
             return StagedMutation::Applied {
@@ -667,7 +672,7 @@ impl Server {
                     .push(batch_error(&entry.id, "queue does not exist"));
                 continue;
             }
-            match self.stage_receipted_mutation(&name, &entry.receipt_handle, |m, _now| {
+            match self.stage_receipted_mutation(&name, &entry.receipt_handle, false, |m, _now| {
                 m.deleted = true;
                 m.receipt_handle = String::new();
             }) {
@@ -725,9 +730,14 @@ impl Server {
                 continue;
             }
             let visibility_timeout = entry.visibility_timeout;
-            match self.stage_receipted_mutation(&name, &entry.receipt_handle, move |m, now| {
-                m.invisible_until = add_seconds(now, visibility_timeout);
-            }) {
+            match self.stage_receipted_mutation(
+                &name,
+                &entry.receipt_handle,
+                true,
+                move |m, now| {
+                    m.invisible_until = add_seconds(now, visibility_timeout);
+                },
+            ) {
                 StagedMutation::Rejected(e) => result.failed.push(batch_error(&entry.id, &e)),
                 StagedMutation::Applied {
                     idx,

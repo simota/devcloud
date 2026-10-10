@@ -333,7 +333,29 @@ fn delete_message_rolls_back_memory_when_persist_fails() {
 }
 
 #[test]
-fn delete_message_expired_handle_rolls_back_clear_when_persist_fails() {
+fn delete_message_accepts_latest_handle_after_visibility_expired() {
+    let mut s = server_with_queue();
+    send(&mut s, "m1");
+    // Visibility 0: the handle's visibility window is already over.
+    let got = receive(&mut s, 1, Some(0));
+    let handle = got[0].receipt_handle.clone();
+    s.delete_message(URL, &handle).unwrap();
+    assert_eq!(live_message_count(&s, "Orders"), 0);
+
+    // Once the message is received again, the older handle is stale.
+    send(&mut s, "m2");
+    let stale = receive(&mut s, 1, Some(0))[0].receipt_handle.clone();
+    let fresh = receive(&mut s, 1, Some(0))[0].receipt_handle.clone();
+    assert!(s
+        .delete_message(URL, &stale)
+        .unwrap_err()
+        .contains("receipt handle is invalid"));
+    s.delete_message(URL, &fresh).unwrap();
+    assert_eq!(live_message_count(&s, "Orders"), 0);
+}
+
+#[test]
+fn delete_message_expired_handle_rolls_back_when_persist_fails() {
     let storage_path = std::env::temp_dir().join(format!(
         "devcloud-sqs-delete-expired-rollback-{}",
         std::process::id()
@@ -360,14 +382,8 @@ fn delete_message_expired_handle_rolls_back_clear_when_persist_fails() {
 
     std::fs::remove_file(&storage_path).unwrap();
     std::fs::create_dir_all(&storage_path).unwrap();
-    assert!(s
-        .delete_message(URL, &handle)
-        .unwrap_err()
-        .contains("receipt handle is invalid"));
-    assert_eq!(
-        s.queue_by_name("Orders").unwrap().messages[0].receipt_handle,
-        ""
-    );
+    s.delete_message(URL, &handle).unwrap();
+    assert_eq!(live_message_count(&s, "Orders"), 0);
 
     std::fs::remove_dir_all(&storage_path).unwrap();
 }
