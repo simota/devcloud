@@ -14,6 +14,7 @@ use tokio::net::{TcpListener, TcpStream};
 
 use crate::server::{Reply, Server};
 use crate::sigv4::{verify_signature, Credentials, SignedRequest};
+use devcloud_hostguard::trusted_host;
 
 const MAX_HEADER_BYTES: usize = 64 * 1024;
 /// Base64 inflates a 50 MiB package to ~67 MiB of JSON.
@@ -391,64 +392,6 @@ fn untrusted_host() -> Reply {
     )
 }
 
-/// DNS-rebinding guard. A page on `http://evil.example` whose name is
-/// re-pointed at 127.0.0.1 makes same-origin requests (no `Origin`, so the
-/// CSRF guard cannot tell), but its `Host` still names the attacker's domain.
-/// Trusted: no `Host` (HTTP/1.0, in-process callers), IP literals, single-label
-/// names (`localhost`, docker-compose service names), and names under
-/// suffixes no public DNS answers for (`.localhost`, `.internal` as in
-/// `host.docker.internal`, `.local`, `.test`, `.example`, `.invalid`,
-/// `.home.arpa`). `DEVCLOUD_ALLOWED_HOSTS` adds names (comma-separated; a
-/// leading `.` allows a suffix, `*` allows any host).
-pub fn trusted_host(host: &str) -> bool {
-    let host = host.trim();
-    if host.is_empty() {
-        return true;
-    }
-    let name = if let Some(v6) = host.strip_prefix('[') {
-        return v6
-            .split_once(']')
-            .is_some_and(|(ip, _)| ip.parse::<std::net::Ipv6Addr>().is_ok());
-    } else {
-        match host.rsplit_once(':') {
-            Some((name, port)) if port.bytes().all(|b| b.is_ascii_digit()) => name,
-            _ => host,
-        }
-    };
-    let name = name.trim_end_matches('.').to_ascii_lowercase();
-    if name.parse::<std::net::Ipv4Addr>().is_ok() || !name.contains('.') {
-        return !name.is_empty();
-    }
-    const PRIVATE_SUFFIXES: [&str; 7] = [
-        ".localhost",
-        ".internal",
-        ".local",
-        ".test",
-        ".example",
-        ".invalid",
-        ".home.arpa",
-    ];
-    if PRIVATE_SUFFIXES.iter().any(|s| name.ends_with(s)) {
-        return true;
-    }
-    allowed_hosts(
-        &std::env::var("DEVCLOUD_ALLOWED_HOSTS").unwrap_or_default(),
-        &name,
-    )
-}
-
-/// Whether `name` (lowercase, no port) is in a `DEVCLOUD_ALLOWED_HOSTS` list.
-fn allowed_hosts(list: &str, name: &str) -> bool {
-    list.split(',')
-        .map(|entry| entry.trim().trim_end_matches('.').to_ascii_lowercase())
-        .filter(|entry| !entry.is_empty())
-        .any(|entry| {
-            entry == "*"
-                || entry == name
-                || (entry.starts_with('.') && (name.ends_with(&entry) || name == &entry[1..]))
-        })
-}
-
 fn body_error_reply(e: crate::body::BodyError) -> Reply {
     use crate::body::BodyError;
     match e {
@@ -548,45 +491,6 @@ fn query_all(q: &str, key: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn host_guard_refuses_rebinding_names() {
-        for ok in [
-            "",
-            "127.0.0.1:18025",
-            "localhost",
-            "localhost:9000",
-            "[::1]:8080",
-            "192.168.1.20:18025",
-            "devcloud:18025",
-            "host.docker.internal:18025",
-            "abc.lambda-url.us-east-1.localhost:19010",
-            "mymac.local",
-            "devcloud.test",
-            "LOCALHOST.",
-        ] {
-            assert!(trusted_host(ok), "{ok}");
-        }
-        for bad in [
-            "evil.example.com",
-            "evil.example.com:18025",
-            "127.0.0.1.nip.io",
-            "localhost.evil.com",
-            "[not-an-ip]",
-            ":80",
-        ] {
-            assert!(!trusted_host(bad), "{bad}");
-        }
-        assert!(allowed_hosts(
-            "devcloud.corp.dev, .lan.example.org",
-            "devcloud.corp.dev"
-        ));
-        assert!(allowed_hosts(".lan.example.org", "box.lan.example.org"));
-        assert!(allowed_hosts(".lan.example.org", "lan.example.org"));
-        assert!(!allowed_hosts(".lan.example.org", "evillan.example.org"));
-        assert!(allowed_hosts("*", "anything.com"));
-        assert!(!allowed_hosts("", "anything.com"));
-    }
 
     #[test]
     fn repeated_headers_keep_every_value() {

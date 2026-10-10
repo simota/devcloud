@@ -9,6 +9,7 @@ name = "devcloud_event_relay"
 path = "src/lib.rs"
 
 [dependencies]
+devcloud-hostguard = { path = "../hostguard" }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal"] }
 tokio-tungstenite = "0.24"
 futures-util = "0.3"

@@ -2156,6 +2156,25 @@ async fn handle_conn(mut stream: TcpStream, server: Arc<Mutex<Server>>) -> std::
         Ok(Some(req)) => req,
         _ => return Ok(()),
     };
+    // DNS rebinding: a page whose own domain resolves to 127.0.0.1 reaches
+    // this port same-origin, but keeps its domain as Host.
+    if !devcloud_hostguard::trusted_host(request.header("host")) {
+        return stream
+            .write_all(&devcloud_hostguard::untrusted_host_response())
+            .await;
+    }
+    // CSRF: browsers send "simple" cross-site writes without a preflight.
+    if devcloud_hostguard::cross_site_write(&request.method, request.header("origin"), request.header("sec-fetch-site"))
+        // POST Object: browser form uploads are meant to work cross-site.
+        && !(request.method == "POST"
+            && request.header("content-type")
+                .to_ascii_lowercase()
+                .starts_with("multipart/form-data"))
+    {
+        return stream
+            .write_all(&devcloud_hostguard::cross_site_response())
+            .await;
+    }
     let response = {
         let mut guard = server.lock().unwrap();
         route(&mut guard, &request)

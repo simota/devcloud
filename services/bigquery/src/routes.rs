@@ -25,6 +25,8 @@ pub struct Request {
     pub authorization: String,
     /// `Content-Type` header value (multipart uploads).
     pub content_type: String,
+    /// `Host` header value (DNS-rebinding guard).
+    pub host: String,
     pub body: Vec<u8>,
 }
 
@@ -42,6 +44,7 @@ impl Request {
             query: Query::parse(raw_query),
             authorization: String::new(),
             content_type: String::new(),
+            host: String::new(),
             body: body.to_vec(),
         }
     }

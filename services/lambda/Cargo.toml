@@ -13,6 +13,7 @@ name = "devcloud-lambda"
 path = "src/main.rs"
 
 [dependencies]
+devcloud-hostguard = { path = "../hostguard" }
 # Same hand-rolled HTTP/1.1-on-tokio approach as the other AWS-protocol crates.
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "io-util", "process", "time", "sync", "fs", "signal"] }
 serde = { version = "1", features = ["derive"] }

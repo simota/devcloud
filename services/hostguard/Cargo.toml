@@ -1,0 +1,9 @@
+[package]
+name = "devcloud-hostguard"
+version = "0.1.0"
+edition = "2021"
+description = "Browser guards shared by the devcloud HTTP services: the DNS-rebinding Host check and the loopback Origin check."
+
+[lib]
+name = "devcloud_hostguard"
+path = "src/lib.rs"

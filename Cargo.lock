@@ -189,6 +189,7 @@ checksum = "a4ae5f15dda3c708c0ade84bfee31ccab44a3da4f88015ed22f63732abe300c8"
 name = "devcloud-applicationautoscaling"
 version = "0.1.0"
 dependencies = [
+ "devcloud-hostguard",
  "hex",
  "hmac",
  "serde",
@@ -201,6 +202,7 @@ dependencies = [
 name = "devcloud-bigquery"
 version = "0.1.0"
 dependencies = [
+ "devcloud-hostguard",
  "devcloud-s3",
  "serde",
  "serde_json",
@@ -211,6 +213,7 @@ dependencies = [
 name = "devcloud-cloudrun"
 version = "0.1.0"
 dependencies = [
+ "devcloud-hostguard",
  "hex",
  "libc",
  "serde",
@@ -225,6 +228,7 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "devcloud-cloudrun",
+ "devcloud-hostguard",
  "devcloud-lambda",
  "futures-util",
  "hex",
@@ -242,6 +246,7 @@ dependencies = [
 name = "devcloud-dynamodb"
 version = "0.1.0"
 dependencies = [
+ "devcloud-hostguard",
  "hex",
  "hmac",
  "serde",
@@ -254,6 +259,7 @@ dependencies = [
 name = "devcloud-event-relay"
 version = "0.1.0"
 dependencies = [
+ "devcloud-hostguard",
  "futures-util",
  "serde",
  "serde_json",
@@ -265,6 +271,7 @@ dependencies = [
 name = "devcloud-gcs"
 version = "0.1.0"
 dependencies = [
+ "devcloud-hostguard",
  "devcloud-s3",
  "hex",
  "serde",
@@ -273,10 +280,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "devcloud-hostguard"
+version = "0.1.0"
+
+[[package]]
 name = "devcloud-lambda"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "devcloud-hostguard",
  "devcloud-s3",
  "hex",
  "hmac",
@@ -293,6 +305,7 @@ name = "devcloud-mail"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "devcloud-hostguard",
  "serde",
  "serde_json",
  "sha2",
@@ -341,6 +354,7 @@ dependencies = [
 name = "devcloud-pubsub"
 version = "0.1.0"
 dependencies = [
+ "devcloud-hostguard",
  "hex",
  "prost",
  "prost-types",
@@ -364,6 +378,7 @@ dependencies = [
 name = "devcloud-redis-control"
 version = "0.1.0"
 dependencies = [
+ "devcloud-hostguard",
  "serde",
  "serde_json",
  "tokio",
@@ -373,6 +388,7 @@ dependencies = [
 name = "devcloud-redshift"
 version = "0.1.0"
 dependencies = [
+ "devcloud-hostguard",
  "devcloud-s3",
  "hex",
  "hmac",
@@ -387,6 +403,7 @@ dependencies = [
 name = "devcloud-s3"
 version = "0.1.0"
 dependencies = [
+ "devcloud-hostguard",
  "hex",
  "hmac",
  "md-5",
@@ -401,6 +418,7 @@ name = "devcloud-sqs"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "devcloud-hostguard",
  "hmac",
  "md-5",
  "serde",

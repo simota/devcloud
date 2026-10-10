@@ -13,6 +13,7 @@ name = "devcloud-dynamodb"
 path = "src/main.rs"
 
 [dependencies]
+devcloud-hostguard = { path = "../hostguard" }
 serde = { version = "1", features = ["derive"] }
 # serde_json's default Map is a BTreeMap (sorted keys), matching legacy sorted-key
 # map marshaling. Do NOT enable preserve_order.
@@ -20,4 +21,4 @@ serde_json = "1"
 sha2 = "0.10"
 hmac = "0.12"
 hex = "0.4"
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "io-util", "signal"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "io-util", "signal", "time"] }

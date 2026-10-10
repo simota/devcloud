@@ -13,6 +13,7 @@ name = "devcloud-pubsub"
 path = "src/main.rs"
 
 [dependencies]
+devcloud-hostguard = { path = "../hostguard" }
 serde = { version = "1", features = ["derive"] }
 # serde_json's default Map is a BTreeMap (sorted keys), matching legacy sorted-key
 # map marshaling. Do NOT enable preserve_order.

@@ -13,6 +13,7 @@ name = "devcloud-sqs"
 path = "src/main.rs"
 
 [dependencies]
+devcloud-hostguard = { path = "../hostguard" }
 md-5 = "0.10"
 sha2 = "0.10"
 hmac = "0.12"

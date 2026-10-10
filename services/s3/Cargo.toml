@@ -13,6 +13,7 @@ name = "devcloud-s3"
 path = "src/main.rs"
 
 [dependencies]
+devcloud-hostguard = { path = "../hostguard" }
 serde = { version = "1", features = ["derive"] }
 # serde_json's default Map is a BTreeMap (sorted keys), matching legacy sorted-key
 # map marshaling. Do NOT enable preserve_order.
@@ -21,4 +22,4 @@ md-5 = "0.10"
 sha2 = "0.10"
 hmac = "0.12"
 hex = "0.4"
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "io-util", "signal", "sync"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "io-util", "signal", "sync", "time"] }

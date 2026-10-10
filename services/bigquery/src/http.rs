@@ -66,6 +66,13 @@ async fn handle_conn(mut stream: TcpStream, server: Arc<Server>) -> std::io::Res
         Ok(Some(req)) => req,
         _ => return Ok(()),
     };
+    // DNS rebinding: a page whose own domain resolves to 127.0.0.1 reaches
+    // this port same-origin, but keeps its domain as Host.
+    if !devcloud_hostguard::trusted_host(&request.host) {
+        return stream
+            .write_all(&devcloud_hostguard::untrusted_host_response())
+            .await;
+    }
     let response = routes::handle(&server, &request);
     write_response(&mut stream, response).await
 }
@@ -99,6 +106,7 @@ async fn read_request(stream: &mut TcpStream) -> std::io::Result<Option<Request>
 
     let mut authorization = String::new();
     let mut content_type = String::new();
+    let mut host = String::new();
     let mut content_length: usize = 0;
     let mut chunked = false;
     for line in lines {
@@ -107,6 +115,7 @@ async fn read_request(stream: &mut TcpStream) -> std::io::Result<Option<Request>
             match k.trim().to_ascii_lowercase().as_str() {
                 "authorization" => authorization = value.to_string(),
                 "content-type" => content_type = value.to_string(),
+                "host" => host = value.to_string(),
                 "content-length" => content_length = value.parse().unwrap_or(0),
                 "transfer-encoding" => {
                     chunked = value.to_ascii_lowercase().contains("chunked");
@@ -139,6 +148,7 @@ async fn read_request(stream: &mut TcpStream) -> std::io::Result<Option<Request>
         query: Query::parse(&raw_query),
         authorization,
         content_type,
+        host,
         body,
     }))
 }

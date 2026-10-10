@@ -63,6 +63,30 @@ async fn handle_conn(mut stream: TcpStream, server: Arc<Server>) -> std::io::Res
     let Some(request) = read_request(&mut stream).await? else {
         return Ok(());
     };
+    // DNS rebinding: a page whose own domain resolves to 127.0.0.1 reaches
+    // this port same-origin, but keeps its domain as Host.
+    if !devcloud_hostguard::trusted_host(
+        request
+            .headers
+            .get("host")
+            .map(String::as_str)
+            .unwrap_or(""),
+    ) {
+        return stream
+            .write_all(&devcloud_hostguard::untrusted_host_response())
+            .await;
+    }
+    let header = |name: &str| request.headers.get(name).map(String::as_str).unwrap_or("");
+    // CSRF: browsers send "simple" cross-site writes without a preflight.
+    if devcloud_hostguard::cross_site_write(
+        &request.method,
+        header("origin"),
+        header("sec-fetch-site"),
+    ) {
+        return stream
+            .write_all(&devcloud_hostguard::cross_site_response())
+            .await;
+    }
     let response = server.dispatch_http(
         &request.method,
         &request.path,

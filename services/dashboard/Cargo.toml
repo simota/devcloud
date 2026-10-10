@@ -13,6 +13,7 @@ name = "devcloud-dashboard"
 path = "src/main.rs"
 
 [dependencies]
+devcloud-hostguard = { path = "../hostguard" }
 serde = { version = "1", features = ["derive"] }
 # BTreeMap default (sorted keys) matches legacy map JSON marshaling — do NOT enable
 # preserve_order.

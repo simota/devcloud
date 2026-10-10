@@ -13,6 +13,7 @@ name = "devcloud-mail"
 path = "src/main.rs"
 
 [dependencies]
+devcloud-hostguard = { path = "../hostguard" }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "io-util", "net", "sync", "time", "signal"] }
 base64 = "0.22"
 serde = { version = "1", features = ["derive"] }

@@ -13,6 +13,7 @@ name = "devcloud-redshift"
 path = "src/main.rs"
 
 [dependencies]
+devcloud-hostguard = { path = "../hostguard" }
 devcloud-s3 = { path = "../s3" }
 md-5 = "0.10"
 sha2 = "0.10"
