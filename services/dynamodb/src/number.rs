@@ -143,8 +143,17 @@ impl Decimal {
     }
 }
 
+/// DynamoDB numbers carry at most 38 significant digits.
+const MAX_SIGNIFICANT_DIGITS: usize = 38;
+/// Smallest allowed decimal exponent of the leading digit (`1E-130`).
+const MIN_EXPONENT: i64 = -130;
+/// Largest allowed decimal exponent of the leading digit (`9.99…E+125`).
+const MAX_EXPONENT: i64 = 125;
+
 /// Parses a legacy-`big.Rat` decimal/exponent string. Returns `None` on anything
-/// outside the supported subset (which legacy broader parser might still accept).
+/// outside the supported subset (which legacy broader parser might still accept)
+/// or outside the DynamoDB number limits: at most 38 significant digits and a
+/// magnitude of zero or within `1E-130..1E+126`.
 pub fn parse(s: &str) -> Option<Decimal> {
     let s = s.trim();
     if s.is_empty() {
@@ -189,7 +198,9 @@ pub fn parse(s: &str) -> Option<Decimal> {
         if exp_digits.is_empty() {
             return None;
         }
-        exp = exp_digits.parse::<i64>().ok()?;
+        // Leading zeros carry no magnitude; anything still too long to fit
+        // an i64 is far outside the DynamoDB range (rejected below anyway).
+        exp = normalize_mag(&exp_digits).parse::<i64>().ok()?;
         if exp_neg {
             exp = -exp;
         }
@@ -203,18 +214,31 @@ pub fn parse(s: &str) -> Option<Decimal> {
     let mut mantissa = int_digits;
     mantissa.push_str(&frac_digits);
     let mantissa = normalize_mag(&mantissa);
-    let total_exp = exp - frac_len;
+    if mantissa == "0" {
+        return Some(Decimal::zero());
+    }
+    // Move trailing zeros into the exponent so `significant` holds exactly
+    // the significant digits and `total_exp` is the power of its last digit.
+    let significant = mantissa.trim_end_matches('0');
+    let total_exp = exp - frac_len + (mantissa.len() - significant.len()) as i64;
+    // DynamoDB limits, enforced before any digits are materialized.
+    if significant.len() > MAX_SIGNIFICANT_DIGITS {
+        return None;
+    }
+    let leading_exp = total_exp + significant.len() as i64 - 1;
+    if !(MIN_EXPONENT..=MAX_EXPONENT).contains(&leading_exp) {
+        return None;
+    }
 
     let (coeff, scale) = if total_exp >= 0 {
-        let mut digits = mantissa;
+        let mut digits = significant.to_string();
         for _ in 0..total_exp {
             digits.push('0');
         }
-        (normalize_mag(&digits), 0)
+        (digits, 0)
     } else {
-        (mantissa, (-total_exp) as u32)
+        (significant.to_string(), (-total_exp) as u32)
     };
-    let negative = negative && coeff != "0";
     Some(Decimal {
         negative,
         coeff,
@@ -467,5 +491,39 @@ mod tests {
         assert!(!is_valid_number("1.2.3"));
         assert!(!is_valid_number(""));
         assert!(!is_valid_number("1e"));
+    }
+
+    #[test]
+    fn enforces_dynamodb_number_limits() {
+        // A negative exponent past u32 must not wrap around to 1.
+        assert!(!is_valid_number("1e-4294967296"));
+        assert_ne!(
+            compare_number_strings("1e-4294967296", "1"),
+            Ordering::Equal
+        );
+        // Huge exponents are rejected up front instead of materializing digits.
+        assert!(!is_valid_number("1e10000000000"));
+        assert!(!is_valid_number("1e99999999999999999999999"));
+        // Magnitude bounds: 1E-130 ..= 9.99…E+125.
+        assert!(is_valid_number("1e-130"));
+        assert!(!is_valid_number("1e-131"));
+        assert!(is_valid_number(
+            "9.9999999999999999999999999999999999999e125"
+        ));
+        assert!(!is_valid_number("1e126"));
+        assert!(is_valid_number("-1e125"));
+        assert!(!is_valid_number("-1e126"));
+        // Zero is always valid, whatever its spelling.
+        assert!(is_valid_number("0e999999"));
+        assert!(is_valid_number("-0.000"));
+        // At most 38 significant digits (leading/trailing zeros don't count).
+        assert!(is_valid_number(&"1".repeat(38)));
+        assert!(!is_valid_number(&"1".repeat(39)));
+        assert!(is_valid_number(&format!(
+            "{}{}",
+            "1".repeat(38),
+            "0".repeat(80)
+        )));
+        assert!(is_valid_number(&format!("0.000{}", "1".repeat(38))));
     }
 }
