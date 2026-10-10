@@ -60,16 +60,12 @@ pub fn family(runtime: &str) -> Option<Family> {
 /// it: `python3.12` → `3.12`, `nodejs20.x` → `20`. `None` when the identifier
 /// carries no usable version.
 pub fn version(runtime: &str) -> Option<String> {
-    let (rest, family) = if let Some(rest) = runtime.strip_prefix("python") {
-        (rest, Family::Python)
-    } else if let Some(rest) = runtime.strip_prefix("nodejs") {
-        (rest, Family::Node)
-    } else {
-        return None;
-    };
-    let v = match family {
-        Family::Python => rest,
-        Family::Node => rest.strip_suffix(".x").unwrap_or(rest),
+    let v = match runtime.strip_prefix("python") {
+        Some(rest) => rest,
+        None => {
+            let rest = runtime.strip_prefix("nodejs")?;
+            rest.strip_suffix(".x").unwrap_or(rest)
+        }
     };
     let numeric = !v.is_empty()
         && v.split('.')
