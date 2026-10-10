@@ -258,6 +258,10 @@ pub struct Server {
     function_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     /// Async (`Event`) invocations still running; aborted on shutdown.
     background: Mutex<Background>,
+    /// Held for reading by every package job running on the blocking pool;
+    /// `shutdown` takes it for writing (waiting for them) and sets it, after
+    /// which no new job starts.
+    blocking_gate: Arc<tokio::sync::RwLock<bool>>,
     /// Warm execution environments.
     pool: Arc<runtime::Pool>,
 }
@@ -290,6 +294,7 @@ impl Server {
             code: CodeStore::new(PathBuf::from(&config.storage_path).join("functions")),
             function_locks: Mutex::new(HashMap::new()),
             background: Mutex::new(Background::default()),
+            blocking_gate: Arc::new(tokio::sync::RwLock::new(false)),
             pool: runtime::Pool::new(
                 PathBuf::from(&config.storage_path).join("environments"),
                 config.idle_timeout.unwrap_or(runtime::DEFAULT_IDLE_TIMEOUT),
@@ -1540,6 +1545,9 @@ impl Server {
     /// Stops accepting async invocations, then aborts and awaits the running
     /// ones so each tears down its handler process group.
     pub async fn shutdown(&self) {
+        // Package jobs are not cancellable midway: let running ones finish
+        // so nothing touches storage after `serve` returns.
+        *self.blocking_gate.write().await = true;
         let mut tasks = {
             let mut bg = self.background.lock().unwrap();
             bg.closed = true;
@@ -1548,6 +1556,25 @@ impl Server {
         tasks.abort_all();
         while tasks.join_next().await.is_some() {}
         self.pool.close().await;
+    }
+
+    /// Runs `job` on the blocking pool, tracked so that `shutdown` waits for
+    /// it. Dropping the returned future does not stop the job.
+    pub(crate) async fn run_blocking(
+        self: &Arc<Self>,
+        job: impl FnOnce(&Server) -> Reply + Send + 'static,
+    ) -> Reply {
+        let gate = Arc::clone(&self.blocking_gate).read_owned().await;
+        if *gate {
+            return Reply::error(503, "ServiceException", "devcloud lambda is shutting down");
+        }
+        let server = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            let _gate = gate;
+            job(&server)
+        })
+        .await
+        .unwrap_or_else(|_| Reply::error(500, "ServiceException", "internal error"))
     }
 
     /// Removes function containers that a previous, killed run of this
@@ -2086,6 +2113,40 @@ fn tagged_log(function: &str, log: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A package job aborted with its connection still finishes before
+    /// `shutdown` returns, and none starts afterwards.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_waits_for_package_jobs() {
+        let server = Arc::new(Server::new(Config::default()));
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (started_tx, started) = std::sync::mpsc::channel();
+        let job = {
+            let (server, done) = (Arc::clone(&server), Arc::clone(&done));
+            tokio::spawn(async move {
+                server
+                    .run_blocking(move |_| {
+                        started_tx.send(()).unwrap();
+                        std::thread::sleep(std::time::Duration::from_millis(300));
+                        done.store(true, Ordering::SeqCst);
+                        Reply::empty(200)
+                    })
+                    .await
+            })
+        };
+        tokio::task::spawn_blocking(move || started.recv().unwrap())
+            .await
+            .unwrap();
+        // The connection goes away mid-job, as on shutdown.
+        job.abort();
+        server.shutdown().await;
+        assert!(
+            done.load(Ordering::SeqCst),
+            "shutdown returned before the job ended"
+        );
+        let late = server.run_blocking(|_| Reply::empty(200)).await;
+        assert_eq!(late.status, 503);
+    }
 
     #[test]
     fn stdout_logs_tag_every_line_with_the_function() {

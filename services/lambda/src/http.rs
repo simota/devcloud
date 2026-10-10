@@ -294,15 +294,12 @@ pub async fn process(server: &Arc<Server>, req: &Request) -> Reply {
 
 /// Runs a handler that unzips, extracts or reads whole packages (and holds
 /// the function's lock meanwhile) off the async workers, so it cannot stall
-/// other connections or running invocations.
+/// other connections or running invocations. Shutdown waits for it.
 async fn blocking(
     server: &Arc<Server>,
     handler: impl FnOnce(&Server) -> Reply + Send + 'static,
 ) -> Reply {
-    let server = Arc::clone(server);
-    tokio::task::spawn_blocking(move || handler(&server))
-        .await
-        .unwrap_or_else(|_| Reply::error(500, "ServiceException", "internal error"))
+    server.run_blocking(handler).await
 }
 
 /// SigV4 verification per auth mode. Kept synchronous so the borrowed header
