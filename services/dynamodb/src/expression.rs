@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use serde_json::{json, Value};
 
 use crate::attribute::{
-    attribute_type_name, attribute_values_equal, compare_attribute_values, numbers_equal,
+    attribute_type_name, attribute_values_equal, binary_len, compare_same_type, numbers_equal,
     resolve_attribute_name,
 };
 use crate::model::Item;
@@ -217,8 +217,14 @@ fn evaluate_between_predicate(
     let Some(actual) = candidate.get(&attr) else {
         return Ok(false);
     };
-    Ok(compare_attribute_values(actual, lower) != Ordering::Less
-        && compare_attribute_values(actual, upper) != Ordering::Greater)
+    // Mismatched types (e.g. N BETWEEN two S) evaluate as false.
+    match (
+        compare_same_type(actual, lower),
+        compare_same_type(actual, upper),
+    ) {
+        (Some(low), Some(high)) => Ok(low != Ordering::Less && high != Ordering::Greater),
+        _ => Ok(false),
+    }
 }
 
 fn evaluate_in_predicate(
@@ -262,8 +268,10 @@ fn evaluate_comparison_predicate(
         let expected = values
             .get(value_token)
             .ok_or_else(|| format!("missing expression attribute value {value_token}"))?;
-        let comparison = compare_attribute_values(&json!({"N": actual_size.to_string()}), expected);
-        return compare_with_operator(comparison, &operator);
+        return match compare_same_type(&json!({"N": actual_size.to_string()}), expected) {
+            Some(comparison) => compare_with_operator(comparison, &operator),
+            None => Ok(false),
+        };
     }
 
     let attr = resolve_attribute_name(name_token.trim(), names);
@@ -277,7 +285,11 @@ fn evaluate_comparison_predicate(
     match operator.as_str() {
         "=" => Ok(attribute_values_equal(actual, expected)),
         "<>" => Ok(!attribute_values_equal(actual, expected)),
-        _ => compare_with_operator(compare_attribute_values(actual, expected), &operator),
+        _ => match compare_same_type(actual, expected) {
+            Some(comparison) => compare_with_operator(comparison, &operator),
+            // Ordering across types (N < S, …) is false, not a type-tag compare.
+            None => Ok(false),
+        },
     }
 }
 
@@ -321,7 +333,7 @@ fn attribute_size(value: &Value) -> Option<i64> {
         return Some(s.len() as i64);
     }
     if let Some(b) = obj.get("B").and_then(Value::as_str) {
-        return Some(b.len() as i64);
+        return Some(binary_len(b) as i64);
     }
     for set in ["SS", "NS", "BS"] {
         if let Some(arr) = obj.get(set).and_then(Value::as_array) {
@@ -659,6 +671,43 @@ mod tests {
         check_condition("n IN (:one, :five)", &names(), &vals, Some(&it)).unwrap();
         check_condition("contains(ns, :one)", &names(), &vals, Some(&it)).unwrap();
         assert!(check_condition("n <> :five", &names(), &vals, Some(&it)).is_err());
+    }
+
+    #[test]
+    fn cross_type_ordering_is_false() {
+        let it = item(&[("n", json!({"N": "5"})), ("s", json!({"S": "abc"}))]);
+        let mut vals = Values::new();
+        vals.insert(":s".to_string(), json!({"S": "zzz"}));
+        vals.insert(":n".to_string(), json!({"N": "1"}));
+        vals.insert(":n9".to_string(), json!({"N": "9"}));
+        for expression in [
+            "n < :s",
+            "n <= :s",
+            "n > :s",
+            "n >= :s",
+            "s > :n",
+            "n BETWEEN :n AND :s",
+            "size(s) < :s",
+        ] {
+            assert_eq!(
+                check_condition(expression, &names(), &vals, Some(&it)),
+                Err(ConditionError::Failed),
+                "{expression}"
+            );
+        }
+        check_condition("n BETWEEN :n AND :n9", &names(), &vals, Some(&it)).unwrap();
+    }
+
+    #[test]
+    fn binary_compares_and_sizes_by_decoded_bytes() {
+        // "/w==" is [0xFF]; "AQA=" is [0x01, 0x00]. As base64 text "/" < "A",
+        // but as bytes 0xFF > 0x01.
+        let it = item(&[("b", json!({"B": "/w=="}))]);
+        let mut vals = Values::new();
+        vals.insert(":v".to_string(), json!({"B": "AQA="}));
+        vals.insert(":one".to_string(), json!({"N": "1"}));
+        check_condition("b > :v", &names(), &vals, Some(&it)).unwrap();
+        check_condition("size(b) = :one", &names(), &vals, Some(&it)).unwrap();
     }
 
     #[test]

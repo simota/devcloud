@@ -378,7 +378,7 @@ pub fn compare_attribute_values(left: &Value, right: &Value) -> std::cmp::Orderi
         }
         if let Some(lb) = lo.get("B").and_then(Value::as_str) {
             return match ro.get("B").and_then(Value::as_str) {
-                Some(rb) => lb.cmp(rb),
+                Some(rb) => compare_binary(lb, rb),
                 None => attribute_type_name(left).cmp(attribute_type_name(right)),
             };
         }
@@ -386,6 +386,40 @@ pub fn compare_attribute_values(left: &Value, right: &Value) -> std::cmp::Orderi
     let lj = crate::wire_json::marshal(left);
     let rj = crate::wire_json::marshal(right);
     lj.cmp(&rj).then(Ordering::Equal)
+}
+
+/// Ordered comparison for the `<`/`<=`/`>`/`>=`/BETWEEN operators: defined
+/// only between two values of the same scalar type (N numerically, S by
+/// UTF-8 bytes, B by decoded bytes). `None` for mismatched or non-scalar
+/// types, which DynamoDB evaluates as false.
+pub fn compare_same_type(left: &Value, right: &Value) -> Option<std::cmp::Ordering> {
+    let (lo, ro) = (left.as_object()?, right.as_object()?);
+    let pair = |kind: &str| Some((lo.get(kind)?.as_str()?, ro.get(kind)?.as_str()?));
+    if let Some((l, r)) = pair("N") {
+        return Some(crate::number::compare_number_strings(l, r));
+    }
+    if let Some((l, r)) = pair("S") {
+        return Some(l.cmp(r));
+    }
+    if let Some((l, r)) = pair("B") {
+        return Some(compare_binary(l, r));
+    }
+    None
+}
+
+/// Compares two base64 `B` payloads by their decoded bytes (falling back to
+/// the text when either is not valid base64).
+fn compare_binary(left: &str, right: &str) -> std::cmp::Ordering {
+    match (base64_decode(left), base64_decode(right)) {
+        (Some(l), Some(r)) => l.cmp(&r),
+        _ => left.cmp(right),
+    }
+}
+
+/// The decoded byte length of a base64 `B` payload (the text length when it
+/// is not valid base64).
+pub fn binary_len(encoded: &str) -> usize {
+    base64_decode(encoded).map_or(encoded.len(), |bytes| bytes.len())
 }
 
 // --- helpers ---------------------------------------------------------------
