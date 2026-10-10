@@ -344,12 +344,18 @@ fn retry_policy_duration(
         }
     };
     match crate::duration::parse_go_duration(value) {
+        Some(n) if n > MAX_RETRY_BACKOFF_NANOS => Err(ApiError::invalid_argument(format!(
+            "retryPolicy.{field} must be between 0s and 600s"
+        ))),
         Some(n) if n >= 0 => Ok(Some(n)),
         _ => Err(ApiError::invalid_argument(format!(
             "retryPolicy.{field} must be a non-negative duration"
         ))),
     }
 }
+
+/// Google Pub/Sub caps both retry backoff bounds at 600 seconds.
+const MAX_RETRY_BACKOFF_NANOS: i128 = 600 * 1_000_000_000;
 
 /// Validates a push config, mirroring `validatePushConfig`.
 pub fn validate_push_config(config: Option<&Value>) -> Result<(), ApiError> {
@@ -440,6 +446,22 @@ mod tests {
             &json!({"minimumBackoff": "600s", "maximumBackoff": "10s"})
         ))
         .is_err());
+    }
+
+    #[test]
+    fn retry_policy_backoff_range() {
+        assert!(validate_retry_policy(Some(&json!({"minimumBackoff": "0s"}))).is_ok());
+        assert!(validate_retry_policy(Some(&json!({"maximumBackoff": "600s"}))).is_ok());
+        for field in ["minimumBackoff", "maximumBackoff"] {
+            for value in ["601s", "9223372036854775807s"] {
+                assert_eq!(
+                    validate_retry_policy(Some(&json!({ field: value })))
+                        .unwrap_err()
+                        .message,
+                    format!("retryPolicy.{field} must be between 0s and 600s")
+                );
+            }
+        }
     }
 
     #[test]

@@ -1154,9 +1154,7 @@ impl Server {
             topic: sub.topic.clone(),
             subscription: sub.name.clone(),
             expire_time: self.snapshot_expire_time(),
-            // Deliveries are captured from the subscription's pending records;
-            // empty here (no messages yet) — the messages part fills them in.
-            deliveries: Vec::new(),
+            deliveries: snapshot_deliveries(self.deliveries.get(subscription).map_or(&[], |v| v)),
             ..Default::default()
         };
         self.snapshots.insert(name.clone(), snapshot.clone());
@@ -1514,6 +1512,7 @@ impl Server {
         let previous_next_message_id = self.next_message_id;
         let previous_messages = self.messages.clone();
         let previous_deliveries = self.deliveries.clone();
+        let previous_snapshots = self.snapshots.clone();
         let mut message_ids = Vec::with_capacity(messages.len());
         for incoming in messages {
             self.next_message_id += 1;
@@ -1543,25 +1542,7 @@ impl Server {
                     .to_string(),
             };
             self.messages.insert(message_id.clone(), message.clone());
-            let matched: Vec<String> = self
-                .subscriptions
-                .values()
-                .filter(|sub| {
-                    sub.topic == name
-                        && !sub.detached
-                        && subscription_matches_message(sub, &message)
-                })
-                .map(|sub| sub.name.clone())
-                .collect();
-            for sub_name in matched {
-                self.deliveries
-                    .entry(sub_name)
-                    .or_default()
-                    .push(crate::model::DeliveryRecord {
-                        message_id: message_id.clone(),
-                        ..Default::default()
-                    });
-            }
+            self.fan_out_published(&name, &message);
             message_ids.push(message_id);
         }
         self.messages_dirty = true;
@@ -1569,11 +1550,62 @@ impl Server {
             self.next_message_id = previous_next_message_id;
             self.messages = previous_messages;
             self.deliveries = previous_deliveries;
+            self.snapshots = previous_snapshots;
             return Err(e);
         }
         Ok(RestResponse::ok_struct(&serde_json::json!({
             "messageIds": message_ids,
         })))
+    }
+
+    /// Adds a delivery for a freshly published message to every matching
+    /// attached subscription and to every unexpired snapshot of the topic
+    /// (a snapshot retains messages published after its creation, so a later
+    /// seek to it replays them).
+    fn fan_out_published(&mut self, topic_name: &str, message: &crate::model::PubsubMessage) {
+        let matched: Vec<String> = self
+            .subscriptions
+            .values()
+            .filter(|sub| {
+                sub.topic == topic_name
+                    && !sub.detached
+                    && subscription_matches_message(sub, message)
+            })
+            .map(|sub| sub.name.clone())
+            .collect();
+        for sub_name in matched {
+            self.deliveries
+                .entry(sub_name)
+                .or_default()
+                .push(crate::model::DeliveryRecord {
+                    message_id: message.message_id.clone(),
+                    ..Default::default()
+                });
+        }
+        let snapshot_names: Vec<String> = self
+            .snapshots
+            .values()
+            .filter(|snap| {
+                snap.topic == topic_name
+                    && !self.snapshot_expired(snap)
+                    && self
+                        .subscriptions
+                        .get(&snap.subscription)
+                        .is_none_or(|sub| subscription_matches_message(sub, message))
+            })
+            .map(|snap| snap.name.clone())
+            .collect();
+        for snap_name in snapshot_names {
+            if let Some(snap) = self.snapshots.get_mut(&snap_name) {
+                snap.deliveries.push(crate::model::DeliveryRecord {
+                    message_id: message.message_id.clone(),
+                    lease_deadline: crate::model::ZERO_TIME.to_string(),
+                    next_delivery_time: crate::model::ZERO_TIME.to_string(),
+                    ..Default::default()
+                });
+                self.resource_dirty = true;
+            }
+        }
     }
 
     /// `POST /v1/projects/<p>/subscriptions/<id>:pull`.
@@ -1835,7 +1867,10 @@ impl Server {
             if deadline == 0 {
                 d.ack_id = String::new();
                 d.lease_deadline = crate::model::ZERO_TIME.to_string();
-                d.next_delivery_time = crate::model::ZERO_TIME.to_string();
+                d.next_delivery_time = nack_next_delivery_time(
+                    self.retry_backoff(&name, d.delivery_attempt),
+                    now_secs,
+                );
             } else {
                 d.lease_deadline = crate::delivery::plus_seconds(now_secs, deadline);
                 d.next_delivery_time = crate::model::ZERO_TIME.to_string();
@@ -2294,6 +2329,7 @@ impl Server {
         let previous_next_message_id = self.next_message_id;
         let previous_messages = self.messages.clone();
         let previous_deliveries = self.deliveries.clone();
+        let previous_snapshots = self.snapshots.clone();
         let mut message_ids = Vec::with_capacity(messages.len());
         for (data, attrs, ordering_key) in messages {
             self.next_message_id += 1;
@@ -2306,25 +2342,7 @@ impl Server {
                 ordering_key: ordering_key.clone(),
             };
             self.messages.insert(message_id.clone(), message.clone());
-            let matched: Vec<String> = self
-                .subscriptions
-                .values()
-                .filter(|sub| {
-                    sub.topic == topic_name
-                        && !sub.detached
-                        && subscription_matches_message(sub, &message)
-                })
-                .map(|sub| sub.name.clone())
-                .collect();
-            for sub_name in matched {
-                self.deliveries
-                    .entry(sub_name)
-                    .or_default()
-                    .push(crate::model::DeliveryRecord {
-                        message_id: message_id.clone(),
-                        ..Default::default()
-                    });
-            }
+            self.fan_out_published(topic_name, &message);
             message_ids.push(message_id);
         }
         self.messages_dirty = true;
@@ -2332,6 +2350,7 @@ impl Server {
             self.next_message_id = previous_next_message_id;
             self.messages = previous_messages;
             self.deliveries = previous_deliveries;
+            self.snapshots = previous_snapshots;
             return Err(ApiError::internal("pubsub resource store unavailable"));
         }
         Ok(message_ids)
@@ -3146,7 +3165,10 @@ impl Server {
             if ack_deadline_seconds == 0 {
                 d.ack_id = String::new();
                 d.lease_deadline = crate::model::ZERO_TIME.to_string();
-                d.next_delivery_time = crate::model::ZERO_TIME.to_string();
+                d.next_delivery_time = nack_next_delivery_time(
+                    self.retry_backoff(subscription, d.delivery_attempt),
+                    now_secs,
+                );
             } else {
                 d.lease_deadline = crate::delivery::plus_seconds(now_secs, ack_deadline_seconds);
                 d.next_delivery_time = crate::model::ZERO_TIME.to_string();
@@ -3910,6 +3932,17 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
         diff |= x ^ y;
     }
     diff == 0
+}
+
+/// `next_delivery_time` after a nack (ack deadline 0): redeliver immediately
+/// unless the subscription's retry policy asks for a backoff, matching the
+/// lease-expiry path in `expire_leases`.
+fn nack_next_delivery_time(backoff_secs: i64, now_secs: i64) -> String {
+    if backoff_secs > 0 {
+        crate::delivery::plus_seconds(now_secs, backoff_secs)
+    } else {
+        crate::model::ZERO_TIME.to_string()
+    }
 }
 
 /// Snapshot deliveries: unacked records with lease fields cleared, mirroring

@@ -30,7 +30,7 @@ pub fn after(value: &str, now_secs: i64) -> bool {
 
 /// `now + seconds` rendered as an RFC3339 timestamp (whole seconds).
 pub fn plus_seconds(now_secs: i64, seconds: i64) -> String {
-    crate::time_fmt::rfc3339nano_from_unix(now_secs + seconds, 0)
+    crate::time_fmt::rfc3339nano_from_unix(now_secs.saturating_add(seconds), 0)
 }
 
 #[cfg(test)]
@@ -56,5 +56,11 @@ mod tests {
     fn plus() {
         let base = unix_secs("2026-05-30T12:00:00Z");
         assert_eq!(plus_seconds(base, 10), "2026-05-30T12:00:10Z");
+    }
+
+    #[test]
+    fn plus_saturates_instead_of_overflowing() {
+        let base = unix_secs("2026-05-30T12:00:00Z");
+        let _ = plus_seconds(base, i64::MAX);
     }
 }

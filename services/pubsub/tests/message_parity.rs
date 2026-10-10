@@ -222,6 +222,92 @@ fn modify_ack_deadline_extends_lease() {
     assert_eq!(resp["receivedMessages"][0]["deliveryAttempt"], 2);
 }
 
+fn retry_server(dir: &std::path::Path, msg_dir: &std::path::Path) -> Server {
+    let mut s = server(dir, msg_dir);
+    s.create_subscription(
+        "devcloud",
+        "retry",
+        &serde_json::from_str::<Subscription>(
+            r#"{"topic":"projects/devcloud/topics/orders","retryPolicy":{"minimumBackoff":"30s","maximumBackoff":"60s"}}"#,
+        )
+        .unwrap(),
+    )
+    .expect("retry sub");
+    s.publish(
+        "devcloud",
+        "orders",
+        &msgs(r#"{"messages":[{"data":"aGk="}]}"#),
+    )
+    .expect("publish");
+    s
+}
+
+fn pull_ack_ids(s: &mut Server) -> Vec<String> {
+    let pulled: Value =
+        serde_json::from_slice(&s.pull("devcloud", "retry", 10).expect("pull").body).unwrap();
+    pulled["receivedMessages"]
+        .as_array()
+        .map(|msgs| {
+            msgs.iter()
+                .map(|m| m["ackId"].as_str().unwrap().to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[test]
+fn nack_applies_retry_backoff() {
+    let (dir, md) = (tempdir(), tempdir());
+    let mut s = retry_server(&dir, &md);
+    let ack_ids = pull_ack_ids(&mut s);
+    assert_eq!(ack_ids.len(), 1);
+    s.modify_ack_deadline("devcloud", "retry", &ack_ids, 0)
+        .expect("nack");
+
+    s.set_fixed_now("2026-05-30T12:00:29Z");
+    assert!(
+        pull_ack_ids(&mut s).is_empty(),
+        "redelivered inside backoff"
+    );
+    s.set_fixed_now("2026-05-30T12:00:30Z");
+    assert_eq!(pull_ack_ids(&mut s).len(), 1, "redelivered after backoff");
+}
+
+#[test]
+fn grpc_nack_applies_retry_backoff() {
+    let (dir, md) = (tempdir(), tempdir());
+    let mut s = retry_server(&dir, &md);
+    let ack_ids = pull_ack_ids(&mut s);
+    assert_eq!(ack_ids.len(), 1);
+    s.grpc_modify_ack_deadline("projects/devcloud/subscriptions/retry", &ack_ids, 0)
+        .expect("nack");
+
+    s.set_fixed_now("2026-05-30T12:00:29Z");
+    assert!(
+        pull_ack_ids(&mut s).is_empty(),
+        "redelivered inside backoff"
+    );
+    s.set_fixed_now("2026-05-30T12:00:30Z");
+    assert_eq!(pull_ack_ids(&mut s).len(), 1, "redelivered after backoff");
+}
+
+#[test]
+fn retry_backoff_outside_range_is_rejected() {
+    let (dir, md) = (tempdir(), tempdir());
+    let mut s = server(&dir, &md);
+    let err = s
+        .create_subscription(
+            "devcloud",
+            "huge",
+            &serde_json::from_str::<Subscription>(
+                r#"{"topic":"projects/devcloud/topics/orders","retryPolicy":{"minimumBackoff":"9223372036854775807s"}}"#,
+            )
+            .unwrap(),
+        )
+        .expect_err("out of range");
+    assert_eq!(err.status, 400);
+}
+
 #[test]
 fn ack_validation() {
     let (dir, md) = (tempdir(), tempdir());

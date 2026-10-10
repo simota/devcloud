@@ -107,6 +107,66 @@ fn snapshot_delete() {
     assert!(s.delete_snapshot("devcloud", "snap1").is_err());
 }
 
+fn pull_and_ack_all(s: &mut Server) -> usize {
+    let pulled: serde_json::Value =
+        serde_json::from_slice(&s.pull("devcloud", "sub1", 10).expect("pull").body).unwrap();
+    let ack_ids: Vec<String> = pulled["receivedMessages"]
+        .as_array()
+        .map(|msgs| {
+            msgs.iter()
+                .map(|m| m["ackId"].as_str().unwrap().to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    if !ack_ids.is_empty() {
+        s.acknowledge("devcloud", "sub1", &ack_ids).expect("ack");
+    }
+    ack_ids.len()
+}
+
+#[test]
+fn rest_snapshot_captures_backlog_for_seek() {
+    let dir = tempdir();
+    let mut s = server(&dir);
+    let messages: Vec<serde_json::Value> = serde_json::from_str(r#"[{"data":"aGk="}]"#).unwrap();
+    s.publish("devcloud", "orders", &messages).expect("publish");
+    s.create_snapshot("devcloud", "snap1", "projects/devcloud/subscriptions/sub1")
+        .expect("snapshot");
+    assert_eq!(pull_and_ack_all(&mut s), 1);
+
+    s.seek("devcloud", "sub1", "projects/devcloud/snapshots/snap1", "")
+        .expect("seek");
+    assert_eq!(
+        pull_and_ack_all(&mut s),
+        1,
+        "seek to a REST snapshot must restore the backlog it captured"
+    );
+}
+
+#[test]
+fn snapshot_retains_messages_published_after_creation() {
+    let dir = tempdir();
+    let mut s = server(&dir);
+    s.create_snapshot("devcloud", "snap1", "projects/devcloud/subscriptions/sub1")
+        .expect("snapshot");
+    let messages: Vec<serde_json::Value> = serde_json::from_str(r#"[{"data":"aGk="}]"#).unwrap();
+    s.publish("devcloud", "orders", &messages).expect("publish");
+    s.grpc_publish(
+        "projects/devcloud/topics/orders",
+        &[("aGk=".to_string(), Default::default(), String::new())],
+    )
+    .expect("grpc publish");
+    assert_eq!(pull_and_ack_all(&mut s), 2);
+
+    s.seek("devcloud", "sub1", "projects/devcloud/snapshots/snap1", "")
+        .expect("seek");
+    assert_eq!(
+        pull_and_ack_all(&mut s),
+        2,
+        "seek must replay messages published after the snapshot was created"
+    );
+}
+
 #[test]
 fn delete_snapshot_cleans_up_now_unreferenced_message() {
     let dir = tempdir();
