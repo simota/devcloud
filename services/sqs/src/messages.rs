@@ -31,8 +31,9 @@ use crate::server::{
 };
 use crate::time_fmt::{add_seconds, before, is_zero, now_rfc3339, unix_millis_from_rfc3339};
 use crate::validation::{
-    valid_batch_entry_id, valid_message_body, validate_message_attribute_name,
-    validate_message_attribute_value, validate_message_system_attribute,
+    message_payload_size, valid_batch_entry_id, valid_message_body,
+    validate_message_attribute_name, validate_message_attribute_value,
+    validate_message_system_attribute, MAX_MESSAGE_ATTRIBUTES,
 };
 
 const FIFO_DEDUPLICATION_WINDOW_SECONDS: i64 = 5 * 60;
@@ -143,10 +144,6 @@ impl Server {
         if input.message_body.is_empty() {
             return Err("MessageBody is required".into());
         }
-        let max_bytes = self.max_message_bytes();
-        if max_bytes > 0 && input.message_body.len() as i64 > max_bytes {
-            return Err("MessageBody exceeds maximum message size".into());
-        }
         if !valid_message_body(&input.message_body) {
             return Err("MessageBody contains invalid characters".into());
         }
@@ -154,12 +151,21 @@ impl Server {
             validate_message_attribute_name(name)?;
             validate_message_attribute_value(name, attr)?;
         }
+        if input.message_attributes.len() > MAX_MESSAGE_ATTRIBUTES {
+            return Err(format!(
+                "MessageAttributes must contain no more than {MAX_MESSAGE_ATTRIBUTES} attributes"
+            ));
+        }
         for (name, attr) in &input.message_system_attributes {
             validate_message_system_attribute(name, attr)?;
         }
         let name = queue_name_from_url(&input.queue_url);
         if name.is_empty() || !self.queues.contains_key(&name) {
             return Err("queue does not exist".into());
+        }
+        let max_bytes = self.queue_max_message_bytes(&name);
+        if message_payload_size(&input.message_body, &input.message_attributes) as i64 > max_bytes {
+            return Err("MessageBody exceeds maximum message size".into());
         }
         // Snapshot only the fields this function mutates (messages, sequence,
         // dedup) rather than the whole QueueState — attributes/tags/name/url/
@@ -246,6 +252,19 @@ impl Server {
             return Err("QueueUrl is required".into());
         }
         validate_batch_entries(entries.iter().map(|e| e.id.as_str()))?;
+        let name = queue_name_from_url(queue_url);
+        if self.queues.contains_key(&name) {
+            let total: usize = entries
+                .iter()
+                .map(|e| message_payload_size(&e.message_body, &e.message_attributes))
+                .sum();
+            let max_bytes = self.queue_max_message_bytes(&name);
+            if total as i64 > max_bytes {
+                return Err(format!(
+                    "batch request too long: the combined payload of all messages must not exceed {max_bytes} bytes"
+                ));
+            }
+        }
         let mut result = SendMessageBatchResult::default();
         for entry in entries {
             let req = SendMessageRequest {
@@ -272,6 +291,17 @@ impl Server {
             }
         }
         Ok(result)
+    }
+
+    /// The queue's `MaximumMessageSize` attribute, falling back to the
+    /// server-wide limit when it is unset or unparsable.
+    fn queue_max_message_bytes(&self, name: &str) -> i64 {
+        self.queues
+            .get(name)
+            .and_then(|q| q.attributes.get("MaximumMessageSize"))
+            .and_then(|v| v.parse::<i64>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or_else(|| self.max_message_bytes())
     }
 
     // --- receive (mirror message_core.rs) ---

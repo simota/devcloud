@@ -725,3 +725,81 @@ fn batch_entry_validation() {
     assert_eq!(res.failed[0].id, "bad");
     assert!(res.failed[0].sender_fault);
 }
+
+fn string_attr(value: &str) -> devcloud_sqs::MessageAttributeValue {
+    devcloud_sqs::MessageAttributeValue {
+        data_type: "String".to_string(),
+        string_value: value.to_string(),
+        ..Default::default()
+    }
+}
+
+fn send_with_attrs(
+    s: &mut Server,
+    body: String,
+    attrs: BTreeMap<String, devcloud_sqs::MessageAttributeValue>,
+) -> Result<devcloud_sqs::MessageState, String> {
+    s.send_message(&SendMessageRequest {
+        queue_url: URL.to_string(),
+        message_body: body,
+        message_attributes: attrs,
+        ..Default::default()
+    })
+}
+
+#[test]
+fn queue_maximum_message_size_counts_body_and_attributes() {
+    let mut s = Server::new(cfg());
+    s.create_queue(
+        "Orders",
+        &map(&[("MaximumMessageSize", "1024")]),
+        &BTreeMap::new(),
+    )
+    .unwrap();
+
+    // Body alone over the queue limit (but far under the server-wide one).
+    let err = send_with_attrs(&mut s, "x".repeat(1025), BTreeMap::new()).unwrap_err();
+    assert!(err.contains("exceeds maximum message size"), "{err}");
+    send_with_attrs(&mut s, "x".repeat(1024), BTreeMap::new()).unwrap();
+
+    // Body fits, but name + data type + value of the attribute push it over:
+    // 1014 + 1 ("k") + 6 ("String") + 4 ("vvvv") = 1025.
+    let attrs = BTreeMap::from([("k".to_string(), string_attr("vvvv"))]);
+    let err = send_with_attrs(&mut s, "x".repeat(1014), attrs.clone()).unwrap_err();
+    assert!(err.contains("exceeds maximum message size"), "{err}");
+    send_with_attrs(&mut s, "x".repeat(1013), attrs).unwrap();
+
+    // More than 10 attributes are rejected.
+    let many: BTreeMap<String, _> = (0..11)
+        .map(|i| (format!("a{i}"), string_attr("v")))
+        .collect();
+    let err = send_with_attrs(&mut s, "hi".to_string(), many).unwrap_err();
+    assert!(err.contains("no more than 10 attributes"), "{err}");
+}
+
+#[test]
+fn send_batch_rejects_combined_payload_over_limit() {
+    let mut s = Server::new(cfg());
+    s.create_queue(
+        "Orders",
+        &map(&[("MaximumMessageSize", "1024")]),
+        &BTreeMap::new(),
+    )
+    .unwrap();
+    let entries: Vec<SendMessageBatchEntry> = (0..3)
+        .map(|i| SendMessageBatchEntry {
+            id: format!("e{i}"),
+            message_body: "x".repeat(400),
+            ..Default::default()
+        })
+        .collect();
+    let err = s.send_message_batch(URL, &entries).unwrap_err();
+    assert_eq!(
+        devcloud_sqs::errors::error_code(&err),
+        "BatchRequestTooLong"
+    );
+    assert_eq!(live_message_count(&s, "Orders"), 0);
+
+    s.send_message_batch(URL, &entries[..2]).unwrap();
+    assert_eq!(live_message_count(&s, "Orders"), 2);
+}

@@ -12,6 +12,8 @@ pub fn error_code(err: &str) -> String {
         "QueueDoesNotExist"
     } else if m.contains("receipt handle is invalid") {
         "ReceiptHandleIsInvalid"
+    } else if m.contains("batch request too long") {
+        "BatchRequestTooLong"
     } else if m.contains("batch entry id must be unique") {
         "BatchEntryIdsNotDistinct"
     } else if m.contains("batch entry id") {

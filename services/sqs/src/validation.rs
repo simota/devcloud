@@ -41,6 +41,33 @@ pub fn validate_message_attribute_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Maximum number of message attributes on one message.
+pub const MAX_MESSAGE_ATTRIBUTES: usize = 10;
+
+/// The size SQS counts against `MaximumMessageSize`: the body plus, for each
+/// message attribute, its name, data type and value (binary values count
+/// their decoded bytes).
+pub fn message_payload_size(
+    body: &str,
+    attributes: &std::collections::BTreeMap<String, MessageAttributeValue>,
+) -> usize {
+    let attributes_size: usize = attributes
+        .iter()
+        .map(|(name, attr)| {
+            let value = if attr.binary_value.is_empty() {
+                attr.string_value.len()
+            } else {
+                BASE64
+                    .decode(attr.binary_value.as_bytes())
+                    .map(|bytes| bytes.len())
+                    .unwrap_or(attr.binary_value.len())
+            };
+            name.len() + attr.data_type.len() + value
+        })
+        .sum();
+    body.len() + attributes_size
+}
+
 /// Mirrors `validateMessageAttributeValue`.
 pub fn validate_message_attribute_value(
     name: &str,
