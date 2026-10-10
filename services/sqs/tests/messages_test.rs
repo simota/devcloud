@@ -283,6 +283,26 @@ fn visibility_zero_keeps_message_visible() {
 }
 
 #[test]
+fn queue_attributes_count_visible_in_flight_and_delayed_messages() {
+    let mut s = server_with_queue();
+    send(&mut s, "in-flight");
+    send(&mut s, "visible");
+    s.send_message(&SendMessageRequest {
+        queue_url: URL.to_string(),
+        message_body: "delayed".to_string(),
+        delay_seconds: Some(60),
+        ..Default::default()
+    })
+    .unwrap();
+    assert_eq!(receive(&mut s, 1, Some(30))[0].body, "in-flight");
+
+    let attrs = s.get_queue_attributes(URL, &["All".to_string()]).unwrap();
+    assert_eq!(attrs["ApproximateNumberOfMessages"], "1");
+    assert_eq!(attrs["ApproximateNumberOfMessagesNotVisible"], "1");
+    assert_eq!(attrs["ApproximateNumberOfMessagesDelayed"], "1");
+}
+
+#[test]
 fn delete_message_removes_in_flight() {
     let mut s = server_with_queue();
     send(&mut s, "m1");

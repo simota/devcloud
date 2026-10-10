@@ -240,23 +240,12 @@ fn snapshot(server: &Server) -> Snapshot {
 
 /// Mirrors `queueSnapshotLocked`.
 fn queue_snapshot(queue: &QueueState, now: &str) -> QueueSnapshot {
-    let mut visible = 0i64;
-    let mut not_visible = 0i64;
-    let mut delayed = 0i64;
-    let mut total = 0i64;
-    for message in &queue.messages {
-        if message.deleted {
-            continue;
-        }
-        total += 1;
-        if before(now, &message.available_at) {
-            delayed += 1;
-        } else if before(now, &message.invisible_until) {
-            not_visible += 1;
-        } else {
-            visible += 1;
-        }
-    }
+    let crate::server::MessageCounts {
+        visible,
+        not_visible,
+        delayed,
+    } = crate::server::message_counts(queue, now);
+    let total = visible + not_visible + delayed;
     QueueSnapshot {
         name: queue.name.clone(),
         url: queue.url.clone(),

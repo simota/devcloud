@@ -17,7 +17,7 @@ use crate::policy::{
     normalized_permission_actions, parse_redrive_allow_policy, parse_redrive_policy, QueuePolicy,
     QueuePolicyPrincipal, QueuePolicyStatement,
 };
-use crate::time_fmt::{now_rfc3339, unix_from_rfc3339};
+use crate::time_fmt::{before, now_rfc3339, unix_from_rfc3339};
 
 pub const MAX_DELAY_SECONDS: i64 = 900;
 pub const MAX_VISIBILITY_TIMEOUT_SECONDS: i64 = 43200;
@@ -795,12 +795,43 @@ fn queue_attributes_with_computed(queue: &QueueState) -> BTreeMap<String, String
         "LastModifiedTimestamp".into(),
         unix_from_rfc3339(&queue_last_modified_at(queue)).to_string(),
     );
-    // Counts are 0 in this part (message lifecycle lands later); the legacy server
-    // computes these from message visibility — wired in the message-handler part.
-    attrs.insert("ApproximateNumberOfMessages".into(), "0".into());
-    attrs.insert("ApproximateNumberOfMessagesNotVisible".into(), "0".into());
-    attrs.insert("ApproximateNumberOfMessagesDelayed".into(), "0".into());
+    let counts = message_counts(queue, &now_rfc3339());
+    attrs.insert(
+        "ApproximateNumberOfMessages".into(),
+        counts.visible.to_string(),
+    );
+    attrs.insert(
+        "ApproximateNumberOfMessagesNotVisible".into(),
+        counts.not_visible.to_string(),
+    );
+    attrs.insert(
+        "ApproximateNumberOfMessagesDelayed".into(),
+        counts.delayed.to_string(),
+    );
     attrs
+}
+
+/// Live (non-deleted) messages of a queue split by state at `now`: delayed
+/// (not yet available), not visible (in flight), and visible.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct MessageCounts {
+    pub visible: i64,
+    pub not_visible: i64,
+    pub delayed: i64,
+}
+
+pub(crate) fn message_counts(queue: &QueueState, now: &str) -> MessageCounts {
+    let mut counts = MessageCounts::default();
+    for message in queue.messages.iter().filter(|m| !m.deleted) {
+        if before(now, &message.available_at) {
+            counts.delayed += 1;
+        } else if before(now, &message.invisible_until) {
+            counts.not_visible += 1;
+        } else {
+            counts.visible += 1;
+        }
+    }
+    counts
 }
 
 fn filter_queue_attributes(
