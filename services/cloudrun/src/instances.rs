@@ -352,20 +352,19 @@ impl Manager {
         // Removals started by dropped instances (connections cancelled by
         // shutdown mid-start or mid-delete) get to finish before devcloud
         // exits, but a wedged Docker daemon must not hang shutdown.
+        // Polled rather than joined: a join on the blocking pool could not be
+        // abandoned, and the runtime waits for blocking tasks when it drops.
         let deadline = tokio::time::Instant::now() + DOCKER_RM_TIMEOUT;
         loop {
-            let pending = std::mem::take(&mut *self.removals.lock().unwrap());
-            if pending.is_empty() {
+            let busy = {
+                let mut pending = self.removals.lock().unwrap();
+                pending.retain(|h| !h.is_finished());
+                !pending.is_empty()
+            };
+            if !busy || tokio::time::Instant::now() >= deadline {
                 break;
             }
-            let joined = tokio::task::spawn_blocking(move || {
-                for handle in pending {
-                    let _ = handle.join();
-                }
-            });
-            if tokio::time::timeout_at(deadline, joined).await.is_err() {
-                break;
-            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }
 

@@ -151,6 +151,7 @@ impl SmtpServer {
             has_mail_from: false,
             authenticated: false,
             crlf_seen: false,
+            last_crlf: false,
             envelope: Envelope::default(),
             helo: String::new(),
             envelope_capture: self.envelope_capture,
@@ -188,6 +189,9 @@ where
     /// `.` line inside DATA is content, not the end of the message: treating
     /// `\n.\n` as the terminator lets one message smuggle in another.
     crlf_seen: bool,
+    /// Whether the last line read ended with CRLF (the DATA command's own
+    /// line, then each DATA line): the terminator's leading line break.
+    last_crlf: bool,
     envelope: Envelope,
     helo: String,
     envelope_capture: bool,
@@ -249,9 +253,8 @@ where
     /// '\r\n' or '\n'. `None` on EOF/error.
     async fn read_line_bytes(&mut self) -> Option<Vec<u8>> {
         let mut buf = self.read_line_raw().await?;
-        if strip_line_end(&mut buf) {
-            self.crlf_seen = true;
-        }
+        self.last_crlf = strip_line_end(&mut buf);
+        self.crlf_seen |= self.last_crlf;
         Some(buf)
     }
 
@@ -379,10 +382,17 @@ where
                 Some(l) => l,
             };
             let crlf = strip_line_end(&mut line);
+            let after_crlf = std::mem::replace(&mut self.last_crlf, crlf);
             self.crlf_seen |= crlf;
-            // Only `<CRLF>.<CRLF>` ends a CRLF client's message; a client that
-            // has only ever sent bare LF may end it with `.<LF>`.
-            if line == b"." && (crlf || !self.crlf_seen) {
+            // Only `<CRLF>.<CRLF>` (both line breaks CRLF) ends a CRLF client's
+            // message: `\n.\r\n` or `\r\n.\n` is content. A client that has
+            // only ever sent bare LF may end it with `<LF>.<LF>`.
+            let terminator = if self.crlf_seen {
+                crlf && after_crlf
+            } else {
+                !crlf && !after_crlf
+            };
+            if line == b"." && terminator {
                 break;
             }
             if line.starts_with(b"..") {

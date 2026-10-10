@@ -847,6 +847,26 @@ async fn bare_lf_dot_does_not_end_a_crlf_clients_message() {
 }
 
 #[tokio::test]
+async fn a_dot_line_needs_crlf_on_both_sides() {
+    let store = Arc::new(RecordingStore::new());
+    let (mut c, done) = start_session(relaxed_cfg(0), store.clone());
+    open_transaction(&mut c).await;
+    // `\n.\r\n`: the dot line's own ending is CRLF, the one before it is not.
+    c.stream
+        .write_all(b"Subject: one\r\n\r\nbody\n.\r\nMAIL FROM:<evil@x.test>\r\nRCPT TO:<victim@x.test>\r\nDATA\r\nSubject: smuggled\r\n\r\nbad\r\n.\r\n")
+        .await
+        .unwrap();
+    c.expect_reply("250").await;
+    c.send_line("QUIT").await;
+    c.expect_reply("221").await;
+    c.close().await;
+    let _ = done.await;
+    let (messages, _) = store.snapshot();
+    assert_eq!(messages.len(), 1, "a second message was smuggled in");
+    assert_eq!(messages[0].subject, "one");
+}
+
+#[tokio::test]
 async fn a_bare_lf_only_client_can_still_end_its_message() {
     let store = Arc::new(RecordingStore::new());
     let (mut c, done) = start_session(relaxed_cfg(0), store.clone());
