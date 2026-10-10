@@ -1373,7 +1373,9 @@ fn put_resumable_upload(server: &mut Server, req: &Request) -> Response {
         bucket: session.bucket.clone(),
         key: session.name.clone(),
         body: payload,
-        content_type: first_non_empty(req.header("content-type"), &session.content_type),
+        // The type declared when the session started wins over whatever the
+        // final chunk happens to carry.
+        content_type: first_non_empty(&session.content_type, req.header("content-type")),
         content_encoding: session.content_encoding.clone(),
         cache_control: session.cache_control.clone(),
         content_disposition: session.content_disposition.clone(),

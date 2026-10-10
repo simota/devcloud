@@ -1552,6 +1552,39 @@ fn start_resumable(s: &mut Server, name: &str, upload_content_type: &str) -> Str
     session_target(&init)
 }
 
+/// The content type declared at session start wins over the final chunk's
+/// Content-Type; the request's is only a fallback.
+#[test]
+fn resumable_upload_keeps_session_content_type() {
+    let mut s = server();
+    create_bucket(&mut s, "demo-bucket");
+
+    let target = start_resumable(&mut s, "img.png", "image/png");
+    let commit = perform_h(
+        &mut s,
+        "PUT",
+        &target,
+        "png",
+        &[
+            ("Content-Type", "application/octet-stream"),
+            ("Content-Range", "bytes 0-2/3"),
+        ],
+    );
+    assert_eq!(commit.status, 200, "{}", body_str(&commit));
+    assert_eq!(json_body(&commit)["contentType"], "image/png");
+
+    let target = start_resumable(&mut s, "plain.txt", "");
+    let commit = perform_h(
+        &mut s,
+        "PUT",
+        &target,
+        "txt",
+        &[("Content-Type", "text/plain")],
+    );
+    assert_eq!(commit.status, 200, "{}", body_str(&commit));
+    assert_eq!(json_body(&commit)["contentType"], "text/plain");
+}
+
 /// DELETE cancels a resumable session: 499, buffered bytes and session state
 /// removed, and the session no longer accepts chunks.
 #[test]
