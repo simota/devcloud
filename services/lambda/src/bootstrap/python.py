@@ -6,15 +6,28 @@
 # "<marker> <tag>" line on stdout tells devcloud where the invocation ends
 # ("ready" after init, "done" after an invocation, "done reset" when the
 # environment must not be reused).
-import decimal, importlib, json, os, sys, time, traceback
+import decimal, importlib, json, os, re, sys, time, traceback, uuid
 
-class _DecimalEncoder(json.JSONEncoder):
-    # Like the Lambda Python runtime: Decimal (what boto3's DynamoDB
-    # deserializer yields) marshals as a JSON number.
-    def default(self, o):
-        if isinstance(o, decimal.Decimal):
-            return int(o) if o == o.to_integral_value() else float(o)
-        return super().default(o)
+def _marshal(result):
+    # Like the Lambda Python runtime: a Decimal (what boto3's DynamoDB
+    # deserializer yields) is written verbatim as a JSON number (str(d), so
+    # 2.0 stays 2.0 and 38 digits stay exact; NaN as NaN). The stdlib encoder
+    # cannot emit raw text, so each Decimal becomes a unique placeholder
+    # string that is swapped back after encoding.
+    tag = "__devcloud_decimal_%s_" % uuid.uuid4().hex
+    raws = []
+
+    class Encoder(json.JSONEncoder):
+        def default(self, o):
+            if isinstance(o, decimal.Decimal):
+                raws.append("NaN" if o.is_nan() else str(o))
+                return "%s%d" % (tag, len(raws) - 1)
+            return super().default(o)
+
+    body = json.dumps(result, cls=Encoder)
+    if raws:
+        body = re.sub('"%s(\\d+)"' % tag, lambda m: raws[int(m.group(1))], body)
+    return body
 
 def _devcloud_main():
     marker_prefix = os.environ.pop("_DEVCLOUD_MARKER")
@@ -103,7 +116,7 @@ def _devcloud_main():
             marker("done")
             continue
         try:
-            body = json.dumps(result, cls=_DecimalEncoder)
+            body = _marshal(result)
         except Exception as e:
             failure("Unable to marshal response: %s" % e, "Runtime.MarshalError", [])
             marker("done")

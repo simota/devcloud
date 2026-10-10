@@ -3434,7 +3434,7 @@ async fn python_decimal_results_marshal_as_numbers() {
         "app.handler",
         (
             "app.py",
-            b"from decimal import Decimal\ndef handler(event, context):\n    return {'count': Decimal('3'), 'price': Decimal('1.5')}\n",
+            b"from decimal import Decimal\ndef handler(event, context):\n    return {'count': Decimal('3'), 'price': Decimal('1.5'), 'exact': Decimal('2.0'), 'big': Decimal('12345678901234567890.5')}\n",
         ),
     )
     .await;
@@ -3444,7 +3444,11 @@ async fn python_decimal_results_marshal_as_numbers() {
         "{}",
         String::from_utf8_lossy(&r.body)
     );
-    assert_eq!(r.json(), json!({ "count": 3, "price": 1.5 }));
+    // Written verbatim, like the Lambda runtime: no float rounding.
+    assert_eq!(
+        String::from_utf8_lossy(&r.body),
+        r#"{"count": 3, "price": 1.5, "exact": 2.0, "big": 12345678901234567890.5}"#
+    );
 }
 
 #[tokio::test]
@@ -3535,6 +3539,27 @@ async fn strict_mode_checks_scope_date_and_normalizes_the_signed_path() {
     let signed = sign_at("GET", path, b"", host, "20261005T000000Z", "20261005");
     let r = send(signed, "//2015-03-31/functions/").await;
     assert_ne!(r.status, 403, "{}", String::from_utf8_lossy(&r.body));
+    // Signers that sign the path exactly as sent are accepted too.
+    let as_sent = sign_at(
+        "GET",
+        "//2015-03-31/functions/",
+        b"",
+        host,
+        "20261005T000000Z",
+        "20261005",
+    );
+    let r = send(as_sent, "//2015-03-31/functions/").await;
+    assert_ne!(r.status, 403, "{}", String::from_utf8_lossy(&r.body));
+    // A signature over some other path still fails.
+    let other = sign_at(
+        "GET",
+        "/2015-03-31/other/",
+        b"",
+        host,
+        "20261005T000000Z",
+        "20261005",
+    );
+    assert_eq!(send(other, "//2015-03-31/functions/").await.status, 403);
 }
 
 #[tokio::test]

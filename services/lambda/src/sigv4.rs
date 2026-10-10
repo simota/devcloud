@@ -103,15 +103,28 @@ fn verify_full(req: &SignedRequest, auth: &str, creds: &Credentials) -> Result<(
         verify_payload_hash(req, req.content_sha256)?;
         req.content_sha256.to_string()
     };
-    let expected = signature_for_request(
-        req,
-        &date_stamp,
-        &region,
-        &signed_headers,
-        &payload_hash,
-        creds,
-    );
-    if !constant_time_eq(signature.as_bytes(), expected.as_bytes()) {
+    // Most SDKs sign the normalized path; some signers (aws-sdk-go,
+    // hand-rolled ones) sign it exactly as sent. Either is accepted.
+    let normalized = canonical_uri(req.path);
+    let as_sent = raw_canonical_uri(req.path);
+    let mut paths = vec![normalized.as_str()];
+    if as_sent != normalized {
+        paths.push(&as_sent);
+    }
+    let mut matched = false;
+    for path in paths {
+        let expected = signature_for_request(
+            req,
+            path,
+            &date_stamp,
+            &region,
+            &signed_headers,
+            &payload_hash,
+            creds,
+        );
+        matched |= constant_time_eq(signature.as_bytes(), expected.as_bytes());
+    }
+    if !matched {
         return Err(err("InvalidSignatureException", 403));
     }
     Ok(())
@@ -174,6 +187,7 @@ fn verify_payload_hash(req: &SignedRequest, payload_hash: &str) -> Result<(), Si
 
 fn signature_for_request(
     req: &SignedRequest,
+    canonical_path: &str,
     date_stamp: &str,
     region: &str,
     signed_headers: &str,
@@ -182,7 +196,7 @@ fn signature_for_request(
 ) -> String {
     let canonical_request = [
         req.method,
-        &canonical_uri(req.path),
+        canonical_path,
         &canonical_query_string(req.query),
         &canonical_headers(req, signed_headers),
         &signed_headers.to_ascii_lowercase(),
@@ -231,6 +245,14 @@ fn valid_amz_date(value: &str) -> bool {
         && b[8] == b'T'
         && b[15] == b'Z'
         && b[..8].iter().chain(&b[9..15]).all(u8::is_ascii_digit)
+}
+
+/// The path exactly as sent, encoded again.
+fn raw_canonical_uri(path: &str) -> String {
+    if path.is_empty() {
+        return "/".to_string();
+    }
+    aws_percent_encode(path, "/~")
 }
 
 /// The path as the AWS SDKs sign it for every service but S3: empty and `.`

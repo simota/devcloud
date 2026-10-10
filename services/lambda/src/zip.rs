@@ -171,29 +171,28 @@ fn safe_join(root: &Path, name: &str) -> Result<PathBuf, String> {
     Ok(out)
 }
 
-/// Checks a symlink entry's target: relative, every `..` before any normal
-/// component, and never climbing above the package root from the link's
-/// directory. Since nothing is extracted beneath a symlink, the `..` steps
-/// walk real directories, and the rest descends from there.
-fn check_symlink_target(name: &str, target: &str) -> Result<(), String> {
-    let escapes = || format!("zip entry {name:?} links outside the package root");
-    let link_parent_depth = Path::new(name)
-        .components()
-        .filter(|c| matches!(c, Component::Normal(_)))
-        .count()
-        .saturating_sub(1);
-    let mut ups = 0usize;
-    let mut descended = false;
-    for component in Path::new(target).components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir if !descended => ups += 1,
-            Component::Normal(_) => descended = true,
-            _ => return Err(escapes()),
+/// Fails if any existing directory between `root` and `path` is a symlink:
+/// creating `path` would then land wherever that link points. Checked on the
+/// filesystem itself, so names that differ only in case or Unicode form
+/// (equal on macOS) cannot slip past a name comparison.
+fn no_link_ancestors(root: &Path, path: &Path, name: &str) -> Result<(), String> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    let rel = parent.strip_prefix(root).unwrap_or(Path::new(""));
+    let mut at = root.to_path_buf();
+    for component in rel.components() {
+        at.push(component);
+        match std::fs::symlink_metadata(&at) {
+            Ok(m) if m.file_type().is_symlink() => {
+                return Err(format!(
+                    "zip entry {name:?} is inside a symlinked directory"
+                ))
+            }
+            Ok(_) => {}
+            // Missing from here down: create_dir_all makes real directories.
+            Err(_) => break,
         }
-    }
-    if target.is_empty() || ups > link_parent_depth {
-        return Err(escapes());
     }
     Ok(())
 }
@@ -202,7 +201,9 @@ fn check_symlink_target(name: &str, target: &str) -> Result<(), String> {
 pub fn extract(archive: &[u8], root: &Path) -> Result<(), String> {
     let entries = read_entries(archive)?;
     // Symlinks are created last, and no other entry may live beneath one:
-    // writes then never pass through a link.
+    // extraction never writes through a link, so a link may point anywhere
+    // (`/usr/bin/python3`, `/opt/...`) as on AWS. Regular entries are all
+    // written before the first link exists.
     let links: Vec<PathBuf> = entries
         .iter()
         .filter(|e| e.is_symlink)
@@ -220,8 +221,13 @@ pub fn extract(archive: &[u8], root: &Path) -> Result<(), String> {
         if entry.is_symlink {
             let target = String::from_utf8(entry.data)
                 .map_err(|_| format!("zip entry {:?} has a non-UTF-8 link target", entry.name))?;
-            check_symlink_target(&entry.name, &target)?;
-            deferred.push((path, target));
+            if target.is_empty() {
+                return Err(format!(
+                    "zip entry {:?} has an empty link target",
+                    entry.name
+                ));
+            }
+            deferred.push((path, target, entry.name));
             continue;
         }
         if entry.is_dir {
@@ -239,7 +245,8 @@ pub fn extract(archive: &[u8], root: &Path) -> Result<(), String> {
                 .map_err(|e| e.to_string())?;
         }
     }
-    for (path, target) in deferred {
+    for (path, target, name) in deferred {
+        no_link_ancestors(root, &path, &name)?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
@@ -492,15 +499,36 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(unix)]
     #[test]
-    fn symlinks_cannot_escape_or_be_written_through() {
+    fn symlinks_may_point_anywhere_but_are_never_written_through() {
+        let archive = build_stored_with_modes(&[
+            ("venv/bin/python3", b"/usr/bin/python3", 0o120777),
+            ("up", b"../..", 0o120777),
+        ]);
+        let dir = temp_root("abslinks");
+        extract(&archive, &dir).unwrap();
+        assert_eq!(
+            std::fs::read_link(dir.join("venv/bin/python3")).unwrap(),
+            Path::new("/usr/bin/python3")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // A link placed beneath another link (the case-insensitive macOS
+        // spelling trick, reproduced here with an exact name) is refused
+        // from the filesystem's view, not just by name.
+        let dir = temp_root("linkparent");
+        std::fs::create_dir_all(dir.join("q")).unwrap();
+        std::os::unix::fs::symlink("..", dir.join("q/a")).unwrap();
+        let err = no_link_ancestors(&dir, &dir.join("q/a/B"), "q/a/B").unwrap_err();
+        assert!(err.contains("symlinked directory"), "{err}");
+        assert!(no_link_ancestors(&dir, &dir.join("q/new/B"), "q/new/B").is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn symlinks_cannot_be_written_through() {
         for (entries, why) in [
-            (
-                vec![("a/l", &b"../../etc"[..], 0o120777)],
-                "climbs above root",
-            ),
-            (vec![("l", &b"/etc/passwd"[..], 0o120777)], "absolute"),
-            (vec![("l", &b"a/../../x"[..], 0o120777)], "up after down"),
             (vec![("l", &b""[..], 0o120777)], "empty"),
             (
                 vec![
@@ -508,6 +536,10 @@ mod tests {
                     ("l/x.py", &b"x"[..], 0o100644),
                 ],
                 "entry beneath a link",
+            ),
+            (
+                vec![("l", &b"sub"[..], 0o120777), ("l/m", &b"x"[..], 0o120777)],
+                "link beneath a link",
             ),
         ] {
             let dir = temp_root("badlinks");
