@@ -810,3 +810,206 @@ async fn smtp_limits_bound_lines_recipients_and_idle() {
     c.expect_reply("421").await;
     done.await.unwrap();
 }
+
+// ── review hardening ────────────────────────────────────────────────────────
+
+async fn open_transaction(c: &mut TestClient) {
+    c.expect_reply("220").await;
+    c.send_line("EHLO localhost").await;
+    c.expect_reply("250").await;
+    c.send_line("MAIL FROM:<sender@example.com>").await;
+    c.expect_reply("250").await;
+    c.send_line("RCPT TO:<user@example.com>").await;
+    c.expect_reply("250").await;
+    c.send_line("DATA").await;
+    c.expect_reply("354").await;
+}
+
+#[tokio::test]
+async fn bare_lf_dot_does_not_end_a_crlf_clients_message() {
+    let store = Arc::new(RecordingStore::new());
+    let (mut c, done) = start_session(relaxed_cfg(0), store.clone());
+    open_transaction(&mut c).await;
+    // The SMTP smuggling pattern: `\n.\n` followed by a second transaction.
+    c.stream
+        .write_all(b"Subject: one\r\n\r\nhello\n.\nMAIL FROM:<evil@x.test>\r\nRCPT TO:<victim@x.test>\r\nDATA\r\nSubject: smuggled\r\n\r\nbad\r\n.\r\n")
+        .await
+        .unwrap();
+    c.expect_reply("250").await;
+    c.send_line("QUIT").await;
+    c.expect_reply("221").await;
+    c.close().await;
+    let _ = done.await;
+    let (messages, raw) = store.snapshot();
+    assert_eq!(messages.len(), 1, "a second message was smuggled in");
+    assert_eq!(messages[0].subject, "one");
+    assert!(String::from_utf8_lossy(&raw[0]).contains("MAIL FROM:<evil@x.test>"));
+}
+
+#[tokio::test]
+async fn a_dot_line_needs_crlf_on_both_sides() {
+    let store = Arc::new(RecordingStore::new());
+    let (mut c, done) = start_session(relaxed_cfg(0), store.clone());
+    open_transaction(&mut c).await;
+    // `\n.\r\n`: the dot line's own ending is CRLF, the one before it is not.
+    c.stream
+        .write_all(b"Subject: one\r\n\r\nbody\n.\r\nMAIL FROM:<evil@x.test>\r\nRCPT TO:<victim@x.test>\r\nDATA\r\nSubject: smuggled\r\n\r\nbad\r\n.\r\n")
+        .await
+        .unwrap();
+    c.expect_reply("250").await;
+    c.send_line("QUIT").await;
+    c.expect_reply("221").await;
+    c.close().await;
+    let _ = done.await;
+    let (messages, _) = store.snapshot();
+    assert_eq!(messages.len(), 1, "a second message was smuggled in");
+    assert_eq!(messages[0].subject, "one");
+}
+
+#[tokio::test]
+async fn a_bare_lf_only_client_can_still_end_its_message() {
+    let store = Arc::new(RecordingStore::new());
+    let (mut c, done) = start_session(relaxed_cfg(0), store.clone());
+    c.expect_reply("220").await;
+    c.stream
+        .write_all(b"HELO lf.test\nMAIL FROM:<a@x.test>\nRCPT TO:<b@x.test>\nDATA\n")
+        .await
+        .unwrap();
+    for code in ["250", "250", "250", "354"] {
+        c.expect_reply(code).await;
+    }
+    c.stream
+        .write_all(b"Subject: lf\n\nbody\n.\nQUIT\n")
+        .await
+        .unwrap();
+    c.expect_reply("250").await;
+    c.expect_reply("221").await;
+    c.close().await;
+    let _ = done.await;
+    let (messages, _) = store.snapshot();
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].subject, "lf");
+}
+
+#[tokio::test]
+async fn default_limits_bound_line_length() {
+    let store = Arc::new(RecordingStore::new());
+    let (client_io, server_io) = tokio::io::duplex(4 * 1024 * 1024);
+    let service = Arc::new(Service::new(store as Arc<dyn devcloud_mail::Store>));
+    let done = tokio::spawn(SmtpServer::new(relaxed_cfg(0), service).handle_conn(server_io));
+    let mut c = TestClient {
+        stream: client_io,
+        buf: Vec::new(),
+    };
+    c.expect_reply("220").await;
+    c.stream
+        .write_all(&vec![b'A'; 2 * 1024 * 1024])
+        .await
+        .unwrap();
+    c.expect_reply("500").await;
+    c.close().await;
+    let _ = done.await;
+}
+
+#[tokio::test]
+async fn mail_from_accepts_keyword_parameters_and_huge_sizes_are_too_large() {
+    let store = Arc::new(RecordingStore::new());
+    let (mut c, done) = start_session(relaxed_cfg(1024), store.clone());
+    c.expect_reply("220").await;
+    c.send_line("EHLO localhost").await;
+    c.expect_reply("250").await;
+    c.send_line("MAIL FROM:<a@x.test> SMTPUTF8").await;
+    c.expect_reply("250").await;
+    c.send_line("RSET").await;
+    c.expect_reply("250").await;
+    c.send_line("MAIL FROM:<a@x.test> SIZE=99999999999999999999")
+        .await;
+    c.expect_reply("552").await;
+    c.send_line("MAIL FROM:<a@x.test> SIZE=abc").await;
+    c.expect_reply("500").await;
+    c.send_line("QUIT").await;
+    c.expect_reply("221").await;
+    c.close().await;
+    let _ = done.await;
+}
+
+#[tokio::test]
+async fn auth_is_refused_inside_a_mail_transaction() {
+    let store = Arc::new(RecordingStore::new());
+    let cfg = SmtpConfig {
+        auth_mode: "relaxed".to_string(),
+        ..Default::default()
+    };
+    let (mut c, done) = start_session(cfg, store);
+    c.expect_reply("220").await;
+    c.send_line("EHLO localhost").await;
+    c.expect_reply("250").await;
+    c.send_line("MAIL FROM:<a@x.test>").await;
+    c.expect_reply("250").await;
+    c.send_line(&format!("AUTH PLAIN {}", BASE64.encode(b"\0u\0p")))
+        .await;
+    c.expect_reply("503").await;
+    c.send_line("QUIT").await;
+    c.expect_reply("221").await;
+    c.close().await;
+    let _ = done.await;
+}
+
+/// A store whose writes always fail.
+struct FailingStore;
+
+impl devcloud_mail::Store for FailingStore {
+    fn append(
+        &self,
+        _: devcloud_mail::Message,
+        _: &[u8],
+    ) -> Result<devcloud_mail::Message, String> {
+        Err("disk full".into())
+    }
+    fn list(
+        &self,
+        _: devcloud_mail::ListMessagesInput,
+    ) -> Result<devcloud_mail::ListMessagesResult, String> {
+        Err("disk full".into())
+    }
+    fn get(&self, _: &str) -> Result<Option<devcloud_mail::Message>, String> {
+        Ok(None)
+    }
+    fn list_all(&self) -> Result<Vec<devcloud_mail::MessageEntry>, String> {
+        Ok(Vec::new())
+    }
+    fn get_raw(&self, _: &str) -> Result<Option<Vec<u8>>, String> {
+        Ok(None)
+    }
+    fn delete(&self, _: &str) -> Result<(), String> {
+        Ok(())
+    }
+    fn delete_all(&self) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn a_failed_delivery_ends_the_transaction() {
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+    let service = Arc::new(Service::new(
+        Arc::new(FailingStore) as Arc<dyn devcloud_mail::Store>
+    ));
+    let done = tokio::spawn(SmtpServer::new(relaxed_cfg(0), service).handle_conn(server_io));
+    let mut c = TestClient {
+        stream: client_io,
+        buf: Vec::new(),
+    };
+    open_transaction(&mut c).await;
+    c.send_line("Subject: x").await;
+    c.send_line("").await;
+    c.send_line(".").await;
+    c.expect_reply("451").await;
+    // The old envelope is gone: DATA needs a new MAIL/RCPT.
+    c.send_line("DATA").await;
+    c.expect_reply("503").await;
+    c.send_line("QUIT").await;
+    c.expect_reply("221").await;
+    c.close().await;
+    let _ = done.await;
+}

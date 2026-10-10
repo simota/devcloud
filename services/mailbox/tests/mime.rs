@@ -169,3 +169,61 @@ fn rfc2231_mixed_continuations_decode_only_starred_segments() {
     );
     assert!(warnings.is_empty());
 }
+
+#[test]
+fn soft_breaks_split_words_and_inline_text_parts_follow_rfc_practice() {
+    let mut warnings = Vec::new();
+    // RFC 2045: transport padding may sit between `=` and the line break.
+    assert_eq!(
+        mime::decode_qp(b"foo= \r\nbar a=\t\nb", &mut warnings),
+        b"foobar ab"
+    );
+    // A multibyte character split across adjacent encoded words.
+    assert_eq!(
+        mime::decode_words(
+            "=?UTF-8?B?44GC?= =?UTF-8?B?44E=?= =?UTF-8?B?gg==?=",
+            &mut warnings
+        ),
+        "ああ"
+    );
+    assert!(warnings.is_empty(), "{warnings:?}");
+
+    // text, image, text (Apple Mail): both text parts are body text...
+    let mixed = b"Content-Type: multipart/mixed; boundary=m\r\n\r\n--m\r\nContent-Type: text/plain\r\n\r\npart one\r\n--m\r\nContent-Type: image/png\r\nContent-Transfer-Encoding: base64\r\n\r\nAAEC\r\n--m\r\nContent-Type: text/plain\r\n\r\npart two\r\n--m--\r\n";
+    let parsed = mime::parse(mixed);
+    assert!(
+        parsed.text.contains("part one") && parsed.text.contains("part two"),
+        "{:?}",
+        parsed.text
+    );
+    // ...but alternatives are one body rendered several ways.
+    let alt = b"Content-Type: multipart/alternative; boundary=a\r\n\r\n--a\r\nContent-Type: text/plain\r\n\r\nfirst\r\n--a\r\nContent-Type: text/plain\r\n\r\nsecond\r\n--a--\r\n";
+    assert_eq!(mime::parse(alt).text.trim(), "first");
+    // Alternatives whose branches are containers: still one rendering.
+    let nested = b"Content-Type: multipart/alternative; boundary=a\r\n\r\n--a\r\nContent-Type: multipart/mixed; boundary=m1\r\n\r\n--m1\r\nContent-Type: text/plain\r\n\r\nplain one\r\n--m1\r\nContent-Type: image/png\r\nContent-Transfer-Encoding: base64\r\n\r\nAAEC\r\n--m1\r\nContent-Type: text/plain\r\n\r\nplain two\r\n--m1--\r\n--a\r\nContent-Type: multipart/mixed; boundary=m2\r\n\r\n--m2\r\nContent-Type: text/plain\r\n\r\nother rendering\r\n--m2--\r\n--a--\r\n";
+    let text = mime::parse(nested).text;
+    assert!(
+        text.contains("plain one") && text.contains("plain two"),
+        "{text:?}"
+    );
+    assert!(!text.contains("other rendering"), "{text:?}");
+}
+
+#[test]
+fn mailhog_json_keeps_repeated_headers() {
+    let raw = b"Received: from a\r\nReceived: from b\r\nTo: x@y.test\r\nTo: z@w.test\r\nSubject: s\r\n\r\nbody\r\n";
+    let message = Message {
+        id: "m1".into(),
+        raw: "r".into(),
+        ..Default::default()
+    };
+    let projected =
+        serde_json::to_value(mailhog::project(&message, raw, "mailhog.example")).unwrap();
+    let headers = projected["Content"]["Headers"].clone();
+    assert_eq!(headers["To"], serde_json::json!(["x@y.test", "z@w.test"]));
+    let received = headers["Received"].as_array().unwrap();
+    assert!(
+        received.iter().any(|v| v == "from a") && received.iter().any(|v| v == "from b"),
+        "{received:?}"
+    );
+}

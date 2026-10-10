@@ -137,3 +137,39 @@ async fn next_text(
         }
     }
 }
+
+#[tokio::test]
+async fn cross_site_and_rebinding_websocket_handshakes_are_refused() {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let relay = mock_relay().await;
+    let dash = dashboard(&relay).await;
+    let url = format!("{dash}/api/events");
+    let addr = dash.trim_start_matches("ws://").to_string();
+    for (host, origin) in [
+        // Any page on another site: WebSockets get no CORS protection.
+        (addr.as_str(), "https://evil.example.com"),
+        // A DNS-rebinding page: same-origin, but its own domain as Host.
+        ("evil.example.com:18025", "http://evil.example.com:18025"),
+    ] {
+        let mut request = url.as_str().into_client_request().unwrap();
+        request.headers_mut().insert("host", host.parse().unwrap());
+        request
+            .headers_mut()
+            .insert("origin", origin.parse().unwrap());
+        match tokio_tungstenite::connect_async(request).await {
+            Err(tokio_tungstenite::tungstenite::Error::Http(resp)) => {
+                assert_eq!(resp.status(), 403, "{host} {origin}")
+            }
+            other => panic!("handshake from {origin} via {host} was not refused: {other:?}"),
+        }
+    }
+    // The SPA itself (same origin) still connects.
+    let mut request = url.as_str().into_client_request().unwrap();
+    request
+        .headers_mut()
+        .insert("origin", format!("http://{addr}").parse().unwrap());
+    let (_, resp) = tokio_tungstenite::connect_async(request)
+        .await
+        .expect("same-origin handshake");
+    assert_eq!(resp.status(), 101);
+}

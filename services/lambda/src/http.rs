@@ -49,7 +49,25 @@ pub async fn serve(
             accepted = listener.accept() => {
                 let (stream, _) = match accepted {
                     Ok(a) => a,
-                    Err(e) => break Err(e),
+                    // Out of descriptors, or a peer gone before the accept:
+                    // back off and keep serving instead of stopping (which
+                    // would take every devcloud service down with it).
+                    Err(e) => {
+                        // Only transient errors; a broken listener still stops.
+                        let transient = matches!(
+                            e.kind(),
+                            std::io::ErrorKind::ConnectionAborted
+                                | std::io::ErrorKind::ConnectionReset
+                                | std::io::ErrorKind::Interrupted
+                                | std::io::ErrorKind::WouldBlock
+                                | std::io::ErrorKind::TimedOut
+                        ) || matches!(e.raw_os_error(), Some(12 | 23 | 24)); // ENOMEM, ENFILE, EMFILE
+                        if !transient {
+                            break Err(e);
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        continue;
+                    }
                 };
                 while connections.try_join_next().is_some() {}
                 let server = Arc::clone(&server);
@@ -173,6 +191,9 @@ async fn write_reply<W: AsyncWrite + Unpin>(
 
 /// Full request pipeline (gate → SigV4 → route). Public for in-process tests.
 pub async fn process(server: &Arc<Server>, req: &Request) -> Reply {
+    if !trusted_host(req.header("host")) {
+        return untrusted_host();
+    }
     if server.load_err().is_some() {
         return Reply::error(500, "ServiceException", "failed to load lambda state");
     }
@@ -195,14 +216,13 @@ pub async fn process(server: &Arc<Server>, req: &Request) -> Reply {
     let seg: Vec<&str> = segments.iter().map(String::as_str).collect();
     let query = parse_query(&req.query);
 
-    // devcloud-only surfaces: unsigned, read-only.
-    match (req.method.as_str(), seg.as_slice()) {
-        ("GET", ["_introspect", "invocations"]) => return server.introspect_invocations(),
-        ("GET", ["_devcloud", "functions", name, "code.zip"]) => {
-            let (name, sha) = (name.to_string(), query.get("CodeSha256").cloned());
-            return blocking(server, move |s| s.code_package(&name, sha.as_deref())).await;
-        }
-        _ => {}
+    // devcloud-only surface: unsigned and read-only, like the presigned URL
+    // AWS hands out as `Code.Location`.
+    if let ("GET", ["_devcloud", "functions", name, "code.zip"]) =
+        (req.method.as_str(), seg.as_slice())
+    {
+        let (name, sha) = (name.to_string(), query.get("CodeSha256").cloned());
+        return blocking(server, move |s| s.code_package(&name, sha.as_deref())).await;
     }
 
     if !matches!(req.method.as_str(), "GET" | "HEAD")
@@ -217,6 +237,12 @@ pub async fn process(server: &Arc<Server>, req: &Request) -> Reply {
 
     if let Err(reply) = check_signature(server, req) {
         return reply;
+    }
+
+    // Invocation log tails are handler output: signed like the API (the
+    // dashboard signs its requests in strict mode).
+    if let ("GET", ["_introspect", "invocations"]) = (req.method.as_str(), seg.as_slice()) {
+        return server.introspect_invocations();
     }
 
     let m = req.method.as_str();
@@ -357,6 +383,72 @@ fn trusted_origin(origin: &str, sec_fetch_site: &str) -> bool {
     host == "localhost" || host == "127.0.0.1" || host == "::1" || host.ends_with(".localhost")
 }
 
+fn untrusted_host() -> Reply {
+    Reply::error(
+        403,
+        "AccessDeniedException",
+        "untrusted Host header (DNS rebinding guard); add the name to DEVCLOUD_ALLOWED_HOSTS to allow it",
+    )
+}
+
+/// DNS-rebinding guard. A page on `http://evil.example` whose name is
+/// re-pointed at 127.0.0.1 makes same-origin requests (no `Origin`, so the
+/// CSRF guard cannot tell), but its `Host` still names the attacker's domain.
+/// Trusted: no `Host` (HTTP/1.0, in-process callers), IP literals, single-label
+/// names (`localhost`, docker-compose service names), and names under
+/// suffixes no public DNS answers for (`.localhost`, `.internal` as in
+/// `host.docker.internal`, `.local`, `.test`, `.example`, `.invalid`,
+/// `.home.arpa`). `DEVCLOUD_ALLOWED_HOSTS` adds names (comma-separated; a
+/// leading `.` allows a suffix, `*` allows any host).
+pub fn trusted_host(host: &str) -> bool {
+    let host = host.trim();
+    if host.is_empty() {
+        return true;
+    }
+    let name = if let Some(v6) = host.strip_prefix('[') {
+        return v6
+            .split_once(']')
+            .is_some_and(|(ip, _)| ip.parse::<std::net::Ipv6Addr>().is_ok());
+    } else {
+        match host.rsplit_once(':') {
+            Some((name, port)) if port.bytes().all(|b| b.is_ascii_digit()) => name,
+            _ => host,
+        }
+    };
+    let name = name.trim_end_matches('.').to_ascii_lowercase();
+    if name.parse::<std::net::Ipv4Addr>().is_ok() || !name.contains('.') {
+        return !name.is_empty();
+    }
+    const PRIVATE_SUFFIXES: [&str; 7] = [
+        ".localhost",
+        ".internal",
+        ".local",
+        ".test",
+        ".example",
+        ".invalid",
+        ".home.arpa",
+    ];
+    if PRIVATE_SUFFIXES.iter().any(|s| name.ends_with(s)) {
+        return true;
+    }
+    allowed_hosts(
+        &std::env::var("DEVCLOUD_ALLOWED_HOSTS").unwrap_or_default(),
+        &name,
+    )
+}
+
+/// Whether `name` (lowercase, no port) is in a `DEVCLOUD_ALLOWED_HOSTS` list.
+fn allowed_hosts(list: &str, name: &str) -> bool {
+    list.split(',')
+        .map(|entry| entry.trim().trim_end_matches('.').to_ascii_lowercase())
+        .filter(|entry| !entry.is_empty())
+        .any(|entry| {
+            entry == "*"
+                || entry == name
+                || (entry.starts_with('.') && (name.ends_with(&entry) || name == &entry[1..]))
+        })
+}
+
 fn body_error_reply(e: crate::body::BodyError) -> Reply {
     use crate::body::BodyError;
     match e {
@@ -456,6 +548,45 @@ fn query_all(q: &str, key: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_guard_refuses_rebinding_names() {
+        for ok in [
+            "",
+            "127.0.0.1:18025",
+            "localhost",
+            "localhost:9000",
+            "[::1]:8080",
+            "192.168.1.20:18025",
+            "devcloud:18025",
+            "host.docker.internal:18025",
+            "abc.lambda-url.us-east-1.localhost:19010",
+            "mymac.local",
+            "devcloud.test",
+            "LOCALHOST.",
+        ] {
+            assert!(trusted_host(ok), "{ok}");
+        }
+        for bad in [
+            "evil.example.com",
+            "evil.example.com:18025",
+            "127.0.0.1.nip.io",
+            "localhost.evil.com",
+            "[not-an-ip]",
+            ":80",
+        ] {
+            assert!(!trusted_host(bad), "{bad}");
+        }
+        assert!(allowed_hosts(
+            "devcloud.corp.dev, .lan.example.org",
+            "devcloud.corp.dev"
+        ));
+        assert!(allowed_hosts(".lan.example.org", "box.lan.example.org"));
+        assert!(allowed_hosts(".lan.example.org", "lan.example.org"));
+        assert!(!allowed_hosts(".lan.example.org", "evillan.example.org"));
+        assert!(allowed_hosts("*", "anything.com"));
+        assert!(!allowed_hosts("", "anything.com"));
+    }
 
     #[test]
     fn repeated_headers_keep_every_value() {

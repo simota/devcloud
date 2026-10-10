@@ -985,7 +985,13 @@ impl Server {
             return true;
         }
         let token = authorization.strip_prefix("Bearer ").unwrap_or("").trim();
-        !token.is_empty() && token == self.config.bearer_token
+        let expected = self.config.bearer_token.as_bytes();
+        // Constant time: the comparison must not reveal how much matched.
+        let mut diff = token.len() ^ expected.len();
+        for (i, b) in token.bytes().enumerate() {
+            diff |= usize::from(b ^ expected.get(i).copied().unwrap_or(0));
+        }
+        !token.is_empty() && diff == 0
     }
 
     /// Every service across projects/locations (introspection only).

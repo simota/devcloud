@@ -63,7 +63,25 @@ pub async fn serve(
             accepted = listener.accept() => {
                 let (stream, _) = match accepted {
                     Ok(a) => a,
-                    Err(e) => break Err(e),
+                    // Out of descriptors, or a peer gone before the accept:
+                    // back off and keep serving instead of stopping (which
+                    // would take every devcloud service down with it).
+                    Err(e) => {
+                        // Only transient errors; a broken listener still stops.
+                        let transient = matches!(
+                            e.kind(),
+                            std::io::ErrorKind::ConnectionAborted
+                                | std::io::ErrorKind::ConnectionReset
+                                | std::io::ErrorKind::Interrupted
+                                | std::io::ErrorKind::WouldBlock
+                                | std::io::ErrorKind::TimedOut
+                        ) || matches!(e.raw_os_error(), Some(12 | 23 | 24)); // ENOMEM, ENFILE, EMFILE
+                        if !transient {
+                            break Err(e);
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        continue;
+                    }
                 };
                 while connections.try_join_next().is_some() {}
                 let server = Arc::clone(&server);
@@ -85,6 +103,20 @@ async fn handle_conn(mut stream: TcpStream, server: Arc<Server>) -> std::io::Res
         return Ok(());
     };
     let (path, query) = split_target(&head.target);
+
+    // Both planes: a rebinding page must not drive the Admin API nor read
+    // the services it serves.
+    if !trusted_host(head.headers.get("host").map(String::as_str).unwrap_or("")) {
+        return write_reply(
+            &mut stream,
+            Reply::error(
+                403,
+                "PERMISSION_DENIED",
+                "untrusted Host header (DNS rebinding guard); add the name to DEVCLOUD_ALLOWED_HOSTS to allow it",
+            ),
+        )
+        .await;
+    }
 
     if let Some(route) = data_plane_route(&head) {
         return proxy(stream, &server, head, route).await;
@@ -332,21 +364,53 @@ async fn proxy(
         "{} {} {}\r\n",
         head.method, route.upstream_target, head.version
     );
+    let upgrade = is_upgrade(&head);
+    // Hop-by-hop headers stop here, including any the client listed in
+    // `Connection`; the forwarding headers are the platform's to set.
+    // Every `Connection` field counts, not just the last one parsed.
+    let listed: Vec<String> = head
+        .raw_headers
+        .iter()
+        .filter(|(k, _)| k.eq_ignore_ascii_case("connection"))
+        .flat_map(|(_, v)| v.split(','))
+        .map(|t| t.trim().to_ascii_lowercase())
+        // Framing and routing headers are never the client's to drop: the
+        // body is relayed as sent.
+        .filter(|t| {
+            !matches!(
+                t.as_str(),
+                "upgrade" | "host" | "content-length" | "transfer-encoding"
+            )
+        })
+        .collect();
+    let mut forwarded_for = Vec::new();
     for (k, v) in &head.raw_headers {
         let lower = k.to_ascii_lowercase();
-        if matches!(
+        let hop_by_hop = matches!(
             lower.as_str(),
-            "connection" | "keep-alive" | "proxy-connection"
-        ) {
+            "connection" | "keep-alive" | "proxy-connection" | "te" | "proxy-authorization"
+        ) || (lower == "upgrade" && !upgrade)
+            || listed.contains(&lower);
+        if hop_by_hop || lower == "x-forwarded-proto" {
+            continue;
+        }
+        if lower == "x-forwarded-for" {
+            forwarded_for.push(v.trim().to_string());
             continue;
         }
         out.push_str(&format!("{k}: {v}\r\n"));
     }
     out.push_str("X-Forwarded-Proto: http\r\n");
-    out.push_str("X-Forwarded-For: 127.0.0.1\r\n");
+    // Like Cloud Run's front end: the client's own chain, then its address,
+    // as one header.
+    forwarded_for.push("127.0.0.1".to_string());
+    out.push_str(&format!(
+        "X-Forwarded-For: {}\r\n",
+        forwarded_for.join(", ")
+    ));
     // An upgrade (WebSocket) handshake needs `Connection: Upgrade` next to
     // `Upgrade:`; plain requests are one-shot.
-    if is_upgrade(&head) {
+    if upgrade {
         out.push_str("Connection: Upgrade\r\n\r\n");
     } else {
         out.push_str("Connection: close\r\n\r\n");
@@ -388,10 +452,12 @@ async fn proxy(
 
 fn is_upgrade(head: &Head) -> bool {
     head.headers.contains_key("upgrade")
-        && head.headers.get("connection").is_some_and(|c| {
-            c.split(',')
-                .any(|t| t.trim().eq_ignore_ascii_case("upgrade"))
-        })
+        && head
+            .raw_headers
+            .iter()
+            .filter(|(k, _)| k.eq_ignore_ascii_case("connection"))
+            .flat_map(|(_, v)| v.split(','))
+            .any(|t| t.trim().eq_ignore_ascii_case("upgrade"))
 }
 
 /// Copies the upstream response head to the client, re-prefixing redirects
@@ -536,6 +602,15 @@ pub async fn process(server: &Arc<Server>, req: &Request) -> Reply {
     let m = req.method.as_str();
 
     if let Some(rest) = req.path.strip_prefix("/_introspect/") {
+        // Service resources carry env values and logs carry app output: in
+        // strict mode they need the same token as the Admin API.
+        if !server.authorized(req.header("authorization")) {
+            return Reply::error(
+                401,
+                "UNAUTHENTICATED",
+                "Request had invalid authentication credentials. Expected OAuth 2 access token.",
+            );
+        }
         if m != "GET" {
             return Reply::error(405, "INVALID_ARGUMENT", "method not allowed");
         }
@@ -674,6 +749,64 @@ fn trusted_origin(origin: &str, sec_fetch_site: &str) -> bool {
     host == "localhost" || host == "127.0.0.1" || host == "::1" || host.ends_with(".localhost")
 }
 
+/// DNS-rebinding guard. A page on `http://evil.example` whose name is
+/// re-pointed at 127.0.0.1 makes same-origin requests (no `Origin`, so the
+/// CSRF guard cannot tell), but its `Host` still names the attacker's domain.
+/// Trusted: no `Host` (HTTP/1.0, in-process callers), IP literals, single-label
+/// names (`localhost`, docker-compose service names), and names under
+/// suffixes no public DNS answers for (`.localhost`, `.internal` as in
+/// `host.docker.internal`, `.local`, `.test`, `.example`, `.invalid`,
+/// `.home.arpa`). `DEVCLOUD_ALLOWED_HOSTS` adds names (comma-separated; a
+/// leading `.` allows a suffix, `*` allows any host).
+pub fn trusted_host(host: &str) -> bool {
+    let host = host.trim();
+    if host.is_empty() {
+        return true;
+    }
+    let name = if let Some(v6) = host.strip_prefix('[') {
+        return v6
+            .split_once(']')
+            .is_some_and(|(ip, _)| ip.parse::<std::net::Ipv6Addr>().is_ok());
+    } else {
+        match host.rsplit_once(':') {
+            Some((name, port)) if port.bytes().all(|b| b.is_ascii_digit()) => name,
+            _ => host,
+        }
+    };
+    let name = name.trim_end_matches('.').to_ascii_lowercase();
+    if name.parse::<std::net::Ipv4Addr>().is_ok() || !name.contains('.') {
+        return !name.is_empty();
+    }
+    const PRIVATE_SUFFIXES: [&str; 7] = [
+        ".localhost",
+        ".internal",
+        ".local",
+        ".test",
+        ".example",
+        ".invalid",
+        ".home.arpa",
+    ];
+    if PRIVATE_SUFFIXES.iter().any(|s| name.ends_with(s)) {
+        return true;
+    }
+    allowed_hosts(
+        &std::env::var("DEVCLOUD_ALLOWED_HOSTS").unwrap_or_default(),
+        &name,
+    )
+}
+
+/// Whether `name` (lowercase, no port) is in a `DEVCLOUD_ALLOWED_HOSTS` list.
+fn allowed_hosts(list: &str, name: &str) -> bool {
+    list.split(',')
+        .map(|entry| entry.trim().trim_end_matches('.').to_ascii_lowercase())
+        .filter(|entry| !entry.is_empty())
+        .any(|entry| {
+            entry == "*"
+                || entry == name
+                || (entry.starts_with('.') && (name.ends_with(&entry) || name == &entry[1..]))
+        })
+}
+
 fn not_allowed() -> Reply {
     Reply::error(405, "INVALID_ARGUMENT", "method not allowed")
 }
@@ -737,6 +870,45 @@ fn parse_query(q: &str) -> BTreeMap<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_guard_refuses_rebinding_names() {
+        for ok in [
+            "",
+            "127.0.0.1:18025",
+            "localhost",
+            "localhost:9000",
+            "[::1]:8080",
+            "192.168.1.20:18025",
+            "devcloud:18025",
+            "host.docker.internal:18025",
+            "abc.lambda-url.us-east-1.localhost:19010",
+            "mymac.local",
+            "devcloud.test",
+            "LOCALHOST.",
+        ] {
+            assert!(trusted_host(ok), "{ok}");
+        }
+        for bad in [
+            "evil.example.com",
+            "evil.example.com:18025",
+            "127.0.0.1.nip.io",
+            "localhost.evil.com",
+            "[not-an-ip]",
+            ":80",
+        ] {
+            assert!(!trusted_host(bad), "{bad}");
+        }
+        assert!(allowed_hosts(
+            "devcloud.corp.dev, .lan.example.org",
+            "devcloud.corp.dev"
+        ));
+        assert!(allowed_hosts(".lan.example.org", "box.lan.example.org"));
+        assert!(allowed_hosts(".lan.example.org", "lan.example.org"));
+        assert!(!allowed_hosts(".lan.example.org", "evillan.example.org"));
+        assert!(allowed_hosts("*", "anything.com"));
+        assert!(!allowed_hosts("", "anything.com"));
+    }
 
     fn head(target: &str, host: &str) -> Head {
         let mut headers = HashMap::new();
@@ -868,7 +1040,22 @@ mod tests {
         h.headers.insert("upgrade".into(), "websocket".into());
         h.headers
             .insert("connection".into(), "keep-alive, Upgrade".into());
+        h.raw_headers
+            .push(("Connection".into(), "keep-alive, Upgrade".into()));
         assert!(is_upgrade(&h));
+        // The token may sit in any of several Connection fields.
+        let mut split = head("/ws", "127.0.0.1");
+        split.headers.insert("upgrade".into(), "websocket".into());
+        split
+            .raw_headers
+            .push(("Connection".into(), "Upgrade".into()));
+        split
+            .raw_headers
+            .push(("connection".into(), "keep-alive".into()));
+        split
+            .headers
+            .insert("connection".into(), "keep-alive".into());
+        assert!(is_upgrade(&split));
     }
 
     #[test]

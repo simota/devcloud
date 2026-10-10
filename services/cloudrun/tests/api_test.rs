@@ -468,8 +468,9 @@ async fn proxies_requests_to_local_process_and_rolls_revisions() {
         .next()
         .unwrap()
         .to_string();
-    let (_, body) = raw_http(port, format!("GET / HTTP/1.1\r\nHost: {host}\r\n\r\n")).await;
-    let v: Value = serde_json::from_str(&body).unwrap();
+    let (st, body) = raw_http(port, format!("GET / HTTP/1.1\r\nHost: {host}\r\n\r\n")).await;
+    let v: Value = serde_json::from_str(&body)
+        .unwrap_or_else(|_| panic!("non-JSON reply: status={st} body={body:?}"));
     assert_eq!(v["greeting"], "v2");
     assert_eq!(v["k_revision"], rev2.as_str());
 
@@ -590,6 +591,19 @@ async fn strict_mode_requires_bearer_token_and_invoker_binding() {
     )
     .await;
     assert_eq!(status, 503);
+
+    // Introspection exposes env values and logs: it needs the token too.
+    let (status, _) = call(&server, "GET", "/_introspect/services", Value::Null).await;
+    assert_eq!(status, 401);
+    let (status, _) = call_auth(
+        &server,
+        "GET",
+        "/_introspect/services",
+        Value::Null,
+        "Bearer secret",
+    )
+    .await;
+    assert_eq!(status, 200);
 
     let _ = tx.send(());
     serve_task.await.unwrap().unwrap();
@@ -1594,5 +1608,91 @@ async fn chunked_admin_api_bodies_are_applied() {
     assert_eq!(status, 501);
     let _ = tx.send(());
     task.await.unwrap().unwrap();
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Echoes the request headers as a JSON list of `[name, value]` pairs.
+const HEADER_APP: &str = r#"
+import http.server, json, os
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        out = json.dumps([[k.lower(), v] for k, v in self.headers.items()]).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(out)))
+        self.end_headers()
+        self.wfile.write(out)
+    def log_message(self, *a):
+        pass
+http.server.HTTPServer(("127.0.0.1", int(os.environ["PORT"])), H).serve_forever()
+"#;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn proxied_requests_get_clean_forwarding_and_rebinding_hosts_are_refused() {
+    if !has_python() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let dir = temp_dir("fwd");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = Arc::new(Server::new(config(&dir, &format!("127.0.0.1:{port}"))));
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    let serve_task = tokio::spawn(serve(listener, Arc::clone(&server), async {
+        let _ = rx.await;
+    }));
+    let body = json!({
+        "template": { "containers": [{
+            "image": "us-docker.pkg.dev/cloudrun/container/hello",
+            "command": ["python3", "-c", HEADER_APP],
+        }]}
+    });
+    let (status, _) = call(
+        &server,
+        "POST",
+        &format!("{PARENT}/services?serviceId=hdr"),
+        body,
+    )
+    .await;
+    assert_eq!(status, 200);
+
+    let host = format!("hdr.us-central1.demo.run.localhost:{port}");
+    let (status, body) = raw_http(
+        port,
+        format!(
+            "GET / HTTP/1.1\r\nHost: {host}\r\nX-Forwarded-For: 10.0.0.9\r\nX-Forwarded-Proto: https\r\nTE: trailers\r\nProxy-Authorization: Basic eDp5\r\nX-Secret-Hop: 1\r\nConnection: X-Secret-Hop, Host\r\nConnection: keep-alive\r\nUpgrade: h2c\r\nX-Kept: yes\r\n\r\n"
+        ),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let headers: Vec<(String, String)> = serde_json::from_str(&body).unwrap();
+    let all = |name: &str| -> Vec<&str> {
+        headers
+            .iter()
+            .filter(|(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
+            .collect()
+    };
+    assert_eq!(all("x-forwarded-for"), vec!["10.0.0.9, 127.0.0.1"]);
+    assert_eq!(all("x-forwarded-proto"), vec!["http"]);
+    for gone in ["te", "proxy-authorization", "x-secret-hop", "upgrade"] {
+        assert!(all(gone).is_empty(), "{gone} was forwarded: {headers:?}");
+    }
+    assert_eq!(all("x-kept"), vec!["yes"]);
+    // Naming a framing/routing header in Connection does not drop it.
+    assert_eq!(all("host"), vec![host.as_str()]);
+
+    // A DNS-rebinding page keeps its own Host: refused on both planes.
+    for target in ["/", &format!("{PARENT}/services")] {
+        let (status, _) = raw_http(
+            port,
+            format!("GET {target} HTTP/1.1\r\nHost: evil.example.com:{port}\r\n\r\n"),
+        )
+        .await;
+        assert_eq!(status, 403, "{target}");
+    }
+
+    let _ = tx.send(());
+    serve_task.await.unwrap().unwrap();
     let _ = std::fs::remove_dir_all(dir);
 }

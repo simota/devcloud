@@ -8,7 +8,7 @@
 //! execution is enabled. Either way the instance listens on a free loopback
 //! port passed in `PORT`, which the HTTP layer reverse-proxies to.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::net::TcpListener as StdListener;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
@@ -20,6 +20,10 @@ use tokio::io::AsyncReadExt;
 use tokio::process::{Child, Command};
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long readiness insists that the child's own process group holds the
+/// listener (long enough for a child that lost its port to exit).
+#[cfg(target_os = "linux")]
+const OWNER_GRACE: Duration = Duration::from_secs(3);
 const LOG_LINES: usize = 200;
 /// Longest kept log line; longer output is split into several entries.
 const MAX_LOG_LINE_BYTES: usize = 16 * 1024;
@@ -156,7 +160,13 @@ struct TeardownGuard {
     pgid: Option<u32>,
     /// `(docker binary, container name)`.
     container: Option<(String, String)>,
+    /// Where a container removal started from `drop` is tracked, so
+    /// `stop_all` waits for it before devcloud exits.
+    removals: Removals,
 }
+
+/// Container removals running on their own threads.
+type Removals = Arc<Mutex<Vec<std::thread::JoinHandle<()>>>>;
 
 impl TeardownGuard {
     fn disarm(&mut self) {
@@ -172,15 +182,36 @@ impl Drop for TeardownGuard {
         }
         if let Some((docker, name)) = self.container.take() {
             // No runtime to await on here: remove the container from a
-            // detached thread (bounded by the CLI itself).
-            std::thread::spawn(move || {
+            // thread (bounded by the CLI itself), tracked so shutdown waits
+            // for it — killing the CLI alone leaves the container running.
+            let handle = std::thread::spawn(move || {
                 let _ = std::process::Command::new(docker)
                     .args(["rm", "-f", &name])
                     .stdout(Stdio::null())
                     .stderr(Stdio::null())
                     .status();
             });
+            let mut pending = self.removals.lock().unwrap();
+            pending.retain(|h| !h.is_finished());
+            pending.push(handle);
         }
+    }
+}
+
+impl Instance {
+    /// Whether the instance's process is still running. Reaping the leader
+    /// also kills what is left of its group at once and forgets the group:
+    /// once empty, its id can be reused, and a later signal to it would hit
+    /// an unrelated process group.
+    fn alive(&mut self) -> bool {
+        if matches!(self.child.try_wait(), Ok(None)) {
+            return true;
+        }
+        if let Some(pid) = self.pid.take() {
+            signal_group(pid, Signal::Kill);
+        }
+        self.guard.pgid = None;
+        false
     }
 }
 
@@ -221,6 +252,10 @@ pub struct Manager {
     /// Short critical sections only — never held across an `.await`.
     slots: Mutex<Slots>,
     logs: Arc<Mutex<HashMap<String, VecDeque<String>>>>,
+    /// Ports handed to instances that are starting or running, so two cold
+    /// starts never get the same one (`free_port` releases its listener).
+    ports: Mutex<HashSet<u16>>,
+    removals: Removals,
 }
 
 impl Manager {
@@ -230,6 +265,8 @@ impl Manager {
             run_id: new_run_id(),
             slots: Mutex::new(Slots::default()),
             logs: Arc::new(Mutex::new(HashMap::new())),
+            ports: Mutex::new(HashSet::new()),
+            removals: Removals::default(),
         }
     }
 
@@ -269,7 +306,7 @@ impl Manager {
             return Err(StartError::Gone);
         };
         if let Some(inst) = guard.instance.as_mut() {
-            if matches!(inst.child.try_wait(), Ok(None)) && inst.spec == spec {
+            if inst.alive() && inst.spec == spec {
                 inst.requests += 1;
                 return Ok(inst.port);
             }
@@ -312,6 +349,38 @@ impl Manager {
         for slot in drained {
             self.retire(slot).await;
         }
+        // Removals started by dropped instances (connections cancelled by
+        // shutdown mid-start or mid-delete) get to finish before devcloud
+        // exits, but a wedged Docker daemon must not hang shutdown.
+        // Polled rather than joined: a join on the blocking pool could not be
+        // abandoned, and the runtime waits for blocking tasks when it drops.
+        let deadline = tokio::time::Instant::now() + DOCKER_RM_TIMEOUT;
+        loop {
+            let busy = {
+                let mut pending = self.removals.lock().unwrap();
+                pending.retain(|h| !h.is_finished());
+                !pending.is_empty()
+            };
+            if !busy || tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// A port no other instance of this manager holds.
+    fn reserve_port(&self) -> Result<u16, String> {
+        for _ in 0..32 {
+            let port = free_port()?;
+            if self.ports.lock().unwrap().insert(port) {
+                return Ok(port);
+            }
+        }
+        Err("allocate port: no free port".to_string())
+    }
+
+    fn release_port(&self, port: u16) {
+        self.ports.lock().unwrap().remove(&port);
     }
 
     async fn retire(&self, slot: Arc<tokio::sync::Mutex<Slot>>) {
@@ -334,7 +403,7 @@ impl Manager {
             let Some(i) = guard.instance.as_mut() else {
                 continue;
             };
-            if !matches!(i.child.try_wait(), Ok(None)) {
+            if !i.alive() {
                 continue;
             }
             out.push(InstanceInfo {
@@ -373,7 +442,15 @@ impl Manager {
         if spec.command.is_empty() && self.docker_bin.is_none() {
             return Err(not_runnable(spec));
         }
-        let port = free_port().map_err(StartError::Spawn)?;
+        let port = self.reserve_port().map_err(StartError::Spawn)?;
+        let started = self.start_on(spec, port).await;
+        if started.is_err() {
+            self.release_port(port);
+        }
+        started
+    }
+
+    async fn start_on(&self, spec: &LaunchSpec, port: u16) -> Result<Instance, StartError> {
         let (mut cmd, docker_name) = self.command_for(spec, port)?;
         cmd.stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -390,6 +467,7 @@ impl Manager {
         let mut guard = TeardownGuard {
             pgid: pid,
             container: self.docker_bin.clone().zip(docker_name.clone()),
+            removals: Arc::clone(&self.removals),
         };
         if let Some(out) = child.stdout.take() {
             self.pump_logs(&spec.service, out);
@@ -399,13 +477,30 @@ impl Manager {
         }
 
         let deadline = tokio::time::Instant::now() + STARTUP_TIMEOUT;
+        #[cfg(target_os = "linux")]
+        let spawned = std::time::Instant::now();
         loop {
-            if tokio::net::TcpStream::connect(("127.0.0.1", port))
+            #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
+            let mut listening = tokio::net::TcpStream::connect(("127.0.0.1", port))
                 .await
-                .is_ok()
-            {
-                break;
+                .is_ok();
+            // The port was free when picked, but another program may have
+            // taken it before the child could: then the child fails to bind
+            // while something else answers. A local child must own the
+            // listener (Docker's proxy listens for containers, so it is
+            // exempt).
+            // Only for a short while: a command may legitimately hand the
+            // port to a process outside its group (`docker run -p`, `setsid`
+            // launchers); after the grace any answer counts, as before.
+            #[cfg(target_os = "linux")]
+            if listening && docker_name.is_none() && spawned.elapsed() < OWNER_GRACE {
+                if let Some(pgid) = pid {
+                    listening = listener_in_group(port, pgid) != Some(false);
+                }
             }
+            // Checked after the connect: a child that already exited (say it
+            // lost the port to another program) must not be taken as ready
+            // because something else answered.
             if let Ok(Some(status)) = child.try_wait() {
                 if let Some(pid) = pid {
                     signal_group(pid, Signal::Kill);
@@ -420,10 +515,15 @@ impl Manager {
                     "The user-provided container failed to start and listen on the port defined provided by the PORT={port} environment variable (exited with {status})"
                 )));
             }
+            if listening {
+                break;
+            }
             if tokio::time::Instant::now() >= deadline {
                 let inst = Instance {
                     spec: spec.clone(),
-                    port,
+                    // `start` releases the reservation; releasing it here
+                    // too could drop another cold start's claim on it.
+                    port: 0,
                     child,
                     pid,
                     docker_name,
@@ -521,6 +621,7 @@ impl Manager {
     }
 
     async fn terminate(&self, mut inst: Instance) {
+        self.release_port(inst.port);
         if let Some(name) = &inst.docker_name {
             self.remove_container(name).await;
         }
@@ -675,6 +776,61 @@ pub fn docker_run_args(spec: &LaunchSpec, host_port: u16, name: &str) -> Vec<Str
     args.push(spec.image.clone());
     args.extend(spec.args.iter().cloned());
     args
+}
+
+/// Whether a process in group `pgid` holds the TCP listener on `port`;
+/// `None` when that cannot be told (no matching socket visible).
+#[cfg(target_os = "linux")]
+fn listener_in_group(port: u16, pgid: u32) -> Option<bool> {
+    let mut inodes = HashSet::new();
+    for table in ["/proc/net/tcp", "/proc/net/tcp6"] {
+        let Ok(data) = std::fs::read_to_string(table) else {
+            continue;
+        };
+        for line in data.lines().skip(1) {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            // `0A` is LISTEN; the local address is `ADDR:PORT` in hex.
+            if fields.len() < 10 || fields[3] != "0A" {
+                continue;
+            }
+            let local = fields[1].rsplit(':').next();
+            if local.and_then(|p| u16::from_str_radix(p, 16).ok()) == Some(port) {
+                inodes.insert(format!("socket:[{}]", fields[9]));
+            }
+        }
+    }
+    if inodes.is_empty() {
+        return None;
+    }
+    for entry in std::fs::read_dir("/proc").ok()?.flatten() {
+        let name = entry.file_name();
+        let Some(pid) = name
+            .to_str()
+            .filter(|n| n.bytes().all(|b| b.is_ascii_digit()))
+        else {
+            continue;
+        };
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            continue;
+        };
+        // `pid (comm) state ppid pgrp ...`; comm may hold spaces and parens.
+        let after_comm = stat.rsplit_once(')').map_or("", |(_, rest)| rest);
+        let pgrp = after_comm.split_whitespace().nth(2);
+        if pgrp.and_then(|g| g.parse::<u32>().ok()) != Some(pgid) {
+            continue;
+        }
+        let Ok(fds) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
+            continue;
+        };
+        for fd in fds.flatten() {
+            if let Ok(target) = std::fs::read_link(fd.path()) {
+                if target.to_str().is_some_and(|t| inodes.contains(t)) {
+                    return Some(true);
+                }
+            }
+        }
+    }
+    Some(false)
 }
 
 fn free_port() -> Result<u16, String> {
@@ -873,6 +1029,7 @@ mod tests {
             guard: TeardownGuard {
                 pgid: pid,
                 container: None,
+                removals: Removals::default(),
             },
         };
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -889,6 +1046,67 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         assert!(gone, "process group survived a cancelled terminate");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn readiness_requires_the_child_to_own_its_listener() {
+        // Someone else listens on the port...
+        let other = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = other.local_addr().unwrap().port();
+        let mut cmd = Command::new("sleep");
+        cmd.arg("30").kill_on_drop(true).process_group(0);
+        let child = cmd.spawn().unwrap();
+        let pgid = child.id().unwrap();
+        // ...so the child's group does not own it.
+        assert_eq!(listener_in_group(port, pgid), Some(false));
+        // Our own process group does.
+        let own = unsafe { libc::getpgrp() } as u32;
+        assert_eq!(listener_in_group(port, own), Some(true));
+        drop(other);
+        drop(child);
+    }
+
+    #[test]
+    fn reserved_ports_are_never_handed_out_twice() {
+        let m = Manager::new(None);
+        let ports: HashSet<u16> = (0..20).map(|_| m.reserve_port().unwrap()).collect();
+        assert_eq!(ports.len(), 20);
+        let p = *ports.iter().next().unwrap();
+        m.release_port(p);
+        assert!(!m.ports.lock().unwrap().contains(&p));
+    }
+
+    #[tokio::test]
+    async fn a_reaped_instance_forgets_its_process_group() {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "exit 0"]).process_group(0);
+        let child = cmd.spawn().unwrap();
+        let pid = child.id();
+        let mut inst = Instance {
+            spec: LaunchSpec::from_service(&service()).unwrap(),
+            port: 0,
+            pid,
+            child,
+            docker_name: None,
+            started_at: String::new(),
+            requests: 0,
+            guard: TeardownGuard {
+                pgid: pid,
+                container: None,
+                removals: Removals::default(),
+            },
+        };
+        // `alive` itself is the reap site, as in `ensure` and `list`.
+        let mut tries = 0;
+        while inst.alive() {
+            tries += 1;
+            assert!(tries < 200, "child never exited");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // Nothing left to signal later, by `terminate` or the drop guard.
+        assert_eq!(inst.pid, None);
+        assert_eq!(inst.guard.pgid, None);
     }
 
     #[tokio::test]
@@ -919,6 +1137,7 @@ mod tests {
             guard: TeardownGuard {
                 pgid: None,
                 container: None,
+                removals: Removals::default(),
             },
         };
         let started = std::time::Instant::now();
