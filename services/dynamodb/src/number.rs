@@ -251,6 +251,36 @@ pub fn is_valid_number(s: &str) -> bool {
     parse(s).is_some()
 }
 
+/// The canonical plain-decimal spelling of a valid number, so numerically
+/// equal spellings map to one string (`"1.0"`, `"+1"`, `"1e0"` → `"1"`;
+/// `"0.50"` → `"0.5"`; `"-0"` → `"0"`). `None` when `s` is not a valid number.
+pub fn canonical_number_string(s: &str) -> Option<String> {
+    let value = parse(s)?;
+    let scale = value.scale as usize;
+    let mut digits = value.coeff;
+    let body = if scale == 0 {
+        digits
+    } else {
+        while digits.len() <= scale {
+            digits.insert(0, '0');
+        }
+        let split = digits.len() - scale;
+        format!("{}.{}", &digits[..split], &digits[split..])
+    };
+    Some(if value.negative {
+        format!("-{body}")
+    } else {
+        body
+    })
+}
+
+/// The number of significant digits of a valid number (leading and trailing
+/// zeros trimmed; zero counts as one digit), used for item sizing.
+pub fn significant_digits(s: &str) -> Option<usize> {
+    let value = parse(s)?;
+    Some(value.coeff.trim_end_matches('0').len().max(1))
+}
+
 /// Compares two decimal values; mirrors `big.Rat.Cmp`.
 pub fn compare(a: &Decimal, b: &Decimal) -> Ordering {
     if a.is_zero() && b.is_zero() {
@@ -491,6 +521,35 @@ mod tests {
         assert!(!is_valid_number("1.2.3"));
         assert!(!is_valid_number(""));
         assert!(!is_valid_number("1e"));
+    }
+
+    #[test]
+    fn canonical_spelling_and_significant_digits() {
+        for (raw, canonical) in [
+            ("1", "1"),
+            ("1.0", "1"),
+            ("+1", "1"),
+            ("1e0", "1"),
+            ("10e-1", "1"),
+            ("100", "100"),
+            ("1e2", "100"),
+            ("0.50", "0.5"),
+            (".5", "0.5"),
+            ("-0", "0"),
+            ("-0.0", "0"),
+            ("-12.340", "-12.34"),
+            ("1e-3", "0.001"),
+        ] {
+            assert_eq!(
+                canonical_number_string(raw).as_deref(),
+                Some(canonical),
+                "{raw}"
+            );
+        }
+        assert_eq!(canonical_number_string("abc"), None);
+        assert_eq!(significant_digits("12300"), Some(3));
+        assert_eq!(significant_digits("0.00120"), Some(2));
+        assert_eq!(significant_digits("0"), Some(1));
     }
 
     #[test]

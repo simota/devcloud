@@ -156,17 +156,29 @@ pub fn attribute_type_name(value: &Value) -> &'static str {
 }
 
 /// Builds the internal item-key string: `json.Marshal` of the key attribute
-/// values in key-schema order. Mirrors `itemKey`.
+/// values in key-schema order. Mirrors `itemKey`, except that `N` values use
+/// their canonical spelling so numerically equal keys (`"1"`, `"1.0"`) address
+/// the same item.
 pub fn item_key(description: &TableDescription, values: &Item) -> Result<String, String> {
-    let mut key_values: Vec<&Value> = Vec::with_capacity(description.key_schema.len());
+    let mut key_values: Vec<Value> = Vec::with_capacity(description.key_schema.len());
     for element in &description.key_schema {
         let value = values
             .get(&element.attribute_name)
             .ok_or_else(|| format!("missing key attribute {}", element.attribute_name))?;
         validate_attribute_value(value, &element.attribute_name)?;
-        key_values.push(value);
+        key_values.push(canonical_key_value(value));
     }
     Ok(crate::wire_json::marshal_string(&key_values))
+}
+
+/// A key attribute value with any `N` number in canonical spelling.
+fn canonical_key_value(value: &Value) -> Value {
+    if let Some(number) = value.get("N").and_then(Value::as_str) {
+        if let Some(canonical) = crate::number::canonical_number_string(number) {
+            return serde_json::json!({ "N": canonical });
+        }
+    }
+    value.clone()
 }
 
 /// Extracts the primary-key attributes from an item, mirroring `extractKey`.
@@ -284,11 +296,66 @@ pub fn resolve_attribute_name(
     token.to_string()
 }
 
-/// Deep value equality used by `=`/`<>` and IN, mirroring
-/// `attributeValuesEqual` (a structural compare; `serde_json::Value` equality
-/// already matches legacy `reflect.DeepEqual` + JSON fallback for these shapes).
+/// Deep value equality used by `=`/`<>`, IN and `contains`. Values of
+/// different types are never equal; numbers (`N`, and `NS` members) compare
+/// numerically so `"1"` equals `"1.0"`; sets compare as unordered sets; lists
+/// and maps recurse.
 pub fn attribute_values_equal(left: &Value, right: &Value) -> bool {
-    left == right
+    let (Some(lo), Some(ro)) = (left.as_object(), right.as_object()) else {
+        return left == right;
+    };
+    let (Some((lt, lv)), Some((rt, rv))) = (single_entry(lo), single_entry(ro)) else {
+        return left == right;
+    };
+    if lt != rt {
+        return false;
+    }
+    match lt.as_str() {
+        "N" => match (lv.as_str(), rv.as_str()) {
+            (Some(a), Some(b)) => numbers_equal(a, b),
+            _ => lv == rv,
+        },
+        "NS" => sets_equal(lv, rv, numbers_equal),
+        "SS" | "BS" => sets_equal(lv, rv, |a, b| a == b),
+        "L" => match (lv.as_array(), rv.as_array()) {
+            (Some(a), Some(b)) => {
+                a.len() == b.len() && a.iter().zip(b).all(|(x, y)| attribute_values_equal(x, y))
+            }
+            _ => lv == rv,
+        },
+        "M" => match (lv.as_object(), rv.as_object()) {
+            (Some(a), Some(b)) => {
+                a.len() == b.len()
+                    && a.iter()
+                        .all(|(name, x)| b.get(name).is_some_and(|y| attribute_values_equal(x, y)))
+            }
+            _ => lv == rv,
+        },
+        _ => lv == rv,
+    }
+}
+
+fn single_entry(obj: &serde_json::Map<String, Value>) -> Option<(&String, &Value)> {
+    if obj.len() == 1 {
+        obj.iter().next()
+    } else {
+        None
+    }
+}
+
+/// Numeric equality of two number strings.
+pub fn numbers_equal(left: &str, right: &str) -> bool {
+    crate::number::compare_number_strings(left, right) == std::cmp::Ordering::Equal
+}
+
+/// Unordered equality of two string-set payloads under `eq`.
+fn sets_equal(left: &Value, right: &Value, eq: impl Fn(&str, &str) -> bool) -> bool {
+    let (Some(a), Some(b)) = (string_slice(left), string_slice(right)) else {
+        return left == right;
+    };
+    a.len() == b.len()
+        && a.iter().all(|x| b.iter().any(|y| eq(x, y)))
+        && b.iter().all(|y| a.iter().any(|x| eq(x, y)))
 }
 
 /// Ordered comparison of two attribute values, mirroring `compareAttributeValues`
@@ -478,6 +545,60 @@ mod tests {
         let key = item_key(&desc, &item).unwrap();
         // legacy json.Marshal HTML-escapes `<`/`>` even in the internal key string.
         assert_eq!(key, "[{\"S\":\"u\\u003c1\\u003e\"},{\"N\":\"7\"}]");
+    }
+
+    #[test]
+    fn numbers_are_equal_by_value() {
+        assert!(attribute_values_equal(
+            &json!({"N": "1"}),
+            &json!({"N": "1.0"})
+        ));
+        assert!(attribute_values_equal(
+            &json!({"N": "100"}),
+            &json!({"N": "1e2"})
+        ));
+        assert!(!attribute_values_equal(
+            &json!({"N": "1"}),
+            &json!({"N": "1.5"})
+        ));
+        assert!(!attribute_values_equal(
+            &json!({"N": "1"}),
+            &json!({"S": "1"})
+        ));
+        assert!(attribute_values_equal(
+            &json!({"NS": ["1", "2.50"]}),
+            &json!({"NS": ["2.5", "1.0"]})
+        ));
+        assert!(attribute_values_equal(
+            &json!({"SS": ["a", "b"]}),
+            &json!({"SS": ["b", "a"]})
+        ));
+        assert!(attribute_values_equal(
+            &json!({"M": {"n": {"N": "2"}}}),
+            &json!({"M": {"n": {"N": "2.0"}}})
+        ));
+        assert!(attribute_values_equal(
+            &json!({"L": [{"N": "3"}]}),
+            &json!({"L": [{"N": "3.00"}]})
+        ));
+    }
+
+    #[test]
+    fn item_key_uses_canonical_numbers() {
+        let mut desc = test_description();
+        desc.key_schema = vec![KeySchemaElement {
+            attribute_name: "pk".to_string(),
+            key_type: "HASH".to_string(),
+        }];
+        let key_of = |n: &str| {
+            let mut item = Item::new();
+            item.insert("pk".to_string(), json!({ "N": n }));
+            item_key(&desc, &item).unwrap()
+        };
+        assert_eq!(key_of("1"), key_of("1.0"));
+        assert_eq!(key_of("1"), key_of("1e0"));
+        assert_eq!(key_of("1"), "[{\"N\":\"1\"}]");
+        assert_ne!(key_of("1"), key_of("1.5"));
     }
 
     #[test]

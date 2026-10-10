@@ -16,9 +16,7 @@ use std::collections::BTreeMap;
 
 use serde_json::{Map, Value};
 
-use crate::attribute::{
-    attribute_values_equal, item_key, project_item, validate_item_attribute_values,
-};
+use crate::attribute::{item_key, project_item, validate_item_attribute_values};
 use crate::errors::ApiError;
 use crate::expression::{
     check_condition, key_condition_has_equality_on, match_filter, match_key_condition,
@@ -255,6 +253,7 @@ impl Server {
                 resource_policy: table.resource_policy,
                 resource_policy_revision: table.resource_policy_revision,
             };
+            rekey_items(&mut state);
             state.description.item_count = state.items.len() as i64;
             update_index_item_counts(&mut state);
             self.tables.insert(name, state);
@@ -2615,7 +2614,8 @@ fn updated_attributes(old: &Item, new: &Item) -> Item {
     let mut result = Item::new();
     for (name, new_attr) in new {
         match old.get(name) {
-            Some(old_attr) if attribute_values_equal(old_attr, new_attr) => {}
+            // A respelled number ("1" → "1.0") still counts as an update.
+            Some(old_attr) if old_attr == new_attr => {}
             _ => {
                 result.insert(name.clone(), new_attr.clone());
             }
@@ -2630,7 +2630,7 @@ fn updated_old_attributes(old: &Item, new: &Item) -> Item {
     let mut result = Item::new();
     for (name, old_attr) in old {
         match new.get(name) {
-            Some(new_attr) if attribute_values_equal(old_attr, new_attr) => {}
+            Some(new_attr) if old_attr == new_attr => {}
             _ => {
                 result.insert(name.clone(), old_attr.clone());
             }
@@ -2931,6 +2931,17 @@ fn transact_condition_error(err: ConditionError) -> ApiError {
     match err {
         ConditionError::Failed => transaction_cancelled(),
         ConditionError::Invalid(message) => ApiError::validation(message),
+    }
+}
+
+/// Re-derives every item's map key from its key attributes, so state written
+/// before keys used canonical number spellings (`{"N":"1.0"}` vs `"1"`) stays
+/// addressable. Items whose key cannot be derived keep their stored key.
+fn rekey_items(state: &mut TableState) {
+    let items = std::mem::take(&mut state.items);
+    for (stored_key, value) in items {
+        let key = item_key(&state.description, &value).unwrap_or(stored_key);
+        state.items.insert(key, value);
     }
 }
 

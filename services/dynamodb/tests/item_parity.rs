@@ -194,6 +194,60 @@ fn get_full_projection_and_missing() {
 }
 
 #[test]
+fn numerically_equal_keys_address_the_same_item() {
+    let dir = tempdir();
+    let mut s = server(&dir);
+    create_t(&mut s);
+    s.put_item(&put_req(item(&[
+        ("pk", json!({"S": "a"})),
+        ("sk", json!({"N": "1"})),
+        ("v", json!({"S": "first"})),
+    ])))
+    .expect("seed");
+
+    // GetItem with a different spelling of the same number finds the item.
+    let got = parse(
+        &s.get_item(&GetItemRequest {
+            table_name: "T".to_string(),
+            key: item(&[("pk", json!({"S": "a"})), ("sk", json!({"N": "1.0"}))]),
+            ..Default::default()
+        })
+        .expect("get"),
+    );
+    assert_eq!(got["Item"]["v"], json!({"S": "first"}));
+
+    // PutItem with another spelling replaces it instead of adding a twin.
+    s.put_item(&put_req(item(&[
+        ("pk", json!({"S": "a"})),
+        ("sk", json!({"N": "1e0"})),
+        ("v", json!({"S": "second"})),
+    ])))
+    .expect("overwrite");
+    let state = std::fs::read_to_string(dir.join("state.json")).expect("state");
+    assert!(state.contains("\"ItemCount\":1"), "{state}");
+    assert!(!state.contains("first"));
+
+    // State written with a non-canonical key string is re-keyed on load.
+    let legacy = state.replace(
+        "\"[{\\\"S\\\":\\\"a\\\"},{\\\"N\\\":\\\"1\\\"}]\"",
+        "\"[{\\\"S\\\":\\\"a\\\"},{\\\"N\\\":\\\"1e0\\\"}]\"",
+    );
+    assert_ne!(legacy, state);
+    std::fs::write(dir.join("state.json"), legacy).expect("write state");
+    let reloaded = server(&dir);
+    let got = parse(
+        &reloaded
+            .get_item(&GetItemRequest {
+                table_name: "T".to_string(),
+                key: item(&[("pk", json!({"S": "a"})), ("sk", json!({"N": "1"}))]),
+                ..Default::default()
+            })
+            .expect("get after reload"),
+    );
+    assert_eq!(got["Item"]["v"], json!({"S": "second"}));
+}
+
+#[test]
 fn unevaluable_condition_is_a_validation_error() {
     let dir = tempdir();
     let mut s = server(&dir);

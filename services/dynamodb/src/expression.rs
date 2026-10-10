@@ -11,7 +11,8 @@ use std::collections::BTreeMap;
 use serde_json::{json, Value};
 
 use crate::attribute::{
-    attribute_type_name, attribute_values_equal, compare_attribute_values, resolve_attribute_name,
+    attribute_type_name, attribute_values_equal, compare_attribute_values, numbers_equal,
+    resolve_attribute_name,
 };
 use crate::model::Item;
 
@@ -386,6 +387,16 @@ fn attribute_contains(actual: Option<&Value>, expected: &Value) -> bool {
             continue;
         };
         let actual_strings: Vec<&str> = actual_values.iter().filter_map(Value::as_str).collect();
+        // NS members match by numeric value ("1" contains "1.0").
+        let has_member = |want: &str| {
+            actual_strings.iter().any(|have| {
+                if set == "NS" {
+                    numbers_equal(have, want)
+                } else {
+                    *have == want
+                }
+            })
+        };
         // expected as a one-element set of the same type, or a scalar element.
         if let Some(expected_values) = expected
             .as_object()
@@ -394,7 +405,7 @@ fn attribute_contains(actual: Option<&Value>, expected: &Value) -> bool {
         {
             if expected_values.len() == 1 {
                 if let Some(want) = expected_values[0].as_str() {
-                    return actual_strings.contains(&want);
+                    return has_member(want);
                 }
             }
             return false;
@@ -410,7 +421,7 @@ fn attribute_contains(actual: Option<&Value>, expected: &Value) -> bool {
             .and_then(|o| o.get(scalar_type))
             .and_then(Value::as_str)
         {
-            return actual_strings.contains(&scalar);
+            return has_member(scalar);
         }
         return false;
     }
@@ -636,6 +647,18 @@ mod tests {
         check_condition("a = :x AND b > :one", &names(), &vals, Some(&it)).unwrap();
         check_condition("a = :x OR b < :one", &names(), &vals, Some(&it)).unwrap();
         assert!(check_condition("NOT a = :x", &names(), &vals, Some(&it)).is_err());
+    }
+
+    #[test]
+    fn numbers_compare_by_value() {
+        let it = item(&[("n", json!({"N": "5"})), ("ns", json!({"NS": ["1", "2"]}))]);
+        let mut vals = Values::new();
+        vals.insert(":five".to_string(), json!({"N": "5.0"}));
+        vals.insert(":one".to_string(), json!({"N": "1.00"}));
+        check_condition("n = :five", &names(), &vals, Some(&it)).unwrap();
+        check_condition("n IN (:one, :five)", &names(), &vals, Some(&it)).unwrap();
+        check_condition("contains(ns, :one)", &names(), &vals, Some(&it)).unwrap();
+        assert!(check_condition("n <> :five", &names(), &vals, Some(&it)).is_err());
     }
 
     #[test]
