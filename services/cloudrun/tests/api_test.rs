@@ -1660,7 +1660,7 @@ async fn proxied_requests_get_clean_forwarding_and_rebinding_hosts_are_refused()
     let (status, body) = raw_http(
         port,
         format!(
-            "GET / HTTP/1.1\r\nHost: {host}\r\nX-Forwarded-For: 10.0.0.9\r\nX-Forwarded-Proto: https\r\nTE: trailers\r\nProxy-Authorization: Basic eDp5\r\nX-Secret-Hop: 1\r\nConnection: X-Secret-Hop, Host\r\nUpgrade: h2c\r\nX-Kept: yes\r\n\r\n"
+            "GET / HTTP/1.1\r\nHost: {host}\r\nX-Forwarded-For: 10.0.0.9\r\nX-Forwarded-Proto: https\r\nTE: trailers\r\nProxy-Authorization: Basic eDp5\r\nX-Secret-Hop: 1\r\nConnection: X-Secret-Hop, Host\r\nConnection: keep-alive\r\nUpgrade: h2c\r\nX-Kept: yes\r\n\r\n"
         ),
     )
     .await;

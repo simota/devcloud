@@ -367,23 +367,22 @@ async fn proxy(
     let upgrade = is_upgrade(&head);
     // Hop-by-hop headers stop here, including any the client listed in
     // `Connection`; the forwarding headers are the platform's to set.
+    // Every `Connection` field counts, not just the last one parsed.
     let listed: Vec<String> = head
-        .headers
-        .get("connection")
-        .map(|c| {
-            c.split(',')
-                .map(|t| t.trim().to_ascii_lowercase())
-                // Framing and routing headers are never the client's to drop:
-                // the body is relayed as sent.
-                .filter(|t| {
-                    !matches!(
-                        t.as_str(),
-                        "upgrade" | "host" | "content-length" | "transfer-encoding"
-                    )
-                })
-                .collect()
+        .raw_headers
+        .iter()
+        .filter(|(k, _)| k.eq_ignore_ascii_case("connection"))
+        .flat_map(|(_, v)| v.split(','))
+        .map(|t| t.trim().to_ascii_lowercase())
+        // Framing and routing headers are never the client's to drop: the
+        // body is relayed as sent.
+        .filter(|t| {
+            !matches!(
+                t.as_str(),
+                "upgrade" | "host" | "content-length" | "transfer-encoding"
+            )
         })
-        .unwrap_or_default();
+        .collect();
     let mut forwarded_for = Vec::new();
     for (k, v) in &head.raw_headers {
         let lower = k.to_ascii_lowercase();
@@ -453,10 +452,12 @@ async fn proxy(
 
 fn is_upgrade(head: &Head) -> bool {
     head.headers.contains_key("upgrade")
-        && head.headers.get("connection").is_some_and(|c| {
-            c.split(',')
-                .any(|t| t.trim().eq_ignore_ascii_case("upgrade"))
-        })
+        && head
+            .raw_headers
+            .iter()
+            .filter(|(k, _)| k.eq_ignore_ascii_case("connection"))
+            .flat_map(|(_, v)| v.split(','))
+            .any(|t| t.trim().eq_ignore_ascii_case("upgrade"))
 }
 
 /// Copies the upstream response head to the client, re-prefixing redirects
@@ -1039,7 +1040,22 @@ mod tests {
         h.headers.insert("upgrade".into(), "websocket".into());
         h.headers
             .insert("connection".into(), "keep-alive, Upgrade".into());
+        h.raw_headers
+            .push(("Connection".into(), "keep-alive, Upgrade".into()));
         assert!(is_upgrade(&h));
+        // The token may sit in any of several Connection fields.
+        let mut split = head("/ws", "127.0.0.1");
+        split.headers.insert("upgrade".into(), "websocket".into());
+        split
+            .raw_headers
+            .push(("Connection".into(), "Upgrade".into()));
+        split
+            .raw_headers
+            .push(("connection".into(), "keep-alive".into()));
+        split
+            .headers
+            .insert("connection".into(), "keep-alive".into());
+        assert!(is_upgrade(&split));
     }
 
     #[test]
