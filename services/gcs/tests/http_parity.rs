@@ -909,6 +909,28 @@ fn object_patch_merges_metadata_and_null_deletes_key() {
     );
 }
 
+/// `maxResults=0` means the default page size; it must not return an empty
+/// page whose nextPageToken repeats the current one forever.
+#[test]
+fn objects_list_treats_zero_max_results_as_default() {
+    let mut s = server();
+    create_bucket(&mut s, "demo-bucket");
+    for name in ["a.txt", "b.txt", "c.txt"] {
+        upload_text(&mut s, "demo-bucket", name, "x");
+    }
+
+    let list = perform(
+        &mut s,
+        "GET",
+        "/storage/v1/b/demo-bucket/o?maxResults=0",
+        "",
+    );
+    assert_eq!(list.status, 200, "{}", body_str(&list));
+    let body = json_body(&list);
+    assert_eq!(body["items"].as_array().map(Vec::len), Some(3));
+    assert!(body.get("nextPageToken").is_none(), "{body}");
+}
+
 // ---------------------------------------------------------------------------
 // preconditions_test.rs
 // ---------------------------------------------------------------------------

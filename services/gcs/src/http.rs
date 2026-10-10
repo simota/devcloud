@@ -31,6 +31,8 @@ use tokio::net::{TcpListener, TcpStream};
 
 const MAX_HEADER_BYTES: usize = 64 * 1024;
 const MAX_BODY_BYTES: usize = 128 * 1024 * 1024;
+/// Largest list page GCS returns, whatever `maxResults` asks for.
+const MAX_PAGE_SIZE: usize = 1000;
 
 #[derive(Debug, Clone, Default)]
 pub struct Config {
@@ -2091,8 +2093,10 @@ fn page_window(
             .ok()
             .filter(|v| *v >= 0)
             .ok_or("invalid maxResults".to_string())?;
-        if (parsed as usize) < limit {
-            limit = parsed as usize;
+        // 0 means "use the default" (a 0-item page would hand back the same
+        // pageToken forever); larger pages are capped like GCS.
+        if parsed > 0 {
+            limit = limit.min((parsed as usize).min(MAX_PAGE_SIZE));
         }
     }
     let end = (start + limit).min(total);
@@ -2368,7 +2372,14 @@ async fn read_chunked_body(stream: &mut TcpStream, mut buf: Vec<u8>) -> std::io:
         if size == 0 {
             return Ok(out);
         }
-        while buf.len() < pos + size + 2 {
+        // Refuse an oversized chunk before buffering any of it.
+        let chunk_end = pos
+            .checked_add(size)
+            .filter(|_| size <= MAX_BODY_BYTES - out.len());
+        let Some(needed) = chunk_end.and_then(|end| end.checked_add(2)) else {
+            return Err(body_too_large());
+        };
+        while buf.len() < needed {
             let n = stream.read(&mut tmp).await?;
             if n == 0 {
                 return Ok(out);
@@ -2376,11 +2387,15 @@ async fn read_chunked_body(stream: &mut TcpStream, mut buf: Vec<u8>) -> std::io:
             buf.extend_from_slice(&tmp[..n]);
         }
         out.extend_from_slice(&buf[pos..pos + size]);
-        if out.len() > MAX_BODY_BYTES {
-            return Ok(Vec::new());
-        }
-        pos += size + 2;
+        pos = needed;
     }
+}
+
+fn body_too_large() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        "request body exceeds the size limit",
+    )
 }
 
 fn parse_target(target: &str) -> (String, BTreeMap<String, String>) {
@@ -2656,6 +2671,66 @@ mod tests {
             },
         );
         assert_eq!(String::from_utf8(r.body).unwrap(), "{\"sessions\":[]}\n");
+    }
+
+    /// `maxResults` above the GCS page limit is capped at 1000.
+    #[test]
+    fn page_window_caps_max_results() {
+        let query = BTreeMap::from([("maxResults".to_string(), "5000".to_string())]);
+        assert_eq!(
+            page_window(&query, 2500).unwrap(),
+            (0, 1000, "1000".to_string())
+        );
+    }
+
+    /// Sends `raw` as a request and returns what `read_request` makes of it.
+    fn read_raw_request(raw: &'static [u8]) -> std::io::Result<Option<Request>> {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let addr = listener.local_addr().unwrap();
+                let client = tokio::spawn(async move {
+                    let mut stream = TcpStream::connect(addr).await.unwrap();
+                    stream.write_all(raw).await.unwrap();
+                    stream.shutdown().await.unwrap();
+                    // Hold the socket open until the server side is done.
+                    let mut sink = Vec::new();
+                    let _ = stream.read_to_end(&mut sink).await;
+                });
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let result = read_request(&mut stream).await;
+                drop(stream);
+                client.await.unwrap();
+                result
+            })
+    }
+
+    /// A chunk size past the body limit is refused before any of it is
+    /// buffered, and a size near `usize::MAX` must not overflow the offset
+    /// arithmetic (which used to panic).
+    #[test]
+    fn chunked_body_rejects_oversized_chunk_sizes() {
+        for raw in [
+            &b"POST /x HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\nFFFFFFFFFFFFFFFF\r\nabc\r\n0\r\n\r\n"[..],
+            &b"POST /x HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n1000000000\r\nabc"[..],
+        ] {
+            let result = read_raw_request(raw);
+            assert!(
+                result.is_err(),
+                "oversized chunk accepted: {:?}",
+                result.map(|r| r.map(|r| r.body.len()))
+            );
+        }
+
+        let ok = read_raw_request(
+            b"POST /x HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n2\r\nde\r\n0\r\n\r\n",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(ok.body, b"abcde");
     }
 
     /// Golden oracle: error responses must match legacy
