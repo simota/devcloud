@@ -136,15 +136,16 @@ impl FileStore {
             Err(e) => return Err(format!("open messages log: {e}")),
         };
         let mut messages = Vec::new();
-        // A last line without its newline is a torn append (a crash or a full
-        // disk mid-write): an incomplete record, never acknowledged, so it is
-        // ignored rather than making the whole mailbox unreadable.
-        let complete = match data.iter().rposition(|&b| b == b'\n') {
-            Some(i) => &data[..=i],
-            None => &[][..],
-        };
-        for line in complete.split(|&b| b == b'\n') {
+        let lines: Vec<&[u8]> = data.split(|&b| b == b'\n').collect();
+        let last = lines.len() - 1;
+        for (i, line) in lines.into_iter().enumerate() {
             if line.is_empty() {
+                continue;
+            }
+            // A last line without its newline that does not parse is a torn
+            // append (a crash or a full disk mid-write): never acknowledged,
+            // so it is ignored rather than making the mailbox unreadable.
+            if i == last && serde_json::from_slice::<Message>(line).is_err() {
                 continue;
             }
             let m: Message = serde_json::from_slice(line)
@@ -322,9 +323,10 @@ fn now_nanos() -> u128 {
         .unwrap_or(0)
 }
 
-/// Truncates an incomplete last record (no trailing newline) left by an
-/// earlier interrupted append, so the next record starts on its own line.
-/// Returns the resulting length.
+/// Makes sure the next record starts on its own line: an unterminated last
+/// record that parses (a hand edit saved without a newline) gets its newline;
+/// one that does not is the torn remains of an interrupted append and is cut
+/// off. Returns the resulting length.
 fn drop_torn_tail(path: &Path, file: &fs::File) -> io::Result<u64> {
     use std::io::{Read, Seek, SeekFrom};
     let len = file.metadata()?.len();
@@ -341,12 +343,14 @@ fn drop_torn_tail(path: &Path, file: &fs::File) -> io::Result<u64> {
     reader.seek(SeekFrom::Start(0))?;
     let mut data = Vec::new();
     reader.read_to_end(&mut data)?;
-    let keep = data
-        .iter()
-        .rposition(|&b| b == b'\n')
-        .map_or(0, |i| i as u64 + 1);
-    file.set_len(keep)?;
-    Ok(keep)
+    let keep = data.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
+    if serde_json::from_slice::<Message>(&data[keep..]).is_ok() {
+        let mut appender = file;
+        appender.write_all(b"\n")?;
+        return Ok(len + 1);
+    }
+    file.set_len(keep as u64)?;
+    Ok(keep as u64)
 }
 
 /// Writes `data` to `path` via a temp file + atomic rename.

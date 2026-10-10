@@ -20,6 +20,10 @@ use tokio::io::AsyncReadExt;
 use tokio::process::{Child, Command};
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long readiness insists that the child's own process group holds the
+/// listener (long enough for a child that lost its port to exit).
+#[cfg(target_os = "linux")]
+const OWNER_GRACE: Duration = Duration::from_secs(3);
 const LOG_LINES: usize = 200;
 /// Longest kept log line; longer output is split into several entries.
 const MAX_LOG_LINE_BYTES: usize = 16 * 1024;
@@ -346,18 +350,22 @@ impl Manager {
             self.retire(slot).await;
         }
         // Removals started by dropped instances (connections cancelled by
-        // shutdown mid-start or mid-delete) finish before devcloud exits.
+        // shutdown mid-start or mid-delete) get to finish before devcloud
+        // exits, but a wedged Docker daemon must not hang shutdown.
+        let deadline = tokio::time::Instant::now() + DOCKER_RM_TIMEOUT;
         loop {
             let pending = std::mem::take(&mut *self.removals.lock().unwrap());
             if pending.is_empty() {
                 break;
             }
-            let _ = tokio::task::spawn_blocking(move || {
+            let joined = tokio::task::spawn_blocking(move || {
                 for handle in pending {
                     let _ = handle.join();
                 }
-            })
-            .await;
+            });
+            if tokio::time::timeout_at(deadline, joined).await.is_err() {
+                break;
+            }
         }
     }
 
@@ -470,7 +478,10 @@ impl Manager {
         }
 
         let deadline = tokio::time::Instant::now() + STARTUP_TIMEOUT;
+        #[cfg(target_os = "linux")]
+        let spawned = std::time::Instant::now();
         loop {
+            #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
             let mut listening = tokio::net::TcpStream::connect(("127.0.0.1", port))
                 .await
                 .is_ok();
@@ -479,8 +490,11 @@ impl Manager {
             // while something else answers. A local child must own the
             // listener (Docker's proxy listens for containers, so it is
             // exempt).
+            // Only for a short while: a command may legitimately hand the
+            // port to a process outside its group (`docker run -p`, `setsid`
+            // launchers); after the grace any answer counts, as before.
             #[cfg(target_os = "linux")]
-            if listening && docker_name.is_none() {
+            if listening && docker_name.is_none() && spawned.elapsed() < OWNER_GRACE {
                 if let Some(pgid) = pid {
                     listening = listener_in_group(port, pgid) != Some(false);
                 }
@@ -508,7 +522,9 @@ impl Manager {
             if tokio::time::Instant::now() >= deadline {
                 let inst = Instance {
                     spec: spec.clone(),
-                    port,
+                    // `start` releases the reservation; releasing it here
+                    // too could drop another cold start's claim on it.
+                    port: 0,
                     child,
                     pid,
                     docker_name,

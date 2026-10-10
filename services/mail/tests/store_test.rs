@@ -362,3 +362,36 @@ fn tombstones_do_not_keep_message_contents() {
     let size = std::fs::metadata(store.messages_path()).unwrap().len();
     assert!(size < 10_000, "log still holds the body: {size} bytes");
 }
+
+#[test]
+fn an_unterminated_but_complete_last_record_is_kept() {
+    let (store, _) = new_store("noeol");
+    let line = serde_json::to_string(&fixed_msg(
+        "msg_hand",
+        "a@example.com",
+        "Hand",
+        "2026-04-30T10:00:00Z",
+    ))
+    .unwrap();
+    std::fs::create_dir_all(store.messages_path().parent().unwrap()).unwrap();
+    std::fs::write(store.messages_path(), line).unwrap();
+    assert_eq!(
+        store
+            .list(ListMessagesInput::default())
+            .unwrap()
+            .messages
+            .len(),
+        1
+    );
+    store
+        .append(
+            fixed_msg("msg_next", "b@example.com", "Next", "2026-04-30T10:01:00Z"),
+            b"Subject: Next\r\n\r\nBody",
+        )
+        .expect("append");
+    let data = std::fs::read_to_string(store.messages_path()).unwrap();
+    assert_eq!(data.lines().count(), 2, "{data}");
+    for l in data.lines() {
+        serde_json::from_str::<Message>(l).expect("each record on its own line");
+    }
+}

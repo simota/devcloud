@@ -62,13 +62,14 @@ pub struct SmtpLimits {
 impl SmtpLimits {
     /// What a server gets unless `with_limits` says otherwise: a line (a
     /// command, or one line of DATA) can no longer grow memory without bound,
-    /// nor can an endless RCPT loop. Both are far above what real mail uses
-    /// (RFC 5321 caps a text line at 1000 octets and requires only 100
-    /// recipients).
+    /// nor can an endless RCPT loop, nor can a stalled client hold a session
+    /// forever. All are far above what real mail uses (RFC 5321 caps a text
+    /// line at 1000 octets, requires only 100 recipients, and suggests a
+    /// 5-minute command timeout).
     pub fn standard() -> Self {
         SmtpLimits {
             max_line_bytes: 1024 * 1024,
-            idle_timeout: None,
+            idle_timeout: Some(Duration::from_secs(300)),
             max_recipients: 1000,
         }
     }
@@ -104,7 +105,19 @@ impl SmtpServer {
                 Ok((sock, _)) => sock,
                 // Out of descriptors, or a peer that went away before the
                 // accept: wait and keep serving rather than stop the service.
-                Err(_) => {
+                Err(e) => {
+                    // Only transient errors; a broken listener still stops.
+                    let transient = matches!(
+                        e.kind(),
+                        std::io::ErrorKind::ConnectionAborted
+                            | std::io::ErrorKind::ConnectionReset
+                            | std::io::ErrorKind::Interrupted
+                            | std::io::ErrorKind::WouldBlock
+                            | std::io::ErrorKind::TimedOut
+                    ) || matches!(e.raw_os_error(), Some(12 | 23 | 24)); // ENOMEM, ENFILE, EMFILE
+                    if !transient {
+                        return Err(e);
+                    }
                     tokio::time::sleep(Duration::from_millis(100)).await;
                     continue;
                 }

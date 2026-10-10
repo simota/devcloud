@@ -66,7 +66,19 @@ pub async fn serve(
                     // Out of descriptors, or a peer gone before the accept:
                     // back off and keep serving instead of stopping (which
                     // would take every devcloud service down with it).
-                    Err(_) => {
+                    Err(e) => {
+                        // Only transient errors; a broken listener still stops.
+                        let transient = matches!(
+                            e.kind(),
+                            std::io::ErrorKind::ConnectionAborted
+                                | std::io::ErrorKind::ConnectionReset
+                                | std::io::ErrorKind::Interrupted
+                                | std::io::ErrorKind::WouldBlock
+                                | std::io::ErrorKind::TimedOut
+                        ) || matches!(e.raw_os_error(), Some(12 | 23 | 24)); // ENOMEM, ENFILE, EMFILE
+                        if !transient {
+                            break Err(e);
+                        }
                         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                         continue;
                     }
@@ -361,7 +373,14 @@ async fn proxy(
         .map(|c| {
             c.split(',')
                 .map(|t| t.trim().to_ascii_lowercase())
-                .filter(|t| t != "upgrade")
+                // Framing and routing headers are never the client's to drop:
+                // the body is relayed as sent.
+                .filter(|t| {
+                    !matches!(
+                        t.as_str(),
+                        "upgrade" | "host" | "content-length" | "transfer-encoding"
+                    )
+                })
                 .collect()
         })
         .unwrap_or_default();
