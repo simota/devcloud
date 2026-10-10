@@ -98,7 +98,7 @@ fn match_predicate(
     values: &Values,
     candidate: &Item,
 ) -> Result<bool, String> {
-    if expression.to_uppercase().starts_with("NOT ") {
+    if expression.to_ascii_uppercase().starts_with("NOT ") {
         let inner = expression[4..].trim();
         return Ok(!match_predicate(inner, names, values, candidate)?);
     }
@@ -425,7 +425,7 @@ fn split_conjunctive_predicates(expression: &str) -> Result<Vec<String>, String>
     let mut current: Vec<&str> = Vec::new();
     let mut between_needs_and = false;
     for field in fields {
-        let upper = field.to_uppercase();
+        let upper = field.to_ascii_uppercase();
         if upper == "BETWEEN" {
             between_needs_and = true;
             current.push(field);

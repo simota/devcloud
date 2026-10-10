@@ -344,7 +344,7 @@ fn process(server: &Mutex<Server>, req: &Request, auth_mode: &str) -> Outcome {
             headers: &req.headers,
             body: &req.body,
         };
-        let guard = server.lock().unwrap();
+        let guard = lock_server(server);
         if let Some(sig) = verify_sigv4(&guard, auth_mode, &signed) {
             return sig;
         }
@@ -369,8 +369,16 @@ fn process(server: &Mutex<Server>, req: &Request, auth_mode: &str) -> Outcome {
         body: &req.body,
     };
     let now = crate::time_util::now_unix();
-    let mut guard = server.lock().unwrap();
+    let mut guard = lock_server(server);
     guard.dispatch(&target, &req.body, auth_mode, Some(&signed), now)
+}
+
+/// Locks the shared server, recovering from poisoning: a panic in one request
+/// must not turn every later request into a panic too.
+fn lock_server(server: &Mutex<Server>) -> std::sync::MutexGuard<'_, Server> {
+    server
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Runs the SigV4 verifier for the introspection path, returning an error
@@ -487,4 +495,37 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         return None;
     }
     haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn poisoned_lock_still_serves_requests() {
+        let server = std::sync::Arc::new(Mutex::new(Server::new(Default::default())));
+        let poisoner = std::sync::Arc::clone(&server);
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.lock().unwrap();
+            panic!("poison the server lock");
+        })
+        .join();
+        assert!(server.is_poisoned());
+
+        let mut headers = BTreeMap::new();
+        headers.insert(
+            "x-amz-target".to_string(),
+            "DynamoDB_20120810.ListTables".to_string(),
+        );
+        let request = Request {
+            method: "POST".to_string(),
+            path: "/".to_string(),
+            query: String::new(),
+            headers,
+            body: b"{}".to_vec(),
+            host: "127.0.0.1".to_string(),
+        };
+        let outcome = process(&server, &request, "relaxed");
+        assert_eq!(outcome.status, 200);
+    }
 }

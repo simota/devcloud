@@ -263,7 +263,9 @@ struct UpdateClause {
 }
 
 fn split_update_clauses(expression: &str) -> Result<Vec<UpdateClause>, String> {
-    let upper = expression.to_uppercase();
+    // ASCII-only folding keeps byte offsets identical to `expression`, so the
+    // keyword positions found in `upper` can slice the original safely.
+    let upper = expression.to_ascii_uppercase();
     let mut starts: Vec<(String, usize)> = Vec::new();
     for keyword in ["SET", "REMOVE", "ADD", "DELETE"] {
         let mut offset = 0;
@@ -473,6 +475,21 @@ mod tests {
         .unwrap();
         assert_eq!(target["count"], json!({"N": "3"}));
         assert!(!target.contains_key("old"));
+    }
+
+    #[test]
+    fn non_ascii_names_do_not_shift_clause_offsets() {
+        // `ſ`/`ı` change byte length under Unicode uppercasing; the clause
+        // split must still slice the original expression at the right places.
+        let mut target = item(&[("x", json!({"S": "gone"})), ("ı", json!({"N": "1"}))]);
+        let mut vals = Values::new();
+        vals.insert(":é".to_string(), json!({"S": "v"}));
+        apply_update_expression(&mut target, "SET ſſ = :é REMOVE x", &names(), &vals).unwrap();
+        assert_eq!(target["ſſ"], json!({"S": "v"}));
+        assert!(!target.contains_key("x"));
+        apply_update_expression(&mut target, "SET ıı = :é REMOVE ı", &names(), &vals).unwrap();
+        assert_eq!(target["ıı"], json!({"S": "v"}));
+        assert!(!target.contains_key("ı"));
     }
 
     #[test]
