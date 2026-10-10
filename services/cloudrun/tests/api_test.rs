@@ -468,8 +468,9 @@ async fn proxies_requests_to_local_process_and_rolls_revisions() {
         .next()
         .unwrap()
         .to_string();
-    let (_, body) = raw_http(port, format!("GET / HTTP/1.1\r\nHost: {host}\r\n\r\n")).await;
-    let v: Value = serde_json::from_str(&body).unwrap();
+    let (st, body) = raw_http(port, format!("GET / HTTP/1.1\r\nHost: {host}\r\n\r\n")).await;
+    let v: Value = serde_json::from_str(&body)
+        .unwrap_or_else(|_| panic!("non-JSON reply: status={st} body={body:?}"));
     assert_eq!(v["greeting"], "v2");
     assert_eq!(v["k_revision"], rev2.as_str());
 

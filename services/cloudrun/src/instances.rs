@@ -483,9 +483,20 @@ impl Manager {
 
         let deadline = tokio::time::Instant::now() + STARTUP_TIMEOUT;
         loop {
-            let listening = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            let mut listening = tokio::net::TcpStream::connect(("127.0.0.1", port))
                 .await
                 .is_ok();
+            // The port was free when picked, but another program may have
+            // taken it before the child could: then the child fails to bind
+            // while something else answers. A local child must own the
+            // listener (Docker's proxy listens for containers, so it is
+            // exempt).
+            #[cfg(target_os = "linux")]
+            if listening && docker_name.is_none() {
+                if let Some(pgid) = pid {
+                    listening = listener_in_group(port, pgid) != Some(false);
+                }
+            }
             // Checked after the connect: a child that already exited (say it
             // lost the port to another program) must not be taken as ready
             // because something else answered.
@@ -764,6 +775,61 @@ pub fn docker_run_args(spec: &LaunchSpec, host_port: u16, name: &str) -> Vec<Str
     args
 }
 
+/// Whether a process in group `pgid` holds the TCP listener on `port`;
+/// `None` when that cannot be told (no matching socket visible).
+#[cfg(target_os = "linux")]
+fn listener_in_group(port: u16, pgid: u32) -> Option<bool> {
+    let mut inodes = HashSet::new();
+    for table in ["/proc/net/tcp", "/proc/net/tcp6"] {
+        let Ok(data) = std::fs::read_to_string(table) else {
+            continue;
+        };
+        for line in data.lines().skip(1) {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            // `0A` is LISTEN; the local address is `ADDR:PORT` in hex.
+            if fields.len() < 10 || fields[3] != "0A" {
+                continue;
+            }
+            let local = fields[1].rsplit(':').next();
+            if local.and_then(|p| u16::from_str_radix(p, 16).ok()) == Some(port) {
+                inodes.insert(format!("socket:[{}]", fields[9]));
+            }
+        }
+    }
+    if inodes.is_empty() {
+        return None;
+    }
+    for entry in std::fs::read_dir("/proc").ok()?.flatten() {
+        let name = entry.file_name();
+        let Some(pid) = name
+            .to_str()
+            .filter(|n| n.bytes().all(|b| b.is_ascii_digit()))
+        else {
+            continue;
+        };
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            continue;
+        };
+        // `pid (comm) state ppid pgrp ...`; comm may hold spaces and parens.
+        let after_comm = stat.rsplit_once(')').map_or("", |(_, rest)| rest);
+        let pgrp = after_comm.split_whitespace().nth(2);
+        if pgrp.and_then(|g| g.parse::<u32>().ok()) != Some(pgid) {
+            continue;
+        }
+        let Ok(fds) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
+            continue;
+        };
+        for fd in fds.flatten() {
+            if let Ok(target) = std::fs::read_link(fd.path()) {
+                if target.to_str().is_some_and(|t| inodes.contains(t)) {
+                    return Some(true);
+                }
+            }
+        }
+    }
+    Some(false)
+}
+
 fn free_port() -> Result<u16, String> {
     let listener = StdListener::bind("127.0.0.1:0").map_err(|e| format!("allocate port: {e}"))?;
     listener
@@ -979,6 +1045,25 @@ mod tests {
         assert!(gone, "process group survived a cancelled terminate");
     }
 
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn readiness_requires_the_child_to_own_its_listener() {
+        // Someone else listens on the port...
+        let other = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = other.local_addr().unwrap().port();
+        let mut cmd = Command::new("sleep");
+        cmd.arg("30").kill_on_drop(true).process_group(0);
+        let child = cmd.spawn().unwrap();
+        let pgid = child.id().unwrap();
+        // ...so the child's group does not own it.
+        assert_eq!(listener_in_group(port, pgid), Some(false));
+        // Our own process group does.
+        let own = unsafe { libc::getpgrp() } as u32;
+        assert_eq!(listener_in_group(port, own), Some(true));
+        drop(other);
+        drop(child);
+    }
+
     #[test]
     fn reserved_ports_are_never_handed_out_twice() {
         let m = Manager::new(None);
@@ -993,9 +1078,8 @@ mod tests {
     async fn a_reaped_instance_forgets_its_process_group() {
         let mut cmd = Command::new("sh");
         cmd.args(["-c", "exit 0"]).process_group(0);
-        let mut child = cmd.spawn().unwrap();
+        let child = cmd.spawn().unwrap();
         let pid = child.id();
-        let _ = child.wait().await;
         let mut inst = Instance {
             spec: LaunchSpec::from_service(&service()).unwrap(),
             port: 0,
@@ -1010,7 +1094,13 @@ mod tests {
                 removals: Removals::default(),
             },
         };
-        assert!(!inst.alive());
+        // `alive` itself is the reap site, as in `ensure` and `list`.
+        let mut tries = 0;
+        while inst.alive() {
+            tries += 1;
+            assert!(tries < 200, "child never exited");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         // Nothing left to signal later, by `terminate` or the drop guard.
         assert_eq!(inst.pid, None);
         assert_eq!(inst.guard.pgid, None);
