@@ -1304,15 +1304,22 @@ fn put_resumable_upload(server: &mut Server, req: &Request) -> Response {
     let Some(mut session) = server.sessions.get(&id).cloned() else {
         return json_error(404, "notFound", "upload session not found");
     };
-    if is_status_query(req.header("content-range")) {
-        let mut r = Response::empty(308);
-        if session.received_bytes > 0 {
-            r.headers.insert(
-                "Range".to_string(),
-                format!("bytes=0-{}", session.received_bytes - 1),
-            );
+    // `bytes */N` is a status query, except that once all N bytes have been
+    // received it finalizes the upload (how clients that streamed with an
+    // unknown `*` total commit).
+    let mut finalize_buffered = false;
+    if let Some(total) = status_query_total(req.header("content-range")) {
+        if !req.body.is_empty() || total.parse::<i64>() != Ok(session.received_bytes) {
+            let mut r = Response::empty(308);
+            if session.received_bytes > 0 {
+                r.headers.insert(
+                    "Range".to_string(),
+                    format!("bytes=0-{}", session.received_bytes - 1),
+                );
+            }
+            return r;
         }
-        return r;
+        finalize_buffered = true;
     }
     if let Err(r) = check_stored_preconditions(
         server,
@@ -1329,7 +1336,14 @@ fn put_resumable_upload(server: &mut Server, req: &Request) -> Response {
     // offset. `None` covers one-shot and headerless commits, where nothing was
     // persisted before `put_object` and no rollback is needed.
     let mut committed_chunk_rollback: Option<i64> = None;
-    if !req.header("content-range").trim().is_empty() {
+    if finalize_buffered {
+        if session.received_bytes > 0 {
+            payload = match server.read_session_body(&id) {
+                Ok(v) => v,
+                Err(_) => return json_error(500, "backendError", "internal error"),
+            };
+        }
+    } else if !req.header("content-range").trim().is_empty() {
         let upload_range = match parse_resumable_content_range(
             req.header("content-range"),
             payload.len() as i64,
@@ -1346,7 +1360,8 @@ fn put_resumable_upload(server: &mut Server, req: &Request) -> Response {
         }
         let prior_received_bytes = session.received_bytes;
         session.received_bytes = upload_range.end + 1;
-        let one_shot = upload_range.start == 0 && session.received_bytes == upload_range.total;
+        let one_shot =
+            upload_range.start == 0 && Some(session.received_bytes) == upload_range.total;
         if !one_shot {
             if server.append_session_body(&id, &payload).is_err()
                 || server.save_session(&id, &session).is_err()
@@ -1355,7 +1370,11 @@ fn put_resumable_upload(server: &mut Server, req: &Request) -> Response {
             }
             committed_chunk_rollback = Some(prior_received_bytes);
         }
-        if session.received_bytes < upload_range.total {
+        // An unknown (`*`) total means more chunks follow.
+        if upload_range
+            .total
+            .is_none_or(|total| session.received_bytes < total)
+        {
             server.sessions.insert(id, session);
             let mut r = Response::empty(308);
             r.headers
@@ -1621,11 +1640,13 @@ fn check_stored_preconditions(
 struct UploadRange {
     start: i64,
     end: i64,
-    total: i64,
+    /// `None` for an unknown (`*`) total size.
+    total: Option<i64>,
 }
 
-fn is_status_query(content_range: &str) -> bool {
-    content_range.trim().starts_with("bytes */")
+/// The `N` of a `bytes */N` status query, if `content_range` is one.
+fn status_query_total(content_range: &str) -> Option<&str> {
+    content_range.trim().strip_prefix("bytes */")
 }
 
 fn parse_resumable_content_range(header: &str, payload_size: i64) -> Result<UploadRange, String> {
@@ -1635,9 +1656,6 @@ fn parse_resumable_content_range(header: &str, payload_size: i64) -> Result<Uplo
     let Some((span, total_value)) = rest.split_once('/') else {
         return Err("invalid Content-Range".to_string());
     };
-    if total_value == "*" {
-        return Err("invalid Content-Range".to_string());
-    }
     let Some((left, right)) = span.split_once('-') else {
         return Err("invalid Content-Range".to_string());
     };
@@ -1647,10 +1665,15 @@ fn parse_resumable_content_range(header: &str, payload_size: i64) -> Result<Uplo
     let end = right
         .parse::<i64>()
         .map_err(|_| "invalid Content-Range".to_string())?;
-    let total = total_value
-        .parse::<i64>()
-        .map_err(|_| "invalid Content-Range".to_string())?;
-    if start < 0 || end < start || total <= 0 || end >= total {
+    let total = match total_value {
+        "*" => None,
+        value => Some(
+            value
+                .parse::<i64>()
+                .map_err(|_| "invalid Content-Range".to_string())?,
+        ),
+    };
+    if start < 0 || end < start || total.is_some_and(|total| total <= 0 || end >= total) {
         return Err("invalid Content-Range".to_string());
     }
     if payload_size != end - start + 1 {

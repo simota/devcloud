@@ -1552,6 +1552,89 @@ fn start_resumable(s: &mut Server, name: &str, upload_content_type: &str) -> Str
     session_target(&init)
 }
 
+/// Chunks with an unknown (`*`) total are accepted; once every byte is in, a
+/// `bytes */N` request finalizes the upload instead of reporting status.
+#[test]
+fn resumable_upload_accepts_unknown_total_and_finalizes_on_status_query() {
+    let root = temp_root("resumable-unknown-total");
+    let mut s = Server::new(
+        Config {
+            upload_session_path: root.join("sessions").to_string_lossy().to_string(),
+            ..Default::default()
+        },
+        FileBucketStore::new(root.join("buckets")),
+    );
+    create_bucket(&mut s, "demo-bucket");
+    let target = start_resumable(&mut s, "docs/streamed.txt", "text/plain");
+
+    let chunk = perform_h(
+        &mut s,
+        "PUT",
+        &target,
+        "hello",
+        &[("Content-Range", "bytes 0-4/*")],
+    );
+    assert_eq!(chunk.status, 308, "{}", body_str(&chunk));
+    assert_eq!(header(&chunk, "Range"), "bytes=0-4");
+
+    let chunk = perform_h(
+        &mut s,
+        "PUT",
+        &target,
+        " world",
+        &[("Content-Range", "bytes 5-10/*")],
+    );
+    assert_eq!(chunk.status, 308, "{}", body_str(&chunk));
+    assert_eq!(header(&chunk, "Range"), "bytes=0-10");
+
+    // A status query for a larger total still only reports progress.
+    let status = perform_h(
+        &mut s,
+        "PUT",
+        &target,
+        "",
+        &[("Content-Range", "bytes */12")],
+    );
+    assert_eq!(status.status, 308, "{}", body_str(&status));
+
+    let commit = perform_h(
+        &mut s,
+        "PUT",
+        &target,
+        "",
+        &[("Content-Range", "bytes */11")],
+    );
+    assert_eq!(commit.status, 200, "{}", body_str(&commit));
+    assert_eq!(json_body(&commit)["size"], "11");
+
+    let download = perform(
+        &mut s,
+        "GET",
+        "/download/storage/v1/b/demo-bucket/o/docs%2Fstreamed.txt?alt=media",
+        "",
+    );
+    assert_eq!(download.status, 200, "{}", body_str(&download));
+    assert_eq!(download.body, b"hello world");
+}
+
+/// `bytes */0` on a fresh session commits an empty object.
+#[test]
+fn resumable_upload_finalizes_empty_object_with_status_query() {
+    let mut s = server();
+    create_bucket(&mut s, "demo-bucket");
+    let target = start_resumable(&mut s, "docs/empty.txt", "text/plain");
+
+    let commit = perform_h(
+        &mut s,
+        "PUT",
+        &target,
+        "",
+        &[("Content-Range", "bytes */0")],
+    );
+    assert_eq!(commit.status, 200, "{}", body_str(&commit));
+    assert_eq!(json_body(&commit)["size"], "0");
+}
+
 /// The content type declared at session start wins over the final chunk's
 /// Content-Type; the request's is only a fallback.
 #[test]
