@@ -199,7 +199,8 @@ pub async fn process(server: &Arc<Server>, req: &Request) -> Reply {
     match (req.method.as_str(), seg.as_slice()) {
         ("GET", ["_introspect", "invocations"]) => return server.introspect_invocations(),
         ("GET", ["_devcloud", "functions", name, "code.zip"]) => {
-            return server.code_package(name, query.get("CodeSha256").map(String::as_str))
+            let (name, sha) = (name.to_string(), query.get("CodeSha256").cloned());
+            return blocking(server, move |s| s.code_package(&name, sha.as_deref())).await;
         }
         _ => {}
     }
@@ -222,7 +223,10 @@ pub async fn process(server: &Arc<Server>, req: &Request) -> Reply {
     match seg.as_slice() {
         ["2015-03-31", "functions"] | ["2015-03-31", "functions", ""] => match m {
             "GET" => server.list_functions(&query),
-            "POST" => server.create_function(&req.body),
+            "POST" => {
+                let body = req.body.clone();
+                blocking(server, move |s| s.create_function(&body)).await
+            }
             _ => method_not_allowed(),
         },
         ["2015-03-31", "functions", id] => match m {
@@ -236,7 +240,10 @@ pub async fn process(server: &Arc<Server>, req: &Request) -> Reply {
             _ => method_not_allowed(),
         },
         ["2015-03-31", "functions", id, "code"] => match m {
-            "PUT" => server.update_function_code(id, &req.body),
+            "PUT" => {
+                let (id, body) = (id.to_string(), req.body.clone());
+                blocking(server, move |s| s.update_function_code(&id, &body)).await
+            }
             _ => method_not_allowed(),
         },
         ["2015-03-31", "functions", id, "invocations"] => match m {
@@ -283,6 +290,19 @@ pub async fn process(server: &Arc<Server>, req: &Request) -> Reply {
             &format!("devcloud lambda does not implement {m} {}", req.raw_path),
         ),
     }
+}
+
+/// Runs a handler that unzips, extracts or reads whole packages (and holds
+/// the function's lock meanwhile) off the async workers, so it cannot stall
+/// other connections or running invocations.
+async fn blocking(
+    server: &Arc<Server>,
+    handler: impl FnOnce(&Server) -> Reply + Send + 'static,
+) -> Reply {
+    let server = Arc::clone(server);
+    tokio::task::spawn_blocking(move || handler(&server))
+        .await
+        .unwrap_or_else(|_| Reply::error(500, "ServiceException", "internal error"))
 }
 
 /// SigV4 verification per auth mode. Kept synchronous so the borrowed header
