@@ -495,6 +495,8 @@ enum Wait {
     },
     TimedOut {
         log: Vec<u8>,
+        /// Peak memory, read before the process group was killed.
+        max_memory_mb: Option<u64>,
     },
 }
 
@@ -525,23 +527,27 @@ impl Environment {
             Woke::Event(_) => match tokio::time::timeout_at(deadline, self.child.wait()).await {
                 Ok(status) => status,
                 Err(_) => {
+                    let max_memory_mb = self.child.id().and_then(peak_rss_mb);
                     self.kill_group();
                     return Wait::TimedOut {
                         log: self.drain().await,
+                        max_memory_mb,
                     };
                 }
             },
             Woke::Exit(status) => status,
             Woke::Deadline => {
+                let max_memory_mb = self.child.id().and_then(peak_rss_mb);
                 self.kill_group();
                 return Wait::TimedOut {
                     log: self.drain().await,
+                    max_memory_mb,
                 };
             }
         };
         let crashed = match status {
             Ok(s) if s.success() => None,
-            Ok(s) => Some(s.to_string()),
+            Ok(s) => Some(exit_status_text(s)),
             Err(e) => Some(e.to_string()),
         };
         // Descendants still holding the log pipes go down with the group.
@@ -710,7 +716,7 @@ pub async fn run(
         Wait::Marker { tag, log } => {
             reusable = tag == "done";
             max_memory_mb = pid.and_then(peak_rss_mb);
-            (read_result(&result_path), log, false)
+            (read_result(&result_path, &inv.request_id), log, false)
         }
         Wait::Exited {
             crashed: Some(status),
@@ -728,8 +734,16 @@ pub async fn run(
         ),
         // A clean exit can still have recorded the result (a Node callback
         // whose event loop had already drained).
-        Wait::Exited { crashed: None, log } => (read_result(&result_path), log, false),
-        Wait::TimedOut { log } => (timed_out_error(inv), log, true),
+        Wait::Exited { crashed: None, log } => {
+            (read_result(&result_path, &inv.request_id), log, false)
+        }
+        Wait::TimedOut {
+            log,
+            max_memory_mb: peak,
+        } => {
+            max_memory_mb = peak;
+            (timed_out_error(inv), log, true)
+        }
     };
     let _ = std::fs::remove_file(&result_path);
 
@@ -756,7 +770,7 @@ pub async fn run(
 /// The invocation's result when the environment never became ready.
 fn failed_init(inv: &Invocation, waited: Wait, init: Duration) -> Completed {
     let (outcome, log, timed_out) = match waited {
-        Wait::TimedOut { log } => (timed_out_error(inv), log, true),
+        Wait::TimedOut { log, .. } => (timed_out_error(inv), log, true),
         Wait::Exited { crashed, log } => (
             Outcome::FunctionError(error_doc(
                 &format!(
@@ -1336,14 +1350,20 @@ fn attach_control_pipe(cmd: &mut tokio::process::Command) -> std::io::Result<Con
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     let mut fds = [0 as libc::c_int; 2];
     // SAFETY: `fds` is a valid two-element buffer; on success both
-    // descriptors are new and owned here. FD_CLOEXEC (set right after; macOS
-    // has no pipe2) keeps them out of other children; the dup2 below gives
-    // only this child its copy.
-    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+    // descriptors are new and owned here. FD_CLOEXEC keeps them out of other
+    // children; the dup2 below gives only this child its copy. Linux sets it
+    // atomically, so a concurrent spawn on another thread cannot inherit the
+    // pipe; macOS has no pipe2 and sets it right after.
+    #[cfg(target_os = "linux")]
+    let created = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
+    #[cfg(not(target_os = "linux"))]
+    let created = unsafe { libc::pipe(fds.as_mut_ptr()) };
+    if created != 0 {
         return Err(std::io::Error::last_os_error());
     }
     // SAFETY: both descriptors were just created and are owned by nobody else.
     let (read, write) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+    #[cfg(not(target_os = "linux"))]
     for fd in [&read, &write] {
         // SAFETY: plain fcntl on a descriptor we own.
         unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) };
@@ -1554,12 +1574,44 @@ fn reserved_env(inv: &Invocation, env_id: u64) -> Vec<(String, String)> {
     env
 }
 
-fn read_result(path: &Path) -> Outcome {
+/// An exit status the way the Lambda runtime reports it (Go's
+/// `ProcessState.String`): `exit status 1`, `signal: killed`.
+fn exit_status_text(status: std::process::ExitStatus) -> String {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(sig) = status.signal() {
+            let name = match sig {
+                libc::SIGHUP => "hangup",
+                libc::SIGINT => "interrupt",
+                libc::SIGQUIT => "quit",
+                libc::SIGILL => "illegal instruction",
+                libc::SIGABRT => "aborted",
+                libc::SIGBUS => "bus error",
+                libc::SIGFPE => "floating point exception",
+                libc::SIGKILL => "killed",
+                libc::SIGSEGV => "segmentation fault",
+                libc::SIGPIPE => "broken pipe",
+                libc::SIGTERM => "terminated",
+                _ => return format!("signal: {sig}"),
+            };
+            return format!("signal: {name}");
+        }
+    }
+    match status.code() {
+        Some(code) => format!("exit status {code}"),
+        None => status.to_string(),
+    }
+}
+
+fn read_result(path: &Path, request_id: &str) -> Outcome {
     let data = match std::fs::read(path) {
         Ok(d) => d,
         Err(_) => {
             return Outcome::FunctionError(error_doc(
-                "RequestId: runtime exited without providing a reason",
+                &format!(
+                    "RequestId: {request_id} Error: Runtime exited without providing a reason"
+                ),
                 "Runtime.ExitError",
             ))
         }
@@ -1901,11 +1953,15 @@ mod tests {
 
     #[test]
     fn missing_result_is_exit_error() {
-        let out = read_result(Path::new("/nonexistent/devcloud/result.json"));
+        let out = read_result(Path::new("/nonexistent/devcloud/result.json"), "req-1");
         match out {
             Outcome::FunctionError(body) => {
                 let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
                 assert_eq!(v["errorType"], "Runtime.ExitError");
+                assert_eq!(
+                    v["errorMessage"],
+                    "RequestId: req-1 Error: Runtime exited without providing a reason"
+                );
             }
             other => panic!("unexpected {other:?}"),
         }

@@ -6,7 +6,15 @@
 # "<marker> <tag>" line on stdout tells devcloud where the invocation ends
 # ("ready" after init, "done" after an invocation, "done reset" when the
 # environment must not be reused).
-import importlib, json, os, sys, time, traceback
+import decimal, importlib, json, os, sys, time, traceback
+
+class _DecimalEncoder(json.JSONEncoder):
+    # Like the Lambda Python runtime: Decimal (what boto3's DynamoDB
+    # deserializer yields) marshals as a JSON number.
+    def default(self, o):
+        if isinstance(o, decimal.Decimal):
+            return int(o) if o == o.to_integral_value() else float(o)
+        return super().default(o)
 
 def _devcloud_main():
     marker_prefix = os.environ.pop("_DEVCLOUD_MARKER")
@@ -95,7 +103,7 @@ def _devcloud_main():
             marker("done")
             continue
         try:
-            body = json.dumps(result)
+            body = json.dumps(result, cls=_DecimalEncoder)
         except Exception as e:
             failure("Unable to marshal response: %s" % e, "Runtime.MarshalError", [])
             marker("done")
@@ -103,14 +111,26 @@ def _devcloud_main():
         write({"result": body})
         marker("done")
 
+_exit_code = 0
 try:
     _devcloud_main()
+except SystemExit as e:
+    # sys.exit() from a handler ends the runtime with that status, as on
+    # Lambda ("Runtime exited with error: exit status 1").
+    if e.code is None:
+        _exit_code = 0
+    elif isinstance(e.code, int):
+        _exit_code = e.code & 0xFF
+    else:
+        print(e.code)
+        _exit_code = 1
 except BaseException:
     traceback.print_exc()
+    _exit_code = 1
 finally:
     # End now: a normal interpreter exit would wait for non-daemon threads the
     # handler left behind.
     sys.stdout.flush()
     sys.__stdout__.flush()
     sys.__stderr__.flush()
-    os._exit(0)
+    os._exit(_exit_code)

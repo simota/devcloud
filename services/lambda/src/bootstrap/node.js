@@ -166,15 +166,43 @@ const loadHandler = async () => {
     return;
   }
   const walk = (obj) => fnPath.reduce((o, key) => (o == null ? undefined : o[key]), obj);
-  fn = walk(mod) !== undefined ? walk(mod) : walk(mod.default);
+  fn = walk(mod) !== undefined || mod == null ? walk(mod) : walk(mod.default);
   if (typeof fn !== 'function') {
     initError = { errorType: 'Runtime.HandlerNotFound', errorMessage: `${modName}.${fnName} is undefined or not exported`, trace: [] };
   }
 };
 
+// The invocation in flight, so an error that escapes the handler's own
+// promise chain still fails it, as in the AWS Node runtime.
+let current = null;
+const fatal = (errorType) => (e) => {
+  console.error(`ERROR\t${errorType === 'Runtime.UnhandledPromiseRejection' ? 'Unhandled Promise Rejection' : 'Uncaught Exception'}\t${e && e.stack ? e.stack : e}`);
+  if (current) {
+    const body = errorType === 'Runtime.UnhandledPromiseRejection'
+      ? { errorType, errorMessage: e && e.name ? `${e.name}: ${e.message}` : String(e), trace: e && e.stack ? String(e.stack).split('\n') : [] }
+      : errorBody(e);
+    try { fs.writeFileSync(current.resultPath, JSON.stringify({ error: body })); } catch {}
+    current = null;
+    // The environment is in an unknown state: it is discarded.
+    marker('done reset', () => process.exit(1));
+    return;
+  }
+  // Outside an invocation (init, or a callback-free wait): the runtime
+  // exits, as Node itself would.
+  process.stdout.write('', () => process.exit(1));
+};
+process.on('unhandledRejection', fatal('Runtime.UnhandledPromiseRejection'));
+process.on('uncaughtException', fatal());
+
 const invoke = async (req) => {
-  const write = (obj) => fs.writeFileSync(req.resultPath, JSON.stringify(obj));
-  const finish = (obj) => { write(obj); marker('done', next); };
+  current = req;
+  const write = (obj) => { if (current === req) fs.writeFileSync(req.resultPath, JSON.stringify(obj)); };
+  const finish = (obj) => {
+    if (current !== req) return;
+    write(obj);
+    current = null;
+    marker('done', next);
+  };
   if (initError) {
     // Like Lambda: a failed init fails the invocation and the environment is
     // discarded.
@@ -245,7 +273,7 @@ const invoke = async (req) => {
   // results, and handlers that set the flag to false finish immediately.
   if (settledByCallback && context.callbackWaitsForEmptyEventLoop) {
     write({ result: body });
-    process.once('beforeExit', () => marker('done', next));
+    process.once('beforeExit', () => { if (current === req) { current = null; marker('done', next); } });
     return;
   }
   finish({ result: body });

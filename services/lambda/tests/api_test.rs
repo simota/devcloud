@@ -2900,7 +2900,10 @@ async fn crash_after_success_callback_is_a_function_error() {
         "{}",
         String::from_utf8_lossy(&r.body)
     );
-    assert_eq!(r.json()["errorType"], "Runtime.ExitError");
+    // As in the AWS Node runtime, the uncaught exception fails the
+    // invocation with its own error, not as an anonymous runtime exit.
+    assert_eq!(r.json()["errorType"], "Error");
+    assert_eq!(r.json()["errorMessage"], "late crash");
 }
 
 #[tokio::test]
@@ -3373,4 +3376,120 @@ async fn environment_variable_names_follow_the_lambda_pattern() {
     )
     .await;
     assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+}
+
+// ── runtime bootstrap fidelity ──────────────────────────────────────────────
+
+#[tokio::test]
+async fn python_sys_exit_reports_its_exit_status() {
+    if !has("python3") {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let e = env("pyexit");
+    let (r, _) = deploy_and_invoke(
+        &e.server,
+        "exit-fn",
+        "python3.12",
+        "app.handler",
+        (
+            "app.py",
+            b"import sys\ndef handler(event, context):\n    sys.exit(3)\n",
+        ),
+    )
+    .await;
+    assert_eq!(r.header("X-Amz-Function-Error"), Some("Unhandled"));
+    let doc = r.json();
+    assert_eq!(doc["errorType"], "Runtime.ExitError");
+    let msg = doc["errorMessage"].as_str().unwrap();
+    assert!(msg.starts_with("RequestId: "), "{msg}");
+    assert!(
+        msg.ends_with("Error: Runtime exited with error: exit status 3"),
+        "{msg}"
+    );
+}
+
+#[tokio::test]
+async fn python_decimal_results_marshal_as_numbers() {
+    if !has("python3") {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let e = env("pydecimal");
+    let (r, _) = deploy_and_invoke(
+        &e.server,
+        "decimal-fn",
+        "python3.12",
+        "app.handler",
+        (
+            "app.py",
+            b"from decimal import Decimal\ndef handler(event, context):\n    return {'count': Decimal('3'), 'price': Decimal('1.5')}\n",
+        ),
+    )
+    .await;
+    assert_eq!(
+        r.header("X-Amz-Function-Error"),
+        None,
+        "{}",
+        String::from_utf8_lossy(&r.body)
+    );
+    assert_eq!(r.json(), json!({ "count": 3, "price": 1.5 }));
+}
+
+#[tokio::test]
+async fn node_unhandled_rejection_fails_the_invocation_and_recovers() {
+    if !has("node") {
+        eprintln!("skipping: node not available");
+        return;
+    }
+    let e = env("noderej");
+    let (r, _) = deploy_and_invoke(
+        &e.server,
+        "reject-fn",
+        "nodejs20.x",
+        "index.handler",
+        (
+            "index.js",
+            b"exports.handler = async (event) => { if (!event.ok) { Promise.reject(new Error('dangling')); await new Promise((r) => setTimeout(r, 200)); } return 'fine'; };\n",
+        ),
+    )
+    .await;
+    assert_eq!(r.header("X-Amz-Function-Error"), Some("Unhandled"));
+    assert_eq!(r.json()["errorType"], "Runtime.UnhandledPromiseRejection");
+    assert_eq!(r.json()["errorMessage"], "Error: dangling");
+    // The broken environment is replaced; the next invocation succeeds.
+    let ok = call(
+        &e.server,
+        "POST",
+        "/2015-03-31/functions/reject-fn/invocations",
+        &[],
+        br#"{"ok":true}"#,
+    )
+    .await;
+    assert_eq!(
+        ok.header("X-Amz-Function-Error"),
+        None,
+        "{}",
+        String::from_utf8_lossy(&ok.body)
+    );
+    assert_eq!(ok.json(), json!("fine"));
+}
+
+#[tokio::test]
+async fn node_null_module_exports_is_handler_not_found() {
+    if !has("node") {
+        eprintln!("skipping: node not available");
+        return;
+    }
+    let e = env("nodenull");
+    let (r, _) = deploy_and_invoke(
+        &e.server,
+        "null-fn",
+        "nodejs20.x",
+        "index.handler",
+        ("index.js", b"module.exports = null;\n"),
+    )
+    .await;
+    assert_eq!(r.header("X-Amz-Function-Error"), Some("Unhandled"));
+    assert_eq!(r.json()["errorType"], "Runtime.HandlerNotFound");
 }
