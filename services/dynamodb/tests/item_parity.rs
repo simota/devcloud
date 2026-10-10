@@ -194,6 +194,36 @@ fn get_full_projection_and_missing() {
 }
 
 #[test]
+fn unevaluable_condition_is_a_validation_error() {
+    let dir = tempdir();
+    let mut s = server(&dir);
+    create_t(&mut s);
+    let key = item(&[("pk", json!({"S": "a"})), ("sk", json!({"N": "1"}))]);
+    s.put_item(&put_req(key.clone())).expect("seed");
+
+    // A missing :placeholder and an unsupported predicate cannot be
+    // evaluated: that is a ValidationException, not a failed condition.
+    for condition in ["pk = :missing", "pk ~~ nonsense"] {
+        let err = s
+            .put_item(&PutItemRequest {
+                condition_expression: condition.to_string(),
+                ..put_req(key.clone())
+            })
+            .expect_err(condition);
+        assert_eq!(err.name, "ValidationException", "put {condition}");
+        let err = s
+            .delete_item(&DeleteItemRequest {
+                table_name: "T".to_string(),
+                key: key.clone(),
+                condition_expression: condition.to_string(),
+                ..Default::default()
+            })
+            .expect_err(condition);
+        assert_eq!(err.name, "ValidationException", "delete {condition}");
+    }
+}
+
+#[test]
 fn delete_condition_failure_and_all_old() {
     let dir = tempdir();
     let mut s = server(&dir);

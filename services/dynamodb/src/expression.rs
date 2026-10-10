@@ -18,25 +18,44 @@ use crate::model::Item;
 type Names = BTreeMap<String, String>;
 type Values = BTreeMap<String, Value>;
 
+/// Why a ConditionExpression did not pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConditionError {
+    /// The expression evaluated to false (ConditionalCheckFailedException).
+    Failed,
+    /// The expression could not be evaluated: a parse error, an unsupported
+    /// predicate, or a missing placeholder (ValidationException).
+    Invalid(String),
+}
+
+impl std::fmt::Display for ConditionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ConditionError::Failed => f.write_str("condition check failed"),
+            ConditionError::Invalid(message) => f.write_str(message),
+        }
+    }
+}
+
 /// Evaluates a ConditionExpression against the current item, mirroring
-/// `checkCondition`. An empty expression always passes; a non-match yields the
-/// legacy "condition check failed" error.
+/// `checkCondition`. An empty expression always passes; a non-match yields
+/// [`ConditionError::Failed`], an evaluation error [`ConditionError::Invalid`].
 pub fn check_condition(
     expression: &str,
     names: &Names,
     values: &Values,
     existing: Option<&Item>,
-) -> Result<(), String> {
+) -> Result<(), ConditionError> {
     let expression = expression.trim();
     if expression.is_empty() {
         return Ok(());
     }
     let empty = Item::new();
     let candidate = existing.unwrap_or(&empty);
-    if match_conjunctive_expression(expression, names, values, candidate)? {
-        Ok(())
-    } else {
-        Err("condition check failed".to_string())
+    match match_conjunctive_expression(expression, names, values, candidate) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(ConditionError::Failed),
+        Err(message) => Err(ConditionError::Invalid(message)),
     }
 }
 
@@ -623,7 +642,10 @@ mod tests {
     fn missing_value_placeholder_errors() {
         let it = item(&[("n", json!({"N": "5"}))]);
         let err = check_condition("n < :missing", &names(), &Values::new(), Some(&it)).unwrap_err();
-        assert_eq!(err, "missing expression attribute value :missing");
+        assert_eq!(
+            err,
+            ConditionError::Invalid("missing expression attribute value :missing".to_string())
+        );
     }
 
     #[test]

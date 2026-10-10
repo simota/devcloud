@@ -305,6 +305,27 @@ fn transact_write_condition_failure_is_cancelled() {
 }
 
 #[test]
+fn transact_write_unevaluable_condition_is_a_validation_error() {
+    let dir = tempdir();
+    let mut s = seeded(&dir);
+    let err = s
+        .transact_write_items(&TransactWriteItemsRequest {
+            transact_items: vec![TransactWriteItem {
+                condition_check: Some(TransactConditionCheck {
+                    table_name: "T".to_string(),
+                    key: item(&[("pk", json!({"S": "a"}))]),
+                    condition_expression: "v = :missing".to_string(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+        })
+        .expect_err("invalid condition");
+    assert_eq!(err.name, "ValidationException");
+    assert_eq!(err.message, "missing expression attribute value :missing");
+}
+
+#[test]
 fn transact_write_duplicate_item_operations_rejected() {
     let dir = tempdir();
     let mut s = seeded(&dir);

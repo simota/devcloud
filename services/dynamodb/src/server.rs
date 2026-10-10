@@ -22,6 +22,7 @@ use crate::attribute::{
 use crate::errors::ApiError;
 use crate::expression::{
     check_condition, key_condition_has_equality_on, match_filter, match_key_condition,
+    ConditionError,
 };
 use crate::model::{
     AttributeDefinition, BackupDescription, BackupDetails, BackupSummary, BillingModeSummary,
@@ -641,9 +642,7 @@ impl Server {
             &request.expression_attribute_values,
             old_item.as_ref(),
         )
-        .map_err(|msg| {
-            ApiError::condition_check_failed(msg, &condition_failure_return, old_item.as_ref())
-        })?;
+        .map_err(|err| condition_error(err, &condition_failure_return, old_item.as_ref()))?;
 
         let existed = old_item.is_some();
         let stream_len = self.tables[&request.table_name].stream_records.len();
@@ -761,9 +760,7 @@ impl Server {
             &request.expression_attribute_values,
             old_item.as_ref(),
         )
-        .map_err(|msg| {
-            ApiError::condition_check_failed(msg, &condition_failure_return, old_item.as_ref())
-        })?;
+        .map_err(|err| condition_error(err, &condition_failure_return, old_item.as_ref()))?;
 
         let stream_len = self.tables[&request.table_name].stream_records.len();
         let state = self.tables.get_mut(&request.table_name).unwrap();
@@ -844,9 +841,7 @@ impl Server {
             &request.expression_attribute_values,
             old_item.as_ref(),
         )
-        .map_err(|msg| {
-            ApiError::condition_check_failed(msg, &condition_failure_return, old_item.as_ref())
-        })?;
+        .map_err(|err| condition_error(err, &condition_failure_return, old_item.as_ref()))?;
 
         crate::update_expression::apply_update_expression(
             &mut updated,
@@ -1359,7 +1354,7 @@ impl Server {
             &request.expression_attribute_values,
             old_item,
         )
-        .map_err(|_| transaction_cancelled())?;
+        .map_err(transact_condition_error)?;
         self.validate_item_size(&request.item)
             .map_err(ApiError::validation)?;
         Ok(PlannedWrite {
@@ -1389,7 +1384,7 @@ impl Server {
             &request.expression_attribute_values,
             old_item.as_ref(),
         )
-        .map_err(|_| transaction_cancelled())?;
+        .map_err(transact_condition_error)?;
         crate::update_expression::apply_update_expression(
             &mut updated,
             &request.update_expression,
@@ -1425,7 +1420,7 @@ impl Server {
             &request.expression_attribute_values,
             old_item,
         )
-        .map_err(|_| transaction_cancelled())?;
+        .map_err(transact_condition_error)?;
         Ok(PlannedWrite {
             table: request.table_name.clone(),
             key,
@@ -1455,7 +1450,7 @@ impl Server {
             &request.expression_attribute_values,
             old_item,
         )
-        .map_err(|_| transaction_cancelled())?;
+        .map_err(transact_condition_error)?;
         Ok(())
     }
 
@@ -2883,6 +2878,26 @@ fn lsi_descriptions(
             projection: projection_from_request(&index.projection),
         })
         .collect()
+}
+
+/// Maps a ConditionExpression outcome to the wire error: a false condition is
+/// a ConditionalCheckFailedException, an unevaluable one a ValidationException.
+fn condition_error(err: ConditionError, return_values: &str, old_item: Option<&Item>) -> ApiError {
+    match err {
+        ConditionError::Failed => {
+            ApiError::condition_check_failed(err.to_string(), return_values, old_item)
+        }
+        ConditionError::Invalid(message) => ApiError::validation(message),
+    }
+}
+
+/// Like [`condition_error`] for a transaction item: a false condition cancels
+/// the transaction.
+fn transact_condition_error(err: ConditionError) -> ApiError {
+    match err {
+        ConditionError::Failed => transaction_cancelled(),
+        ConditionError::Invalid(message) => ApiError::validation(message),
+    }
 }
 
 /// The partition (HASH) key attribute of the table or the named index.
