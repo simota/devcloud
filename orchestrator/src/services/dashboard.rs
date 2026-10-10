@@ -56,6 +56,8 @@ fn build_config(cfg: &AppConfig) -> Config {
         sqs_base: http_ep(cfg.server.sqs_port),
         sqs_region: cfg.services.sqs.region.clone(),
         sqs_auth_mode: cfg.auth.sqs.mode.clone(),
+        sqs_access_key_id: cfg.auth.sqs.access_key_id.clone(),
+        sqs_secret_access_key: cfg.auth.sqs.secret_access_key.clone(),
         sqs_storage_path: join(s, "sqs"),
 
         mail_base: http_ep(cfg.server.mail_http_port),

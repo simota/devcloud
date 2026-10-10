@@ -264,3 +264,50 @@ async fn cloudrun_revisions_view_follows_every_page() {
     assert_eq!(v["revisions"].as_array().unwrap().len(), 101);
     let _ = std::fs::remove_dir_all(dir);
 }
+
+async fn strict_sqs(dir: &std::path::Path) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let server = Arc::new(std::sync::Mutex::new(devcloud_sqs::server::Server::new(
+        devcloud_sqs::server::Config {
+            addr: addr.clone(),
+            region: "us-east-1".into(),
+            account_id: "000000000000".into(),
+            auth_mode: "strict".into(),
+            access_key_id: "dev".into(),
+            secret_access_key: "devsecret".into(),
+            storage_path: dir.to_string_lossy().into_owned(),
+            ..Default::default()
+        },
+    )));
+    tokio::spawn(devcloud_sqs::http::serve(
+        listener,
+        server,
+        std::future::pending(),
+    ));
+    format!("http://{addr}")
+}
+
+#[tokio::test]
+async fn sqs_forwarding_is_signed_for_strict_mode() {
+    let dir = temp_dir("sqs");
+    let base = strict_sqs(&dir).await;
+    let cfg = Config {
+        sqs_base: base,
+        sqs_region: "us-east-1".into(),
+        sqs_auth_mode: "strict".into(),
+        sqs_access_key_id: "dev".into(),
+        sqs_secret_access_key: "devsecret".into(),
+        ..Config::default()
+    };
+    // Introspection (GET) and the provider protocol (POST) are both signed.
+    let resp = route(&cfg, &req("GET", "/api/sqs/queues", &[], b"")).await;
+    assert_eq!(resp.status, 200, "{}", String::from_utf8_lossy(&resp.body));
+    let unsigned = Config {
+        sqs_auth_mode: "relaxed".into(),
+        ..cfg.clone()
+    };
+    let resp = route(&unsigned, &req("GET", "/api/sqs/queues", &[], b"")).await;
+    assert_eq!(resp.status, 403, "{}", String::from_utf8_lossy(&resp.body));
+    let _ = std::fs::remove_dir_all(dir);
+}

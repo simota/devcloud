@@ -35,6 +35,9 @@ pub struct Config {
     pub sqs_base: String,
     pub sqs_region: String,
     pub sqs_auth_mode: String,
+    /// Credentials the dashboard signs SQS requests with in non-relaxed modes.
+    pub sqs_access_key_id: String,
+    pub sqs_secret_access_key: String,
     pub sqs_storage_path: String,
 
     // Remaining services carry only display metadata in the foundation
@@ -102,6 +105,8 @@ impl Config {
             sqs_base: env("DEVCLOUD_DASHBOARD_SQS_BASE"),
             sqs_region: env_or("DEVCLOUD_DASHBOARD_SQS_REGION", "us-east-1"),
             sqs_auth_mode: env_or("DEVCLOUD_DASHBOARD_SQS_AUTH_MODE", "relaxed"),
+            sqs_access_key_id: env("DEVCLOUD_DASHBOARD_SQS_ACCESS_KEY"),
+            sqs_secret_access_key: env("DEVCLOUD_DASHBOARD_SQS_SECRET_KEY"),
             sqs_storage_path: env_or("DEVCLOUD_DASHBOARD_SQS_STORAGE", ".devcloud/data/sqs"),
 
             mail_base: env("DEVCLOUD_DASHBOARD_MAIL_BASE"),

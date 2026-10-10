@@ -230,6 +230,7 @@ dependencies = [
  "devcloud-cloudrun",
  "devcloud-hostguard",
  "devcloud-lambda",
+ "devcloud-sqs",
  "futures-util",
  "hex",
  "hmac",

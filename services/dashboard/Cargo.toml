@@ -46,3 +46,4 @@ hex = "0.4"
 # to prove the dashboard's signed / bearer forwarding is accepted.
 devcloud-lambda = { path = "../lambda" }
 devcloud-cloudrun = { path = "../cloudrun" }
+devcloud-sqs = { path = "../sqs" }

@@ -313,10 +313,43 @@ async fn introspect(config: &Config, path: &str) -> Result<ForwardResponse, Forw
         base: &config.sqs_base,
         method: "GET",
         path,
-        headers: Vec::new(),
+        headers: auth_headers(config, "GET", path, b""),
         body: Vec::new(),
     })
     .await
+}
+
+/// SigV4 headers for an SQS request when the service runs in a non-relaxed
+/// auth mode (strict SQS verifies every request, introspection included).
+fn auth_headers(config: &Config, method: &str, path: &str, body: &[u8]) -> Vec<(String, String)> {
+    let mode = config.sqs_auth_mode.as_str();
+    if mode.is_empty() || mode.eq_ignore_ascii_case("relaxed") {
+        return Vec::new();
+    }
+    let host = config
+        .sqs_base
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(&config.sqs_base)
+        .trim_end_matches('/');
+    let region = if config.sqs_region.is_empty() {
+        "us-east-1"
+    } else {
+        &config.sqs_region
+    };
+    crate::sigv4::sign(
+        method,
+        path,
+        host,
+        body,
+        &crate::sigv4::Credentials {
+            access_key_id: &config.sqs_access_key_id,
+            secret_access_key: &config.sqs_secret_access_key,
+            region,
+            service: "sqs",
+        },
+        &crate::sigv4::amz_date_now(),
+    )
 }
 
 /// Forwards a dashboard mutation request to the SQS provider protocol, mirroring
@@ -358,17 +391,19 @@ async fn forward_provider_json(
     operation: &str,
     input: Vec<u8>,
 ) -> Result<ForwardResponse, ForwardError> {
+    let mut headers = vec![
+        (
+            "Content-Type".to_string(),
+            "application/x-amz-json-1.0".to_string(),
+        ),
+        ("X-Amz-Target".to_string(), format!("AmazonSQS.{operation}")),
+    ];
+    headers.extend(auth_headers(config, "POST", "/", &input));
     forward(ForwardRequest {
         base: &config.sqs_base,
         method: "POST",
         path: "/",
-        headers: vec![
-            (
-                "Content-Type".to_string(),
-                "application/x-amz-json-1.0".to_string(),
-            ),
-            ("X-Amz-Target".to_string(), format!("AmazonSQS.{operation}")),
-        ],
+        headers,
         body: input,
     })
     .await
