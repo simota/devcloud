@@ -349,6 +349,8 @@ Legend:
 | IAM/ACLs, retention, lifecycle | No | Not implemented. |
 | Pub/Sub notifications, signed URLs | No | Not implemented. |
 
+Completed resumable uploads retain a small metadata receipt and notification marker in the shared object-store root until the workspace is reset; these contain no uploaded body and let retries return the original result after restarts, overwrites, or deletions.
+
 ### BigQuery-Compatible REST API
 
 | Feature | Status | Notes |

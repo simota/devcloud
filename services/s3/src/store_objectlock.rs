@@ -29,10 +29,21 @@ impl FileBucketStore {
         acl: &str,
     ) -> Result<bool> {
         let _guard = self.lock_object_writes();
+        self.require_bucket_and_key(bucket, key)?;
+        if !version_id.is_empty() {
+            Self::version_path(&self.object_path(bucket, key), version_id)?;
+        }
+        self.preserve_current_resumable_upload(bucket, key)?;
         let (mut object, mut body) = match self.get_object_version(bucket, key, version_id)? {
             Some(v) => v,
             None => return Ok(false),
         };
+        if !version_id.is_empty() {
+            let path = Self::version_path(&self.object_path(bucket, key), version_id)?;
+            if path.join("object.json").is_file() {
+                self.preserve_resumable_upload_result(&object, &path.join("object.json"))?;
+            }
+        }
         object.acl = acl.to_string();
         if object.delete_marker {
             body = Vec::new();
@@ -138,10 +149,21 @@ impl FileBucketStore {
         update: impl FnOnce(&mut Object),
     ) -> Result<Option<Object>> {
         let _guard = self.lock_object_writes();
+        self.require_bucket_and_key(bucket, key)?;
+        if !version_id.is_empty() {
+            Self::version_path(&self.object_path(bucket, key), version_id)?;
+        }
+        self.preserve_current_resumable_upload(bucket, key)?;
         let (mut object, mut body) = match self.get_object_version(bucket, key, version_id)? {
             Some(v) => v,
             None => return Ok(None),
         };
+        if !version_id.is_empty() {
+            let path = Self::version_path(&self.object_path(bucket, key), version_id)?;
+            if path.join("object.json").is_file() {
+                self.preserve_resumable_upload_result(&object, &path.join("object.json"))?;
+            }
+        }
         update(&mut object);
         if object.delete_marker {
             body = Vec::new();

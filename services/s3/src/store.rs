@@ -147,6 +147,13 @@ impl FileBucketStore {
         self.root.join(name)
     }
 
+    /// Small immutable completion results survive object/bucket deletion and
+    /// session cleanup until the workspace is reset. These are files, so bucket
+    /// listing ignores them; no uploaded body is retained in this history.
+    pub(crate) fn resumable_upload_receipt_path(&self, upload_id: &str) -> PathBuf {
+        self.root.join(format!(".gcs-upload-{upload_id}.json"))
+    }
+
     pub fn objects_path(&self, bucket: &str) -> PathBuf {
         self.bucket_path(bucket).join("objects")
     }
@@ -282,6 +289,7 @@ impl FileBucketStore {
         if !valid_bucket_name(name) {
             return Err(StoreError::InvalidBucketName);
         }
+        let _guard = self.lock_object_writes();
         let path = self.bucket_path(name);
         match fs::metadata(&path) {
             Ok(_) => {}
@@ -415,6 +423,51 @@ fn splitmix64(state: &mut u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bucket_deletion_waits_for_an_in_flight_object_commit() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let root =
+            std::env::temp_dir().join(format!("devcloud-s3-delete-lock-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let store = FileBucketStore::new(&root);
+        store.create_bucket("data").unwrap();
+        let deleting_store = FileBucketStore::new(&root);
+        let guard = store.lock_object_writes();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            done_tx.send(deleting_store.delete_bucket("data")).unwrap();
+        });
+        started_rx.recv().unwrap();
+        assert!(matches!(
+            done_rx.recv_timeout(Duration::from_millis(100)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        store
+            .put_object_locked(crate::objops::PutObjectInput {
+                bucket: "data".to_string(),
+                key: "key".to_string(),
+                body: b"committed".to_vec(),
+                ..Default::default()
+            })
+            .unwrap();
+        drop(guard);
+        assert!(matches!(
+            done_rx.recv().unwrap(),
+            Err(StoreError::BucketNotEmpty)
+        ));
+        worker.join().unwrap();
+        assert!(store.get_bucket("data").unwrap().is_some());
+        assert_eq!(
+            store.get_object("data", "key").unwrap().unwrap().1,
+            b"committed"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn instances_over_one_root_share_the_object_write_lock() {

@@ -1549,6 +1549,382 @@ fn final_chunk_does_not_commit_session_offset_before_object() {
     fs::remove_dir_all(root).unwrap();
 }
 
+struct CommittedUpload {
+    root: std::path::PathBuf,
+    config: Config,
+    target: String,
+    id: String,
+    key: String,
+    response: Response,
+}
+
+impl CommittedUpload {
+    fn store(&self) -> FileBucketStore {
+        let mut store = FileBucketStore::new(self.root.join("buckets"));
+        // A second write must get a visibly different generation; no sleeps
+        // or dependence on the resolution of the wall clock are needed.
+        store.set_fixed_now("2026-10-12T02:00:01Z");
+        store
+    }
+
+    fn restart(&self) -> Server {
+        Server::new(self.config.clone(), self.store())
+    }
+
+    fn receipt_path(&self) -> std::path::PathBuf {
+        self.root
+            .join("buckets")
+            .join(format!(".gcs-upload-{}.json", self.id))
+    }
+}
+
+/// Reconstruct the persisted boundary after the object commit but before
+/// either the completion receipt or session cleanup. The object comes from
+/// the real upload handler, including any commit identity it writes.
+fn committed_upload_before_cleanup(
+    key: &str,
+    create_only: bool,
+    versioned: bool,
+) -> CommittedUpload {
+    let root = temp_root("resumable-committed-retry");
+    let sessions = root.join("sessions");
+    let config = Config {
+        upload_session_path: sessions.to_string_lossy().into_owned(),
+        ..Default::default()
+    };
+    let mut store = FileBucketStore::new(root.join("buckets"));
+    store.set_fixed_now("2026-10-12T02:00:00Z");
+    let mut server = Server::new(config.clone(), store);
+    create_bucket(&mut server, "demo-bucket");
+    if versioned {
+        FileBucketStore::new(root.join("buckets"))
+            .put_bucket_versioning("demo-bucket", "Enabled")
+            .unwrap();
+    }
+    let precondition = if create_only {
+        "&ifGenerationMatch=0"
+    } else {
+        ""
+    };
+    let init = perform(
+        &mut server,
+        "POST",
+        &format!(
+            "/upload/storage/v1/b/demo-bucket/o?uploadType=resumable&name={key}{precondition}"
+        ),
+        "",
+    );
+    assert_eq!(init.status, 200, "{}", body_str(&init));
+    let id = header(&init, "X-GUploader-UploadID").to_string();
+    let target = session_target(&init);
+    let first = perform_h(
+        &mut server,
+        "PUT",
+        &target,
+        "first",
+        &[("Content-Range", "bytes 0-4/10")],
+    );
+    assert_eq!(first.status, 308, "{}", body_str(&first));
+    let session_dir = sessions.join(&id);
+    let pending_metadata = fs::read(session_dir.join("session.json")).unwrap();
+    let response = perform_h(
+        &mut server,
+        "PUT",
+        &target,
+        "last!",
+        &[("Content-Range", "bytes 5-9/10")],
+    );
+    assert_eq!(response.status, 200, "{}", body_str(&response));
+    fs::create_dir_all(&session_dir).unwrap();
+    fs::write(session_dir.join("session.json"), pending_metadata).unwrap();
+    fs::write(session_dir.join("body.part"), b"firstlast!").unwrap();
+    let fixture = CommittedUpload {
+        root,
+        config,
+        target,
+        id,
+        key: key.to_string(),
+        response,
+    };
+    match fs::remove_file(fixture.receipt_path()) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => panic!("remove completion receipt: {error}"),
+    }
+    fixture
+}
+
+#[test]
+fn resumable_upload_replays_committed_result_without_new_generation_or_event() {
+    let (tx, mut events) = tokio::sync::mpsc::unbounded_channel();
+    devcloud_gcs::set_event_sink(tx);
+    for create_only in [false, true] {
+        let key = format!("committed-retry-{create_only}.txt");
+        let upload = committed_upload_before_cleanup(&key, create_only, true);
+        let mut event_count = 0;
+        while let Ok(event) = events.try_recv() {
+            let event: serde_json::Value = serde_json::from_str(&event).unwrap();
+            if event["type"] == "gcs.object.put" && event["payload"]["key"] == key {
+                event_count += 1;
+            }
+        }
+        assert_eq!(event_count, 1);
+        let mut restarted = upload.restart();
+        // A status query must also recognize the completed upload, before
+        // re-evaluating a create-only precondition against its own object.
+        let status = perform_h(
+            &mut restarted,
+            "PUT",
+            &upload.target,
+            "",
+            &[("Content-Range", "bytes */10")],
+        );
+        assert_eq!(status.status, 200, "{}", body_str(&status));
+        assert_eq!(status.body, upload.response.body);
+        let retry = perform_h(
+            &mut restarted,
+            "PUT",
+            &upload.target,
+            "last!",
+            &[("Content-Range", "bytes 5-9/10")],
+        );
+        assert_eq!(retry.status, 200, "{}", body_str(&retry));
+        assert_eq!(retry.body, upload.response.body);
+        assert!(!body_str(&retry).contains("_resumableUploadId"));
+        let (object, body) = upload
+            .store()
+            .get_object("demo-bucket", &key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(body, b"firstlast!");
+        assert_eq!(object.last_modified, "2026-10-12T02:00:00Z");
+        let versions = upload
+            .store()
+            .list_object_versions("demo-bucket", &key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(versions.len(), 1);
+        while let Ok(event) = events.try_recv() {
+            let event: serde_json::Value = serde_json::from_str(&event).unwrap();
+            assert!(event["type"] != "gcs.object.put" || event["payload"]["key"] != key);
+        }
+        fs::remove_dir_all(upload.root).unwrap();
+    }
+
+    // The process continues through post-commit I/O errors. Recovery must emit
+    // the previously unannounced completion once, then suppress further retries.
+    for failure in ["version", "notification"] {
+        let root = temp_root("resumable-completion-io");
+        let config = Config {
+            upload_session_path: root.join("sessions").to_string_lossy().into_owned(),
+            ..Default::default()
+        };
+        let store = FileBucketStore::new(root.join("buckets"));
+        let mut server = Server::new(config, FileBucketStore::new(root.join("buckets")));
+        create_bucket(&mut server, "demo-bucket");
+        store
+            .put_bucket_versioning("demo-bucket", "Enabled")
+            .unwrap();
+        let key = format!("completion-io-{failure}.txt");
+        let init = perform(
+            &mut server,
+            "POST",
+            &format!("/upload/storage/v1/b/demo-bucket/o?uploadType=resumable&name={key}&ifGenerationMatch=0"),
+            "",
+        );
+        assert_eq!(init.status, 200, "{}", body_str(&init));
+        let target = session_target(&init);
+        let id = header(&init, "X-GUploader-UploadID");
+        let blocker = if failure == "version" {
+            let path = store.object_path("demo-bucket", &key);
+            fs::create_dir_all(&path).unwrap();
+            fs::write(path.join("versions"), b"blocked").unwrap();
+            path.join("versions")
+        } else {
+            let path = root
+                .join("buckets")
+                .join(format!(".gcs-upload-{id}.notified"));
+            fs::create_dir(&path).unwrap();
+            path
+        };
+        let failed = perform_h(
+            &mut server,
+            "PUT",
+            &target,
+            "body",
+            &[("Content-Range", "bytes 0-3/4")],
+        );
+        assert!(failed.status >= 400, "{failure}");
+        let (committed, body) = store.get_object("demo-bucket", &key).unwrap().unwrap();
+        assert_eq!(body, b"body");
+        while let Ok(event) = events.try_recv() {
+            let event: serde_json::Value = serde_json::from_str(&event).unwrap();
+            assert!(event["type"] != "gcs.object.put" || event["payload"]["key"] != key);
+        }
+        if failure == "version" {
+            fs::remove_file(blocker).unwrap();
+        } else {
+            fs::remove_dir(blocker).unwrap();
+        }
+        let recovered = perform_h(
+            &mut server,
+            "PUT",
+            &target,
+            "body",
+            &[("Content-Range", "bytes 0-3/4")],
+        );
+        assert_eq!(recovered.status, 200, "{}", body_str(&recovered));
+        let (after, body) = store.get_object("demo-bucket", &key).unwrap().unwrap();
+        assert_eq!(after, committed);
+        assert_eq!(body, b"body");
+        let (_, version_body) = store
+            .get_object_version("demo-bucket", &key, &after.version_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(version_body, b"body");
+        let repeated = perform_h(
+            &mut server,
+            "PUT",
+            &target,
+            "body",
+            &[("Content-Range", "bytes 0-3/4")],
+        );
+        assert_eq!(repeated.status, 200);
+        assert_eq!(repeated.body, recovered.body);
+        let mut notifications = 0;
+        while let Ok(event) = events.try_recv() {
+            let event: serde_json::Value = serde_json::from_str(&event).unwrap();
+            if event["type"] == "gcs.object.put" && event["payload"]["key"] == key {
+                notifications += 1;
+            }
+        }
+        assert_eq!(notifications, 1, "{failure}");
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
+fn resumable_upload_completion_survives_later_object_changes() {
+    use devcloud_s3::objops::{PutObjectInput, UpdateObjectMetadataInput};
+
+    for change in ["overwrite", "metadata", "delete", "delete-version"] {
+        let upload = committed_upload_before_cleanup(
+            &format!("committed-before-{change}.txt"),
+            true,
+            change == "delete-version",
+        );
+        let store = upload.store();
+        match change {
+            "overwrite" => {
+                store
+                    .put_object(PutObjectInput {
+                        bucket: "demo-bucket".to_string(),
+                        key: upload.key.clone(),
+                        body: b"newer contents".to_vec(),
+                        ..Default::default()
+                    })
+                    .unwrap();
+            }
+            "metadata" => {
+                store
+                    .update_object_metadata(UpdateObjectMetadataInput {
+                        bucket: "demo-bucket".to_string(),
+                        key: upload.key.clone(),
+                        content_type: "text/plain".to_string(),
+                        ..Default::default()
+                    })
+                    .unwrap();
+            }
+            "delete" => {
+                store.delete_object("demo-bucket", &upload.key).unwrap();
+                store.delete_bucket("demo-bucket").unwrap();
+            }
+            "delete-version" => {
+                let (object, _) = store
+                    .get_object("demo-bucket", &upload.key)
+                    .unwrap()
+                    .unwrap();
+                store
+                    .delete_object_version("demo-bucket", &upload.key, &object.version_id, false)
+                    .unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let before_retry = if change == "delete" {
+            assert!(matches!(
+                store.get_object("demo-bucket", &upload.key),
+                Err(devcloud_s3::store::StoreError::BucketNotExist)
+            ));
+            None
+        } else {
+            let found = store.get_object("demo-bucket", &upload.key).unwrap();
+            match change {
+                "overwrite" => {
+                    let (object, body) = found.as_ref().unwrap();
+                    assert_eq!(body, b"newer contents");
+                    assert_eq!(object.last_modified, "2026-10-12T02:00:01Z");
+                    assert!(object.resumable_upload_id.is_empty());
+                }
+                "metadata" => {
+                    let (object, body) = found.as_ref().unwrap();
+                    assert_eq!(body, b"firstlast!");
+                    assert_eq!(object.content_type, "text/plain");
+                    assert_eq!(object.metageneration, 2);
+                }
+                "delete-version" => assert!(found.is_none()),
+                _ => unreachable!(),
+            }
+            found
+        };
+        let mut restarted = upload.restart();
+        let retry = perform_h(
+            &mut restarted,
+            "PUT",
+            &upload.target,
+            "last!",
+            &[("Content-Range", "bytes 5-9/10")],
+        );
+        assert_eq!(retry.status, 200, "{change}: {}", body_str(&retry));
+        assert_eq!(retry.body, upload.response.body, "{change}");
+        if change == "delete" {
+            assert!(matches!(
+                store.get_object("demo-bucket", &upload.key),
+                Err(devcloud_s3::store::StoreError::BucketNotExist)
+            ));
+        } else {
+            assert_eq!(
+                store.get_object("demo-bucket", &upload.key).unwrap(),
+                before_retry,
+                "{change}"
+            );
+        }
+        // A receipt in the root must never appear as a bucket or prevent a
+        // bucket whose objects have been deleted from being removed.
+        assert!(store
+            .list_buckets()
+            .unwrap()
+            .iter()
+            .all(|bucket| bucket.name == "demo-bucket"));
+        fs::remove_dir_all(upload.root).unwrap();
+    }
+}
+
+#[test]
+fn resumable_upload_replays_create_only_commit_before_cleanup() {
+    let upload = committed_upload_before_cleanup("committed-create-only.txt", true, false);
+    let mut restarted = upload.restart();
+    let retry = perform_h(
+        &mut restarted,
+        "PUT",
+        &upload.target,
+        "last!",
+        &[("Content-Range", "bytes 5-9/10")],
+    );
+    assert_eq!(retry.status, 200, "{}", body_str(&retry));
+    assert_eq!(retry.body, upload.response.body);
+    fs::remove_dir_all(upload.root).unwrap();
+}
+
 /// A crash between appending bytes and recording their offset leaves a tail
 /// outside the committed range. Recover from that persisted offset on retry.
 #[test]

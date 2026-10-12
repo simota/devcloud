@@ -1224,7 +1224,7 @@ fn handle_multipart_upload(server: &mut Server, req: &Request, bucket: &str) -> 
 fn handle_resumable_upload(server: &mut Server, req: &Request, bucket: &str) -> Response {
     match req.method.as_str() {
         "POST" => create_resumable_upload(server, req, bucket),
-        "PUT" => put_resumable_upload(server, req),
+        "PUT" => put_resumable_upload(server, req, bucket),
         _ => method_not_allowed("POST, PUT"),
     }
 }
@@ -1279,12 +1279,32 @@ fn create_resumable_upload(server: &mut Server, req: &Request, bucket: &str) -> 
     r
 }
 
-fn put_resumable_upload(server: &mut Server, req: &Request) -> Response {
+fn put_resumable_upload(server: &mut Server, req: &Request, bucket: &str) -> Response {
     let id = req.query_value("upload_id").to_string();
     if id.is_empty() {
         return json_error(400, "required", "upload_id is required");
     }
-    let Some(mut session) = server.sessions.get(&id).cloned() else {
+    let pending = server.sessions.get(&id).cloned();
+    if pending
+        .as_ref()
+        .is_some_and(|session| session.bucket != bucket)
+    {
+        return json_error(404, "notFound", "upload session not found");
+    }
+    // Completion is checked before status/offset validation and preconditions:
+    // a create-only upload must not reject a retry because of its own object.
+    match server.store.get_resumable_upload_result(
+        bucket,
+        pending.as_ref().map(|session| session.name.as_str()),
+        &id,
+    ) {
+        Ok(Some(object)) => {
+            return complete_resumable_upload(server, &id, &object);
+        }
+        Ok(None) => {}
+        Err(_) => return json_error(500, "backendError", "internal error"),
+    }
+    let Some(mut session) = pending else {
         return json_error(404, "notFound", "upload session not found");
     };
     if is_status_query(req.header("content-range")) {
@@ -1361,31 +1381,21 @@ fn put_resumable_upload(server: &mut Server, req: &Request) -> Response {
             };
         }
     }
-    match server.store.put_object(PutObjectInput {
-        bucket: session.bucket.clone(),
-        key: session.name.clone(),
-        body: payload,
-        content_type: first_non_empty(req.header("content-type"), &session.content_type),
-        content_encoding: session.content_encoding.clone(),
-        cache_control: session.cache_control.clone(),
-        content_disposition: session.content_disposition.clone(),
-        metadata: session.metadata.clone().unwrap_or_default(),
-        ..Default::default()
-    }) {
-        Ok(object) => {
-            server.sessions.remove(&id);
-            let _ = server.delete_session(&id);
-            emit_dashboard_event(
-                "gcs.object.put",
-                serde_json::json!({
-                    "bucket": object.bucket,
-                    "key": object.key,
-                    "etag": object.etag,
-                    "contentLength": object.size,
-                }),
-            );
-            Response::json(200, &object_resource(&object))
-        }
+    match server.store.put_resumable_object(
+        PutObjectInput {
+            bucket: session.bucket.clone(),
+            key: session.name.clone(),
+            body: payload,
+            content_type: first_non_empty(req.header("content-type"), &session.content_type),
+            content_encoding: session.content_encoding.clone(),
+            cache_control: session.cache_control.clone(),
+            content_disposition: session.content_disposition.clone(),
+            metadata: session.metadata.clone().unwrap_or_default(),
+            ..Default::default()
+        },
+        &id,
+    ) {
+        Ok(object) => complete_resumable_upload(server, &id, &object),
         Err(e) => {
             let message = store_error_text(&e, &session.bucket, &session.name);
             if let Some(prior_received_bytes) = staged_chunk_rollback {
@@ -1397,6 +1407,29 @@ fn put_resumable_upload(server: &mut Server, req: &Request) -> Response {
             json_error(404, "notFound", &message)
         }
     }
+}
+
+fn complete_resumable_upload(server: &mut Server, id: &str, object: &Object) -> Response {
+    let notify = match server.store.claim_resumable_upload_event(object) {
+        Ok(notify) => notify,
+        Err(_) => return json_error(500, "backendError", "internal error"),
+    };
+    server.sessions.remove(id);
+    let _ = server.delete_session(id);
+    if notify {
+        // The relay is best-effort across process stops. A stop between the
+        // claim and send is repaired by the dashboard's reconnect resync.
+        emit_dashboard_event(
+            "gcs.object.put",
+            serde_json::json!({
+                "bucket": object.bucket,
+                "key": object.key,
+                "etag": object.etag,
+                "contentLength": object.size,
+            }),
+        );
+    }
+    Response::json(200, &object_resource(object))
 }
 
 /// Stores the object and writes the legacy upload-handler response: the object

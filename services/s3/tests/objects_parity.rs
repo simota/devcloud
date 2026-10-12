@@ -36,6 +36,251 @@ fn keys(objs: &[Object]) -> Vec<String> {
 }
 
 #[test]
+fn resumable_receipt_failure_blocks_mutation_before_committed_data_is_lost() {
+    use devcloud_s3::model::{ObjectLegalHold, ObjectRetention};
+    use devcloud_s3::objops::UpdateObjectMetadataInput;
+
+    for operation in [
+        "put",
+        "metadata",
+        "acl",
+        "retention",
+        "legal-hold",
+        "delete",
+        "delete-version",
+    ] {
+        let root = tempdir();
+        let store = FileBucketStore::new(&root);
+        store.create_bucket("data").unwrap();
+        store.put_bucket_versioning("data", "Enabled").unwrap();
+        let id = "0123456789abcdef0123456789abcdef";
+        let original = store
+            .put_resumable_object(
+                PutObjectInput {
+                    bucket: "data".to_string(),
+                    key: "key".to_string(),
+                    body: b"committed".to_vec(),
+                    ..Default::default()
+                },
+                id,
+            )
+            .unwrap();
+        let receipt = root.join(format!(".gcs-upload-{id}.json"));
+        std::fs::remove_file(&receipt).unwrap();
+        std::fs::create_dir(&receipt).unwrap();
+        let result = match operation {
+            "put" => store
+                .put_object(PutObjectInput {
+                    bucket: "data".to_string(),
+                    key: "key".to_string(),
+                    body: b"replacement".to_vec(),
+                    ..Default::default()
+                })
+                .map(|_| ()),
+            "metadata" => store
+                .update_object_metadata(UpdateObjectMetadataInput {
+                    bucket: "data".to_string(),
+                    key: "key".to_string(),
+                    content_type: "text/plain".to_string(),
+                    ..Default::default()
+                })
+                .map(|_| ()),
+            "acl" => store
+                .put_object_acl("data", "key", "", "public-read")
+                .map(|_| ()),
+            "retention" => store
+                .put_object_retention(
+                    "data",
+                    "key",
+                    "",
+                    ObjectRetention {
+                        mode: "GOVERNANCE".to_string(),
+                        retain_until_date: "2099-01-01T00:00:00Z".to_string(),
+                    },
+                )
+                .map(|_| ()),
+            "legal-hold" => store
+                .put_object_legal_hold(
+                    "data",
+                    "key",
+                    "",
+                    ObjectLegalHold {
+                        status: "ON".to_string(),
+                    },
+                )
+                .map(|_| ()),
+            "delete" => store.delete_object("data", "key").map(|_| ()),
+            "delete-version" => store
+                .delete_object_version("data", "key", &original.version_id, false)
+                .map(|_| ()),
+            _ => unreachable!(),
+        };
+        assert!(
+            result.is_err(),
+            "{operation} must preserve the receipt before mutating"
+        );
+        assert_eq!(
+            store.get_object("data", "key").unwrap().unwrap(),
+            (original.clone(), b"committed".to_vec()),
+            "{operation}"
+        );
+        assert_eq!(
+            store
+                .get_object_version("data", "key", &original.version_id)
+                .unwrap()
+                .unwrap(),
+            (original.clone(), b"committed".to_vec()),
+            "{operation}"
+        );
+        std::fs::remove_dir(&receipt).unwrap();
+        assert_eq!(
+            store
+                .get_resumable_upload_result("data", Some("key"), id)
+                .unwrap(),
+            Some(original)
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
+fn explicit_version_operations_recover_an_interrupted_resumable_snapshot() {
+    use devcloud_s3::model::{ObjectLegalHold, ObjectRetention};
+
+    for operation in ["replay", "acl", "retention", "legal-hold", "delete"] {
+        for missing in ["snapshot", "body"] {
+            let root = tempdir();
+            let store = FileBucketStore::new(&root);
+            store.create_bucket("data").unwrap();
+            store.put_bucket_versioning("data", "Enabled").unwrap();
+            let id = "0123456789abcdef0123456789abcdef";
+            let original = store
+                .put_resumable_object(
+                    PutObjectInput {
+                        bucket: "data".to_string(),
+                        key: "key".to_string(),
+                        body: b"committed".to_vec(),
+                        ..Default::default()
+                    },
+                    id,
+                )
+                .unwrap();
+            std::fs::remove_file(root.join(format!(".gcs-upload-{id}.json"))).unwrap();
+            let version = store
+                .object_versions_path("data", "key")
+                .join(&original.version_id);
+            if missing == "snapshot" {
+                std::fs::remove_dir_all(&version).unwrap();
+            } else {
+                std::fs::remove_file(version.join("body")).unwrap();
+            }
+            match operation {
+                "replay" => assert_eq!(
+                    store
+                        .get_resumable_upload_result("data", Some("key"), id)
+                        .unwrap(),
+                    Some(original.clone())
+                ),
+                "acl" => assert!(store
+                    .put_object_acl("data", "key", &original.version_id, "public-read")
+                    .unwrap()),
+                "retention" => assert!(store
+                    .put_object_retention(
+                        "data",
+                        "key",
+                        &original.version_id,
+                        ObjectRetention {
+                            mode: "GOVERNANCE".to_string(),
+                            retain_until_date: "2099-01-01T00:00:00Z".to_string(),
+                        }
+                    )
+                    .unwrap()
+                    .is_some()),
+                "legal-hold" => assert!(store
+                    .put_object_legal_hold(
+                        "data",
+                        "key",
+                        &original.version_id,
+                        ObjectLegalHold {
+                            status: "ON".to_string()
+                        }
+                    )
+                    .unwrap()
+                    .is_some()),
+                "delete" => assert!(
+                    store
+                        .delete_object_version("data", "key", &original.version_id, false)
+                        .unwrap()
+                        .1
+                ),
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                store
+                    .get_resumable_upload_result("data", Some("key"), id)
+                    .unwrap(),
+                Some(original.clone())
+            );
+            let version_after = store
+                .get_object_version("data", "key", &original.version_id)
+                .unwrap();
+            if operation == "delete" {
+                assert!(version_after.is_none());
+                assert!(store.get_object("data", "key").unwrap().is_none());
+            } else {
+                assert_eq!(version_after.unwrap().1, b"committed");
+            }
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+}
+
+#[test]
+fn resumable_receipts_are_bound_to_the_upload_bucket_and_key() {
+    let root = tempdir();
+    let store = FileBucketStore::new(&root);
+    store.create_bucket("first").unwrap();
+    store.create_bucket("second").unwrap();
+    let id = "0123456789abcdef0123456789abcdef";
+    store
+        .put_resumable_object(
+            PutObjectInput {
+                bucket: "first".to_string(),
+                key: "key".to_string(),
+                body: b"committed".to_vec(),
+                ..Default::default()
+            },
+            id,
+        )
+        .unwrap();
+    assert!(store
+        .get_resumable_upload_result("second", None, id)
+        .unwrap()
+        .is_none());
+    assert!(store
+        .get_resumable_upload_result("first", Some("other-key"), id)
+        .unwrap()
+        .is_none());
+    assert!(store
+        .get_resumable_upload_result("first", None, "../key")
+        .unwrap()
+        .is_none());
+    assert!(store
+        .put_resumable_object(
+            PutObjectInput {
+                bucket: "first".to_string(),
+                key: "other-key".to_string(),
+                body: b"replacement".to_vec(),
+                ..Default::default()
+            },
+            id
+        )
+        .is_err());
+    assert!(store.get_object("first", "other-key").unwrap().is_none());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn delete_marker_json_matches_oracle() {
     // A delete marker leaves createdAt at the legacy zero time and always emits the
     // empty etag / struct fields.
