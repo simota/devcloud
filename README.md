@@ -296,7 +296,9 @@ Legend:
 | Dashboard inbox | Yes | Inspect messages and raw source. |
 | Delete messages | Yes | Single-message and clear-all paths are available through dashboard API. |
 | Outbound relay | No | devcloud is an inbox emulator, not an SMTP relay. |
-| SMTP AUTH | No | Default `auth.smtp.mode` is `off`. |
+| SMTP AUTH | Partial | `PLAIN` and `LOGIN` are available when `auth.smtp.mode` is not `off`; strict mode validates supplied credentials. `MAIL FROM` before AUTH remains accepted. The default mode is `off`. |
+| HTTP API authentication | Partial | Strict mode protects the introspection/control API with the configured SMTP Basic credentials; the dashboard forwards those credentials for reads and mutations. |
+| Browser guards | Yes | Direct introspection/control HTTP endpoints reject public DNS Host names and cross-site mutations, using the Dashboard API host allowlist. SDK/CLI requests without Origin remain supported. |
 | TLS / STARTTLS | No | Local plaintext development endpoint only. |
 | IMAP / POP3 | No | Not implemented. |
 
@@ -441,12 +443,14 @@ Pub/Sub dashboard actions are available under `/dashboard/pubsub`:
 | Feature | Status | Notes |
 | --- | --- | --- |
 | Redis wire endpoint | Yes | Uses a real `redis-server` child process in managed mode; devcloud does not re-implement RESP. |
-| External Redis mode | Yes | `services.redis.mode: external` validates `externalUrl` with `PING` and exposes the same dashboard surface. |
+| External Redis mode | Yes | `services.redis.mode: external` accepts `redis://[:password@]host[:port][/db]`, validates `AUTH`/`SELECT`/`PING`, and uses that target for dashboard commands. Credentials are omitted from the displayed endpoint. TLS and non-default ACL users are not supported. |
 | Managed persistence | Yes | Runtime data is kept under `.devcloud/data/redis` by default. |
 | String/hash/list/set/zset inspection | Partial | `/dashboard/redis` lists keys with SCAN and shows type-specific previews. |
 | Command runner | Partial | Dashboard commands are restricted to the Redis allowlist in `docs/design-redis-compat.md`. |
 | Destructive actions | Partial | Key delete, expire, and guarded `FLUSHDB` are supported; `FLUSHALL` and unsafe commands are rejected. |
 | Redis AUTH | Partial | Relaxed mode does not set `requirepass`; strict mode passes the configured password to managed Redis. |
+| HTTP API authentication | Partial | Strict mode protects the Redis control API with the configured Redis Basic credentials; the dashboard forwards those credentials for reads and mutations. |
+| Browser guards | Yes | Direct introspection/control HTTP endpoints reject public DNS Host names and cross-site mutations, using the Dashboard API host allowlist. SDK/CLI requests without Origin remain supported. |
 | Cluster, Sentinel, modules, RedisJSON, RediSearch | No | Out of local compatibility scope. |
 
 ### AWS Lambda-Compatible API
@@ -501,10 +505,43 @@ Pub/Sub dashboard actions are available under `/dashboard/pubsub`:
 
 ### Local build and test
 
+Install a current stable Rust toolchain, Node.js 22 or later, and the Protocol
+Buffers compiler (`protoc`, including its standard `.proto` files). Pub/Sub's
+build script uses `protoc`; on Debian/Ubuntu, install `protobuf-compiler`.
+
 ```bash
-cargo build --workspace
-cargo test --workspace
+cd web/dashboard
+npm ci
+npm test
+npm run build
+cd ../..
+cargo build --locked --workspace
+cargo test --locked --workspace
 ```
+
+The dashboard build writes the assets embedded by the Rust dashboard crate.
+Commit the generated bundle with dashboard changes. `npm test` exercises the
+event relay frame contract, reconnects, resynchronization, subscription cleanup,
+and stale React responses without requiring a browser.
+
+To exercise the built CLI and dashboard together in Chromium:
+
+```bash
+cargo build --locked -p devcloud-orchestrator
+cd web/dashboard
+npx playwright install --with-deps chromium
+npm run test:browser
+```
+
+The browser test starts an isolated GCS workspace and verifies that provider
+mutations appear through the live event stream, including a snapshot refresh
+after a disconnected interval. Its screenshot and result are written to
+`target/dashboard-browser/` and uploaded as a CI artifact.
+
+Pull requests run `.github/workflows/ci.yml`: Rust formatting, individual service
+builds, workspace tests and Clippy, dashboard tests and bundle consistency,
+the Chromium smoke test, and Rust/npm dependency audits. Individual builds catch missing Cargo features that
+can otherwise be hidden by workspace-wide feature unification.
 
 Service acceptance gates and E2E scripts are run locally because they require service-specific external tooling (`awscli-local`, `postgres` server binaries, `aws` CLI, etc.).
 
