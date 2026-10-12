@@ -13,4 +13,4 @@ name = "devcloud-redis"
 path = "src/main.rs"
 
 [dependencies]
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "process", "signal"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "process", "signal", "time"] }

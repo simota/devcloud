@@ -95,11 +95,15 @@ impl<R: AsyncRead + Unpin> Input<'_, R> {
         const MAX_LINE: usize = 8 * 1024;
         loop {
             if let Some(i) = self.buf[self.pos..].windows(2).position(|w| w == b"\r\n") {
+                if i > MAX_LINE {
+                    return Ok(Err(BodyError::Malformed("chunk line too long")));
+                }
                 let line = String::from_utf8_lossy(&self.buf[self.pos..self.pos + i]).into_owned();
                 self.pos += i + 2;
                 return Ok(Ok(line));
             }
-            if self.buf.len() - self.pos > MAX_LINE {
+            // A maximum-length line may have received its CR but not its LF.
+            if self.buf.len() - self.pos > MAX_LINE + 1 {
                 return Ok(Err(BodyError::Malformed("chunk line too long")));
             }
             let pending = self.buf.len() - self.pos + 1;
@@ -212,6 +216,42 @@ mod tests {
         )
         .await;
         assert_eq!(body.unwrap(), b"{\"value\":1}   ");
+    }
+
+    #[tokio::test]
+    async fn chunk_line_limits_do_not_depend_on_read_boundaries() {
+        let te = [("transfer-encoding", "chunked")];
+        let valid = format!("1;{}\r\nx\r\n0\r\n\r\n", "a".repeat(8190));
+        for split in [0, 8193, valid.len()] {
+            assert_eq!(
+                read(
+                    &valid.as_bytes()[..split],
+                    &valid.as_bytes()[split..],
+                    &te,
+                    1
+                )
+                .await
+                .unwrap(),
+                b"x"
+            );
+        }
+        for invalid in [
+            format!("1;{}\r\nx\r\n0\r\n\r\n", "a".repeat(8191)),
+            format!("0\r\nX: {}\r\n\r\n", "a".repeat(8190)),
+        ] {
+            for split in [0, 8192, invalid.len()] {
+                assert_eq!(
+                    read(
+                        &invalid.as_bytes()[..split],
+                        &invalid.as_bytes()[split..],
+                        &te,
+                        1,
+                    )
+                    .await,
+                    Err(BodyError::Malformed("chunk line too long"))
+                );
+            }
+        }
     }
 
     #[tokio::test]

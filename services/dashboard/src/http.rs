@@ -14,7 +14,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::config::Config;
@@ -399,11 +399,14 @@ fn legacy_redirect(req: &Request, target: &str) -> Response {
     Response::redirect(301, target)
 }
 
-async fn read_request(stream: &mut TcpStream) -> std::io::Result<Option<Request>> {
+async fn read_request<S: AsyncRead + Unpin>(stream: &mut S) -> std::io::Result<Option<Request>> {
     let mut buf = Vec::new();
     let mut tmp = [0u8; 4096];
     let header_end = loop {
         if let Some(pos) = find_subslice(&buf, b"\r\n\r\n") {
+            if pos + 4 > MAX_HEADER_BYTES {
+                return Ok(None);
+            }
             break pos;
         }
         if buf.len() > MAX_HEADER_BYTES {
@@ -431,14 +434,26 @@ async fn read_request(stream: &mut TcpStream) -> std::io::Result<Option<Request>
     let mut headers = HashMap::new();
     for line in lines {
         if let Some((k, v)) = line.split_once(':') {
-            headers.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
+            let name = k.trim().to_ascii_lowercase();
+            if name == "content-length" && headers.contains_key(&name) {
+                return Ok(None);
+            }
+            headers.insert(name, v.trim().to_string());
         }
     }
 
-    let content_length: usize = headers
-        .get("content-length")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
+    // These one-shot endpoints support fixed-length bodies only. Reject
+    // ambiguous framing before a mutation can see a partial or empty body.
+    if headers.contains_key("transfer-encoding") {
+        return Ok(None);
+    }
+    let content_length = match headers.get("content-length") {
+        None => 0,
+        Some(raw) => match raw.parse::<usize>() {
+            Ok(length) if raw.bytes().all(|b| b.is_ascii_digit()) => length,
+            _ => return Ok(None),
+        },
+    };
     if content_length > MAX_BODY_BYTES {
         return Ok(None);
     }
@@ -447,7 +462,7 @@ async fn read_request(stream: &mut TcpStream) -> std::io::Result<Option<Request>
     while body.len() < content_length {
         let n = stream.read(&mut tmp).await?;
         if n == 0 {
-            break;
+            return Ok(None);
         }
         body.extend_from_slice(&tmp[..n]);
     }
@@ -659,6 +674,49 @@ fn hex_val(b: u8) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn transport_rejects_incomplete_or_ambiguous_bodies() {
+        for raw in [
+            "POST / HTTP/1.1\r\nContent-Length: 5\r\n\r\nabc",
+            "POST / HTTP/1.1\r\nContent-Length: invalid\r\n\r\n",
+            "POST / HTTP/1.1\r\nContent-Length: +3\r\n\r\nabc",
+            "POST / HTTP/1.1\r\nContent-Length: \r\n\r\n",
+            "POST / HTTP/1.1\r\nContent-Length: 99999999999999999999999999\r\n\r\n",
+            "POST / HTTP/1.1\r\nContent-Length: 3\r\nContent-Length: 0\r\n\r\nabc",
+            "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+            "POST / HTTP/1.1\r\nContent-Length: 0\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+        ] {
+            assert!(read_request(&mut raw.as_bytes()).await.unwrap().is_none());
+        }
+        let oversized = format!(
+            "POST / HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
+            MAX_BODY_BYTES + 1
+        );
+        assert!(read_request(&mut oversized.as_bytes())
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn transport_accepts_complete_bodies_and_enforces_the_header_boundary() {
+        for raw in [
+            "POST / HTTP/1.1\r\nContent-Length: 3\r\n\r\nabc",
+            "GET / HTTP/1.1\r\n\r\n",
+        ] {
+            assert!(read_request(&mut raw.as_bytes()).await.unwrap().is_some());
+        }
+        // The terminator arrives in the read that crosses the cap. Checking
+        // only the buffer length before looking for it misses this case.
+        let mut oversized = b"GET / HTTP/1.1\r\nX-Large: ".to_vec();
+        oversized.resize(MAX_HEADER_BYTES - 1, b'a');
+        oversized.extend_from_slice(b"\r\n\r\n");
+        assert!(read_request(&mut oversized.as_slice())
+            .await
+            .unwrap()
+            .is_none());
+    }
 
     #[tokio::test]
     async fn api_mutations_and_rebinding_hosts_are_refused() {

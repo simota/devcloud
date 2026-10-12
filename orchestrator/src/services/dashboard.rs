@@ -30,21 +30,11 @@ fn join(path: &str, sub: &str) -> String {
     Path::new(path).join(sub).to_string_lossy().into_owned()
 }
 
-/// Mirrors legacy `redisEndpointForDisplay`: display-only metadata.
+/// Display-only metadata, rebuilt without the external URL's credentials.
 fn redis_display_endpoint(cfg: &AppConfig) -> String {
-    let fallback = format!("redis://127.0.0.1:{}", cfg.server.redis_port);
-    let mode = cfg.services.redis.mode.trim().to_lowercase();
-    let is_external = mode == "external"
-        || (mode.is_empty() && !cfg.services.redis.external_url.trim().is_empty());
-    if !is_external {
-        return fallback;
-    }
-    let raw = cfg.services.redis.external_url.trim();
-    if raw.is_empty() {
-        fallback
-    } else {
-        raw.to_string()
-    }
+    super::redis::connection_target(cfg)
+        .map(|target| target.display_endpoint())
+        .unwrap_or_else(|_| "invalid Redis configuration".to_string())
 }
 
 fn build_config(cfg: &AppConfig) -> Config {
@@ -62,6 +52,9 @@ fn build_config(cfg: &AppConfig) -> Config {
         mail_endpoint: format!("smtp://127.0.0.1:{}", cfg.server.smtp_port),
         mail_storage_path: join(s, "mail"),
         mail_disabled: !cfg.services.mail.enabled,
+        mail_auth_mode: cfg.auth.smtp.mode.clone(),
+        mail_username: cfg.auth.smtp.username.clone(),
+        mail_password: cfg.auth.smtp.password.clone(),
 
         s3_base: http_ep(cfg.server.s3_port),
         s3_endpoint: http_ep(cfg.server.s3_port),
@@ -88,6 +81,8 @@ fn build_config(cfg: &AppConfig) -> Config {
         redis_endpoint: redis_display_endpoint(cfg),
         redis_storage_path: scoped_data_dir(s, &cfg.services.redis.data_dir, "redis"),
         redis_enabled: cfg.services.redis.enabled,
+        redis_auth_mode: cfg.auth.redis.mode.clone(),
+        redis_password: cfg.auth.redis.password.clone(),
 
         pubsub_base: http_ep(cfg.server.pubsub_rest_port),
         pubsub_endpoint: http_ep(cfg.server.pubsub_rest_port),

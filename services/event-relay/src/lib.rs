@@ -56,6 +56,7 @@ const CLIENT_QUEUE_SIZE: usize = 256;
 
 /// Keepalive ping interval — mirrors legacy `pingInterval = 15 * time.Second`.
 const PING_INTERVAL: Duration = Duration::from_secs(15);
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 // ---------------------------------------------------------------------------
 // Frame (wire format)
@@ -394,18 +395,6 @@ async fn serve_client(
     // Skip the first immediate tick — we just sent the hello frame.
     ping_interval.tick().await;
 
-    // Drain inbound frames so close frames are observed (mirrors legacy drain goroutine).
-    let (client_closed_tx, mut client_closed_rx) = mpsc::channel::<()>(1);
-    tokio::spawn(async move {
-        while let Some(msg) = ws_rx.next().await {
-            match msg {
-                Ok(Message::Close(_)) | Err(_) => break,
-                _ => {}
-            }
-        }
-        let _ = client_closed_tx.send(()).await;
-    });
-
     loop {
         tokio::select! {
             // Shutdown signal.
@@ -415,9 +404,12 @@ async fn serve_client(
                     break;
                 }
             }
-            // Client disconnected.
-            _ = client_closed_rx.recv() => {
-                break;
+            // Keep both socket halves in this task so cancellation closes the
+            // whole connection instead of leaving a detached reader alive.
+            incoming = ws_rx.next() => {
+                if matches!(incoming, None | Some(Ok(Message::Close(_))) | Some(Err(_))) {
+                    break;
+                }
             }
             // Keepalive ping.
             _ = ping_interval.tick() => {
@@ -475,13 +467,21 @@ async fn serve_client(
 /// be bound.
 pub async fn run(
     addr: String,
-    mut events: UnboundedReceiver<String>,
+    events: UnboundedReceiver<String>,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> Result<(), String> {
     let listener = TcpListener::bind(&addr)
         .await
         .map_err(|e| format!("event-relay: bind {addr}: {e}"))?;
 
+    run_listener(listener, events, shutdown).await
+}
+
+async fn run_listener(
+    listener: TcpListener,
+    mut events: UnboundedReceiver<String>,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) -> Result<(), String> {
     let state = RelayState::new();
 
     // Shutdown watch channel — broadcast `true` when the shutdown future resolves.
@@ -530,11 +530,13 @@ pub async fn run(
     // the HTTP upgrade request during the handshake (mirrors legacy parseTopics
     // call inside ServeHTTP).
     let mut srx_accept = shutdown_rx.clone();
+    let mut clients = tokio::task::JoinSet::new();
     loop {
         tokio::select! {
             _ = srx_accept.changed() => {
                 if *srx_accept.borrow() { break; }
             }
+            _ = clients.join_next(), if !clients.is_empty() => {}
             accepted = listener.accept() => {
                 let (stream, _): (tokio::net::TcpStream, SocketAddr) = match accepted {
                     Ok(p) => p,
@@ -591,18 +593,27 @@ pub async fn run(
                     Ok(resp)
                 };
 
-                let ws = match tokio_tungstenite::accept_hdr_async(stream, callback).await {
-                    Ok(ws) => ws,
-                    Err(_) => continue, // bad handshake — skip
-                };
-
-                let topics = topics_cell.lock().unwrap().clone();
                 let state_clone = Arc::clone(&state);
                 let srx = shutdown_rx.clone();
-                tokio::spawn(serve_client(ws, state_clone, topics, srx));
+                // A peer that opens TCP without sending an upgrade must not
+                // block every other client or prevent shutdown of the relay.
+                clients.spawn(async move {
+                    let ws = match time::timeout(
+                        HANDSHAKE_TIMEOUT,
+                        tokio_tungstenite::accept_hdr_async(stream, callback),
+                    ).await {
+                        Ok(Ok(ws)) => ws,
+                        _ => return,
+                    };
+                    let topics = topics_cell.lock().unwrap().clone();
+                    serve_client(ws, state_clone, topics, srx).await;
+                });
             }
         }
     }
+
+    clients.abort_all();
+    while clients.join_next().await.is_some() {}
 
     Ok(())
 }
@@ -698,6 +709,67 @@ fn allowed_hosts(list: &str, name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn incomplete_handshake_does_not_block_events_or_shutdown() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (events_tx, events_rx) = mpsc::unbounded_channel();
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+        let relay = tokio::spawn(run_listener(listener, events_rx, async move {
+            let _ = stop_rx.await;
+        }));
+
+        let mut idle = tokio::net::TcpStream::connect(addr).await.unwrap();
+        idle.write_all(b"GET /_events HTTP/1.1\r\n").await.unwrap();
+        let (mut ws, _) = time::timeout(
+            Duration::from_secs(2),
+            tokio_tungstenite::connect_async(format!("ws://{addr}/_events?topics=mail")),
+        )
+        .await
+        .expect("an idle handshake must not block later connections")
+        .unwrap();
+        let hello = time::timeout(Duration::from_secs(2), ws.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let hello: serde_json::Value = serde_json::from_str(hello.to_text().unwrap()).unwrap();
+        assert_eq!(hello["type"], "hello");
+
+        events_tx
+            .send(r#"{"type":"s3.object.put","service":"s3"}"#.into())
+            .unwrap();
+        events_tx
+            .send(
+                r#"{"type":"mail.received","service":"mail","payload":{"messageID":"one"}}"#.into(),
+            )
+            .unwrap();
+        let frame = time::timeout(Duration::from_secs(2), ws.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let frame: serde_json::Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+        assert_eq!(frame["type"], "event");
+        assert_eq!(frame["event"]["service"], "mail");
+        assert_eq!(frame["event"]["payload"]["messageID"], "one");
+        assert!(frame["event"]["timestamp"].is_string());
+
+        stop_tx.send(()).unwrap();
+        time::timeout(Duration::from_secs(2), relay)
+            .await
+            .expect("shutdown must cancel pending handshakes")
+            .unwrap()
+            .unwrap();
+        let mut byte = [0u8; 1];
+        let closed = time::timeout(Duration::from_secs(2), idle.read(&mut byte))
+            .await
+            .unwrap();
+        assert!(matches!(closed, Ok(0)) || closed.is_err());
+    }
 
     #[test]
     fn websocket_handshakes_from_other_sites_are_refused() {
