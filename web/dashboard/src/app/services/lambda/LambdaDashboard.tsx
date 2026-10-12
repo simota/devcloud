@@ -4,6 +4,7 @@ import { Button } from '../../../ui/Button'
 import { EmptyState } from '../../../ui/EmptyState'
 import { Panel } from '../../../ui/Panel'
 import { useDashboardEvents } from '../../api/hooks/useDashboardEvents'
+import { useLatestRequest } from '../../api/hooks/useLatestRequest'
 import type { DashboardService } from '../dashboard/types'
 import { getLambdaStatus, invokeLambdaFunction, listLambdaFunctions, listLambdaInvocations } from './api'
 import type { LambdaFunction, LambdaInvocation, LambdaInvokeResult, LambdaStatus } from './types'
@@ -35,12 +36,15 @@ export function LambdaDashboard({ service }: LambdaDashboardProps): JSX.Element 
   const invokeSeq = useRef(0)
   const isDisabled = service?.status === 'disabled'
 
+  const startRefresh = useLatestRequest()
   const refresh = useCallback(() => {
+    const isCurrent = startRefresh()
     if (isDisabled) {
       return
     }
     Promise.all([getLambdaStatus(), listLambdaFunctions(), listLambdaInvocations()])
       .then(([statusPayload, functionsPayload, invocationsPayload]) => {
+        if (!isCurrent()) return
         setState({
           status: 'success',
           statusPayload,
@@ -54,15 +58,16 @@ export function LambdaDashboard({ service }: LambdaDashboardProps): JSX.Element 
         )
       })
       .catch((error: Error) => {
+        if (!isCurrent()) return
         setState({ status: 'error', message: error.message })
       })
-  }, [isDisabled])
+  }, [startRefresh, isDisabled])
 
   useEffect(() => {
     refresh()
   }, [refresh])
 
-  useDashboardEvents({ topics: ['lambda'], onEvent: refresh, enabled: !isDisabled })
+  useDashboardEvents({ topics: ['lambda'], onEvent: refresh, onResync: refresh, enabled: !isDisabled })
 
   if (isDisabled) {
     return (

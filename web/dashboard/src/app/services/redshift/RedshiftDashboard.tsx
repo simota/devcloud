@@ -4,6 +4,7 @@ import { Button } from '../../../ui/Button'
 import { EmptyState } from '../../../ui/EmptyState'
 import { Panel } from '../../../ui/Panel'
 import { useDashboardEvents } from '../../api/hooks/useDashboardEvents'
+import { useLatestRequest } from '../../api/hooks/useLatestRequest'
 import type { DashboardService } from '../dashboard/types'
 import { getRedshiftCatalog, getRedshiftStatus, listRedshiftClusters, listRedshiftStatements, runRedshiftQuery } from './api'
 import type { RedshiftCatalog, RedshiftCluster, RedshiftQueryResult, RedshiftStatement, RedshiftStatus, RedshiftTable } from './types'
@@ -29,7 +30,9 @@ export function RedshiftDashboard({ service }: RedshiftDashboardProps): JSX.Elem
   const [tableFilter, setTableFilter] = useState('')
   const isDisabled = service?.status === 'disabled'
 
+  const startRefresh = useLatestRequest()
   const refresh = useCallback(() => {
+    const isCurrent = startRefresh()
     if (isDisabled) {
       setState({
         status: 'success',
@@ -45,6 +48,7 @@ export function RedshiftDashboard({ service }: RedshiftDashboardProps): JSX.Elem
     setState({ status: 'loading' })
     Promise.all([getRedshiftStatus(), listRedshiftClusters(), getRedshiftCatalog(), listRedshiftStatements()])
       .then(([statusPayload, clustersPayload, catalogPayload, statementsPayload]) => {
+        if (!isCurrent()) return
         const tables = catalogPayload.catalog.tables
         setState({
           status: 'success',
@@ -56,15 +60,16 @@ export function RedshiftDashboard({ service }: RedshiftDashboardProps): JSX.Elem
         setActiveTableKey((current) => (current && tables.some((table) => tableKey(table) === current) ? current : tableKey(tables[0])))
       })
       .catch((error: Error) => {
+        if (!isCurrent()) return
         setState({ status: 'error', message: error.message })
       })
-  }, [isDisabled, service])
+  }, [startRefresh, isDisabled, service])
 
   useEffect(() => {
     refresh()
   }, [refresh])
 
-  useDashboardEvents({ topics: ['redshift'], onEvent: refresh, enabled: !isDisabled })
+  useDashboardEvents({ topics: ['redshift'], onEvent: refresh, onResync: refresh, enabled: !isDisabled })
 
   const catalog = state.status === 'success' ? state.catalog : undefined
   const tables = catalog?.tables ?? []
