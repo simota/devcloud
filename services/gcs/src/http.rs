@@ -22,7 +22,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use devcloud_s3::base64;
 use devcloud_s3::model::{Bucket, Object};
 use devcloud_s3::objops::{PutObjectInput, UpdateObjectMetadataInput};
-use devcloud_s3::store::{FileBucketStore, StoreError};
+use devcloud_s3::store::{ConditionalError, FileBucketStore, StoreError};
 use devcloud_s3::time_fmt::{now_rfc3339nano, parse_rfc3339};
 use devcloud_s3::wire_json;
 use serde::{Deserialize, Serialize};
@@ -880,11 +880,19 @@ fn read_object(
     key: &str,
 ) -> Result<(Object, Vec<u8>), Response> {
     let (object, body) = fetch_object(server, bucket, key)?;
-    if !generation_matches(req, &object)? {
+    check_existing_object(req, Some(&object))?;
+    Ok((object, body))
+}
+
+/// Reads, metadata updates and deletes must apply both the selector and the
+/// preconditions to the same object. Mutations call this again with the current
+/// metadata while holding the shared S3/GCS store's write lock.
+fn check_existing_object(req: &Request, found: Option<&Object>) -> Result<(), Response> {
+    let object = found.ok_or_else(|| json_error(404, "notFound", "object not found"))?;
+    if !generation_matches(req, object)? {
         return Err(json_error(404, "notFound", "object not found"));
     }
-    check_object_preconditions(server, req, bucket, key)?;
-    Ok((object, body))
+    check_preconditions(Some(object), &preconditions_from_request(req))
 }
 
 fn handle_object(server: &mut Server, req: &Request, bucket: &str, key: &str) -> Response {
@@ -916,9 +924,8 @@ fn handle_object(server: &mut Server, req: &Request, bucket: &str, key: &str) ->
                 Err(_) if req.body.is_empty() => ObjectMetadataRequest::default(),
                 Err(_) => return json_error(400, "invalid", "invalid json request"),
             };
-            match server
-                .store
-                .update_object_metadata(UpdateObjectMetadataInput {
+            match server.store.update_object_metadata_if(
+                UpdateObjectMetadataInput {
                     bucket: bucket.to_string(),
                     key: key.to_string(),
                     content_type: parsed.content_type,
@@ -926,17 +933,23 @@ fn handle_object(server: &mut Server, req: &Request, bucket: &str, key: &str) ->
                     cache_control: parsed.cache_control,
                     content_disposition: parsed.content_disposition,
                     metadata: parsed.metadata,
-                }) {
+                },
+                |current| check_existing_object(req, current),
+            ) {
                 Ok(Some(object)) => Response::json(200, &object_resource(&object)),
                 Ok(None) => json_error(404, "notFound", "object not found"),
-                Err(_) => json_error(404, "notFound", "bucket not found"),
+                Err(ConditionalError::Condition(response)) => response,
+                Err(ConditionalError::Store(_)) => json_error(404, "notFound", "bucket not found"),
             }
         }
         "DELETE" => {
             if let Err(r) = read_object(server, req, bucket, key) {
                 return r;
             }
-            match server.store.delete_object(bucket, key) {
+            match server
+                .store
+                .delete_object_if(bucket, key, |current| check_existing_object(req, current))
+            {
                 Ok(true) => {
                     emit_dashboard_event(
                         "gcs.object.deleted",
@@ -945,7 +958,8 @@ fn handle_object(server: &mut Server, req: &Request, bucket: &str, key: &str) ->
                     Response::empty(204)
                 }
                 Ok(false) => json_error(404, "notFound", "object not found"),
-                Err(_) => json_error(404, "notFound", "bucket not found"),
+                Err(ConditionalError::Condition(response)) => response,
+                Err(ConditionalError::Store(_)) => json_error(404, "notFound", "bucket not found"),
             }
         }
         _ => method_not_allowed("GET, PATCH, DELETE"),
@@ -1034,21 +1048,13 @@ fn handle_compose_object(
         if source.name.is_empty() {
             return json_error(400, "required", "source object name is required");
         }
-        let (object, payload) = match server.store.get_object(bucket, &source.name) {
+        let (object, payload) = match server.store.get_object_snapshot(bucket, &source.name) {
             Ok(Some(found)) => found,
             Ok(None) => return json_error(404, "notFound", "source object not found"),
             Err(_) => return json_error(404, "notFound", "bucket not found"),
         };
-        let actual_generation = generation(&object);
-        if (!source.generation.is_empty() && source.generation != actual_generation)
-            || (!source.object_preconditions.if_generation_match.is_empty()
-                && source.object_preconditions.if_generation_match != actual_generation)
-        {
-            return json_error(
-                412,
-                "conditionNotMet",
-                "source generation precondition failed",
-            );
+        if let Err(response) = check_compose_source_preconditions(Some(&object), source) {
+            return response;
         }
         if first_source.is_none() {
             first_source = Some(object);
@@ -1056,20 +1062,58 @@ fn handle_compose_object(
         body.extend_from_slice(&payload);
     }
     let first_source = first_source.unwrap_or_default();
-    match server.store.put_object(PutObjectInput {
-        bucket: bucket.to_string(),
-        key: dest_key.clone(),
-        body,
-        content_type: first_non_empty(&parsed.destination.content_type, &first_source.content_type),
-        content_encoding: parsed.destination.content_encoding,
-        cache_control: parsed.destination.cache_control,
-        content_disposition: parsed.destination.content_disposition,
-        metadata: parsed.destination.metadata.unwrap_or_default(),
-        ..Default::default()
-    }) {
+    match server.store.put_object_if(
+        PutObjectInput {
+            bucket: bucket.to_string(),
+            key: dest_key.clone(),
+            body,
+            content_type: first_non_empty(
+                &parsed.destination.content_type,
+                &first_source.content_type,
+            ),
+            content_encoding: parsed.destination.content_encoding,
+            cache_control: parsed.destination.cache_control,
+            content_disposition: parsed.destination.content_disposition,
+            metadata: parsed.destination.metadata.unwrap_or_default(),
+            ..Default::default()
+        },
+        |current| {
+            // A source can also be the destination. Its conditions then guard
+            // this mutation and must still hold when the destination is saved.
+            for source in &parsed.source_objects {
+                if source.name == dest_key {
+                    check_compose_source_preconditions(current, source)?;
+                }
+            }
+            check_preconditions(current, &preconditions_from_request(req))
+        },
+    ) {
         Ok(object) => Response::json(200, &object_resource(&object)),
-        Err(e) => json_error(404, "notFound", &store_error_text(&e, bucket, &dest_key)),
+        Err(ConditionalError::Condition(response)) => response,
+        Err(ConditionalError::Store(e)) => {
+            json_error(404, "notFound", &store_error_text(&e, bucket, &dest_key))
+        }
     }
+}
+
+fn check_compose_source_preconditions(
+    found: Option<&Object>,
+    source: &ComposeSourceObject,
+) -> Result<(), Response> {
+    let actual_generation = found.map(generation);
+    if (!source.generation.is_empty()
+        && Some(source.generation.as_str()) != actual_generation.as_deref())
+        || (!source.object_preconditions.if_generation_match.is_empty()
+            && Some(source.object_preconditions.if_generation_match.as_str())
+                != actual_generation.as_deref())
+    {
+        return Err(json_error(
+            412,
+            "conditionNotMet",
+            "source generation precondition failed",
+        ));
+    }
+    Ok(())
 }
 
 fn copy_object(
@@ -1103,45 +1147,56 @@ fn copy_object(
             "invalid destination object name",
         ));
     }
-    let (source, body) = match server.store.get_object(source_bucket, &source_key) {
+    let (source, body) = match server.store.get_object_snapshot(source_bucket, &source_key) {
         Ok(Some(found)) => found,
         Ok(None) => return Err(json_error(404, "notFound", "source object not found")),
         Err(_) => return Err(json_error(404, "notFound", "source bucket not found")),
     };
-    check_stored_preconditions(
-        server,
-        source_bucket,
-        &source_key,
-        &source_preconditions_from_request(req),
-    )?;
+    let source_preconditions = source_preconditions_from_request(req);
+    check_preconditions(Some(&source), &source_preconditions)?;
     check_object_preconditions(server, req, &dest_bucket, &dest_key)?;
 
+    let same_object = source_bucket == dest_bucket && source_key == dest_key;
     let metadata = destination
         .metadata
         .unwrap_or_else(|| source.metadata.clone());
-    match server.store.put_object(PutObjectInput {
-        bucket: dest_bucket,
-        key: dest_key,
-        body,
-        content_type: first_non_empty(&destination.content_type, &source.content_type),
-        content_encoding: first_non_empty(&destination.content_encoding, &source.content_encoding),
-        cache_control: first_non_empty(&destination.cache_control, &source.cache_control),
-        content_disposition: first_non_empty(
-            &destination.content_disposition,
-            &source.content_disposition,
-        ),
-        metadata,
-        ..Default::default()
-    }) {
+    match server.store.put_object_if(
+        PutObjectInput {
+            bucket: dest_bucket,
+            key: dest_key,
+            body,
+            content_type: first_non_empty(&destination.content_type, &source.content_type),
+            content_encoding: first_non_empty(
+                &destination.content_encoding,
+                &source.content_encoding,
+            ),
+            cache_control: first_non_empty(&destination.cache_control, &source.cache_control),
+            content_disposition: first_non_empty(
+                &destination.content_disposition,
+                &source.content_disposition,
+            ),
+            metadata,
+            ..Default::default()
+        },
+        |current| {
+            if same_object {
+                check_preconditions(current, &source_preconditions)?;
+            }
+            check_preconditions(current, &preconditions_from_request(req))
+        },
+    ) {
         Ok(object) => Ok(object),
-        Err(_) => Err(json_error(404, "notFound", "destination bucket not found")),
+        Err(ConditionalError::Condition(response)) => Err(response),
+        Err(ConditionalError::Store(_)) => {
+            Err(json_error(404, "notFound", "destination bucket not found"))
+        }
     }
 }
 
 /// Object fetch with the legacy single-object handler error mapping: any store
 /// error reads as a missing bucket.
 fn fetch_object(server: &Server, bucket: &str, key: &str) -> Result<(Object, Vec<u8>), Response> {
-    match server.store.get_object(bucket, key) {
+    match server.store.get_object_snapshot(bucket, key) {
         Ok(Some(found)) => Ok(found),
         Ok(None) => Err(json_error(404, "notFound", "object not found")),
         Err(_) => Err(json_error(404, "notFound", "bucket not found")),
@@ -1176,6 +1231,7 @@ fn handle_media_upload(server: &mut Server, req: &Request, bucket: &str) -> Resp
     }
     put_object_response(
         server,
+        req,
         PutObjectInput {
             bucket: bucket.to_string(),
             key: name,
@@ -1207,6 +1263,7 @@ fn handle_multipart_upload(server: &mut Server, req: &Request, bucket: &str) -> 
     }
     put_object_response(
         server,
+        req,
         PutObjectInput {
             bucket: bucket.to_string(),
             key: name,
@@ -1317,14 +1374,6 @@ fn put_resumable_upload(server: &mut Server, req: &Request, bucket: &str) -> Res
         }
         return r;
     }
-    if let Err(r) = check_stored_preconditions(
-        server,
-        &session.bucket.clone(),
-        &session.name.clone(),
-        &session.preconditions,
-    ) {
-        return r;
-    }
     let mut payload = req.body.clone();
     // The final chunk may be appended to `body.part`, but its session checkpoint
     // must stay at the previous offset until the object is committed. A restart
@@ -1350,6 +1399,16 @@ fn put_resumable_upload(server: &mut Server, req: &Request, bucket: &str) -> Res
         session.received_bytes = upload_range.end + 1;
         let is_final = session.received_bytes == upload_range.total;
         let one_shot = upload_range.start == 0 && is_final;
+        if !is_final {
+            if let Err(response) = check_stored_preconditions(
+                server,
+                &session.bucket,
+                &session.name,
+                &session.preconditions,
+            ) {
+                return response;
+            }
+        }
         if !one_shot {
             if server
                 .append_session_body(&id, prior_received_bytes, &payload)
@@ -1381,7 +1440,9 @@ fn put_resumable_upload(server: &mut Server, req: &Request, bucket: &str) -> Res
             };
         }
     }
-    match server.store.put_resumable_object(
+    // A final write checks its conditions only inside the store lock, after
+    // replaying any completion that appeared since the initial lookup.
+    match server.store.put_resumable_object_if(
         PutObjectInput {
             bucket: session.bucket.clone(),
             key: session.name.clone(),
@@ -1394,17 +1455,24 @@ fn put_resumable_upload(server: &mut Server, req: &Request, bucket: &str) -> Res
             ..Default::default()
         },
         &id,
+        |current| check_preconditions(current, &session.preconditions),
     ) {
         Ok(object) => complete_resumable_upload(server, &id, &object),
-        Err(e) => {
-            let message = store_error_text(&e, &session.bucket, &session.name);
+        Err(error) => {
             if let Some(prior_received_bytes) = staged_chunk_rollback {
                 // The in-memory and on-disk checkpoints still contain this
                 // offset. Discard the staged tail so a retry cannot duplicate
                 // it, without requiring another metadata write to roll back.
                 let _ = server.truncate_session_body(&id, prior_received_bytes);
             }
-            json_error(404, "notFound", &message)
+            match error {
+                ConditionalError::Condition(response) => response,
+                ConditionalError::Store(e) => json_error(
+                    404,
+                    "notFound",
+                    &store_error_text(&e, &session.bucket, &session.name),
+                ),
+            }
         }
     }
 }
@@ -1435,9 +1503,11 @@ fn complete_resumable_upload(server: &mut Server, id: &str, object: &Object) -> 
 /// Stores the object and writes the legacy upload-handler response: the object
 /// resource on success, or `404 notFound` with the store error text (matching
 /// legacy `writeError(w, http.StatusNotFound, "notFound", err.Error())`).
-fn put_object_response(server: &mut Server, input: PutObjectInput) -> Response {
+fn put_object_response(server: &mut Server, req: &Request, input: PutObjectInput) -> Response {
     let (bucket, key) = (input.bucket.clone(), input.key.clone());
-    match server.store.put_object(input) {
+    match server.store.put_object_if(input, |current| {
+        check_preconditions(current, &preconditions_from_request(req))
+    }) {
         Ok(object) => {
             emit_dashboard_event(
                 "gcs.object.put",
@@ -1450,7 +1520,10 @@ fn put_object_response(server: &mut Server, input: PutObjectInput) -> Response {
             );
             Response::json(200, &object_resource(&object))
         }
-        Err(e) => json_error(404, "notFound", &store_error_text(&e, &bucket, &key)),
+        Err(ConditionalError::Condition(response)) => response,
+        Err(ConditionalError::Store(e)) => {
+            json_error(404, "notFound", &store_error_text(&e, &bucket, &key))
+        }
     }
 }
 
@@ -1565,7 +1638,7 @@ fn check_stored_preconditions(
     key: &str,
     preconditions: &ObjectPreconditions,
 ) -> Result<(), Response> {
-    let found = match server.store.get_object(bucket, key) {
+    let found = match server.store.get_object_snapshot(bucket, key) {
         Ok(found) => found.map(|(object, _)| object),
         Err(e) => {
             return Err(json_error(
@@ -1575,8 +1648,17 @@ fn check_stored_preconditions(
             ))
         }
     };
-    let generation = found.as_ref().map(generation_value).unwrap_or(0);
-    let metageneration = found.as_ref().map(|o| o.metageneration.max(1)).unwrap_or(0);
+    check_preconditions(found.as_ref(), preconditions)
+}
+
+/// Evaluates conditions against one snapshot. Store mutations use this inside
+/// their shared write lock, after any resumable completion has been replayed.
+fn check_preconditions(
+    found: Option<&Object>,
+    preconditions: &ObjectPreconditions,
+) -> Result<(), Response> {
+    let generation = found.map(generation_value).unwrap_or(0);
+    let metageneration = found.map(|o| o.metageneration.max(1)).unwrap_or(0);
     for (name, expected, actual, invert) in [
         (
             "ifGenerationMatch",

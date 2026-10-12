@@ -56,6 +56,21 @@ pub enum StoreError {
     Io(io::Error),
 }
 
+/// Keeps provider-specific condition failures separate from storage failures.
+/// The store only serializes the check and mutation; callers define the
+/// condition and its error without adding provider rules to this crate.
+#[derive(Debug)]
+pub enum ConditionalError<E> {
+    Store(StoreError),
+    Condition(E),
+}
+
+impl<E> From<StoreError> for ConditionalError<E> {
+    fn from(error: StoreError) -> Self {
+        Self::Store(error)
+    }
+}
+
 impl From<io::Error> for StoreError {
     fn from(e: io::Error) -> Self {
         StoreError::Io(e)
@@ -423,6 +438,61 @@ fn splitmix64(state: &mut u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn object_snapshot_waits_until_metadata_and_body_writes_finish() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let root =
+            std::env::temp_dir().join(format!("devcloud-s3-snapshot-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let store = FileBucketStore::new(&root);
+        store.create_bucket("data").unwrap();
+        store
+            .put_object(crate::objops::PutObjectInput {
+                bucket: "data".to_string(),
+                key: "key".to_string(),
+                body: b"old".to_vec(),
+                ..Default::default()
+            })
+            .unwrap();
+        let reading_store = FileBucketStore::new(&root);
+        let guard = store.lock_object_writes();
+        // Pause a write at the real intermediate state: a replaced body with
+        // the previous object metadata still present.
+        write_atomic(&store.object_path("data", "key").join("body"), b"new body").unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            done_tx
+                .send(reading_store.get_object_snapshot("data", "key"))
+                .unwrap();
+        });
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(matches!(
+            done_rx.recv_timeout(Duration::from_millis(100)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        let committed = store
+            .put_object_locked(crate::objops::PutObjectInput {
+                bucket: "data".to_string(),
+                key: "key".to_string(),
+                body: b"new body".to_vec(),
+                ..Default::default()
+            })
+            .unwrap();
+        drop(guard);
+        let snapshot = done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        reader.join().unwrap();
+        assert_eq!(snapshot, (committed, b"new body".to_vec()));
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn bucket_deletion_waits_for_an_in_flight_object_commit() {

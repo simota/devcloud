@@ -10,8 +10,8 @@ use crate::objops::{
     UpdateObjectMetadataInput,
 };
 use crate::store::{
-    remove_dir_all_ignoring_missing, remove_if_exists, write_atomic, FileBucketStore, Result,
-    StoreError,
+    remove_dir_all_ignoring_missing, remove_if_exists, write_atomic, ConditionalError,
+    FileBucketStore, Result, StoreError,
 };
 use crate::time_fmt::{time_after, GO_ZERO_TIME};
 use crate::validation::{valid_bucket_name, valid_object_key, valid_upload_id};
@@ -68,6 +68,32 @@ impl FileBucketStore {
     pub fn put_object(&self, input: PutObjectInput) -> Result<Object> {
         let _guard = self.lock_object_writes();
         self.put_object_locked(input)
+    }
+
+    /// Checks the current object and stores its replacement under one shared
+    /// root write lock. Missing objects and delete markers are passed as None.
+    /// The predicate must not call any locking API on a store over this root.
+    pub fn put_object_if<E>(
+        &self,
+        input: PutObjectInput,
+        predicate: impl FnOnce(Option<&Object>) -> std::result::Result<(), E>,
+    ) -> std::result::Result<Object, ConditionalError<E>> {
+        let _guard = self.lock_object_writes();
+        self.check_current_object_locked(&input.bucket, &input.key, predicate)?;
+        Ok(self.put_object_locked(input)?)
+    }
+
+    /// The caller must retain the root write lock through the mutation.
+    fn check_current_object_locked<E>(
+        &self,
+        bucket: &str,
+        key: &str,
+        predicate: impl FnOnce(Option<&Object>) -> std::result::Result<(), E>,
+    ) -> std::result::Result<(), ConditionalError<E>> {
+        self.require_bucket_and_key(bucket, key)?;
+        let current = self.read_current_object_metadata(bucket, key)?;
+        predicate(current.as_ref().filter(|object| !object.delete_marker))
+            .map_err(ConditionalError::Condition)
     }
 
     /// `put_object` for a caller already holding `lock_object_writes`.
@@ -148,17 +174,51 @@ impl FileBucketStore {
             return Err(StoreError::InvalidUploadId);
         }
         let _guard = self.lock_object_writes();
+        if let Some(receipt) = self.resumable_result_for_input_locked(&input, upload_id)? {
+            return Ok(receipt);
+        }
+        self.commit_resumable_object_locked(input, upload_id)
+    }
+
+    /// Like put_object_if, but an upload already committed returns its original
+    /// receipt before evaluating the predicate, including after bucket deletion.
+    /// The predicate must not call any locking API on a store over this root.
+    pub fn put_resumable_object_if<E>(
+        &self,
+        input: PutObjectInput,
+        upload_id: &str,
+        predicate: impl FnOnce(Option<&Object>) -> std::result::Result<(), E>,
+    ) -> std::result::Result<Object, ConditionalError<E>> {
+        if !valid_upload_id(upload_id) {
+            return Err(StoreError::InvalidUploadId.into());
+        }
+        let _guard = self.lock_object_writes();
+        if let Some(receipt) = self.resumable_result_for_input_locked(&input, upload_id)? {
+            return Ok(receipt);
+        }
+        self.check_current_object_locked(&input.bucket, &input.key, predicate)?;
+        Ok(self.commit_resumable_object_locked(input, upload_id)?)
+    }
+
+    fn resumable_result_for_input_locked(
+        &self,
+        input: &PutObjectInput,
+        upload_id: &str,
+    ) -> Result<Option<Object>> {
         if let Some(receipt) = self.read_resumable_upload_receipt(upload_id)? {
             if receipt.bucket != input.bucket || receipt.key != input.key {
                 return Err(StoreError::InvalidUploadId);
             }
-            return Ok(receipt);
+            return Ok(Some(receipt));
         }
-        if let Some(receipt) =
-            self.get_resumable_upload_result_locked(&input.bucket, Some(&input.key), upload_id)?
-        {
-            return Ok(receipt);
-        }
+        self.get_resumable_upload_result_locked(&input.bucket, Some(&input.key), upload_id)
+    }
+
+    fn commit_resumable_object_locked(
+        &self,
+        input: PutObjectInput,
+        upload_id: &str,
+    ) -> Result<Object> {
         let object = self.put_object_with_resumable_id_locked(input, upload_id)?;
         // The version snapshot is already complete on this path. Recovery of
         // an interrupted commit uses preserve_resumable_upload_result instead.
@@ -341,6 +401,26 @@ impl FileBucketStore {
         input: UpdateObjectMetadataInput,
     ) -> Result<Option<Object>> {
         let _guard = self.lock_object_writes();
+        self.update_object_metadata_locked(input)
+    }
+
+    /// Checks current metadata and updates it without admitting another writer
+    /// between the check and update. Delete markers are passed as None.
+    /// The predicate must not call any locking API on a store over this root.
+    pub fn update_object_metadata_if<E>(
+        &self,
+        input: UpdateObjectMetadataInput,
+        predicate: impl FnOnce(Option<&Object>) -> std::result::Result<(), E>,
+    ) -> std::result::Result<Option<Object>, ConditionalError<E>> {
+        let _guard = self.lock_object_writes();
+        self.check_current_object_locked(&input.bucket, &input.key, predicate)?;
+        Ok(self.update_object_metadata_locked(input)?)
+    }
+
+    fn update_object_metadata_locked(
+        &self,
+        input: UpdateObjectMetadataInput,
+    ) -> Result<Option<Object>> {
         if !valid_bucket_name(&input.bucket) {
             return Err(StoreError::InvalidBucketName);
         }
@@ -407,6 +487,18 @@ impl FileBucketStore {
         Ok(Some((object, body)))
     }
 
+    /// Reads metadata and body without an intervening object write. Use this
+    /// boundary for provider conditions or copy/compose sources; get_object is
+    /// also used internally by callers that already hold the root write lock.
+    pub fn get_object_snapshot(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<Option<(Object, Vec<u8>)>> {
+        let _guard = self.lock_object_writes();
+        self.get_object(bucket, key)
+    }
+
     /// Reads a specific object version; an empty `version_id` falls back to the
     /// current object. A delete-marker version returns `Some` with an empty body.
     pub fn get_object_version(
@@ -442,6 +534,20 @@ impl FileBucketStore {
         Ok(self.delete_object_with_result(bucket, key, false)?.1)
     }
 
+    /// Checks the current object and deletes it under the same root write lock.
+    /// The predicate receives None for a missing object or a delete marker and
+    /// must not call any locking API on a store over this root.
+    pub fn delete_object_if<E>(
+        &self,
+        bucket: &str,
+        key: &str,
+        predicate: impl FnOnce(Option<&Object>) -> std::result::Result<(), E>,
+    ) -> std::result::Result<bool, ConditionalError<E>> {
+        let _guard = self.lock_object_writes();
+        self.check_current_object_locked(bucket, key, predicate)?;
+        Ok(self.delete_object_with_result_locked(bucket, key, false)?.1)
+    }
+
     /// Deletes the current object, returning the delete marker (when versioned)
     /// and whether anything existed. Honors object-lock retention/legal-hold.
     pub fn delete_object_with_result(
@@ -451,6 +557,15 @@ impl FileBucketStore {
         bypass_governance: bool,
     ) -> Result<(Object, bool)> {
         let _guard = self.lock_object_writes();
+        self.delete_object_with_result_locked(bucket, key, bypass_governance)
+    }
+
+    fn delete_object_with_result_locked(
+        &self,
+        bucket: &str,
+        key: &str,
+        bypass_governance: bool,
+    ) -> Result<(Object, bool)> {
         if !valid_bucket_name(bucket) {
             return Err(StoreError::InvalidBucketName);
         }
