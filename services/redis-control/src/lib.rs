@@ -121,7 +121,7 @@ pub async fn run(
     // as the legacy listener which always runs regardless of upstream liveness.
     server.refresh_database_count().await;
     if cfg.initial_db != 0 {
-        server.set_current_db(cfg.initial_db).await.map_err(|_| {
+        server.set_initial_db(cfg.initial_db).await.map_err(|_| {
             "redis control: failed to select the configured initial database".to_string()
         })?;
     }

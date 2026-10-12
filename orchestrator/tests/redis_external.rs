@@ -49,7 +49,7 @@ fn bulk(value: &str) -> String {
     format!("${}\r\n{value}\r\n", value.len())
 }
 
-async fn fake_redis(stream: TcpStream, wrong_auth: Arc<AtomicBool>) {
+async fn fake_redis(stream: TcpStream, wrong_auth: Arc<AtomicBool>, config_allowed: bool) {
     let mut stream = BufReader::new(stream);
     let mut authenticated = false;
     let mut db = 0;
@@ -70,10 +70,13 @@ async fn fake_redis(stream: TcpStream, wrong_auth: Arc<AtomicBool>) {
                 db = args[1].parse().unwrap();
                 "+OK\r\n".into()
             }
-            Some("CONFIG") => format!("*2\r\n{}{}", bulk("databases"), bulk("16")),
-            Some("INFO") => bulk(
-                "redis_version:7.0.0\r\nconnected_clients:2\r\nused_memory_human:1M\r\ndb3:keys=1,expires=0\r\n",
-            ),
+            Some("CONFIG") if config_allowed => {
+                format!("*2\r\n{}{}", bulk("databases"), bulk("16"))
+            }
+            Some("CONFIG") => "-NOPERM this user cannot run CONFIG\r\n".into(),
+            Some("INFO") => bulk(&format!(
+                "redis_version:7.0.0\r\nconnected_clients:2\r\nused_memory_human:1M\r\ndb{db}:keys=1,expires=0\r\n"
+            )),
             Some("GET") => bulk(&format!("database-{db}")),
             _ => "-ERR unsupported test command\r\n".into(),
         };
@@ -122,6 +125,15 @@ async fn http(port: u16, method: &str, path: &str, body: &str) -> Result<(u16, V
 
 #[tokio::test]
 async fn external_redis_dashboard_uses_its_url_password_port_and_database() {
+    check_external_redis(3, true, 16).await;
+}
+
+#[tokio::test]
+async fn external_redis_without_config_permission_accepts_a_database_above_the_default_range() {
+    check_external_redis(20, false, 21).await;
+}
+
+async fn check_external_redis(database: i64, config_allowed: bool, expected_database_count: i64) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upstream_port = listener.local_addr().unwrap().port();
     let wrong_auth = Arc::new(AtomicBool::new(false));
@@ -135,7 +147,7 @@ async fn external_redis_dashboard_uses_its_url_password_port_and_database() {
                 _ = &mut stopped => break,
                 connection = listener.accept() => {
                     let (stream, _) = connection.unwrap();
-                    connections.spawn(fake_redis(stream, Arc::clone(&observed)));
+                    connections.spawn(fake_redis(stream, Arc::clone(&observed), config_allowed));
                 }
             }
         }
@@ -163,7 +175,7 @@ async fn external_redis_dashboard_uses_its_url_password_port_and_database() {
     fs::write(
         root.join(".devcloud/config.yaml"),
         format!(
-            "server:\n  dashboardPort: {dashboard}\n  eventRelayPort: {relay}\n  redisHttpPort: {control}\n  redisPort: {managed}\nauth:\n  redis:\n    mode: strict\n    password: control-only-secret\nservices:\n  redis:\n    mode: external\n    externalUrl: redis://:upstream%2Dsecret@127.0.0.1:{upstream_port}/3\n    binaryPath: /redis-must-not-be-started\n"
+            "server:\n  dashboardPort: {dashboard}\n  eventRelayPort: {relay}\n  redisHttpPort: {control}\n  redisPort: {managed}\nauth:\n  redis:\n    mode: strict\n    password: control-only-secret\nservices:\n  redis:\n    mode: external\n    externalUrl: redis://:upstream%2Dsecret@127.0.0.1:{upstream_port}/{database}\n    binaryPath: /redis-must-not-be-started\n"
         ),
     )
     .unwrap();
@@ -194,7 +206,23 @@ async fn external_redis_dashboard_uses_its_url_password_port_and_database() {
     };
     assert_eq!(status["mode"], "external");
     assert_eq!(status["address"], format!("127.0.0.1:{upstream_port}"));
-    assert_eq!(status["currentDB"], 3);
+    assert_eq!(status["currentDB"], database);
+    assert_eq!(status["databaseCount"], expected_database_count);
+    assert_eq!(status["currentDBKeys"], 1);
+    // The selected DB must also remain available in the normal UI switcher,
+    // whose range comes from databaseCount rather than the external URL.
+    for db in [0, database] {
+        let (status, result) = http(
+            dashboard,
+            "POST",
+            "/api/redis/select-db",
+            &json!({"db": db}).to_string(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status, 200);
+        assert_eq!(result["currentDB"], db);
+    }
     let (status, result) = http(
         dashboard,
         "POST",
@@ -204,7 +232,7 @@ async fn external_redis_dashboard_uses_its_url_password_port_and_database() {
     .await
     .unwrap();
     assert_eq!(status, 200);
-    assert_eq!(result["rows"], json!(["database-3"]));
+    assert_eq!(result["rows"], json!([format!("database-{database}")]));
     assert!(!wrong_auth.load(Ordering::SeqCst));
     let (_, registry) = http(dashboard, "GET", "/api/services", "").await.unwrap();
     let registry = registry.to_string();

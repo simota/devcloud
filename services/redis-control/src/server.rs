@@ -318,6 +318,20 @@ impl Server {
         if count > 0 && db >= count {
             return Err(format!("db {db} out of range (0..{})", count - 1));
         }
+        self.select_db(db).await
+    }
+
+    /// The configured initial database is validated by Redis itself. CONFIG
+    /// may be forbidden, so its fallback count must not reject a valid SELECT.
+    pub async fn set_initial_db(&self, db: i64) -> Result<(), String> {
+        self.select_db(db).await
+    }
+
+    async fn select_db(&self, db: i64) -> Result<(), String> {
+        let minimum_count = db
+            .checked_add(1)
+            .filter(|count| *count > 0)
+            .ok_or_else(|| format!("invalid database index {db}"))?;
         // Ensure a connection exists and is live for this db.
         self.with_conn(db, |mut conn| async move {
             let reply = conn.command(&["PING"]).await.map(|_| ());
@@ -325,7 +339,11 @@ impl Server {
         })
         .await
         .map_err(|e| format!("ping redis db {db}: {e}"))?;
-        self.state.lock().unwrap().current_db = db;
+        let mut state = self.state.lock().unwrap();
+        state.current_db = db;
+        // A successful SELECT proves this database exists even when CONFIG is
+        // unavailable. Keep the status/UI range consistent with the selection.
+        state.database_count = state.database_count.max(minimum_count);
         Ok(())
     }
 
