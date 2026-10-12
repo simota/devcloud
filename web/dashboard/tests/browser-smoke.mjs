@@ -107,6 +107,15 @@ try {
   // Settle the hello-triggered snapshot before mutating; otherwise that initial
   // request could include the new object and mask a broken event dispatcher.
   await page.waitForLoadState('networkidle')
+  const registryResponse = await fetch(`${dashboard}/api/services`, { signal: AbortSignal.timeout(5000) })
+  assert.equal(registryResponse.status, 200)
+  const registry = await registryResponse.json()
+  assert.equal(registry.services.length, 12)
+  assert.deepEqual(registry.services.filter((service) => service.status === 'running').map((service) => service.id), ['gcs'],
+    'devcloud up gcs must report only GCS as running')
+  assert.ok(registry.services.every((service) => service.id === 'gcs' || service.status === 'disabled'),
+    'unselected services must be disabled')
+  await page.getByText('1/12 running', { exact: true }).waitFor()
 
   // A provider mutation must reach the page through the real relay and proxy.
   await upload('live-event.txt')
@@ -128,10 +137,10 @@ try {
   assert.deepEqual(errors, [], 'the dashboard must not throw in the browser')
   await page.screenshot({ path: join(output, 'gcs-live-and-reconnect.png'), fullPage: true })
   await writeFile(join(output, 'result.json'), JSON.stringify({
-    passed: ['initial snapshot', 'live provider event', 'snapshot after reconnect', 'object inspector'],
+    passed: ['selected service registry', 'initial snapshot', 'live provider event', 'snapshot after reconnect', 'object inspector'],
     helloCount, pageErrors: errors,
   }, null, 2) + '\n')
-  console.log('Dashboard browser smoke passed: initial snapshot, live event, reconnect snapshot, inspector.')
+  console.log('Dashboard browser smoke passed: selected service registry, initial snapshot, live event, reconnect snapshot, inspector.')
 } catch (error) {
   if (page) await page.screenshot({ path: join(output, 'failure.png'), fullPage: true }).catch(() => {})
   throw error

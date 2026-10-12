@@ -80,11 +80,7 @@ pub async fn handle_status(config: &Config, req: &Request) -> Response {
         }
     }
 
-    let endpoint = if config.sqs_base.is_empty() {
-        "http://127.0.0.1:19324".to_string()
-    } else {
-        config.sqs_base.clone()
-    };
+    let endpoint = config.sqs_endpoint_display();
     let region = if region.is_empty() {
         "us-east-1".to_string()
     } else {

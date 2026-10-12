@@ -33,6 +33,9 @@ pub struct Config {
     /// Base URL of the SQS service HTTP listener (provider protocol +
     /// `/_introspect/`), e.g. `http://127.0.0.1:19324`. Empty == disabled.
     pub sqs_base: String,
+    /// Display endpoint, including when disabled. Empty falls back to the base
+    /// URL or the default SQS port for callers using the legacy env contract.
+    pub sqs_endpoint: String,
     pub sqs_region: String,
     pub sqs_auth_mode: String,
     pub sqs_storage_path: String,
@@ -105,6 +108,7 @@ impl Config {
             event_relay_endpoint: env("DEVCLOUD_DASHBOARD_EVENT_RELAY"),
 
             sqs_base: env("DEVCLOUD_DASHBOARD_SQS_BASE"),
+            sqs_endpoint: env("DEVCLOUD_DASHBOARD_SQS_ENDPOINT"),
             sqs_region: env_or("DEVCLOUD_DASHBOARD_SQS_REGION", "us-east-1"),
             sqs_auth_mode: env_or("DEVCLOUD_DASHBOARD_SQS_AUTH_MODE", "relaxed"),
             sqs_storage_path: env_or("DEVCLOUD_DASHBOARD_SQS_STORAGE", ".devcloud/data/sqs"),
