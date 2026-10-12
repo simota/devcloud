@@ -145,34 +145,37 @@ fn dirty_tracking_persists_multiple_tables_independently() {
 /// a mutation whose persist fails must never leave the per-table cache (or
 /// dirty flag) in a state that lets a later, unrelated persist write the
 /// failed mutation's (rolled-back) data to disk.
-#[cfg(unix)]
 #[test]
 fn persist_failure_rollback_then_next_persist_writes_pre_mutation_state() {
-    use std::os::unix::fs::PermissionsExt;
-
     let dir = tempdir();
     let mut s = server(&dir);
     create_table(&mut s, "A");
     put(&mut s, "A", item("k", "before")).expect("initial put");
+    let committed = std::fs::read(dir.join("state.json")).expect("read committed state");
 
-    // Force the next persist to fail: creating a new `state.json.tmp` entry
-    // requires write permission on the directory itself.
-    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555))
-        .expect("make dir read-only");
+    // A directory at the temporary file's path makes the write fail for every
+    // user, including root. Permission-only failure injection is ineffective
+    // with elevated privileges and is unavailable on non-Unix platforms.
+    let blocked = dir.join("state.json.tmp");
+    std::fs::create_dir(&blocked).expect("block temporary state file");
 
     let err = put(&mut s, "A", item("k", "after-failed"))
-        .expect_err("persist must fail when the directory is read-only");
+        .expect_err("persist must fail when its temporary path is a directory");
     assert_eq!(err.name, "InternalServerError");
+    assert_eq!(
+        std::fs::read(dir.join("state.json")).expect("read state after failed persist"),
+        committed,
+        "a failed persist must leave the committed file unchanged"
+    );
 
     // Caller-side rollback (pre-existing behavior) must already have
     // restored the in-memory item.
     assert_eq!(get_val(&s, "A", "k").as_deref(), Some("before"));
 
-    // Restore permissions and drive a real persist via an unrelated write to
+    // Remove the obstruction and drive a real persist via an unrelated write to
     // the same table, so the fix under test — not leaving a stale cache/dirty
     // entry from the failed attempt — is what's exercised.
-    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755))
-        .expect("restore dir permissions");
+    std::fs::remove_dir(&blocked).expect("unblock temporary state file");
     put(&mut s, "A", item("k2", "unrelated")).expect("put after recovery");
 
     let after = read_state(&dir);

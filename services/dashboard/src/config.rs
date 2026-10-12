@@ -33,6 +33,9 @@ pub struct Config {
     /// Base URL of the SQS service HTTP listener (provider protocol +
     /// `/_introspect/`), e.g. `http://127.0.0.1:19324`. Empty == disabled.
     pub sqs_base: String,
+    /// Display endpoint, including when disabled. Empty falls back to the base
+    /// URL or the default SQS port for callers using the legacy env contract.
+    pub sqs_endpoint: String,
     pub sqs_region: String,
     pub sqs_auth_mode: String,
     pub sqs_storage_path: String,
@@ -44,6 +47,9 @@ pub struct Config {
     pub mail_endpoint: String,
     pub mail_storage_path: String,
     pub mail_disabled: bool,
+    pub mail_auth_mode: String,
+    pub mail_username: String,
+    pub mail_password: String,
     pub s3_base: String,
     pub s3_endpoint: String,
     pub s3_storage_path: String,
@@ -64,6 +70,8 @@ pub struct Config {
     pub redis_endpoint: String,
     pub redis_storage_path: String,
     pub redis_enabled: bool,
+    pub redis_auth_mode: String,
+    pub redis_password: String,
     pub pubsub_base: String,
     pub pubsub_endpoint: String,
     pub pubsub_storage_path: String,
@@ -100,6 +108,7 @@ impl Config {
             event_relay_endpoint: env("DEVCLOUD_DASHBOARD_EVENT_RELAY"),
 
             sqs_base: env("DEVCLOUD_DASHBOARD_SQS_BASE"),
+            sqs_endpoint: env("DEVCLOUD_DASHBOARD_SQS_ENDPOINT"),
             sqs_region: env_or("DEVCLOUD_DASHBOARD_SQS_REGION", "us-east-1"),
             sqs_auth_mode: env_or("DEVCLOUD_DASHBOARD_SQS_AUTH_MODE", "relaxed"),
             sqs_storage_path: env_or("DEVCLOUD_DASHBOARD_SQS_STORAGE", ".devcloud/data/sqs"),
@@ -108,6 +117,9 @@ impl Config {
             mail_endpoint: env_or("DEVCLOUD_DASHBOARD_MAIL_ENDPOINT", "smtp://127.0.0.1:11025"),
             mail_storage_path: env_or("DEVCLOUD_DASHBOARD_MAIL_STORAGE", ".devcloud/data/mail"),
             mail_disabled: env("DEVCLOUD_DASHBOARD_MAIL_DISABLED") == "1",
+            mail_auth_mode: env_or("DEVCLOUD_DASHBOARD_MAIL_AUTH_MODE", "off"),
+            mail_username: env("DEVCLOUD_DASHBOARD_MAIL_USERNAME"),
+            mail_password: env("DEVCLOUD_DASHBOARD_MAIL_PASSWORD"),
             s3_base: env("DEVCLOUD_DASHBOARD_S3_BASE"),
             s3_endpoint: env_or("DEVCLOUD_DASHBOARD_S3_ENDPOINT", "http://127.0.0.1:14566"),
             s3_storage_path: env_or("DEVCLOUD_DASHBOARD_S3_STORAGE", ".devcloud/data/s3"),
@@ -152,6 +164,8 @@ impl Config {
             ),
             redis_storage_path: env_or("DEVCLOUD_DASHBOARD_REDIS_STORAGE", ".devcloud/data/redis"),
             redis_enabled: env("DEVCLOUD_DASHBOARD_REDIS_ENABLED") == "1",
+            redis_auth_mode: env_or("DEVCLOUD_DASHBOARD_REDIS_AUTH_MODE", "relaxed"),
+            redis_password: env("DEVCLOUD_DASHBOARD_REDIS_PASSWORD"),
             pubsub_base: env("DEVCLOUD_DASHBOARD_PUBSUB_BASE"),
             pubsub_endpoint: env_or(
                 "DEVCLOUD_DASHBOARD_PUBSUB_ENDPOINT",

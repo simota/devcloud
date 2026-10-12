@@ -40,6 +40,7 @@ fn main() {
     runtime.block_on(async move {
         let mut child = match Command::new(&config.binary)
             .args(args)
+            .kill_on_drop(true)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -67,8 +68,10 @@ fn main() {
                 }
             }
             _ = shutdown_signal() => {
-                let _ = child.start_kill();
-                let _ = child.wait().await;
+                if let Err(e) = devcloud_redis::stop_child(&mut child).await {
+                    eprintln!("devcloud-redis: stop redis-server: {e}");
+                    std::process::exit(1);
+                }
             }
         }
     });

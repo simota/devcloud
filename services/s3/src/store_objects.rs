@@ -10,11 +10,11 @@ use crate::objops::{
     UpdateObjectMetadataInput,
 };
 use crate::store::{
-    remove_dir_all_ignoring_missing, remove_if_exists, write_atomic, FileBucketStore, Result,
-    StoreError,
+    remove_dir_all_ignoring_missing, remove_if_exists, write_atomic, ConditionalError,
+    FileBucketStore, Result, StoreError,
 };
 use crate::time_fmt::{time_after, GO_ZERO_TIME};
-use crate::validation::{valid_bucket_name, valid_object_key};
+use crate::validation::{valid_bucket_name, valid_object_key, valid_upload_id};
 use std::cmp::Ordering;
 use std::fs;
 use std::io;
@@ -70,8 +70,42 @@ impl FileBucketStore {
         self.put_object_locked(input)
     }
 
+    /// Checks the current object and stores its replacement under one shared
+    /// root write lock. Missing objects and delete markers are passed as None.
+    /// The predicate must not call any locking API on a store over this root.
+    pub fn put_object_if<E>(
+        &self,
+        input: PutObjectInput,
+        predicate: impl FnOnce(Option<&Object>) -> std::result::Result<(), E>,
+    ) -> std::result::Result<Object, ConditionalError<E>> {
+        let _guard = self.lock_object_writes();
+        self.check_current_object_locked(&input.bucket, &input.key, predicate)?;
+        Ok(self.put_object_locked(input)?)
+    }
+
+    /// The caller must retain the root write lock through the mutation.
+    fn check_current_object_locked<E>(
+        &self,
+        bucket: &str,
+        key: &str,
+        predicate: impl FnOnce(Option<&Object>) -> std::result::Result<(), E>,
+    ) -> std::result::Result<(), ConditionalError<E>> {
+        self.require_bucket_and_key(bucket, key)?;
+        let current = self.read_current_object_metadata(bucket, key)?;
+        predicate(current.as_ref().filter(|object| !object.delete_marker))
+            .map_err(ConditionalError::Condition)
+    }
+
     /// `put_object` for a caller already holding `lock_object_writes`.
     pub(crate) fn put_object_locked(&self, input: PutObjectInput) -> Result<Object> {
+        self.put_object_with_resumable_id_locked(input, "")
+    }
+
+    fn put_object_with_resumable_id_locked(
+        &self,
+        input: PutObjectInput,
+        upload_id: &str,
+    ) -> Result<Object> {
         if !valid_bucket_name(&input.bucket) {
             return Err(StoreError::InvalidBucketName);
         }
@@ -106,6 +140,7 @@ impl FileBucketStore {
             encryption: clean_server_side_encryption(&input.encryption),
             retention: clean_object_retention(&input.retention),
             legal_hold: clean_object_legal_hold(&input.legal_hold),
+            resumable_upload_id: upload_id.to_string(),
             ..Default::default()
         };
         if object.retention.mode.is_empty() {
@@ -122,12 +157,223 @@ impl FileBucketStore {
 
         let path = self.object_path(&input.bucket, &input.key);
         fs::create_dir_all(&path)?;
+        self.preserve_current_resumable_upload(&input.bucket, &input.key)?;
         write_atomic(&path.join("body"), &input.body)?;
         Self::write_json(&path.join("object.json"), &object)?;
         if !object.version_id.is_empty() {
             self.write_object_version(&path, &object, &input.body)?;
         }
         Ok(object)
+    }
+
+    /// Commits a GCS resumable upload exactly once. The identity is included in
+    /// the atomic object metadata write, so a crash before the completion
+    /// receipt is linked can be recovered without assigning a new generation.
+    pub fn put_resumable_object(&self, input: PutObjectInput, upload_id: &str) -> Result<Object> {
+        if !valid_upload_id(upload_id) {
+            return Err(StoreError::InvalidUploadId);
+        }
+        let _guard = self.lock_object_writes();
+        if let Some(receipt) = self.resumable_result_for_input_locked(&input, upload_id)? {
+            return Ok(receipt);
+        }
+        self.commit_resumable_object_locked(input, upload_id)
+    }
+
+    /// Like put_object_if, but an upload already committed returns its original
+    /// receipt before evaluating the predicate, including after bucket deletion.
+    /// The predicate must not call any locking API on a store over this root.
+    pub fn put_resumable_object_if<E>(
+        &self,
+        input: PutObjectInput,
+        upload_id: &str,
+        predicate: impl FnOnce(Option<&Object>) -> std::result::Result<(), E>,
+    ) -> std::result::Result<Object, ConditionalError<E>> {
+        if !valid_upload_id(upload_id) {
+            return Err(StoreError::InvalidUploadId.into());
+        }
+        let _guard = self.lock_object_writes();
+        if let Some(receipt) = self.resumable_result_for_input_locked(&input, upload_id)? {
+            return Ok(receipt);
+        }
+        self.check_current_object_locked(&input.bucket, &input.key, predicate)?;
+        Ok(self.commit_resumable_object_locked(input, upload_id)?)
+    }
+
+    fn resumable_result_for_input_locked(
+        &self,
+        input: &PutObjectInput,
+        upload_id: &str,
+    ) -> Result<Option<Object>> {
+        if let Some(receipt) = self.read_resumable_upload_receipt(upload_id)? {
+            if receipt.bucket != input.bucket || receipt.key != input.key {
+                return Err(StoreError::InvalidUploadId);
+            }
+            return Ok(Some(receipt));
+        }
+        self.get_resumable_upload_result_locked(&input.bucket, Some(&input.key), upload_id)
+    }
+
+    fn commit_resumable_object_locked(
+        &self,
+        input: PutObjectInput,
+        upload_id: &str,
+    ) -> Result<Object> {
+        let object = self.put_object_with_resumable_id_locked(input, upload_id)?;
+        // The version snapshot is already complete on this path. Recovery of
+        // an interrupted commit uses preserve_resumable_upload_result instead.
+        fs::hard_link(
+            self.object_path(&object.bucket, &object.key)
+                .join("object.json"),
+            self.resumable_upload_receipt_path(upload_id),
+        )?;
+        Ok(object)
+    }
+
+    /// Claims the best-effort dashboard notification after a durable result is
+    /// available. Both an initial completion and a recovered retry use this
+    /// boundary, so an I/O failure can be retried without emitting twice.
+    pub fn claim_resumable_upload_event(&self, object: &Object) -> Result<bool> {
+        let _guard = self.lock_object_writes();
+        let receipt = self.read_resumable_upload_receipt(&object.resumable_upload_id)?;
+        if receipt.as_ref() != Some(object) {
+            return Err(StoreError::InvalidUploadId);
+        }
+        let path = self
+            .resumable_upload_receipt_path(&object.resumable_upload_id)
+            .with_extension("notified");
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                if fs::metadata(path)?.is_file() {
+                    Ok(false)
+                } else {
+                    Err(StoreError::Io(error))
+                }
+            }
+            Err(error) => Err(StoreError::Io(error)),
+        }
+    }
+
+    /// Returns the original completion result even after session cleanup or a
+    /// later object overwrite/deletion. An outstanding session supplies `key`
+    /// so the atomic object marker can recover a missing receipt after restart.
+    pub fn get_resumable_upload_result(
+        &self,
+        bucket: &str,
+        key: Option<&str>,
+        upload_id: &str,
+    ) -> Result<Option<Object>> {
+        let _guard = self.lock_object_writes();
+        self.get_resumable_upload_result_locked(bucket, key, upload_id)
+    }
+
+    fn get_resumable_upload_result_locked(
+        &self,
+        bucket: &str,
+        key: Option<&str>,
+        upload_id: &str,
+    ) -> Result<Option<Object>> {
+        if !valid_upload_id(upload_id)
+            || !valid_bucket_name(bucket)
+            || key.is_some_and(|key| !valid_object_key(key))
+        {
+            return Ok(None);
+        }
+        if let Some(receipt) = self.read_resumable_upload_receipt(upload_id)? {
+            return Ok(
+                (receipt.bucket == bucket && key.is_none_or(|key| receipt.key == key))
+                    .then_some(receipt),
+            );
+        }
+        let Some(key) = key else {
+            return Ok(None);
+        };
+        let path = self.object_path(bucket, key).join("object.json");
+        if let Some(object) = read_object(&path)? {
+            if !object.delete_marker
+                && object.resumable_upload_id == upload_id
+                && object.bucket == bucket
+                && object.key == key
+            {
+                self.preserve_resumable_upload_result(&object, &path)?;
+                return self.read_resumable_upload_receipt(upload_id);
+            }
+        }
+        Ok(None)
+    }
+
+    fn read_resumable_upload_receipt(&self, upload_id: &str) -> Result<Option<Object>> {
+        if !valid_upload_id(upload_id) {
+            return Ok(None);
+        }
+        let receipt = read_object(&self.resumable_upload_receipt_path(upload_id))?;
+        if receipt.as_ref().is_some_and(|object| {
+            object.resumable_upload_id != upload_id
+                || object.delete_marker
+                || !valid_bucket_name(&object.bucket)
+                || !valid_object_key(&object.key)
+        }) {
+            return Err(StoreError::Io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid resumable upload receipt",
+            )));
+        }
+        Ok(receipt)
+    }
+
+    pub(crate) fn preserve_current_resumable_upload(&self, bucket: &str, key: &str) -> Result<()> {
+        let path = self.object_path(bucket, key).join("object.json");
+        if let Some(object) = read_object(&path)? {
+            self.preserve_resumable_upload_result(&object, &path)?;
+        }
+        Ok(())
+    }
+
+    /// Must run under the root-wide write lock before replacing any metadata
+    /// or deleting an object. Every metadata update uses rename, so a hard link
+    /// atomically preserves the exact original result in an immutable inode.
+    /// If the receipt cannot be preserved, the subsequent mutation must fail.
+    pub(crate) fn preserve_resumable_upload_result(
+        &self,
+        object: &Object,
+        source: &Path,
+    ) -> Result<()> {
+        let upload_id = &object.resumable_upload_id;
+        if upload_id.is_empty() {
+            return Ok(());
+        }
+        if !valid_upload_id(upload_id)
+            || !valid_bucket_name(&object.bucket)
+            || !valid_object_key(&object.key)
+            || object.delete_marker
+        {
+            return Err(StoreError::InvalidUploadId);
+        }
+        if let Some(receipt) = self.read_resumable_upload_receipt(upload_id)? {
+            if receipt.bucket != object.bucket
+                || receipt.key != object.key
+                || receipt.last_modified != object.last_modified
+                || receipt.etag != object.etag
+                || receipt.size != object.size
+            {
+                return Err(StoreError::InvalidUploadId);
+            }
+            return Ok(());
+        }
+        let path = self.object_path(&object.bucket, &object.key);
+        if !object.version_id.is_empty() && source == path.join("object.json") {
+            // Also recover a stop between the current metadata rename and its
+            // version snapshot, before any subsequent writer discards the body.
+            let body = fs::read(path.join("body"))?;
+            self.write_object_version(&path, object, &body)?;
+        }
+        fs::hard_link(source, self.resumable_upload_receipt_path(upload_id))?;
+        Ok(())
     }
 
     /// `put_object` guarded by `If-None-Match: *`: fails with
@@ -155,6 +401,26 @@ impl FileBucketStore {
         input: UpdateObjectMetadataInput,
     ) -> Result<Option<Object>> {
         let _guard = self.lock_object_writes();
+        self.update_object_metadata_locked(input)
+    }
+
+    /// Checks current metadata and updates it without admitting another writer
+    /// between the check and update. Delete markers are passed as None.
+    /// The predicate must not call any locking API on a store over this root.
+    pub fn update_object_metadata_if<E>(
+        &self,
+        input: UpdateObjectMetadataInput,
+        predicate: impl FnOnce(Option<&Object>) -> std::result::Result<(), E>,
+    ) -> std::result::Result<Option<Object>, ConditionalError<E>> {
+        let _guard = self.lock_object_writes();
+        self.check_current_object_locked(&input.bucket, &input.key, predicate)?;
+        Ok(self.update_object_metadata_locked(input)?)
+    }
+
+    fn update_object_metadata_locked(
+        &self,
+        input: UpdateObjectMetadataInput,
+    ) -> Result<Option<Object>> {
         if !valid_bucket_name(&input.bucket) {
             return Err(StoreError::InvalidBucketName);
         }
@@ -169,6 +435,7 @@ impl FileBucketStore {
             Some(o) => o,
             None => return Ok(None),
         };
+        self.preserve_resumable_upload_result(&object, &path.join("object.json"))?;
         if !input.content_type.is_empty() {
             object.content_type = input.content_type;
         }
@@ -220,6 +487,18 @@ impl FileBucketStore {
         Ok(Some((object, body)))
     }
 
+    /// Reads metadata and body without an intervening object write. Use this
+    /// boundary for provider conditions or copy/compose sources; get_object is
+    /// also used internally by callers that already hold the root write lock.
+    pub fn get_object_snapshot(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<Option<(Object, Vec<u8>)>> {
+        let _guard = self.lock_object_writes();
+        self.get_object(bucket, key)
+    }
+
     /// Reads a specific object version; an empty `version_id` falls back to the
     /// current object. A delete-marker version returns `Some` with an empty body.
     pub fn get_object_version(
@@ -255,6 +534,20 @@ impl FileBucketStore {
         Ok(self.delete_object_with_result(bucket, key, false)?.1)
     }
 
+    /// Checks the current object and deletes it under the same root write lock.
+    /// The predicate receives None for a missing object or a delete marker and
+    /// must not call any locking API on a store over this root.
+    pub fn delete_object_if<E>(
+        &self,
+        bucket: &str,
+        key: &str,
+        predicate: impl FnOnce(Option<&Object>) -> std::result::Result<(), E>,
+    ) -> std::result::Result<bool, ConditionalError<E>> {
+        let _guard = self.lock_object_writes();
+        self.check_current_object_locked(bucket, key, predicate)?;
+        Ok(self.delete_object_with_result_locked(bucket, key, false)?.1)
+    }
+
     /// Deletes the current object, returning the delete marker (when versioned)
     /// and whether anything existed. Honors object-lock retention/legal-hold.
     pub fn delete_object_with_result(
@@ -264,6 +557,15 @@ impl FileBucketStore {
         bypass_governance: bool,
     ) -> Result<(Object, bool)> {
         let _guard = self.lock_object_writes();
+        self.delete_object_with_result_locked(bucket, key, bypass_governance)
+    }
+
+    fn delete_object_with_result_locked(
+        &self,
+        bucket: &str,
+        key: &str,
+        bypass_governance: bool,
+    ) -> Result<(Object, bool)> {
         if !valid_bucket_name(bucket) {
             return Err(StoreError::InvalidBucketName);
         }
@@ -286,6 +588,7 @@ impl FileBucketStore {
                 {
                     return Err(StoreError::ObjectLocked);
                 }
+                self.preserve_resumable_upload_result(&current, &path.join("object.json"))?;
             }
             let now = self.now();
             let version_id = if existing_bucket.versioning == "Suspended" {
@@ -316,6 +619,7 @@ impl FileBucketStore {
             if object_lock_prevents_delete(&current, &self.now(), bypass_governance) {
                 return Err(StoreError::ObjectLocked);
             }
+            self.preserve_resumable_upload_result(&current, &path.join("object.json"))?;
         }
         fs::remove_dir_all(&path)?;
         let _ = fs::remove_dir(&objects_path);
@@ -335,6 +639,9 @@ impl FileBucketStore {
             return Err(StoreError::VersionIdRequired);
         }
         let _guard = self.lock_object_writes();
+        self.require_bucket_and_key(bucket, key)?;
+        let version_dir = Self::version_path(&self.object_path(bucket, key), version_id)?;
+        self.preserve_current_resumable_upload(bucket, key)?;
         let object = match self.get_object_version(bucket, key, version_id)? {
             Some((o, _)) => o,
             None => return Ok((Object::default(), false)),
@@ -344,7 +651,11 @@ impl FileBucketStore {
         {
             return Err(StoreError::ObjectLocked);
         }
-        let version_dir = Self::version_path(&self.object_path(bucket, key), version_id)?;
+        // A null-version read may use the current object when no version
+        // snapshot exists yet; the current preservation above covers it.
+        if version_dir.join("object.json").is_file() {
+            self.preserve_resumable_upload_result(&object, &version_dir.join("object.json"))?;
+        }
         remove_dir_all_ignoring_missing(&version_dir)?;
         self.rebuild_current_object(bucket, key)?;
         Ok((object, true))
@@ -518,6 +829,7 @@ impl FileBucketStore {
     }
 
     fn rebuild_current_object(&self, bucket: &str, key: &str) -> Result<()> {
+        self.preserve_current_resumable_upload(bucket, key)?;
         let path = self.object_path(bucket, key);
         let versions_dir = path.join("versions");
         let entries = match fs::read_dir(&versions_dir) {

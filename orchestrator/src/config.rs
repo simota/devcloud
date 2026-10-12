@@ -20,7 +20,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::io::{self, BufRead};
-use std::path::{PathBuf, MAIN_SEPARATOR};
+use std::path::{Component, Path, PathBuf, MAIN_SEPARATOR};
 
 // ---------------------------------------------------------------------------
 // Config struct types (legacy config.rs lines ~12-274)
@@ -1723,21 +1723,47 @@ pub fn default_config_yaml(cfg: &Config) -> String {
 // InitWorkspace / ResetWorkspace (legacy config.rs lines ~513-637)
 // ---------------------------------------------------------------------------
 
-/// legacy `validateStoragePath`: path must be under `.devcloud`.
+/// Storage operations must stay inside the workspace's `.devcloud` directory.
+/// Check components instead of a string prefix: `PathBuf` does not resolve
+/// `..`, and an intermediate symbolic link could redirect a reset elsewhere.
 fn validate_storage_path(path: &str) -> io::Result<()> {
-    let clean = clean_path(path);
-    let prefix = format!(".devcloud{MAIN_SEPARATOR}");
-    if clean == ".devcloud" || clean.starts_with(&prefix) {
-        return Ok(());
+    let invalid = || {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("storage.path must be under .devcloud without parent traversal: {path}"),
+        )
+    };
+    let mut components = Path::new(path)
+        .components()
+        .filter(|component| *component != Component::CurDir);
+    if components.next() != Some(Component::Normal(".devcloud".as_ref()))
+        || components.any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(invalid());
     }
-    Err(io::Error::new(
-        io::ErrorKind::InvalidInput,
-        format!("storage.path must be under .devcloud: {path}"),
-    ))
+
+    let mut ancestor = PathBuf::new();
+    for component in Path::new(path).components() {
+        ancestor.push(component.as_os_str());
+        match fs::symlink_metadata(&ancestor) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("storage.path must not follow symbolic links: {path}"),
+                ));
+            }
+            Ok(_) => {}
+            // Descendants cannot exist before this directory is created.
+            Err(err) if err.kind() == io::ErrorKind::NotFound => break,
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(())
 }
 
 /// legacy `ensureFile`: write `data` only if `path` does not already exist.
 fn ensure_file(path: &str, data: &[u8]) -> io::Result<()> {
+    validate_storage_path(path)?;
     match fs::metadata(path) {
         Ok(_) => Ok(()),
         Err(err) if err.kind() == io::ErrorKind::NotFound => fs::write(path, data),
@@ -1746,6 +1772,8 @@ fn ensure_file(path: &str, data: &[u8]) -> io::Result<()> {
 }
 
 fn mkdir_all(path: &str, ctx: &str) -> io::Result<()> {
+    validate_storage_path(path)
+        .map_err(|err| io::Error::new(err.kind(), format!("{ctx}: {err}")))?;
     fs::create_dir_all(path).map_err(|err| io::Error::new(err.kind(), format!("{ctx}: {err}")))
 }
 

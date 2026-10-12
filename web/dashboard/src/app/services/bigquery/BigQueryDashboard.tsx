@@ -3,6 +3,7 @@ import { EmptyState } from '../../../ui/EmptyState'
 import { Panel } from '../../../ui/Panel'
 import { Button } from '../../../ui/Button'
 import { useDashboardEvents } from '../../api/hooks/useDashboardEvents'
+import { useLatestRequest } from '../../api/hooks/useLatestRequest'
 import type { DashboardService } from '../dashboard/types'
 import {
   getBigQueryStatus,
@@ -34,7 +35,9 @@ export function BigQueryDashboard({ service }: BigQueryDashboardProps): JSX.Elem
   const [rowFilter, setRowFilter] = useState('')
   const isDisabled = service?.status === 'disabled'
 
+  const startRefreshCatalog = useLatestRequest()
   const refreshCatalog = useCallback(() => {
+    const isCurrent = startRefreshCatalog()
     if (isDisabled) {
       setCatalogState({ status: 'success', statusPayload: disabledStatus(service), datasets: [], jobs: [] })
       setRowsState({ status: 'idle' })
@@ -49,6 +52,7 @@ export function BigQueryDashboard({ service }: BigQueryDashboardProps): JSX.Elem
         const project = projects.projects[0]
         const projectId = project?.projectId ?? statusPayload.project
         const [{ datasets }, { jobs }] = await Promise.all([listBigQueryDatasets(projectId), listBigQueryJobs(projectId)])
+        if (!isCurrent()) return
         setCatalogState({ status: 'success', statusPayload, datasets, jobs })
         setActiveDatasetId((current) =>
           current && datasets.some((dataset) => dataset.datasetId === current) ? current : datasets[0]?.datasetId,
@@ -62,22 +66,25 @@ export function BigQueryDashboard({ service }: BigQueryDashboardProps): JSX.Elem
         })
       })
       .catch((error: Error) => {
+        if (!isCurrent()) return
         setCatalogState({ status: 'error', message: error.message })
       })
-  }, [activeDatasetId, isDisabled, service])
+  }, [startRefreshCatalog, activeDatasetId, isDisabled, service])
 
   useEffect(() => {
     refreshCatalog()
   }, [refreshCatalog])
 
-  useDashboardEvents({ topics: ['bigquery'], onEvent: refreshCatalog, enabled: !isDisabled })
+  useDashboardEvents({ topics: ['bigquery'], onEvent: refreshCatalog, onResync: refreshCatalog, enabled: !isDisabled })
 
   const datasets = catalogState.status === 'success' ? catalogState.datasets : []
   const activeDataset = datasets.find((dataset) => dataset.datasetId === activeDatasetId)
   const activeTable = activeDataset?.tables.find((table) => table.tableId === activeTableId)
   const projectId = catalogState.status === 'success' ? catalogState.statusPayload.project : service?.endpoint
 
+  const startRefreshRows = useLatestRequest()
   const refreshRows = useCallback(() => {
+    const isCurrent = startRefreshRows()
     if (!activeDataset || !activeTable || catalogState.status !== 'success' || isDisabled) {
       setRowsState({ status: 'idle' })
       return
@@ -85,13 +92,15 @@ export function BigQueryDashboard({ service }: BigQueryDashboardProps): JSX.Elem
     setRowsState({ status: 'loading' })
     listBigQueryRows(catalogState.statusPayload.project, activeDataset.datasetId, activeTable.tableId)
       .then(({ rows }) => {
+        if (!isCurrent()) return
         setActiveRowIndex(0)
         setRowsState({ status: 'success', rows })
       })
       .catch((error: Error) => {
+        if (!isCurrent()) return
         setRowsState({ status: 'error', message: error.message })
       })
-  }, [activeDataset, activeTable, catalogState, isDisabled])
+  }, [startRefreshRows, activeDataset, activeTable, catalogState, isDisabled])
 
   useEffect(() => {
     refreshRows()

@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 
-use crate::instances::{LaunchSpec, Manager};
+use crate::instances::{LaunchSpec, Manager, StartError};
 use crate::time_fmt::now_rfc3339;
 
 const SERVICE_TYPE: &str = "type.googleapis.com/google.cloud.run.v2.Service";
@@ -946,14 +946,33 @@ impl Server {
         ))
     }
 
+    /// Reads the launch spec and its invocation policy from one state snapshot.
+    /// Call again after waiting for the instance slot: its service may have
+    /// been reconfigured or recreated, or public invocation revoked meanwhile.
+    pub(crate) fn authorized_launch_spec(
+        &self,
+        service_name: &str,
+        authorization: &str,
+    ) -> Result<LaunchSpec, StartError> {
+        let st = self.state.lock().unwrap();
+        let service = st.services.get(service_name).ok_or(StartError::Gone)?;
+        if !self.authorized(authorization) && !self.public_invoke_allowed(&st, service_name) {
+            return Err(StartError::Forbidden);
+        }
+        LaunchSpec::from_service(service).ok_or(StartError::Gone)
+    }
+
     /// Whether unauthenticated callers may invoke the service: always in relaxed
     /// mode; in strict mode only with `invokerIamDisabled` or an `allUsers`
     /// `roles/run.invoker` binding.
     pub fn allows_public_invoke(&self, service_name: &str) -> bool {
+        self.public_invoke_allowed(&self.state.lock().unwrap(), service_name)
+    }
+
+    fn public_invoke_allowed(&self, st: &State, service_name: &str) -> bool {
         if !is_strict(&self.config.auth_mode) {
             return true;
         }
-        let st = self.state.lock().unwrap();
         if st
             .services
             .get(service_name)

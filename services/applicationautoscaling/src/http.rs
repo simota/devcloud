@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::server::{error_outcome, Outcome, Server};
@@ -90,11 +90,14 @@ async fn handle_conn(mut stream: TcpStream, server: Arc<Server>) -> std::io::Res
 
 /// Reads one HTTP/1.1 request: request line + headers (until CRLFCRLF) then a
 /// `Content-Length`-bounded body. Returns `None` on clean EOF or malformed head.
-async fn read_request(stream: &mut TcpStream) -> std::io::Result<Option<Request>> {
+async fn read_request(stream: &mut (impl AsyncRead + Unpin)) -> std::io::Result<Option<Request>> {
     let mut buf = Vec::new();
     let mut tmp = [0u8; 4096];
     let header_end = loop {
         if let Some(pos) = find_subslice(&buf, b"\r\n\r\n") {
+            if pos + 4 > MAX_HEADER_BYTES {
+                return Ok(None);
+            }
             break pos;
         }
         if buf.len() > MAX_HEADER_BYTES {
@@ -121,14 +124,31 @@ async fn read_request(stream: &mut TcpStream) -> std::io::Result<Option<Request>
     let mut headers = HashMap::new();
     for line in lines {
         if let Some((k, v)) = line.split_once(':') {
-            headers.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
+            let key = k.trim().to_ascii_lowercase();
+            if matches!(key.as_str(), "content-length" | "transfer-encoding")
+                && headers.contains_key(&key)
+            {
+                return Ok(None);
+            }
+            headers.insert(key, v.trim().to_string());
         }
     }
 
-    let content_length: usize = headers
-        .get("content-length")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
+    // This transport supports fixed-length request bodies only. Never
+    // dispatch an unsupported transfer coding as an empty request body.
+    if headers.contains_key("transfer-encoding") {
+        return Ok(None);
+    }
+    let content_length: usize = match headers.get("content-length") {
+        None => 0,
+        Some(value) if !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()) => {
+            match value.parse() {
+                Ok(length) => length,
+                Err(_) => return Ok(None),
+            }
+        }
+        Some(_) => return Ok(None),
+    };
     if content_length > MAX_BODY_BYTES {
         return Ok(None);
     }
@@ -137,7 +157,7 @@ async fn read_request(stream: &mut TcpStream) -> std::io::Result<Option<Request>
     while body.len() < content_length {
         let n = stream.read(&mut tmp).await?;
         if n == 0 {
-            break;
+            return Ok(None);
         }
         body.extend_from_slice(&tmp[..n]);
     }
@@ -298,5 +318,63 @@ pub fn serve_for_test(
             None
         },
         body: json,
+    }
+}
+
+#[cfg(test)]
+mod request_framing_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn incomplete_fixed_length_body_is_rejected() {
+        // A complete JSON value is still an incomplete HTTP message. It must
+        // never reach a mutating handler after the client disconnects early.
+        let mut wire = &b"POST / HTTP/1.1\r\nContent-Length: 9\r\n\r\n{}"[..];
+        assert!(read_request(&mut wire).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn invalid_content_length_is_rejected() {
+        for value in ["bad", "-1", "+2", "", "18446744073709551616"] {
+            let wire = format!("POST / HTTP/1.1\r\nContent-Length: {value}\r\n\r\n{{}}");
+            assert!(
+                read_request(&mut wire.as_bytes()).await.unwrap().is_none(),
+                "{value:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn ambiguous_or_unsupported_body_framing_is_rejected() {
+        for headers in [
+            "Transfer-Encoding: gzip\r\n",
+            "Transfer-Encoding: xchunked\r\n",
+            "Transfer-Encoding: chunked, gzip\r\n",
+            "Content-Length: 9\r\nContent-Length: 2\r\n",
+            "Content-Length: 2\r\nTransfer-Encoding: chunked\r\n",
+            "Transfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n",
+        ] {
+            let wire = format!("POST / HTTP/1.1\r\n{headers}\r\n{{}}");
+            assert!(
+                read_request(&mut wire.as_bytes()).await.unwrap().is_none(),
+                "{headers:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn complete_fixed_length_body_is_preserved() {
+        let mut wire = &b"POST / HTTP/1.1\r\nContent-Length: 2\r\n\r\n{}"[..];
+        let request = read_request(&mut wire).await.unwrap().unwrap();
+        assert_eq!(request.body, b"{}");
+    }
+
+    #[tokio::test]
+    async fn oversized_header_is_rejected_even_when_terminator_arrives() {
+        let wire = format!(
+            "POST / HTTP/1.1\r\nX-Padding: {}\r\n\r\n",
+            "a".repeat(MAX_HEADER_BYTES)
+        );
+        assert!(read_request(&mut wire.as_bytes()).await.unwrap().is_none());
     }
 }

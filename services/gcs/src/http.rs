@@ -22,11 +22,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use devcloud_s3::base64;
 use devcloud_s3::model::{Bucket, Object};
 use devcloud_s3::objops::{PutObjectInput, UpdateObjectMetadataInput};
-use devcloud_s3::store::{FileBucketStore, StoreError};
+use devcloud_s3::store::{ConditionalError, FileBucketStore, StoreError};
 use devcloud_s3::time_fmt::{now_rfc3339nano, parse_rfc3339};
 use devcloud_s3::wire_json;
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 const MAX_HEADER_BYTES: usize = 64 * 1024;
@@ -880,11 +880,19 @@ fn read_object(
     key: &str,
 ) -> Result<(Object, Vec<u8>), Response> {
     let (object, body) = fetch_object(server, bucket, key)?;
-    if !generation_matches(req, &object)? {
+    check_existing_object(req, Some(&object))?;
+    Ok((object, body))
+}
+
+/// Reads, metadata updates and deletes must apply both the selector and the
+/// preconditions to the same object. Mutations call this again with the current
+/// metadata while holding the shared S3/GCS store's write lock.
+fn check_existing_object(req: &Request, found: Option<&Object>) -> Result<(), Response> {
+    let object = found.ok_or_else(|| json_error(404, "notFound", "object not found"))?;
+    if !generation_matches(req, object)? {
         return Err(json_error(404, "notFound", "object not found"));
     }
-    check_object_preconditions(server, req, bucket, key)?;
-    Ok((object, body))
+    check_preconditions(Some(object), &preconditions_from_request(req))
 }
 
 fn handle_object(server: &mut Server, req: &Request, bucket: &str, key: &str) -> Response {
@@ -916,9 +924,8 @@ fn handle_object(server: &mut Server, req: &Request, bucket: &str, key: &str) ->
                 Err(_) if req.body.is_empty() => ObjectMetadataRequest::default(),
                 Err(_) => return json_error(400, "invalid", "invalid json request"),
             };
-            match server
-                .store
-                .update_object_metadata(UpdateObjectMetadataInput {
+            match server.store.update_object_metadata_if(
+                UpdateObjectMetadataInput {
                     bucket: bucket.to_string(),
                     key: key.to_string(),
                     content_type: parsed.content_type,
@@ -926,17 +933,23 @@ fn handle_object(server: &mut Server, req: &Request, bucket: &str, key: &str) ->
                     cache_control: parsed.cache_control,
                     content_disposition: parsed.content_disposition,
                     metadata: parsed.metadata,
-                }) {
+                },
+                |current| check_existing_object(req, current),
+            ) {
                 Ok(Some(object)) => Response::json(200, &object_resource(&object)),
                 Ok(None) => json_error(404, "notFound", "object not found"),
-                Err(_) => json_error(404, "notFound", "bucket not found"),
+                Err(ConditionalError::Condition(response)) => response,
+                Err(ConditionalError::Store(_)) => json_error(404, "notFound", "bucket not found"),
             }
         }
         "DELETE" => {
             if let Err(r) = read_object(server, req, bucket, key) {
                 return r;
             }
-            match server.store.delete_object(bucket, key) {
+            match server
+                .store
+                .delete_object_if(bucket, key, |current| check_existing_object(req, current))
+            {
                 Ok(true) => {
                     emit_dashboard_event(
                         "gcs.object.deleted",
@@ -945,7 +958,8 @@ fn handle_object(server: &mut Server, req: &Request, bucket: &str, key: &str) ->
                     Response::empty(204)
                 }
                 Ok(false) => json_error(404, "notFound", "object not found"),
-                Err(_) => json_error(404, "notFound", "bucket not found"),
+                Err(ConditionalError::Condition(response)) => response,
+                Err(ConditionalError::Store(_)) => json_error(404, "notFound", "bucket not found"),
             }
         }
         _ => method_not_allowed("GET, PATCH, DELETE"),
@@ -1034,21 +1048,13 @@ fn handle_compose_object(
         if source.name.is_empty() {
             return json_error(400, "required", "source object name is required");
         }
-        let (object, payload) = match server.store.get_object(bucket, &source.name) {
+        let (object, payload) = match server.store.get_object_snapshot(bucket, &source.name) {
             Ok(Some(found)) => found,
             Ok(None) => return json_error(404, "notFound", "source object not found"),
             Err(_) => return json_error(404, "notFound", "bucket not found"),
         };
-        let actual_generation = generation(&object);
-        if (!source.generation.is_empty() && source.generation != actual_generation)
-            || (!source.object_preconditions.if_generation_match.is_empty()
-                && source.object_preconditions.if_generation_match != actual_generation)
-        {
-            return json_error(
-                412,
-                "conditionNotMet",
-                "source generation precondition failed",
-            );
+        if let Err(response) = check_compose_source_preconditions(Some(&object), source) {
+            return response;
         }
         if first_source.is_none() {
             first_source = Some(object);
@@ -1056,20 +1062,58 @@ fn handle_compose_object(
         body.extend_from_slice(&payload);
     }
     let first_source = first_source.unwrap_or_default();
-    match server.store.put_object(PutObjectInput {
-        bucket: bucket.to_string(),
-        key: dest_key.clone(),
-        body,
-        content_type: first_non_empty(&parsed.destination.content_type, &first_source.content_type),
-        content_encoding: parsed.destination.content_encoding,
-        cache_control: parsed.destination.cache_control,
-        content_disposition: parsed.destination.content_disposition,
-        metadata: parsed.destination.metadata.unwrap_or_default(),
-        ..Default::default()
-    }) {
+    match server.store.put_object_if(
+        PutObjectInput {
+            bucket: bucket.to_string(),
+            key: dest_key.clone(),
+            body,
+            content_type: first_non_empty(
+                &parsed.destination.content_type,
+                &first_source.content_type,
+            ),
+            content_encoding: parsed.destination.content_encoding,
+            cache_control: parsed.destination.cache_control,
+            content_disposition: parsed.destination.content_disposition,
+            metadata: parsed.destination.metadata.unwrap_or_default(),
+            ..Default::default()
+        },
+        |current| {
+            // A source can also be the destination. Its conditions then guard
+            // this mutation and must still hold when the destination is saved.
+            for source in &parsed.source_objects {
+                if source.name == dest_key {
+                    check_compose_source_preconditions(current, source)?;
+                }
+            }
+            check_preconditions(current, &preconditions_from_request(req))
+        },
+    ) {
         Ok(object) => Response::json(200, &object_resource(&object)),
-        Err(e) => json_error(404, "notFound", &store_error_text(&e, bucket, &dest_key)),
+        Err(ConditionalError::Condition(response)) => response,
+        Err(ConditionalError::Store(e)) => {
+            json_error(404, "notFound", &store_error_text(&e, bucket, &dest_key))
+        }
     }
+}
+
+fn check_compose_source_preconditions(
+    found: Option<&Object>,
+    source: &ComposeSourceObject,
+) -> Result<(), Response> {
+    let actual_generation = found.map(generation);
+    if (!source.generation.is_empty()
+        && Some(source.generation.as_str()) != actual_generation.as_deref())
+        || (!source.object_preconditions.if_generation_match.is_empty()
+            && Some(source.object_preconditions.if_generation_match.as_str())
+                != actual_generation.as_deref())
+    {
+        return Err(json_error(
+            412,
+            "conditionNotMet",
+            "source generation precondition failed",
+        ));
+    }
+    Ok(())
 }
 
 fn copy_object(
@@ -1103,45 +1147,56 @@ fn copy_object(
             "invalid destination object name",
         ));
     }
-    let (source, body) = match server.store.get_object(source_bucket, &source_key) {
+    let (source, body) = match server.store.get_object_snapshot(source_bucket, &source_key) {
         Ok(Some(found)) => found,
         Ok(None) => return Err(json_error(404, "notFound", "source object not found")),
         Err(_) => return Err(json_error(404, "notFound", "source bucket not found")),
     };
-    check_stored_preconditions(
-        server,
-        source_bucket,
-        &source_key,
-        &source_preconditions_from_request(req),
-    )?;
+    let source_preconditions = source_preconditions_from_request(req);
+    check_preconditions(Some(&source), &source_preconditions)?;
     check_object_preconditions(server, req, &dest_bucket, &dest_key)?;
 
+    let same_object = source_bucket == dest_bucket && source_key == dest_key;
     let metadata = destination
         .metadata
         .unwrap_or_else(|| source.metadata.clone());
-    match server.store.put_object(PutObjectInput {
-        bucket: dest_bucket,
-        key: dest_key,
-        body,
-        content_type: first_non_empty(&destination.content_type, &source.content_type),
-        content_encoding: first_non_empty(&destination.content_encoding, &source.content_encoding),
-        cache_control: first_non_empty(&destination.cache_control, &source.cache_control),
-        content_disposition: first_non_empty(
-            &destination.content_disposition,
-            &source.content_disposition,
-        ),
-        metadata,
-        ..Default::default()
-    }) {
+    match server.store.put_object_if(
+        PutObjectInput {
+            bucket: dest_bucket,
+            key: dest_key,
+            body,
+            content_type: first_non_empty(&destination.content_type, &source.content_type),
+            content_encoding: first_non_empty(
+                &destination.content_encoding,
+                &source.content_encoding,
+            ),
+            cache_control: first_non_empty(&destination.cache_control, &source.cache_control),
+            content_disposition: first_non_empty(
+                &destination.content_disposition,
+                &source.content_disposition,
+            ),
+            metadata,
+            ..Default::default()
+        },
+        |current| {
+            if same_object {
+                check_preconditions(current, &source_preconditions)?;
+            }
+            check_preconditions(current, &preconditions_from_request(req))
+        },
+    ) {
         Ok(object) => Ok(object),
-        Err(_) => Err(json_error(404, "notFound", "destination bucket not found")),
+        Err(ConditionalError::Condition(response)) => Err(response),
+        Err(ConditionalError::Store(_)) => {
+            Err(json_error(404, "notFound", "destination bucket not found"))
+        }
     }
 }
 
 /// Object fetch with the legacy single-object handler error mapping: any store
 /// error reads as a missing bucket.
 fn fetch_object(server: &Server, bucket: &str, key: &str) -> Result<(Object, Vec<u8>), Response> {
-    match server.store.get_object(bucket, key) {
+    match server.store.get_object_snapshot(bucket, key) {
         Ok(Some(found)) => Ok(found),
         Ok(None) => Err(json_error(404, "notFound", "object not found")),
         Err(_) => Err(json_error(404, "notFound", "bucket not found")),
@@ -1176,6 +1231,7 @@ fn handle_media_upload(server: &mut Server, req: &Request, bucket: &str) -> Resp
     }
     put_object_response(
         server,
+        req,
         PutObjectInput {
             bucket: bucket.to_string(),
             key: name,
@@ -1207,6 +1263,7 @@ fn handle_multipart_upload(server: &mut Server, req: &Request, bucket: &str) -> 
     }
     put_object_response(
         server,
+        req,
         PutObjectInput {
             bucket: bucket.to_string(),
             key: name,
@@ -1224,7 +1281,7 @@ fn handle_multipart_upload(server: &mut Server, req: &Request, bucket: &str) -> 
 fn handle_resumable_upload(server: &mut Server, req: &Request, bucket: &str) -> Response {
     match req.method.as_str() {
         "POST" => create_resumable_upload(server, req, bucket),
-        "PUT" => put_resumable_upload(server, req),
+        "PUT" => put_resumable_upload(server, req, bucket),
         _ => method_not_allowed("POST, PUT"),
     }
 }
@@ -1279,12 +1336,32 @@ fn create_resumable_upload(server: &mut Server, req: &Request, bucket: &str) -> 
     r
 }
 
-fn put_resumable_upload(server: &mut Server, req: &Request) -> Response {
+fn put_resumable_upload(server: &mut Server, req: &Request, bucket: &str) -> Response {
     let id = req.query_value("upload_id").to_string();
     if id.is_empty() {
         return json_error(400, "required", "upload_id is required");
     }
-    let Some(mut session) = server.sessions.get(&id).cloned() else {
+    let pending = server.sessions.get(&id).cloned();
+    if pending
+        .as_ref()
+        .is_some_and(|session| session.bucket != bucket)
+    {
+        return json_error(404, "notFound", "upload session not found");
+    }
+    // Completion is checked before status/offset validation and preconditions:
+    // a create-only upload must not reject a retry because of its own object.
+    match server.store.get_resumable_upload_result(
+        bucket,
+        pending.as_ref().map(|session| session.name.as_str()),
+        &id,
+    ) {
+        Ok(Some(object)) => {
+            return complete_resumable_upload(server, &id, &object);
+        }
+        Ok(None) => {}
+        Err(_) => return json_error(500, "backendError", "internal error"),
+    }
+    let Some(mut session) = pending else {
         return json_error(404, "notFound", "upload session not found");
     };
     if is_status_query(req.header("content-range")) {
@@ -1297,21 +1374,12 @@ fn put_resumable_upload(server: &mut Server, req: &Request) -> Response {
         }
         return r;
     }
-    if let Err(r) = check_stored_preconditions(
-        server,
-        &session.bucket.clone(),
-        &session.name.clone(),
-        &session.preconditions,
-    ) {
-        return r;
-    }
     let mut payload = req.body.clone();
-    // Set when the final chunk has already been durably appended (`body.part`
-    // and `session.json` on disk reflect the post-chunk state) so the
-    // `put_object` failure branch below can roll both back to this pre-chunk
-    // offset. `None` covers one-shot and headerless commits, where nothing was
-    // persisted before `put_object` and no rollback is needed.
-    let mut committed_chunk_rollback: Option<i64> = None;
+    // The final chunk may be appended to `body.part`, but its session checkpoint
+    // must stay at the previous offset until the object is committed. A restart
+    // can then discard the uncommitted tail and accept the same chunk again.
+    // One-shot and headerless commits do not stage data before `put_object`.
+    let mut staged_chunk_rollback: Option<i64> = None;
     if !req.header("content-range").trim().is_empty() {
         let upload_range = match parse_resumable_content_range(
             req.header("content-range"),
@@ -1329,16 +1397,33 @@ fn put_resumable_upload(server: &mut Server, req: &Request) -> Response {
         }
         let prior_received_bytes = session.received_bytes;
         session.received_bytes = upload_range.end + 1;
-        let one_shot = upload_range.start == 0 && session.received_bytes == upload_range.total;
+        let is_final = session.received_bytes == upload_range.total;
+        let one_shot = upload_range.start == 0 && is_final;
+        if !is_final {
+            if let Err(response) = check_stored_preconditions(
+                server,
+                &session.bucket,
+                &session.name,
+                &session.preconditions,
+            ) {
+                return response;
+            }
+        }
         if !one_shot {
-            if server.append_session_body(&id, &payload).is_err()
-                || server.save_session(&id, &session).is_err()
+            if server
+                .append_session_body(&id, prior_received_bytes, &payload)
+                .is_err()
+                || (!is_final && server.save_session(&id, &session).is_err())
             {
+                // An append may succeed (or write a prefix) before the
+                // metadata write fails. The in-memory offset is unchanged;
+                // discard these uncommitted bytes before a client retries.
+                let _ = server.truncate_session_body(&id, prior_received_bytes);
                 return json_error(500, "backendError", "internal error");
             }
-            committed_chunk_rollback = Some(prior_received_bytes);
+            staged_chunk_rollback = Some(prior_received_bytes);
         }
-        if session.received_bytes < upload_range.total {
+        if !is_final {
             server.sessions.insert(id, session);
             let mut r = Response::empty(308);
             r.headers
@@ -1348,58 +1433,81 @@ fn put_resumable_upload(server: &mut Server, req: &Request) -> Response {
         if !one_shot {
             payload = match server.read_session_body(&id) {
                 Ok(v) => v,
-                Err(_) => return json_error(500, "backendError", "internal error"),
+                Err(_) => {
+                    let _ = server.truncate_session_body(&id, prior_received_bytes);
+                    return json_error(500, "backendError", "internal error");
+                }
             };
         }
     }
-    match server.store.put_object(PutObjectInput {
-        bucket: session.bucket.clone(),
-        key: session.name.clone(),
-        body: payload,
-        content_type: first_non_empty(req.header("content-type"), &session.content_type),
-        content_encoding: session.content_encoding.clone(),
-        cache_control: session.cache_control.clone(),
-        content_disposition: session.content_disposition.clone(),
-        metadata: session.metadata.clone().unwrap_or_default(),
-        ..Default::default()
-    }) {
-        Ok(object) => {
-            server.sessions.remove(&id);
-            let _ = server.delete_session(&id);
-            emit_dashboard_event(
-                "gcs.object.put",
-                serde_json::json!({
-                    "bucket": object.bucket,
-                    "key": object.key,
-                    "etag": object.etag,
-                    "contentLength": object.size,
-                }),
-            );
-            Response::json(200, &object_resource(&object))
-        }
-        Err(e) => {
-            let message = store_error_text(&e, &session.bucket, &session.name);
-            if let Some(prior_received_bytes) = committed_chunk_rollback {
-                // Only chunks that were durably appended before this failed
-                // `put_object` need undoing here — otherwise a retried final
-                // chunk re-appends onto bytes already persisted, doubling the
-                // stored object.
-                session.received_bytes = prior_received_bytes;
+    // A final write checks its conditions only inside the store lock, after
+    // replaying any completion that appeared since the initial lookup.
+    match server.store.put_resumable_object_if(
+        PutObjectInput {
+            bucket: session.bucket.clone(),
+            key: session.name.clone(),
+            body: payload,
+            content_type: first_non_empty(req.header("content-type"), &session.content_type),
+            content_encoding: session.content_encoding.clone(),
+            cache_control: session.cache_control.clone(),
+            content_disposition: session.content_disposition.clone(),
+            metadata: session.metadata.clone().unwrap_or_default(),
+            ..Default::default()
+        },
+        &id,
+        |current| check_preconditions(current, &session.preconditions),
+    ) {
+        Ok(object) => complete_resumable_upload(server, &id, &object),
+        Err(error) => {
+            if let Some(prior_received_bytes) = staged_chunk_rollback {
+                // The in-memory and on-disk checkpoints still contain this
+                // offset. Discard the staged tail so a retry cannot duplicate
+                // it, without requiring another metadata write to roll back.
                 let _ = server.truncate_session_body(&id, prior_received_bytes);
-                let _ = server.save_session(&id, &session);
-                server.sessions.insert(id, session);
             }
-            json_error(404, "notFound", &message)
+            match error {
+                ConditionalError::Condition(response) => response,
+                ConditionalError::Store(e) => json_error(
+                    404,
+                    "notFound",
+                    &store_error_text(&e, &session.bucket, &session.name),
+                ),
+            }
         }
     }
+}
+
+fn complete_resumable_upload(server: &mut Server, id: &str, object: &Object) -> Response {
+    let notify = match server.store.claim_resumable_upload_event(object) {
+        Ok(notify) => notify,
+        Err(_) => return json_error(500, "backendError", "internal error"),
+    };
+    server.sessions.remove(id);
+    let _ = server.delete_session(id);
+    if notify {
+        // The relay is best-effort across process stops. A stop between the
+        // claim and send is repaired by the dashboard's reconnect resync.
+        emit_dashboard_event(
+            "gcs.object.put",
+            serde_json::json!({
+                "bucket": object.bucket,
+                "key": object.key,
+                "etag": object.etag,
+                "contentLength": object.size,
+            }),
+        );
+    }
+    Response::json(200, &object_resource(object))
 }
 
 /// Stores the object and writes the legacy upload-handler response: the object
 /// resource on success, or `404 notFound` with the store error text (matching
 /// legacy `writeError(w, http.StatusNotFound, "notFound", err.Error())`).
-fn put_object_response(server: &mut Server, input: PutObjectInput) -> Response {
+fn put_object_response(server: &mut Server, req: &Request, input: PutObjectInput) -> Response {
     let (bucket, key) = (input.bucket.clone(), input.key.clone());
-    match server.store.put_object(input) {
+    match server.store.put_object_if(input, |current| {
+        check_preconditions(current, &preconditions_from_request(req))
+    }) {
         Ok(object) => {
             emit_dashboard_event(
                 "gcs.object.put",
@@ -1412,7 +1520,10 @@ fn put_object_response(server: &mut Server, input: PutObjectInput) -> Response {
             );
             Response::json(200, &object_resource(&object))
         }
-        Err(e) => json_error(404, "notFound", &store_error_text(&e, &bucket, &key)),
+        Err(ConditionalError::Condition(response)) => response,
+        Err(ConditionalError::Store(e)) => {
+            json_error(404, "notFound", &store_error_text(&e, &bucket, &key))
+        }
     }
 }
 
@@ -1527,7 +1638,7 @@ fn check_stored_preconditions(
     key: &str,
     preconditions: &ObjectPreconditions,
 ) -> Result<(), Response> {
-    let found = match server.store.get_object(bucket, key) {
+    let found = match server.store.get_object_snapshot(bucket, key) {
         Ok(found) => found.map(|(object, _)| object),
         Err(e) => {
             return Err(json_error(
@@ -1537,8 +1648,17 @@ fn check_stored_preconditions(
             ))
         }
     };
-    let generation = found.as_ref().map(generation_value).unwrap_or(0);
-    let metageneration = found.as_ref().map(|o| o.metageneration.max(1)).unwrap_or(0);
+    check_preconditions(found.as_ref(), preconditions)
+}
+
+/// Evaluates conditions against one snapshot. Store mutations use this inside
+/// their shared write lock, after any resumable completion has been replayed.
+fn check_preconditions(
+    found: Option<&Object>,
+    preconditions: &ObjectPreconditions,
+) -> Result<(), Response> {
+    let generation = found.map(generation_value).unwrap_or(0);
+    let metageneration = found.map(|o| o.metageneration.max(1)).unwrap_or(0);
     for (name, expected, actual, invert) in [
         (
             "ifGenerationMatch",
@@ -1659,10 +1779,21 @@ impl Server {
             return Ok(());
         };
         fs::create_dir_all(&dir)?;
-        fs::write(dir.join("session.json"), wire_json::to_vec_indent(session))
+        let temporary = dir.join("session.json.tmp");
+        let result = fs::write(&temporary, wire_json::to_vec_indent(session))
+            .and_then(|()| fs::rename(&temporary, dir.join("session.json")));
+        if result.is_err() {
+            let _ = fs::remove_file(&temporary);
+        }
+        result
     }
 
-    fn append_session_body(&self, id: &str, payload: &[u8]) -> std::io::Result<()> {
+    fn append_session_body(
+        &self,
+        id: &str,
+        committed_bytes: i64,
+        payload: &[u8],
+    ) -> std::io::Result<()> {
         use std::io::Write;
         let Some(dir) = self.session_dir(id) else {
             return Err(std::io::Error::new(
@@ -1675,6 +1806,18 @@ impl Server {
             .create(true)
             .append(true)
             .open(dir.join("body.part"))?;
+        let committed_bytes = u64::try_from(committed_bytes).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid upload offset")
+        })?;
+        if f.metadata()?.len() < committed_bytes {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "committed upload data is incomplete",
+            ));
+        }
+        // Recover an interrupted append using the offset committed in
+        // session.json, including after a process restart.
+        f.set_len(committed_bytes)?;
         f.write_all(payload)
     }
 
@@ -1702,7 +1845,16 @@ impl Server {
         let f = fs::OpenOptions::new()
             .write(true)
             .open(dir.join("body.part"))?;
-        f.set_len(len as u64)
+        let len = u64::try_from(len).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid upload offset")
+        })?;
+        if f.metadata()?.len() < len {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "committed upload data is incomplete",
+            ));
+        }
+        f.set_len(len)
     }
 
     fn delete_session(&self, id: &str) -> std::io::Result<()> {
@@ -2163,11 +2315,14 @@ async fn handle_conn(mut stream: TcpStream, server: Arc<Mutex<Server>>) -> std::
     write_response(&mut stream, response).await
 }
 
-async fn read_request(stream: &mut TcpStream) -> std::io::Result<Option<Request>> {
+async fn read_request(stream: &mut (impl AsyncRead + Unpin)) -> std::io::Result<Option<Request>> {
     let mut buf = Vec::new();
     let mut tmp = [0u8; 4096];
     let header_end = loop {
         if let Some(pos) = find_subslice(&buf, b"\r\n\r\n") {
+            if pos + 4 > MAX_HEADER_BYTES {
+                return Ok(None);
+            }
             break pos;
         }
         if buf.len() > MAX_HEADER_BYTES {
@@ -2190,28 +2345,45 @@ async fn read_request(stream: &mut TcpStream) -> std::io::Result<Option<Request>
     let mut headers = BTreeMap::new();
     for line in lines {
         if let Some((k, v)) = line.split_once(':') {
-            headers.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
+            let key = k.trim().to_ascii_lowercase();
+            if matches!(key.as_str(), "content-length" | "transfer-encoding")
+                && headers.contains_key(&key)
+            {
+                return Ok(None);
+            }
+            headers.insert(key, v.trim().to_string());
         }
     }
+    let chunked = match headers.get("transfer-encoding") {
+        None => false,
+        Some(value)
+            if value.eq_ignore_ascii_case("chunked") && !headers.contains_key("content-length") =>
+        {
+            true
+        }
+        Some(_) => return Ok(None),
+    };
     let mut body = buf[header_end + 4..].to_vec();
-    if headers
-        .get("transfer-encoding")
-        .map(|v| v.to_ascii_lowercase().contains("chunked"))
-        .unwrap_or(false)
-    {
+    if chunked {
         body = read_chunked_body(stream, body).await?;
     } else {
-        let content_length: usize = headers
-            .get("content-length")
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0);
+        let content_length: usize = match headers.get("content-length") {
+            None => 0,
+            Some(value) if !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()) => {
+                match value.parse() {
+                    Ok(length) => length,
+                    Err(_) => return Ok(None),
+                }
+            }
+            Some(_) => return Ok(None),
+        };
         if content_length > MAX_BODY_BYTES {
             return Ok(None);
         }
         while body.len() < content_length {
             let n = stream.read(&mut tmp).await?;
             if n == 0 {
-                break;
+                return Ok(None);
             }
             body.extend_from_slice(&tmp[..n]);
         }
@@ -2227,40 +2399,119 @@ async fn read_request(stream: &mut TcpStream) -> std::io::Result<Option<Request>
     }))
 }
 
-async fn read_chunked_body(stream: &mut TcpStream, mut buf: Vec<u8>) -> std::io::Result<Vec<u8>> {
+async fn read_chunked_body(
+    stream: &mut (impl AsyncRead + Unpin),
+    mut buf: Vec<u8>,
+) -> std::io::Result<Vec<u8>> {
     let mut out = Vec::new();
+    let mut framing_bytes = 0usize;
     let mut tmp = [0u8; 4096];
-    let mut pos = 0;
     loop {
-        let line_end = loop {
-            if let Some(i) = find_subslice(&buf[pos..], b"\r\n") {
-                break pos + i;
-            }
-            let n = stream.read(&mut tmp).await?;
-            if n == 0 {
-                return Ok(out);
-            }
-            buf.extend_from_slice(&tmp[..n]);
-        };
-        let size_line = String::from_utf8_lossy(&buf[pos..line_end]);
-        let size_hex = size_line.split(';').next().unwrap_or("").trim();
-        let size = usize::from_str_radix(size_hex, 16).unwrap_or(0);
-        pos = line_end + 2;
+        let line = read_chunk_line(stream, &mut buf, MAX_HEADER_BYTES).await?;
+        framing_bytes += line.len() + 2;
+        // One-byte chunks use five framing bytes per data byte. Reserve that
+        // legal overhead separately from the additional extension budget.
+        if framing_bytes > 5 * out.len() + MAX_HEADER_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "chunk framing too large",
+            ));
+        }
+        let size_hex = line.split(|b| *b == b';').next().unwrap_or_default();
+        if size_hex.is_empty() || !size_hex.iter().all(u8::is_ascii_hexdigit) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid chunk size",
+            ));
+        }
+        // ASCII validation above makes this conversion infallible. Reject a
+        // huge declaration before reading its payload or adding byte offsets.
+        let size =
+            usize::from_str_radix(std::str::from_utf8(size_hex).unwrap(), 16).map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid chunk size")
+            })?;
+        if size > MAX_BODY_BYTES - out.len() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "request body too large",
+            ));
+        }
         if size == 0 {
-            return Ok(out);
+            // The zero chunk is followed by a complete, bounded trailer
+            // section, ending in an empty line. EOF is never a terminator.
+            let mut remaining = MAX_HEADER_BYTES;
+            loop {
+                let trailer = read_chunk_line(stream, &mut buf, remaining).await?;
+                remaining -= trailer.len() + 2;
+                framing_bytes += trailer.len() + 2;
+                if framing_bytes > 5 * out.len() + MAX_HEADER_BYTES {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "chunk framing too large",
+                    ));
+                }
+                if trailer.is_empty() {
+                    return Ok(out);
+                }
+            }
         }
-        while buf.len() < pos + size + 2 {
+        // `size` is now bounded by MAX_BODY_BYTES, so the addition is safe.
+        while buf.len() < size + 2 {
             let n = stream.read(&mut tmp).await?;
             if n == 0 {
-                return Ok(out);
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "incomplete chunk body",
+                ));
             }
             buf.extend_from_slice(&tmp[..n]);
         }
-        out.extend_from_slice(&buf[pos..pos + size]);
-        if out.len() > MAX_BODY_BYTES {
-            return Ok(Vec::new());
+        if &buf[size..size + 2] != b"\r\n" {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid chunk terminator",
+            ));
         }
-        pos += size + 2;
+        out.extend_from_slice(&buf[..size]);
+        framing_bytes += 2;
+        // Discard consumed framing as well as data, so many small chunks do
+        // not retain an unbounded second copy of the request on the heap.
+        buf.drain(..size + 2);
+    }
+}
+
+async fn read_chunk_line(
+    stream: &mut (impl AsyncRead + Unpin),
+    buf: &mut Vec<u8>,
+    limit: usize,
+) -> std::io::Result<Vec<u8>> {
+    let mut tmp = [0u8; 4096];
+    loop {
+        if let Some(end) = find_subslice(buf, b"\r\n") {
+            if end + 2 > limit {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "chunk headers too large",
+                ));
+            }
+            let line = buf[..end].to_vec();
+            buf.drain(..end + 2);
+            return Ok(line);
+        }
+        if buf.len() >= limit {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "chunk headers too large",
+            ));
+        }
+        let n = stream.read(&mut tmp).await?;
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "incomplete chunk headers",
+            ));
+        }
+        buf.extend_from_slice(&tmp[..n]);
     }
 }
 
@@ -2287,8 +2538,11 @@ fn url_decode(value: &str) -> String {
     while i < bytes.len() {
         match bytes[i] {
             b'%' if i + 2 < bytes.len() => {
-                if let Ok(b) = u8::from_str_radix(&value[i + 1..i + 3], 16) {
-                    out.push(b);
+                if let (Some(hi), Some(lo)) = (
+                    (bytes[i + 1] as char).to_digit(16),
+                    (bytes[i + 2] as char).to_digit(16),
+                ) {
+                    out.push((hi * 16 + lo) as u8);
                     i += 3;
                     continue;
                 }
@@ -2529,5 +2783,165 @@ mod tests {
             String::from_utf8(r.body).unwrap(),
             "{\"error\":{\"code\":404,\"message\":\"object not found\",\"errors\":[{\"domain\":\"global\",\"reason\":\"notFound\",\"message\":\"object not found\"}]}}\n"
         );
+    }
+}
+
+#[cfg(test)]
+mod request_framing_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn incomplete_fixed_length_body_is_rejected() {
+        // A complete JSON value is still an incomplete HTTP message. It must
+        // never reach a mutating handler after the client disconnects early.
+        let mut wire = &b"POST / HTTP/1.1\r\nContent-Length: 9\r\n\r\n{}"[..];
+        assert!(read_request(&mut wire).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn invalid_content_length_is_rejected() {
+        for value in ["bad", "-1", "+2", "", "18446744073709551616"] {
+            let wire = format!("POST / HTTP/1.1\r\nContent-Length: {value}\r\n\r\n{{}}");
+            assert!(
+                read_request(&mut wire.as_bytes()).await.unwrap().is_none(),
+                "{value:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn ambiguous_or_unsupported_body_framing_is_rejected() {
+        for headers in [
+            "Transfer-Encoding: gzip\r\n",
+            "Transfer-Encoding: xchunked\r\n",
+            "Transfer-Encoding: chunked, gzip\r\n",
+            "Content-Length: 9\r\nContent-Length: 2\r\n",
+            "Content-Length: 2\r\nTransfer-Encoding: chunked\r\n",
+            "Transfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n",
+        ] {
+            let wire = format!("POST / HTTP/1.1\r\n{headers}\r\n{{}}");
+            assert!(
+                read_request(&mut wire.as_bytes()).await.unwrap().is_none(),
+                "{headers:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn complete_fixed_length_body_is_preserved() {
+        let mut wire = &b"POST / HTTP/1.1\r\nContent-Length: 2\r\n\r\n{}"[..];
+        let request = read_request(&mut wire).await.unwrap().unwrap();
+        assert_eq!(request.body, b"{}");
+    }
+
+    #[tokio::test]
+    async fn oversized_header_is_rejected_even_when_terminator_arrives() {
+        let wire = format!(
+            "POST / HTTP/1.1\r\nX-Padding: {}\r\n\r\n",
+            "a".repeat(MAX_HEADER_BYTES)
+        );
+        assert!(read_request(&mut wire.as_bytes()).await.unwrap().is_none());
+    }
+}
+
+#[cfg(test)]
+mod chunk_framing_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn malformed_or_incomplete_chunks_never_return_a_partial_body() {
+        for wire in [
+            &b"2\r\n{}\r\n"[..],
+            &b"2\r\n{}\r\nxyz\r\n"[..],
+            &b"5\r\n{}"[..],
+            &b"2\r\n{}XX0\r\n\r\n"[..],
+            &b"2\r\n{}\r\n0\r\n"[..],
+            &b"2\r\n{}\r\n0\r\nX-Trailer: unfinished"[..],
+            &b"+2\r\n{}\r\n0\r\n\r\n"[..],
+            &b"\r\n"[..],
+        ] {
+            assert!(
+                read_chunked_body(&mut &b""[..], wire.to_vec())
+                    .await
+                    .is_err(),
+                "{wire:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn oversized_chunk_is_rejected_before_reading_its_payload() {
+        for size in [MAX_BODY_BYTES + 1, usize::MAX] {
+            let wire = format!("{size:x}\r\n");
+            assert!(read_chunked_body(&mut &b""[..], wire.into_bytes())
+                .await
+                .is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn chunk_lines_and_trailers_are_bounded() {
+        for wire in [
+            format!("1;{}", "x".repeat(MAX_HEADER_BYTES)),
+            format!("0\r\nX-Trailer: {}", "x".repeat(MAX_HEADER_BYTES)),
+        ] {
+            assert!(read_chunked_body(&mut &b""[..], wire.into_bytes())
+                .await
+                .is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn cumulative_chunk_framing_is_bounded() {
+        let chunk = format!("1;{}\r\nx\r\n", "x".repeat(MAX_HEADER_BYTES / 2));
+        let wire = format!("{chunk}{chunk}{chunk}0\r\n\r\n");
+        assert!(read_chunked_body(&mut wire.as_bytes(), Vec::new())
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn complete_chunked_request_is_preserved() {
+        let mut wire =
+            &b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n{}\r\n0\r\n\r\n"[..];
+        let request = read_request(&mut wire).await.unwrap().unwrap();
+        assert_eq!(request.body, b"{}");
+    }
+
+    #[tokio::test]
+    async fn many_small_chunks_are_accepted() {
+        // The minimum legal data chunk carries five framing bytes per byte
+        // of content. Fragmentation alone must not exhaust the extension cap.
+        let wire = format!("{}0\r\n\r\n", "1\r\nx\r\n".repeat(20_000));
+        let body = read_chunked_body(&mut wire.as_bytes(), Vec::new())
+            .await
+            .unwrap();
+        assert_eq!(body, vec![b'x'; 20_000]);
+    }
+
+    #[tokio::test]
+    async fn complete_chunks_extensions_and_trailers_are_decoded() {
+        let wire = b"2;part=first\r\nab\r\n2\r\ncd\r\n0\r\nX-Trailer: ok\r\n\r\n";
+        let body = read_chunked_body(&mut wire.as_slice(), Vec::new())
+            .await
+            .unwrap();
+        assert_eq!(body, b"abcd");
+    }
+}
+
+#[cfg(test)]
+mod percent_decode_tests {
+    use super::*;
+
+    #[test]
+    fn malformed_percent_escapes_next_to_unicode_do_not_panic() {
+        for value in ["%あ", "%aあ", "猫%猫", "%é", "%💾", "%", "%2", "%zz"] {
+            assert_eq!(url_decode(value), value);
+        }
+    }
+
+    #[test]
+    fn valid_percent_escapes_and_plus_are_preserved() {
+        assert_eq!(url_decode("%E7%8C%AB+%2B%2F"), "猫 +/");
     }
 }

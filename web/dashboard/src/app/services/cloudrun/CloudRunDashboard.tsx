@@ -3,6 +3,7 @@ import { Button } from '../../../ui/Button'
 import { EmptyState } from '../../../ui/EmptyState'
 import { Panel } from '../../../ui/Panel'
 import { useDashboardEvents } from '../../api/hooks/useDashboardEvents'
+import { useLatestRequest } from '../../api/hooks/useLatestRequest'
 import type { DashboardService } from '../dashboard/types'
 import { getCloudRunLogs, getCloudRunStatus, listCloudRunInstances, listCloudRunRevisions, listCloudRunServices } from './api'
 import type { CloudRunInstance, CloudRunRevision, CloudRunService, CloudRunStatus } from './types'
@@ -30,12 +31,15 @@ export function CloudRunDashboard({ service }: CloudRunDashboardProps): JSX.Elem
   const [detail, setDetail] = useState<DetailState>()
   const isDisabled = service?.status === 'disabled'
 
+  const startRefresh = useLatestRequest()
   const refresh = useCallback(() => {
+    const isCurrent = startRefresh()
     if (isDisabled) {
       return
     }
     Promise.all([getCloudRunStatus(), listCloudRunServices(), listCloudRunInstances()])
       .then(([statusPayload, servicesPayload, instancesPayload]) => {
+        if (!isCurrent()) return
         setState({
           status: 'success',
           statusPayload,
@@ -49,9 +53,10 @@ export function CloudRunDashboard({ service }: CloudRunDashboardProps): JSX.Elem
         )
       })
       .catch((error: Error) => {
+        if (!isCurrent()) return
         setState({ status: 'error', message: error.message })
       })
-  }, [isDisabled])
+  }, [startRefresh, isDisabled])
 
   useEffect(() => {
     refresh()
@@ -79,7 +84,7 @@ export function CloudRunDashboard({ service }: CloudRunDashboardProps): JSX.Elem
     }
   }, [selected, isDisabled, state])
 
-  useDashboardEvents({ topics: ['cloudrun'], onEvent: refresh, enabled: !isDisabled })
+  useDashboardEvents({ topics: ['cloudrun'], onEvent: refresh, onResync: refresh, enabled: !isDisabled })
 
   if (isDisabled) {
     return (

@@ -311,33 +311,26 @@ async fn proxy(
         );
         return client.write_all(resp.as_bytes()).await;
     }
-    let Some(spec) = server.launch_spec(&route.project, &route.location, &route.service_id) else {
-        return write_plain(
-            &mut client,
-            404,
-            &format!("Cloud Run service {service_name} not found\n"),
-        )
-        .await;
+    let authorization = head
+        .headers
+        .get("authorization")
+        .map(String::as_str)
+        .unwrap_or("");
+    let current = || server.authorized_launch_spec(&service_name, authorization);
+    // Reject immediately when possible, and re-check the same snapshot after
+    // acquiring the instance slot so a queued request cannot outlive its grant.
+    let started = match current() {
+        Ok(_) => server.instances.ensure(&service_name, current).await,
+        Err(error) => Err(error),
     };
-    if !server.allows_public_invoke(&service_name)
-        && !server.authorized(
-            head.headers
-                .get("authorization")
-                .map(String::as_str)
-                .unwrap_or(""),
-        )
-    {
-        return write_plain(
+    let port = match started {
+        Ok(p) => p,
+        Err(StartError::Forbidden) => return write_plain(
             &mut client,
             403,
             "Error: Forbidden\nYour client does not have permission to get URL from this server.\n",
         )
-        .await;
-    }
-    drop(spec);
-    let current = || server.launch_spec(&route.project, &route.location, &route.service_id);
-    let port = match server.instances.ensure(&service_name, current).await {
-        Ok(p) => p,
+        .await,
         Err(StartError::Gone) => {
             return write_plain(
                 &mut client,

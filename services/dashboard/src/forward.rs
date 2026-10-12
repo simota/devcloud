@@ -11,7 +11,8 @@
 
 use std::collections::HashMap;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use base64::Engine;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 /// A forwarded request to a downstream service.
@@ -55,6 +56,21 @@ pub enum ForwardError {
 
 const MAX_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
 
+/// The local Mail and Redis control APIs use Basic authentication in strict
+/// mode. Credentials stay on the server-to-server request, never in the UI.
+pub(crate) fn basic_auth_headers(
+    mode: &str,
+    username: &str,
+    password: &str,
+) -> Vec<(String, String)> {
+    if !mode.trim().eq_ignore_ascii_case("strict") {
+        return Vec::new();
+    }
+    let credentials =
+        base64::engine::general_purpose::STANDARD.encode(format!("{username}:{password}"));
+    vec![("Authorization".into(), format!("Basic {credentials}"))]
+}
+
 /// Performs a single HTTP/1.1 request to `req.base + req.path` and returns the
 /// parsed response. Connection is one-shot (`Connection: close`).
 pub async fn forward(req: ForwardRequest<'_>) -> Result<ForwardResponse, ForwardError> {
@@ -95,11 +111,16 @@ pub async fn forward(req: ForwardRequest<'_>) -> Result<ForwardResponse, Forward
     read_response(&mut stream).await
 }
 
-async fn read_response(stream: &mut TcpStream) -> Result<ForwardResponse, ForwardError> {
+async fn read_response<S: AsyncRead + Unpin>(
+    stream: &mut S,
+) -> Result<ForwardResponse, ForwardError> {
     let mut buf = Vec::new();
     let mut tmp = [0u8; 4096];
     let header_end = loop {
         if let Some(pos) = find_subslice(&buf, b"\r\n\r\n") {
+            if pos + 4 > 64 * 1024 {
+                return Err(ForwardError::BadResponse);
+            }
             break pos;
         }
         if buf.len() > 64 * 1024 {
@@ -128,14 +149,24 @@ async fn read_response(stream: &mut TcpStream) -> Result<ForwardResponse, Forwar
     let mut headers = HashMap::new();
     for line in lines {
         if let Some((k, v)) = line.split_once(':') {
-            headers.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
+            let name = k.trim().to_ascii_lowercase();
+            if name == "content-length" && headers.contains_key(&name) {
+                return Err(ForwardError::BadResponse);
+            }
+            headers.insert(name, v.trim().to_string());
         }
     }
 
-    let content_length: usize = headers
-        .get("content-length")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
+    if headers.contains_key("transfer-encoding") {
+        return Err(ForwardError::BadResponse);
+    }
+    let content_length = match headers.get("content-length") {
+        None => 0,
+        Some(raw) => match raw.parse::<usize>() {
+            Ok(length) if raw.bytes().all(|b| b.is_ascii_digit()) => length,
+            _ => return Err(ForwardError::BadResponse),
+        },
+    };
 
     let mut body = buf[header_end + 4..].to_vec();
     if content_length > MAX_RESPONSE_BYTES {
@@ -148,7 +179,7 @@ async fn read_response(stream: &mut TcpStream) -> Result<ForwardResponse, Forwar
                 .await
                 .map_err(ForwardError::Unreachable)?;
             if n == 0 {
-                break;
+                return Err(ForwardError::BadResponse);
             }
             body.extend_from_slice(&tmp[..n]);
         }
@@ -205,6 +236,55 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn rejects_truncated_or_ambiguous_downstream_responses() {
+        for raw in [
+            "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nabc",
+            "HTTP/1.1 200 OK\r\nContent-Length: invalid\r\n\r\n",
+            "HTTP/1.1 200 OK\r\nContent-Length: +3\r\n\r\nabc",
+            "HTTP/1.1 200 OK\r\nContent-Length: \r\n\r\n",
+            "HTTP/1.1 200 OK\r\nContent-Length: 3\r\nContent-Length: 0\r\n\r\nabc",
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\n",
+        ] {
+            assert!(matches!(
+                read_response(&mut raw.as_bytes()).await,
+                Err(ForwardError::BadResponse)
+            ));
+        }
+        let raw = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+            MAX_RESPONSE_BYTES + 1
+        );
+        assert!(matches!(
+            read_response(&mut raw.as_bytes()).await,
+            Err(ForwardError::BadResponse)
+        ));
+    }
+
+    #[tokio::test]
+    async fn accepts_complete_fixed_length_and_close_delimited_responses() {
+        for raw in [
+            "HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabc",
+            "HTTP/1.1 200 OK\r\n\r\nabc",
+        ] {
+            assert_eq!(
+                read_response(&mut raw.as_bytes()).await.unwrap().body,
+                b"abc"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn response_header_terminator_cannot_cross_the_limit() {
+        let mut raw = b"HTTP/1.1 200 OK\r\nX-Large: ".to_vec();
+        raw.resize(64 * 1024 - 1, b'a');
+        raw.extend_from_slice(b"\r\n\r\n");
+        assert!(matches!(
+            read_response(&mut raw.as_slice()).await,
+            Err(ForwardError::BadResponse)
+        ));
+    }
 
     #[test]
     fn parse_authority_with_port() {

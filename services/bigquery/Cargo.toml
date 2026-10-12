@@ -20,4 +20,4 @@ serde = { version = "1", features = ["derive"] }
 # `json.RawMessage` for insertAll row values (preserves number literals like
 # `1.50` byte-for-byte in the streaming-buffer JSONL).
 serde_json = { version = "1", features = ["raw_value"] }
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "io-util", "signal", "sync"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "io-util", "signal", "time", "sync"] }

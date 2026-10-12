@@ -128,6 +128,8 @@ pub enum StartError {
     /// The service was deleted (or devcloud is stopping) while the request
     /// waited; nothing may be started for it.
     Gone,
+    /// The request no longer has permission to invoke the current service.
+    Forbidden,
 }
 
 impl std::fmt::Display for StartError {
@@ -137,6 +139,7 @@ impl std::fmt::Display for StartError {
                 f.write_str(m)
             }
             StartError::Gone => f.write_str("service no longer exists"),
+            StartError::Forbidden => f.write_str("permission to invoke the service was denied"),
         }
     }
 }
@@ -182,18 +185,50 @@ impl Drop for TeardownGuard {
         }
         if let Some((docker, name)) = self.container.take() {
             // No runtime to await on here: remove the container from a
-            // thread (bounded by the CLI itself), tracked so shutdown waits
+            // bounded thread, tracked so shutdown waits
             // for it — killing the CLI alone leaves the container running.
-            let handle = std::thread::spawn(move || {
-                let _ = std::process::Command::new(docker)
-                    .args(["rm", "-f", &name])
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status();
-            });
+            let handle = std::thread::spawn(move || remove_container_blocking(&docker, &name));
             let mut pending = self.removals.lock().unwrap();
             pending.retain(|h| !h.is_finished());
             pending.push(handle);
+        }
+    }
+}
+
+/// Drop-time cleanup has no async runtime to enforce a timeout. Bound the
+/// Docker CLI itself, including any subprocesses it launches, so a stalled
+/// daemon cannot leave cleanup threads and children alive after shutdown.
+fn remove_container_blocking(docker: &str, name: &str) {
+    let mut command = std::process::Command::new(docker);
+    command
+        .args(["rm", "-f", name])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let Ok(mut child) = command.spawn() else {
+        return;
+    };
+    let pid = child.id();
+    let deadline = std::time::Instant::now() + DOCKER_RM_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Ok(Some(_)) => {
+                signal_group(pid, Signal::Kill);
+                return;
+            }
+            _ => {
+                signal_group(pid, Signal::Kill);
+                let _ = child.kill();
+                let _ = child.wait();
+                return;
+            }
         }
     }
 }
@@ -258,6 +293,21 @@ pub struct Manager {
     removals: Removals,
 }
 
+/// Releases a cold start's port if the future exits or is cancelled before an
+/// instance takes ownership of the reservation.
+struct StartingPort<'a> {
+    manager: &'a Manager,
+    port: Option<u16>,
+}
+
+impl Drop for StartingPort<'_> {
+    fn drop(&mut self) {
+        if let Some(port) = self.port {
+            self.manager.release_port(port);
+        }
+    }
+}
+
 impl Manager {
     pub fn new(docker_bin: Option<String>) -> Self {
         Manager {
@@ -283,13 +333,13 @@ impl Manager {
 
     /// Returns the loopback port of a live instance of `service`, starting
     /// (or replacing) one when needed. `current` reads the service's launch
-    /// spec from the control-plane state; it is consulted only after the slot
-    /// lock is held, so a request that raced a delete or an update never
-    /// (re)starts code the service no longer has.
+    /// spec and checks invocation permission against the control-plane state;
+    /// it is consulted after the slot lock is held, so queued requests cannot
+    /// use a stale service or authorization decision.
     pub async fn ensure(
         &self,
         service: &str,
-        current: impl Fn() -> Option<LaunchSpec>,
+        current: impl Fn() -> Result<LaunchSpec, StartError>,
     ) -> Result<u16, StartError> {
         let Some(slot) = self.slot(service) else {
             return Err(StartError::Gone);
@@ -299,11 +349,14 @@ impl Manager {
             // `stop` ran while we waited: the service was deleted.
             return Err(StartError::Gone);
         }
-        let Some(spec) = current() else {
-            // Deleted before we got the slot (its `stop` found no instance).
-            drop(guard);
-            self.discard_empty_slot(service, &slot);
-            return Err(StartError::Gone);
+        let spec = match current() {
+            Ok(spec) => spec,
+            Err(error) => {
+                // Deleted or unauthorized before we got the slot.
+                drop(guard);
+                self.discard_empty_slot(service, &slot);
+                return Err(error);
+            }
         };
         if let Some(inst) = guard.instance.as_mut() {
             if inst.alive() && inst.spec == spec {
@@ -443,11 +496,13 @@ impl Manager {
             return Err(not_runnable(spec));
         }
         let port = self.reserve_port().map_err(StartError::Spawn)?;
-        let started = self.start_on(spec, port).await;
-        if started.is_err() {
-            self.release_port(port);
-        }
-        started
+        let mut reservation = StartingPort {
+            manager: self,
+            port: Some(port),
+        };
+        let instance = self.start_on(spec, port).await?;
+        reservation.port = None;
+        Ok(instance)
     }
 
     async fn start_on(&self, spec: &LaunchSpec, port: u16) -> Result<Instance, StartError> {
@@ -918,7 +973,7 @@ mod tests {
     async fn image_only_container_is_not_runnable_without_docker() {
         let m = Manager::new(None);
         let spec = LaunchSpec::from_service(&service()).unwrap();
-        match m.ensure(&spec.service, || Some(spec.clone())).await {
+        match m.ensure(&spec.service, || Ok(spec.clone())).await {
             Err(StartError::NotRunnable(msg)) => assert!(msg.contains("has no command")),
             other => panic!("unexpected {other:?}"),
         }
@@ -947,7 +1002,7 @@ mod tests {
         let spec = LaunchSpec::from_service(&service()).unwrap();
         m.stop_all().await;
         assert_eq!(
-            m.ensure(&spec.service, || Some(spec.clone())).await,
+            m.ensure(&spec.service, || Ok(spec.clone())).await,
             Err(StartError::Gone)
         );
         assert!(m.slots.lock().unwrap().map.is_empty());
@@ -995,7 +1050,7 @@ mod tests {
         let m = Manager::new(Some(fake.to_string_lossy().into_owned()));
         let spec = LaunchSpec::from_service(&service()).unwrap();
         let err = m
-            .ensure(&spec.service, || Some(spec.clone()))
+            .ensure(&spec.service, || Ok(spec.clone()))
             .await
             .unwrap_err();
         assert!(matches!(err, StartError::Unhealthy(_)), "{err:?}");
@@ -1078,6 +1133,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancelling_a_cold_start_releases_its_reserved_port() {
+        let m = Manager::new(None);
+        let mut spec = LaunchSpec::from_service(&service()).unwrap();
+        spec.command = vec!["sleep".into(), "30".into()];
+        spec.args.clear();
+        for _ in 0..3 {
+            let mut start = Box::pin(m.ensure(&spec.service, || Ok(spec.clone())));
+            tokio::select! {
+                result = &mut start => panic!("non-listening process unexpectedly started: {result:?}"),
+                _ = async {
+                    while m.ports.lock().unwrap().is_empty() {
+                        tokio::task::yield_now().await;
+                    }
+                } => {}
+            }
+            drop(start);
+            assert!(
+                m.ports.lock().unwrap().is_empty(),
+                "a cancelled start must not retain its port reservation"
+            );
+        }
+        m.stop_all().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropped_instance_bounds_and_reaps_a_hung_docker_cleanup() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "devcloud-cloudrun-drop-cleanup-{}-{}",
+            std::process::id(),
+            new_run_id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fake = dir.join("docker");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\nprintf '%s\\n' \"$$\" > \"$0.pid\"\nexec sleep 60\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let m = Manager::new(Some(fake.to_string_lossy().into_owned()));
+        drop(TeardownGuard {
+            pgid: None,
+            container: Some((fake.to_string_lossy().into_owned(), "test-container".into())),
+            removals: Arc::clone(&m.removals),
+        });
+        m.stop_all().await;
+        // The thread can finish just after stop_all's own timeout expires.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let finished = loop {
+            if m.removals.lock().unwrap().iter().all(|h| h.is_finished()) {
+                break true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                break false;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        };
+        let pid: libc::pid_t = std::fs::read_to_string(dir.join("docker.pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        // SAFETY: signal 0 probes only the cleanup process this test started.
+        let still_running = unsafe { libc::kill(pid, 0) } == 0;
+        if still_running {
+            // Ensure a failing regression test does not leave its sleeper.
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+        let _ = std::fs::remove_dir_all(dir);
+        assert!(finished, "drop-time Docker cleanup exceeded its deadline");
+        assert!(
+            !still_running,
+            "drop-time Docker cleanup left its CLI alive"
+        );
+    }
+
+    #[tokio::test]
     async fn a_reaped_instance_forgets_its_process_group() {
         let mut cmd = Command::new("sh");
         cmd.args(["-c", "exit 0"]).process_group(0);
@@ -1155,13 +1290,87 @@ mod tests {
         let m = Manager::new(None);
         let spec = LaunchSpec::from_service(&service()).unwrap();
         assert_eq!(
-            m.ensure(&spec.service, || None).await,
+            m.ensure(&spec.service, || Err(StartError::Gone)).await,
             Err(StartError::Gone)
         );
         assert!(
             m.slots.lock().unwrap().map.is_empty(),
             "no slot is left behind"
         );
+    }
+
+    #[tokio::test]
+    async fn queued_invocation_rechecks_permission_after_waiting() {
+        use crate::server::{Config, Server};
+
+        for iam_disabled in [false, true] {
+            let server = Server::new(Config {
+                auth_mode: "strict".into(),
+                bearer_token: "test-token".into(),
+                ..Config::default()
+            });
+            let service_name = "projects/p/locations/us-central1/services/web";
+            let query = BTreeMap::from([("serviceId".into(), "web".into())]);
+            let input = json!({
+                "template": { "containers": [{ "image": "test-image" }] },
+                "invokerIamDisabled": iam_disabled,
+            });
+            assert_eq!(
+                server
+                    .create_service(
+                        "p",
+                        "us-central1",
+                        &query,
+                        &serde_json::to_vec(&input).unwrap()
+                    )
+                    .status,
+                200
+            );
+            if !iam_disabled {
+                let policy = json!({"policy": {"bindings": [{
+                    "role": "roles/run.invoker", "members": ["allUsers"]
+                }]}});
+                assert_eq!(
+                    server
+                        .set_iam_policy(service_name, &serde_json::to_vec(&policy).unwrap())
+                        .status,
+                    200
+                );
+            }
+            let current = || server.authorized_launch_spec(service_name, "");
+            assert!(current().is_ok(), "the original grant allows invocation");
+            // Simulate a request queued behind another cold start. Poll it
+            // into the lock wait before changing the service's permission.
+            let slot = server.instances.slot(service_name).unwrap();
+            let held = slot.lock().await;
+            let mut request = Box::pin(server.instances.ensure(service_name, current));
+            tokio::select! {
+                biased;
+                result = &mut request => panic!("locked slot completed early: {result:?}"),
+                _ = tokio::task::yield_now() => {}
+            }
+            let revoked = if iam_disabled {
+                server.update_service(
+                    "p",
+                    "us-central1",
+                    "web",
+                    &BTreeMap::new(),
+                    br#"{"invokerIamDisabled":false}"#,
+                )
+            } else {
+                server.set_iam_policy(service_name, br#"{"policy":{"bindings":[]}}"#)
+            };
+            assert_eq!(revoked.status, 200);
+            drop(held);
+            assert_eq!(request.await, Err(StartError::Forbidden));
+            assert!(server.instances.slots.lock().unwrap().map.is_empty());
+            assert!(
+                server
+                    .authorized_launch_spec(service_name, "Bearer test-token")
+                    .is_ok(),
+                "a valid bearer token still grants invocation"
+            );
+        }
     }
 
     /// delete_service: remove from state, then `stop`. Requests already
@@ -1172,7 +1381,11 @@ mod tests {
         let m = Manager::new(None);
         let spec = LaunchSpec::from_service(&service()).unwrap();
         let deleted = AtomicBool::new(false);
-        let current = || (!deleted.load(Ordering::SeqCst)).then(|| spec.clone());
+        let current = || {
+            (!deleted.load(Ordering::SeqCst))
+                .then(|| spec.clone())
+                .ok_or(StartError::Gone)
+        };
         // Hold the slot like an in-flight cold start.
         let slot = m.slot(&spec.service).unwrap();
         let held = slot.lock().await;

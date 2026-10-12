@@ -30,21 +30,11 @@ fn join(path: &str, sub: &str) -> String {
     Path::new(path).join(sub).to_string_lossy().into_owned()
 }
 
-/// Mirrors legacy `redisEndpointForDisplay`: display-only metadata.
+/// Display-only metadata, rebuilt without the external URL's credentials.
 fn redis_display_endpoint(cfg: &AppConfig) -> String {
-    let fallback = format!("redis://127.0.0.1:{}", cfg.server.redis_port);
-    let mode = cfg.services.redis.mode.trim().to_lowercase();
-    let is_external = mode == "external"
-        || (mode.is_empty() && !cfg.services.redis.external_url.trim().is_empty());
-    if !is_external {
-        return fallback;
-    }
-    let raw = cfg.services.redis.external_url.trim();
-    if raw.is_empty() {
-        fallback
-    } else {
-        raw.to_string()
-    }
+    super::redis::connection_target(cfg)
+        .map(|target| target.display_endpoint())
+        .unwrap_or_else(|_| "invalid Redis configuration".to_string())
 }
 
 fn build_config(cfg: &AppConfig) -> Config {
@@ -53,53 +43,62 @@ fn build_config(cfg: &AppConfig) -> Config {
         addr: format!("127.0.0.1:{}", cfg.server.dashboard_port),
         event_relay_endpoint: format!("ws://127.0.0.1:{}", cfg.server.event_relay_port),
 
-        sqs_base: http_ep(cfg.server.sqs_port),
+        // Empty forwarding bases mark disabled services in both the registry
+        // and API handlers. Display endpoints retain their configured ports.
+        sqs_base: enabled_ep(cfg.services.sqs.enabled, cfg.server.sqs_port),
+        sqs_endpoint: http_ep(cfg.server.sqs_port),
         sqs_region: cfg.services.sqs.region.clone(),
         sqs_auth_mode: cfg.auth.sqs.mode.clone(),
         sqs_storage_path: join(s, "sqs"),
 
-        mail_base: http_ep(cfg.server.mail_http_port),
+        mail_base: enabled_ep(cfg.services.mail.enabled, cfg.server.mail_http_port),
         mail_endpoint: format!("smtp://127.0.0.1:{}", cfg.server.smtp_port),
         mail_storage_path: join(s, "mail"),
         mail_disabled: !cfg.services.mail.enabled,
+        mail_auth_mode: cfg.auth.smtp.mode.clone(),
+        mail_username: cfg.auth.smtp.username.clone(),
+        mail_password: cfg.auth.smtp.password.clone(),
 
-        s3_base: http_ep(cfg.server.s3_port),
+        s3_base: enabled_ep(cfg.services.s3.enabled, cfg.server.s3_port),
         s3_endpoint: http_ep(cfg.server.s3_port),
         s3_storage_path: join(s, "s3"),
 
-        gcs_base: http_ep(cfg.server.gcs_port),
+        gcs_base: enabled_ep(cfg.services.gcs.enabled, cfg.server.gcs_port),
         gcs_endpoint: http_ep(cfg.server.gcs_port),
         gcs_storage_path: join(s, "gcs"),
 
-        dynamodb_base: http_ep(cfg.server.dynamodb_port),
+        dynamodb_base: enabled_ep(cfg.services.dynamodb.enabled, cfg.server.dynamodb_port),
         dynamodb_endpoint: http_ep(cfg.server.dynamodb_port),
         dynamodb_storage_path: join(s, "dynamodb"),
 
-        bigquery_base: http_ep(cfg.server.bigquery_port),
+        bigquery_base: enabled_ep(cfg.services.bigquery.enabled, cfg.server.bigquery_port),
         bigquery_endpoint: http_ep(cfg.server.bigquery_port),
         bigquery_storage_path: join(s, "bigquery"),
 
-        redshift_base: http_ep(cfg.server.redshift_api_port),
+        redshift_base: enabled_ep(cfg.services.redshift.enabled, cfg.server.redshift_api_port),
         redshift_sql_endpoint: format!("127.0.0.1:{}", cfg.server.redshift_port),
         redshift_endpoint: http_ep(cfg.server.redshift_api_port),
         redshift_storage_path: scoped_data_dir(s, &cfg.services.redshift.data_dir, "redshift"),
 
-        redis_base: http_ep(cfg.server.redis_http_port),
+        redis_base: enabled_ep(cfg.services.redis.enabled, cfg.server.redis_http_port),
         redis_endpoint: redis_display_endpoint(cfg),
         redis_storage_path: scoped_data_dir(s, &cfg.services.redis.data_dir, "redis"),
         redis_enabled: cfg.services.redis.enabled,
+        redis_auth_mode: cfg.auth.redis.mode.clone(),
+        redis_password: cfg.auth.redis.password.clone(),
 
-        pubsub_base: http_ep(cfg.server.pubsub_rest_port),
+        pubsub_base: enabled_ep(cfg.services.pubsub.enabled, cfg.server.pubsub_rest_port),
         pubsub_endpoint: http_ep(cfg.server.pubsub_rest_port),
         pubsub_storage_path: default_string(&cfg.services.pubsub.data_dir, &join(s, "pubsub")),
 
-        app_auto_scaling_base: http_ep(cfg.server.app_auto_scaling_port),
+        app_auto_scaling_base: enabled_ep(
+            cfg.services.app_auto_scaling.enabled,
+            cfg.server.app_auto_scaling_port,
+        ),
         app_auto_scaling_endpoint: http_ep(cfg.server.app_auto_scaling_port),
         app_auto_scaling_storage_path: join(s, "applicationautoscaling"),
         app_auto_scaling_region: cfg.services.app_auto_scaling.region.clone(),
 
-        // Empty base == disabled: the registry/status handlers report the
-        // service off instead of forwarding to a port nothing listens on.
         lambda_base: enabled_ep(cfg.services.lambda.enabled, cfg.server.lambda_port),
         lambda_endpoint: http_ep(cfg.server.lambda_port),
         lambda_storage_path: join(s, "lambda"),
@@ -133,6 +132,107 @@ pub async fn run(cfg: &AppConfig, shutdown: impl Future<Output = ()>) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn get(path: &str) -> http::Request {
+        http::Request {
+            method: "GET".to_string(),
+            path: path.to_string(),
+            raw_path: path.to_string(),
+            query: String::new(),
+            headers: std::collections::HashMap::new(),
+            body: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn single_service_selection_disables_other_registry_entries_and_apis() {
+        let services = [
+            ("mail", "mail", "/api/messages"),
+            ("s3", "s3", "/api/s3/buckets"),
+            ("gcs", "gcs", "/api/gcs/buckets"),
+            ("dynamodb", "dynamodb", "/api/dynamodb/tables"),
+            ("bigquery", "bigquery", "/api/bigquery/projects"),
+            ("redshift", "redshift", "/api/redshift/clusters"),
+            ("redis", "redis", "/api/redis/keys"),
+            ("sqs", "sqs", "/api/sqs/queues"),
+            ("pubsub", "pubsub", "/api/pubsub/topics"),
+            (
+                "appautoscaling",
+                "applicationautoscaling",
+                "/api/applicationautoscaling/scalable-targets",
+            ),
+            ("lambda", "lambda", "/api/lambda/functions"),
+            ("cloudrun", "cloudrun", "/api/cloudrun/services"),
+        ];
+        let mut covered: Vec<_> = services.iter().map(|(name, _, _)| *name).collect();
+        covered.sort();
+        assert_eq!(covered, crate::config::service_names());
+
+        for (selected, selected_id, _) in services {
+            let cfg = crate::config::apply_service_selection(
+                &AppConfig::default(),
+                &[selected.to_string()],
+            )
+            .unwrap();
+            let dashboard = build_config(&cfg);
+            let response = http::route(&dashboard, &get("/api/services")).await;
+            assert_eq!(response.status, 200);
+            let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+            let registry = body["services"].as_array().unwrap();
+            assert_eq!(registry.len(), services.len());
+            let running: Vec<_> = registry
+                .iter()
+                .filter(|service| service["status"] == "running")
+                .map(|service| service["id"].as_str().unwrap())
+                .collect();
+            assert_eq!(running, [selected_id], "devcloud up {selected}");
+
+            for (name, id, path) in services {
+                let entry = registry.iter().find(|service| service["id"] == id).unwrap();
+                assert!(
+                    !entry["endpoint"].as_str().unwrap().is_empty(),
+                    "{id} must retain its display endpoint"
+                );
+                if name != selected {
+                    assert_eq!(entry["status"], "disabled", "devcloud up {selected}: {id}");
+                    let response = http::route(&dashboard, &get(path)).await;
+                    assert_eq!(
+                        response.status,
+                        503,
+                        "devcloud up {selected}: disabled {path} must not forward: {}",
+                        String::from_utf8_lossy(&response.body)
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn disabled_sqs_preserves_custom_endpoint_in_registry_and_status() {
+        let mut cfg = AppConfig::default();
+        cfg.services.sqs.enabled = false;
+        cfg.server.sqs_port = 29324;
+        let dashboard = build_config(&cfg);
+
+        let response = http::route(&dashboard, &get("/api/services")).await;
+        assert_eq!(response.status, 200);
+        let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        let sqs = body["services"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|service| service["id"] == "sqs")
+            .unwrap();
+        assert_eq!(sqs["status"], "disabled");
+        assert_eq!(sqs["endpoint"], "http://127.0.0.1:29324");
+
+        let response = http::route(&dashboard, &get("/api/sqs/status")).await;
+        assert_eq!(response.status, 200);
+        let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(body["status"], "disabled");
+        assert_eq!(body["running"], false);
+        assert_eq!(body["endpoint"], "http://127.0.0.1:29324");
+    }
 
     #[test]
     fn build_config_uses_distinct_s3_and_gcs_storage_paths() {

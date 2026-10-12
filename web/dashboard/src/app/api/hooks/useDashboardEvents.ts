@@ -8,6 +8,8 @@ type UseDashboardEventsOptions = {
   topics: string[]
   /** Called whenever a matching event arrives. */
   onEvent: (event: DashboardEvent) => void
+  /** Refresh snapshots after reconnect or a relay queue overflow. */
+  onResync?: () => void
   /** Set to false to opt out of the shared WebSocket stream. */
   enabled?: boolean
 }
@@ -20,12 +22,15 @@ type UseDashboardEventsOptions = {
 export function useDashboardEvents({
   topics,
   onEvent,
+  onResync,
   enabled = true,
 }: UseDashboardEventsOptions): void {
   const onEventRef = useRef(onEvent)
+  const onResyncRef = useRef(onResync)
   useEffect(() => {
     onEventRef.current = onEvent
-  }, [onEvent])
+    onResyncRef.current = onResync
+  }, [onEvent, onResync])
 
   const topicsKey = topics.slice().sort().join(',')
 
@@ -34,9 +39,11 @@ export function useDashboardEvents({
       return
     }
     const requestedTopics = topicsKey ? topicsKey.split(',') : []
-    const unsubscribe = subscribeDashboardEvents(requestedTopics, (event) => {
-      onEventRef.current(event)
-    })
+    const unsubscribe = subscribeDashboardEvents(
+      requestedTopics,
+      (event) => onEventRef.current(event),
+      () => onResyncRef.current?.(),
+    )
     return unsubscribe
   }, [topicsKey, enabled])
 }

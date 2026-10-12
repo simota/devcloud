@@ -111,6 +111,69 @@ fn req_q(method: &str, path: &str, query: &str, body: &[u8]) -> Request {
 // ── Redis: a `/_control/` mutation service ──────────────────────────────────
 
 #[tokio::test]
+async fn strict_mail_and_redis_forward_credentials_for_reads_and_mutations() {
+    use base64::Engine;
+    for (service, method, path) in [
+        ("mail", "GET", "/api/messages"),
+        ("mail", "DELETE", "/api/messages/one"),
+        ("redis", "GET", "/api/redis/keys"),
+        ("redis", "POST", "/api/redis/command"),
+    ] {
+        let (base, record) = mock_upstream(200, "{}").await;
+        let cfg = Config {
+            mail_base: base.clone(),
+            mail_auth_mode: " STRICT ".into(),
+            mail_username: "mail-user".into(),
+            mail_password: "mail:password".into(),
+            redis_base: base,
+            redis_auth_mode: "strict".into(),
+            redis_password: "redis:password".into(),
+            ..Config::default()
+        };
+        assert_eq!(route(&cfg, &req(method, path, b"{}")).await.status, 200);
+        let record = record.lock().unwrap();
+        let header = record
+            .headers
+            .get("authorization")
+            .expect("strict forwarding requires authentication");
+        let encoded = header
+            .strip_prefix("Basic ")
+            .expect("local control APIs require Basic authentication");
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .unwrap();
+        let expected = if service == "mail" {
+            b"mail-user:mail:password".as_slice()
+        } else {
+            b"dev:redis:password".as_slice()
+        };
+        assert!(
+            bytes == expected,
+            "forwarding must use the configured service credentials"
+        );
+    }
+}
+
+#[tokio::test]
+async fn relaxed_mail_and_redis_do_not_send_configured_credentials() {
+    for path in ["/api/messages", "/api/redis/keys"] {
+        let (base, record) = mock_upstream(200, "{}").await;
+        let cfg = Config {
+            mail_base: base.clone(),
+            mail_auth_mode: "relaxed".into(),
+            mail_username: "unused-user".into(),
+            mail_password: "unused-password".into(),
+            redis_base: base,
+            redis_auth_mode: "relaxed".into(),
+            redis_password: "unused-password".into(),
+            ..Config::default()
+        };
+        assert_eq!(route(&cfg, &req("GET", path, b"")).await.status, 200);
+        assert!(!record.lock().unwrap().headers.contains_key("authorization"));
+    }
+}
+
+#[tokio::test]
 async fn redis_command_forwards_to_control_exec() {
     let (base, record) =
         mock_upstream(200, r#"{"command":"GET","class":"read","rows":["v"]}"#).await;

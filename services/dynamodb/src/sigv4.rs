@@ -318,8 +318,11 @@ fn url_decode(value: &str) -> String {
     while i < bytes.len() {
         match bytes[i] {
             b'%' if i + 2 < bytes.len() => {
-                if let Ok(b) = u8::from_str_radix(&value[i + 1..i + 3], 16) {
-                    out.push(b);
+                if let (Some(hi), Some(lo)) = (
+                    (bytes[i + 1] as char).to_digit(16),
+                    (bytes[i + 2] as char).to_digit(16),
+                ) {
+                    out.push((hi * 16 + lo) as u8);
                     i += 3;
                     continue;
                 }
@@ -509,5 +512,22 @@ mod tests {
             verify_signature(&creds, &req),
             Err(err("InvalidSignatureException", 403))
         );
+    }
+}
+
+#[cfg(test)]
+mod percent_decode_tests {
+    use super::*;
+
+    #[test]
+    fn malformed_percent_escapes_next_to_unicode_do_not_panic() {
+        for value in ["%あ", "%aあ", "猫%猫", "%é", "%💾", "%", "%2", "%zz"] {
+            assert_eq!(url_decode(value), value);
+        }
+    }
+
+    #[test]
+    fn valid_percent_escapes_and_plus_are_preserved() {
+        assert_eq!(url_decode("%E7%8C%AB+%2B%2F"), "猫 +/");
     }
 }

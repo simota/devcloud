@@ -31,7 +31,7 @@ use std::sync::Arc;
 
 use serde::Deserialize;
 use serde_json::json;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::command_allowlist::{command_allowed, CommandClass};
@@ -187,6 +187,14 @@ async fn handle_conn(
 /// Top-level routing, mirroring `ServeHTTP`: intercept the two prefixes before
 /// anything else, run `verify_http` first, then 404 for everything else.
 async fn dispatch(server: &Server, auth: &HttpAuth, req: &Request) -> Response {
+    if !crate::browser_guard::allowed(
+        &req.method,
+        req.header("host"),
+        req.header("origin"),
+        req.header("sec-fetch-site"),
+    ) {
+        return Response::text(403, "cross-site requests or untrusted Host are not allowed");
+    }
     let path = if req.path.is_empty() { "/" } else { &req.path };
     if path.starts_with(INTROSPECT_PREFIX) {
         if let Some(resp) = verify_http(auth, req) {
@@ -557,11 +565,14 @@ fn key_detail_response(detail: &crate::server::KeyDetail) -> serde_json::Value {
 
 // --- HTTP/1.1 transport (hand-rolled, same pattern as sqs/http.rs) ---
 
-async fn read_request(stream: &mut TcpStream) -> std::io::Result<Option<Request>> {
+async fn read_request<S: AsyncRead + Unpin>(stream: &mut S) -> std::io::Result<Option<Request>> {
     let mut buf = Vec::new();
     let mut tmp = [0u8; 4096];
     let header_end = loop {
         if let Some(pos) = find_subslice(&buf, b"\r\n\r\n") {
+            if pos + 4 > MAX_HEADER_BYTES {
+                return Ok(None);
+            }
             break pos;
         }
         if buf.len() > MAX_HEADER_BYTES {
@@ -590,14 +601,26 @@ async fn read_request(stream: &mut TcpStream) -> std::io::Result<Option<Request>
     let mut headers = HashMap::new();
     for line in lines {
         if let Some((k, v)) = line.split_once(':') {
-            headers.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
+            let name = k.trim().to_ascii_lowercase();
+            if name == "content-length" && headers.contains_key(&name) {
+                return Ok(None);
+            }
+            headers.insert(name, v.trim().to_string());
         }
     }
 
-    let content_length: usize = headers
-        .get("content-length")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
+    // These one-shot endpoints support fixed-length bodies only. Reject
+    // ambiguous framing before a mutation can see a partial or empty body.
+    if headers.contains_key("transfer-encoding") {
+        return Ok(None);
+    }
+    let content_length = match headers.get("content-length") {
+        None => 0,
+        Some(raw) => match raw.parse::<usize>() {
+            Ok(length) if raw.bytes().all(|b| b.is_ascii_digit()) => length,
+            _ => return Ok(None),
+        },
+    };
     if content_length > MAX_BODY_BYTES {
         return Ok(None);
     }
@@ -606,7 +629,7 @@ async fn read_request(stream: &mut TcpStream) -> std::io::Result<Option<Request>
     while body.len() < content_length {
         let n = stream.read(&mut tmp).await?;
         if n == 0 {
-            break;
+            return Ok(None);
         }
         body.extend_from_slice(&tmp[..n]);
     }
@@ -745,6 +768,92 @@ fn base64_decode(input: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn direct_control_rejects_simple_cross_site_posts_before_running_commands() {
+        let server = Server::new(
+            "127.0.0.1:0".into(),
+            String::new(),
+            "managed".into(),
+            16,
+            Box::new(|_, _| {}),
+        );
+        let auth = HttpAuth {
+            auth_mode: "relaxed".into(),
+            password: String::new(),
+        };
+        for (path, body) in [
+            (
+                "/_control/exec",
+                r#"{"command":"SET","args":["test-key","test-value"]}"#,
+            ),
+            ("/_control/select-db", r#"{"db":1}"#),
+            ("/_control/keys/test-key/expire", r#"{"ttlSeconds":10}"#),
+        ] {
+            let mut req = test_request("POST", path);
+            req.body = body.as_bytes().to_vec();
+            req.headers.insert("host".into(), "127.0.0.1:16380".into());
+            req.headers
+                .insert("content-type".into(), "text/plain".into());
+            req.headers
+                .insert("origin".into(), "https://evil.com".into());
+            assert_eq!(dispatch(&server, &auth, &req).await.status, 403);
+            req.headers.remove("origin");
+            req.headers
+                .insert("sec-fetch-site".into(), "cross-site".into());
+            assert_eq!(dispatch(&server, &auth, &req).await.status, 403);
+        }
+        let mut req = test_request("GET", "/_introspect/keys");
+        req.headers.insert("host".into(), "evil.com:16380".into());
+        assert_eq!(dispatch(&server, &auth, &req).await.status, 403);
+
+        // A CLI request without browser headers still reaches normal parsing.
+        let req = test_request("POST", "/_control/exec");
+        assert_eq!(dispatch(&server, &auth, &req).await.status, 400);
+    }
+
+    #[tokio::test]
+    async fn transport_rejects_incomplete_or_ambiguous_bodies() {
+        for raw in [
+            "POST / HTTP/1.1\r\nContent-Length: 5\r\n\r\nabc",
+            "POST / HTTP/1.1\r\nContent-Length: invalid\r\n\r\n",
+            "POST / HTTP/1.1\r\nContent-Length: +3\r\n\r\nabc",
+            "POST / HTTP/1.1\r\nContent-Length: \r\n\r\n",
+            "POST / HTTP/1.1\r\nContent-Length: 99999999999999999999999999\r\n\r\n",
+            "POST / HTTP/1.1\r\nContent-Length: 3\r\nContent-Length: 0\r\n\r\nabc",
+            "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+            "POST / HTTP/1.1\r\nContent-Length: 0\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+        ] {
+            assert!(read_request(&mut raw.as_bytes()).await.unwrap().is_none());
+        }
+        let oversized = format!(
+            "POST / HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
+            MAX_BODY_BYTES + 1
+        );
+        assert!(read_request(&mut oversized.as_bytes())
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn transport_accepts_complete_bodies_and_enforces_the_header_boundary() {
+        for raw in [
+            "POST / HTTP/1.1\r\nContent-Length: 3\r\n\r\nabc",
+            "GET / HTTP/1.1\r\n\r\n",
+        ] {
+            assert!(read_request(&mut raw.as_bytes()).await.unwrap().is_some());
+        }
+        // The terminator arrives in the read that crosses the cap. Checking
+        // only the buffer length before looking for it misses this case.
+        let mut oversized = b"GET / HTTP/1.1\r\nX-Large: ".to_vec();
+        oversized.resize(MAX_HEADER_BYTES - 1, b'a');
+        oversized.extend_from_slice(b"\r\n\r\n");
+        assert!(read_request(&mut oversized.as_slice())
+            .await
+            .unwrap()
+            .is_none());
+    }
 
     #[test]
     fn count_clamps_and_defaults() {
