@@ -26,7 +26,7 @@ use devcloud_s3::store::{FileBucketStore, StoreError};
 use devcloud_s3::time_fmt::{now_rfc3339nano, parse_rfc3339};
 use devcloud_s3::wire_json;
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 const MAX_HEADER_BYTES: usize = 64 * 1024;
@@ -1306,12 +1306,11 @@ fn put_resumable_upload(server: &mut Server, req: &Request) -> Response {
         return r;
     }
     let mut payload = req.body.clone();
-    // Set when the final chunk has already been durably appended (`body.part`
-    // and `session.json` on disk reflect the post-chunk state) so the
-    // `put_object` failure branch below can roll both back to this pre-chunk
-    // offset. `None` covers one-shot and headerless commits, where nothing was
-    // persisted before `put_object` and no rollback is needed.
-    let mut committed_chunk_rollback: Option<i64> = None;
+    // The final chunk may be appended to `body.part`, but its session checkpoint
+    // must stay at the previous offset until the object is committed. A restart
+    // can then discard the uncommitted tail and accept the same chunk again.
+    // One-shot and headerless commits do not stage data before `put_object`.
+    let mut staged_chunk_rollback: Option<i64> = None;
     if !req.header("content-range").trim().is_empty() {
         let upload_range = match parse_resumable_content_range(
             req.header("content-range"),
@@ -1329,16 +1328,23 @@ fn put_resumable_upload(server: &mut Server, req: &Request) -> Response {
         }
         let prior_received_bytes = session.received_bytes;
         session.received_bytes = upload_range.end + 1;
-        let one_shot = upload_range.start == 0 && session.received_bytes == upload_range.total;
+        let is_final = session.received_bytes == upload_range.total;
+        let one_shot = upload_range.start == 0 && is_final;
         if !one_shot {
-            if server.append_session_body(&id, &payload).is_err()
-                || server.save_session(&id, &session).is_err()
+            if server
+                .append_session_body(&id, prior_received_bytes, &payload)
+                .is_err()
+                || (!is_final && server.save_session(&id, &session).is_err())
             {
+                // An append may succeed (or write a prefix) before the
+                // metadata write fails. The in-memory offset is unchanged;
+                // discard these uncommitted bytes before a client retries.
+                let _ = server.truncate_session_body(&id, prior_received_bytes);
                 return json_error(500, "backendError", "internal error");
             }
-            committed_chunk_rollback = Some(prior_received_bytes);
+            staged_chunk_rollback = Some(prior_received_bytes);
         }
-        if session.received_bytes < upload_range.total {
+        if !is_final {
             server.sessions.insert(id, session);
             let mut r = Response::empty(308);
             r.headers
@@ -1348,7 +1354,10 @@ fn put_resumable_upload(server: &mut Server, req: &Request) -> Response {
         if !one_shot {
             payload = match server.read_session_body(&id) {
                 Ok(v) => v,
-                Err(_) => return json_error(500, "backendError", "internal error"),
+                Err(_) => {
+                    let _ = server.truncate_session_body(&id, prior_received_bytes);
+                    return json_error(500, "backendError", "internal error");
+                }
             };
         }
     }
@@ -1379,15 +1388,11 @@ fn put_resumable_upload(server: &mut Server, req: &Request) -> Response {
         }
         Err(e) => {
             let message = store_error_text(&e, &session.bucket, &session.name);
-            if let Some(prior_received_bytes) = committed_chunk_rollback {
-                // Only chunks that were durably appended before this failed
-                // `put_object` need undoing here — otherwise a retried final
-                // chunk re-appends onto bytes already persisted, doubling the
-                // stored object.
-                session.received_bytes = prior_received_bytes;
+            if let Some(prior_received_bytes) = staged_chunk_rollback {
+                // The in-memory and on-disk checkpoints still contain this
+                // offset. Discard the staged tail so a retry cannot duplicate
+                // it, without requiring another metadata write to roll back.
                 let _ = server.truncate_session_body(&id, prior_received_bytes);
-                let _ = server.save_session(&id, &session);
-                server.sessions.insert(id, session);
             }
             json_error(404, "notFound", &message)
         }
@@ -1659,10 +1664,21 @@ impl Server {
             return Ok(());
         };
         fs::create_dir_all(&dir)?;
-        fs::write(dir.join("session.json"), wire_json::to_vec_indent(session))
+        let temporary = dir.join("session.json.tmp");
+        let result = fs::write(&temporary, wire_json::to_vec_indent(session))
+            .and_then(|()| fs::rename(&temporary, dir.join("session.json")));
+        if result.is_err() {
+            let _ = fs::remove_file(&temporary);
+        }
+        result
     }
 
-    fn append_session_body(&self, id: &str, payload: &[u8]) -> std::io::Result<()> {
+    fn append_session_body(
+        &self,
+        id: &str,
+        committed_bytes: i64,
+        payload: &[u8],
+    ) -> std::io::Result<()> {
         use std::io::Write;
         let Some(dir) = self.session_dir(id) else {
             return Err(std::io::Error::new(
@@ -1675,6 +1691,18 @@ impl Server {
             .create(true)
             .append(true)
             .open(dir.join("body.part"))?;
+        let committed_bytes = u64::try_from(committed_bytes).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid upload offset")
+        })?;
+        if f.metadata()?.len() < committed_bytes {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "committed upload data is incomplete",
+            ));
+        }
+        // Recover an interrupted append using the offset committed in
+        // session.json, including after a process restart.
+        f.set_len(committed_bytes)?;
         f.write_all(payload)
     }
 
@@ -1702,7 +1730,16 @@ impl Server {
         let f = fs::OpenOptions::new()
             .write(true)
             .open(dir.join("body.part"))?;
-        f.set_len(len as u64)
+        let len = u64::try_from(len).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid upload offset")
+        })?;
+        if f.metadata()?.len() < len {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "committed upload data is incomplete",
+            ));
+        }
+        f.set_len(len)
     }
 
     fn delete_session(&self, id: &str) -> std::io::Result<()> {
@@ -2163,11 +2200,14 @@ async fn handle_conn(mut stream: TcpStream, server: Arc<Mutex<Server>>) -> std::
     write_response(&mut stream, response).await
 }
 
-async fn read_request(stream: &mut TcpStream) -> std::io::Result<Option<Request>> {
+async fn read_request(stream: &mut (impl AsyncRead + Unpin)) -> std::io::Result<Option<Request>> {
     let mut buf = Vec::new();
     let mut tmp = [0u8; 4096];
     let header_end = loop {
         if let Some(pos) = find_subslice(&buf, b"\r\n\r\n") {
+            if pos + 4 > MAX_HEADER_BYTES {
+                return Ok(None);
+            }
             break pos;
         }
         if buf.len() > MAX_HEADER_BYTES {
@@ -2190,28 +2230,45 @@ async fn read_request(stream: &mut TcpStream) -> std::io::Result<Option<Request>
     let mut headers = BTreeMap::new();
     for line in lines {
         if let Some((k, v)) = line.split_once(':') {
-            headers.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
+            let key = k.trim().to_ascii_lowercase();
+            if matches!(key.as_str(), "content-length" | "transfer-encoding")
+                && headers.contains_key(&key)
+            {
+                return Ok(None);
+            }
+            headers.insert(key, v.trim().to_string());
         }
     }
+    let chunked = match headers.get("transfer-encoding") {
+        None => false,
+        Some(value)
+            if value.eq_ignore_ascii_case("chunked") && !headers.contains_key("content-length") =>
+        {
+            true
+        }
+        Some(_) => return Ok(None),
+    };
     let mut body = buf[header_end + 4..].to_vec();
-    if headers
-        .get("transfer-encoding")
-        .map(|v| v.to_ascii_lowercase().contains("chunked"))
-        .unwrap_or(false)
-    {
+    if chunked {
         body = read_chunked_body(stream, body).await?;
     } else {
-        let content_length: usize = headers
-            .get("content-length")
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0);
+        let content_length: usize = match headers.get("content-length") {
+            None => 0,
+            Some(value) if !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()) => {
+                match value.parse() {
+                    Ok(length) => length,
+                    Err(_) => return Ok(None),
+                }
+            }
+            Some(_) => return Ok(None),
+        };
         if content_length > MAX_BODY_BYTES {
             return Ok(None);
         }
         while body.len() < content_length {
             let n = stream.read(&mut tmp).await?;
             if n == 0 {
-                break;
+                return Ok(None);
             }
             body.extend_from_slice(&tmp[..n]);
         }
@@ -2227,40 +2284,119 @@ async fn read_request(stream: &mut TcpStream) -> std::io::Result<Option<Request>
     }))
 }
 
-async fn read_chunked_body(stream: &mut TcpStream, mut buf: Vec<u8>) -> std::io::Result<Vec<u8>> {
+async fn read_chunked_body(
+    stream: &mut (impl AsyncRead + Unpin),
+    mut buf: Vec<u8>,
+) -> std::io::Result<Vec<u8>> {
     let mut out = Vec::new();
+    let mut framing_bytes = 0usize;
     let mut tmp = [0u8; 4096];
-    let mut pos = 0;
     loop {
-        let line_end = loop {
-            if let Some(i) = find_subslice(&buf[pos..], b"\r\n") {
-                break pos + i;
-            }
-            let n = stream.read(&mut tmp).await?;
-            if n == 0 {
-                return Ok(out);
-            }
-            buf.extend_from_slice(&tmp[..n]);
-        };
-        let size_line = String::from_utf8_lossy(&buf[pos..line_end]);
-        let size_hex = size_line.split(';').next().unwrap_or("").trim();
-        let size = usize::from_str_radix(size_hex, 16).unwrap_or(0);
-        pos = line_end + 2;
+        let line = read_chunk_line(stream, &mut buf, MAX_HEADER_BYTES).await?;
+        framing_bytes += line.len() + 2;
+        // One-byte chunks use five framing bytes per data byte. Reserve that
+        // legal overhead separately from the additional extension budget.
+        if framing_bytes > 5 * out.len() + MAX_HEADER_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "chunk framing too large",
+            ));
+        }
+        let size_hex = line.split(|b| *b == b';').next().unwrap_or_default();
+        if size_hex.is_empty() || !size_hex.iter().all(u8::is_ascii_hexdigit) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid chunk size",
+            ));
+        }
+        // ASCII validation above makes this conversion infallible. Reject a
+        // huge declaration before reading its payload or adding byte offsets.
+        let size =
+            usize::from_str_radix(std::str::from_utf8(size_hex).unwrap(), 16).map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid chunk size")
+            })?;
+        if size > MAX_BODY_BYTES - out.len() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "request body too large",
+            ));
+        }
         if size == 0 {
-            return Ok(out);
+            // The zero chunk is followed by a complete, bounded trailer
+            // section, ending in an empty line. EOF is never a terminator.
+            let mut remaining = MAX_HEADER_BYTES;
+            loop {
+                let trailer = read_chunk_line(stream, &mut buf, remaining).await?;
+                remaining -= trailer.len() + 2;
+                framing_bytes += trailer.len() + 2;
+                if framing_bytes > 5 * out.len() + MAX_HEADER_BYTES {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "chunk framing too large",
+                    ));
+                }
+                if trailer.is_empty() {
+                    return Ok(out);
+                }
+            }
         }
-        while buf.len() < pos + size + 2 {
+        // `size` is now bounded by MAX_BODY_BYTES, so the addition is safe.
+        while buf.len() < size + 2 {
             let n = stream.read(&mut tmp).await?;
             if n == 0 {
-                return Ok(out);
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "incomplete chunk body",
+                ));
             }
             buf.extend_from_slice(&tmp[..n]);
         }
-        out.extend_from_slice(&buf[pos..pos + size]);
-        if out.len() > MAX_BODY_BYTES {
-            return Ok(Vec::new());
+        if &buf[size..size + 2] != b"\r\n" {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid chunk terminator",
+            ));
         }
-        pos += size + 2;
+        out.extend_from_slice(&buf[..size]);
+        framing_bytes += 2;
+        // Discard consumed framing as well as data, so many small chunks do
+        // not retain an unbounded second copy of the request on the heap.
+        buf.drain(..size + 2);
+    }
+}
+
+async fn read_chunk_line(
+    stream: &mut (impl AsyncRead + Unpin),
+    buf: &mut Vec<u8>,
+    limit: usize,
+) -> std::io::Result<Vec<u8>> {
+    let mut tmp = [0u8; 4096];
+    loop {
+        if let Some(end) = find_subslice(buf, b"\r\n") {
+            if end + 2 > limit {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "chunk headers too large",
+                ));
+            }
+            let line = buf[..end].to_vec();
+            buf.drain(..end + 2);
+            return Ok(line);
+        }
+        if buf.len() >= limit {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "chunk headers too large",
+            ));
+        }
+        let n = stream.read(&mut tmp).await?;
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "incomplete chunk headers",
+            ));
+        }
+        buf.extend_from_slice(&tmp[..n]);
     }
 }
 
@@ -2287,8 +2423,11 @@ fn url_decode(value: &str) -> String {
     while i < bytes.len() {
         match bytes[i] {
             b'%' if i + 2 < bytes.len() => {
-                if let Ok(b) = u8::from_str_radix(&value[i + 1..i + 3], 16) {
-                    out.push(b);
+                if let (Some(hi), Some(lo)) = (
+                    (bytes[i + 1] as char).to_digit(16),
+                    (bytes[i + 2] as char).to_digit(16),
+                ) {
+                    out.push((hi * 16 + lo) as u8);
                     i += 3;
                     continue;
                 }
@@ -2529,5 +2668,165 @@ mod tests {
             String::from_utf8(r.body).unwrap(),
             "{\"error\":{\"code\":404,\"message\":\"object not found\",\"errors\":[{\"domain\":\"global\",\"reason\":\"notFound\",\"message\":\"object not found\"}]}}\n"
         );
+    }
+}
+
+#[cfg(test)]
+mod request_framing_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn incomplete_fixed_length_body_is_rejected() {
+        // A complete JSON value is still an incomplete HTTP message. It must
+        // never reach a mutating handler after the client disconnects early.
+        let mut wire = &b"POST / HTTP/1.1\r\nContent-Length: 9\r\n\r\n{}"[..];
+        assert!(read_request(&mut wire).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn invalid_content_length_is_rejected() {
+        for value in ["bad", "-1", "+2", "", "18446744073709551616"] {
+            let wire = format!("POST / HTTP/1.1\r\nContent-Length: {value}\r\n\r\n{{}}");
+            assert!(
+                read_request(&mut wire.as_bytes()).await.unwrap().is_none(),
+                "{value:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn ambiguous_or_unsupported_body_framing_is_rejected() {
+        for headers in [
+            "Transfer-Encoding: gzip\r\n",
+            "Transfer-Encoding: xchunked\r\n",
+            "Transfer-Encoding: chunked, gzip\r\n",
+            "Content-Length: 9\r\nContent-Length: 2\r\n",
+            "Content-Length: 2\r\nTransfer-Encoding: chunked\r\n",
+            "Transfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n",
+        ] {
+            let wire = format!("POST / HTTP/1.1\r\n{headers}\r\n{{}}");
+            assert!(
+                read_request(&mut wire.as_bytes()).await.unwrap().is_none(),
+                "{headers:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn complete_fixed_length_body_is_preserved() {
+        let mut wire = &b"POST / HTTP/1.1\r\nContent-Length: 2\r\n\r\n{}"[..];
+        let request = read_request(&mut wire).await.unwrap().unwrap();
+        assert_eq!(request.body, b"{}");
+    }
+
+    #[tokio::test]
+    async fn oversized_header_is_rejected_even_when_terminator_arrives() {
+        let wire = format!(
+            "POST / HTTP/1.1\r\nX-Padding: {}\r\n\r\n",
+            "a".repeat(MAX_HEADER_BYTES)
+        );
+        assert!(read_request(&mut wire.as_bytes()).await.unwrap().is_none());
+    }
+}
+
+#[cfg(test)]
+mod chunk_framing_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn malformed_or_incomplete_chunks_never_return_a_partial_body() {
+        for wire in [
+            &b"2\r\n{}\r\n"[..],
+            &b"2\r\n{}\r\nxyz\r\n"[..],
+            &b"5\r\n{}"[..],
+            &b"2\r\n{}XX0\r\n\r\n"[..],
+            &b"2\r\n{}\r\n0\r\n"[..],
+            &b"2\r\n{}\r\n0\r\nX-Trailer: unfinished"[..],
+            &b"+2\r\n{}\r\n0\r\n\r\n"[..],
+            &b"\r\n"[..],
+        ] {
+            assert!(
+                read_chunked_body(&mut &b""[..], wire.to_vec())
+                    .await
+                    .is_err(),
+                "{wire:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn oversized_chunk_is_rejected_before_reading_its_payload() {
+        for size in [MAX_BODY_BYTES + 1, usize::MAX] {
+            let wire = format!("{size:x}\r\n");
+            assert!(read_chunked_body(&mut &b""[..], wire.into_bytes())
+                .await
+                .is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn chunk_lines_and_trailers_are_bounded() {
+        for wire in [
+            format!("1;{}", "x".repeat(MAX_HEADER_BYTES)),
+            format!("0\r\nX-Trailer: {}", "x".repeat(MAX_HEADER_BYTES)),
+        ] {
+            assert!(read_chunked_body(&mut &b""[..], wire.into_bytes())
+                .await
+                .is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn cumulative_chunk_framing_is_bounded() {
+        let chunk = format!("1;{}\r\nx\r\n", "x".repeat(MAX_HEADER_BYTES / 2));
+        let wire = format!("{chunk}{chunk}{chunk}0\r\n\r\n");
+        assert!(read_chunked_body(&mut wire.as_bytes(), Vec::new())
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn complete_chunked_request_is_preserved() {
+        let mut wire =
+            &b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n{}\r\n0\r\n\r\n"[..];
+        let request = read_request(&mut wire).await.unwrap().unwrap();
+        assert_eq!(request.body, b"{}");
+    }
+
+    #[tokio::test]
+    async fn many_small_chunks_are_accepted() {
+        // The minimum legal data chunk carries five framing bytes per byte
+        // of content. Fragmentation alone must not exhaust the extension cap.
+        let wire = format!("{}0\r\n\r\n", "1\r\nx\r\n".repeat(20_000));
+        let body = read_chunked_body(&mut wire.as_bytes(), Vec::new())
+            .await
+            .unwrap();
+        assert_eq!(body, vec![b'x'; 20_000]);
+    }
+
+    #[tokio::test]
+    async fn complete_chunks_extensions_and_trailers_are_decoded() {
+        let wire = b"2;part=first\r\nab\r\n2\r\ncd\r\n0\r\nX-Trailer: ok\r\n\r\n";
+        let body = read_chunked_body(&mut wire.as_slice(), Vec::new())
+            .await
+            .unwrap();
+        assert_eq!(body, b"abcd");
+    }
+}
+
+#[cfg(test)]
+mod percent_decode_tests {
+    use super::*;
+
+    #[test]
+    fn malformed_percent_escapes_next_to_unicode_do_not_panic() {
+        for value in ["%あ", "%aあ", "猫%猫", "%é", "%💾", "%", "%2", "%zz"] {
+            assert_eq!(url_decode(value), value);
+        }
+    }
+
+    #[test]
+    fn valid_percent_escapes_and_plus_are_preserved() {
+        assert_eq!(url_decode("%E7%8C%AB+%2B%2F"), "猫 +/");
     }
 }

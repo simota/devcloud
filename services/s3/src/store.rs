@@ -219,32 +219,23 @@ impl FileBucketStore {
 
     // --- bucket CRUD --------------------------------------------------------
 
-    /// Creates a bucket. Returns `(bucket, created)`; `created` is false when the
-    /// bucket directory already existed (matching the legacy `CreateBucket`).
+    /// Creates a bucket. Returns `(bucket, created)`; `created` is false when
+    /// committed bucket metadata already exists. An empty directory left by an
+    /// interrupted creation is completed on retry.
     pub fn create_bucket(&self, name: &str) -> Result<(Bucket, bool)> {
-        if !valid_bucket_name(name) {
-            return Err(StoreError::InvalidBucketName);
+        let _guard = self.lock_object_writes();
+        if let Some(existing) = self.get_bucket(name)? {
+            return Ok((existing, false));
         }
+        let bucket = Bucket {
+            name: name.to_string(),
+            created_at: self.now(),
+            ..Default::default()
+        };
         let path = self.bucket_path(name);
-        match fs::metadata(&path) {
-            Ok(_) => {
-                // Directory exists: mirror legacy `return bucket, !ok, err`.
-                let existing = self.get_bucket(name)?;
-                let created = existing.is_none();
-                Ok((existing.unwrap_or_default(), created))
-            }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                let bucket = Bucket {
-                    name: name.to_string(),
-                    created_at: self.now(),
-                    ..Default::default()
-                };
-                fs::create_dir_all(&path)?;
-                Self::write_json(&path.join("bucket.json"), &bucket)?;
-                Ok((bucket, true))
-            }
-            Err(e) => Err(StoreError::Io(e)),
-        }
+        fs::create_dir_all(&path)?;
+        Self::write_json(&path.join("bucket.json"), &bucket)?;
+        Ok((bucket, true))
     }
 
     /// Reads a bucket's metadata; `None` if it does not exist.

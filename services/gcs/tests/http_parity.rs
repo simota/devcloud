@@ -1414,6 +1414,253 @@ fn resumable_upload_rolls_back_final_chunk_after_commit_failure() {
     );
 }
 
+/// A failed metadata write must not leave uncommitted chunk bytes behind:
+/// retries use the same offset and must produce exactly one copy of the body.
+#[test]
+fn resumable_upload_rolls_back_chunk_when_session_metadata_cannot_be_saved() {
+    let root = temp_root("resumable-session-write-rollback");
+    let sessions = root.join("sessions");
+    let buckets = root.join("buckets");
+    let mut s = Server::new(
+        Config {
+            upload_session_path: sessions.to_string_lossy().into_owned(),
+            ..Default::default()
+        },
+        FileBucketStore::new(&buckets),
+    );
+    create_bucket(&mut s, "demo-bucket");
+    let init = perform(
+        &mut s,
+        "POST",
+        "/upload/storage/v1/b/demo-bucket/o?uploadType=resumable&name=retry.txt",
+        "",
+    );
+    assert_eq!(init.status, 200, "{}", body_str(&init));
+    let target = session_target(&init);
+    let session_dir = sessions.join(header(&init, "X-GUploader-UploadID"));
+    let metadata = session_dir.join("session.json");
+    let backup = session_dir.join("session.backup");
+    fs::rename(&metadata, &backup).unwrap();
+    fs::create_dir(&metadata).unwrap();
+
+    let failed = perform_h(
+        &mut s,
+        "PUT",
+        &target,
+        "first",
+        &[("Content-Range", "bytes 0-4/10")],
+    );
+    assert_eq!(failed.status, 500, "{}", body_str(&failed));
+    assert_eq!(
+        fs::metadata(session_dir.join("body.part")).unwrap().len(),
+        0
+    );
+
+    fs::remove_dir(&metadata).unwrap();
+    fs::rename(&backup, &metadata).unwrap();
+    drop(s);
+    let mut restarted = Server::new(
+        Config {
+            upload_session_path: sessions.to_string_lossy().into_owned(),
+            ..Default::default()
+        },
+        FileBucketStore::new(&buckets),
+    );
+    let retried = perform_h(
+        &mut restarted,
+        "PUT",
+        &target,
+        "first",
+        &[("Content-Range", "bytes 0-4/10")],
+    );
+    assert_eq!(retried.status, 308, "{}", body_str(&retried));
+    let committed = perform_h(
+        &mut restarted,
+        "PUT",
+        &target,
+        "last!",
+        &[("Content-Range", "bytes 5-9/10")],
+    );
+    assert_eq!(committed.status, 200, "{}", body_str(&committed));
+    let downloaded = perform(
+        &mut restarted,
+        "GET",
+        "/download/storage/v1/b/demo-bucket/o/retry.txt?alt=media",
+        "",
+    );
+    assert_eq!(downloaded.body, b"firstlast!");
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// The final offset must stay uncommitted until the object exists. Otherwise
+/// a crash in between leaves a full session that cannot accept its final retry.
+#[test]
+fn final_chunk_does_not_commit_session_offset_before_object() {
+    let root = temp_root("resumable-final-offset");
+    let sessions = root.join("sessions");
+    let buckets = root.join("buckets");
+    let mut s = Server::new(
+        Config {
+            upload_session_path: sessions.to_string_lossy().into_owned(),
+            ..Default::default()
+        },
+        FileBucketStore::new(&buckets),
+    );
+    create_bucket(&mut s, "demo-bucket");
+    let init = perform(
+        &mut s,
+        "POST",
+        "/upload/storage/v1/b/demo-bucket/o?uploadType=resumable&name=final.txt",
+        "",
+    );
+    assert_eq!(init.status, 200, "{}", body_str(&init));
+    let target = session_target(&init);
+    let chunk = perform_h(
+        &mut s,
+        "PUT",
+        &target,
+        "first",
+        &[("Content-Range", "bytes 0-4/10")],
+    );
+    assert_eq!(chunk.status, 308, "{}", body_str(&chunk));
+    let session_dir = sessions.join(header(&init, "X-GUploader-UploadID"));
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&fs::read(session_dir.join("session.json")).unwrap()).unwrap();
+    assert_eq!(metadata["ReceivedBytes"], 5);
+    // Finalization must proceed directly to the object store, without first
+    // publishing the final offset to the session checkpoint.
+    fs::create_dir(session_dir.join("session.json.tmp")).unwrap();
+    let committed = perform_h(
+        &mut s,
+        "PUT",
+        &target,
+        "last!",
+        &[("Content-Range", "bytes 5-9/10")],
+    );
+    assert_eq!(committed.status, 200, "{}", body_str(&committed));
+    let downloaded = perform(
+        &mut s,
+        "GET",
+        "/download/storage/v1/b/demo-bucket/o/final.txt?alt=media",
+        "",
+    );
+    assert_eq!(downloaded.body, b"firstlast!");
+    assert!(!session_dir.exists());
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// A crash between appending bytes and recording their offset leaves a tail
+/// outside the committed range. Recover from that persisted offset on retry.
+#[test]
+fn resumable_upload_discards_uncommitted_tail_after_restart() {
+    let root = temp_root("resumable-uncommitted-tail");
+    let sessions = root.join("sessions");
+    let buckets = root.join("buckets");
+    let config = Config {
+        upload_session_path: sessions.to_string_lossy().into_owned(),
+        ..Default::default()
+    };
+    let mut s = Server::new(config.clone(), FileBucketStore::new(&buckets));
+    create_bucket(&mut s, "demo-bucket");
+    let init = perform(
+        &mut s,
+        "POST",
+        "/upload/storage/v1/b/demo-bucket/o?uploadType=resumable&name=recovered.txt",
+        "",
+    );
+    assert_eq!(init.status, 200, "{}", body_str(&init));
+    let target = session_target(&init);
+    let chunk = perform_h(
+        &mut s,
+        "PUT",
+        &target,
+        "first",
+        &[("Content-Range", "bytes 0-4/10")],
+    );
+    assert_eq!(chunk.status, 308, "{}", body_str(&chunk));
+    let session_dir = sessions.join(header(&init, "X-GUploader-UploadID"));
+    // Simulate stopping after the complete final chunk was appended but
+    // before the object was committed. The last acknowledged offset is five.
+    fs::write(session_dir.join("body.part"), b"firstlast!").unwrap();
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&fs::read(session_dir.join("session.json")).unwrap()).unwrap();
+    assert_eq!(metadata["ReceivedBytes"], 5);
+    drop(s);
+
+    let mut restarted = Server::new(config, FileBucketStore::new(&buckets));
+    let committed = perform_h(
+        &mut restarted,
+        "PUT",
+        &target,
+        "last!",
+        &[("Content-Range", "bytes 5-9/10")],
+    );
+    assert_eq!(committed.status, 200, "{}", body_str(&committed));
+    let downloaded = perform(
+        &mut restarted,
+        "GET",
+        "/download/storage/v1/b/demo-bucket/o/recovered.txt?alt=media",
+        "",
+    );
+    assert_eq!(downloaded.body, b"firstlast!");
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// Missing committed bytes are corruption, not room to pad the file with
+/// zeroes. Reject the next chunk and preserve the persisted offset and data.
+#[test]
+fn resumable_upload_rejects_missing_committed_bytes_without_padding() {
+    let root = temp_root("resumable-missing-bytes");
+    let sessions = root.join("sessions");
+    let buckets = root.join("buckets");
+    let mut s = Server::new(
+        Config {
+            upload_session_path: sessions.to_string_lossy().into_owned(),
+            ..Default::default()
+        },
+        FileBucketStore::new(&buckets),
+    );
+    create_bucket(&mut s, "demo-bucket");
+    let init = perform(
+        &mut s,
+        "POST",
+        "/upload/storage/v1/b/demo-bucket/o?uploadType=resumable&name=truncated.txt",
+        "",
+    );
+    assert_eq!(init.status, 200, "{}", body_str(&init));
+    let target = session_target(&init);
+    let chunk = perform_h(
+        &mut s,
+        "PUT",
+        &target,
+        "first",
+        &[("Content-Range", "bytes 0-4/10")],
+    );
+    assert_eq!(chunk.status, 308, "{}", body_str(&chunk));
+    let session_dir = sessions.join(header(&init, "X-GUploader-UploadID"));
+    fs::write(session_dir.join("body.part"), b"fir").unwrap();
+    let metadata = fs::read(session_dir.join("session.json")).unwrap();
+
+    let failed = perform_h(
+        &mut s,
+        "PUT",
+        &target,
+        "last!",
+        &[("Content-Range", "bytes 5-9/10")],
+    );
+    assert_eq!(failed.status, 500, "{}", body_str(&failed));
+    assert_eq!(fs::read(session_dir.join("body.part")).unwrap(), b"fir");
+    assert_eq!(
+        fs::read(session_dir.join("session.json")).unwrap(),
+        metadata
+    );
+    assert!(FileBucketStore::new(&buckets)
+        .get_object("demo-bucket", "truncated.txt")
+        .unwrap()
+        .is_none());
+    fs::remove_dir_all(root).unwrap();
+}
+
 /// legacy: TestResumableUploadRejectsMalformedCommitRequests
 #[test]
 fn resumable_upload_rejects_malformed_commit_requests() {
