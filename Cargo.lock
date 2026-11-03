@@ -331,6 +331,8 @@ dependencies = [
  "devcloud-redshift",
  "devcloud-s3",
  "devcloud-sqs",
+ "devcloud-ssm",
+ "devcloud-sts",
  "serde",
  "serde_json",
  "tokio",
@@ -403,6 +405,30 @@ dependencies = [
  "base64",
  "hmac",
  "md-5",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+]
+
+[[package]]
+name = "devcloud-ssm"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "hmac",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+]
+
+[[package]]
+name = "devcloud-sts"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "hmac",
  "serde",
  "serde_json",
  "sha2",
