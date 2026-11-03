@@ -88,8 +88,10 @@ fn verify_full(req: &SignedRequest, auth: &str, creds: &Credentials) -> Result<(
     if req.amz_date.is_empty() {
         return Err(err("IncompleteSignatureException", 400));
     }
+    // SDKs sign the body's SHA-256 for this service without sending the
+    // header (only S3 uses the header-driven `UNSIGNED-PAYLOAD` convention).
     let payload_hash = if req.content_sha256.is_empty() {
-        "UNSIGNED-PAYLOAD".to_string()
+        sha256_hex(req.body)
     } else {
         verify_payload_hash(req, req.content_sha256)?;
         req.content_sha256.to_string()
