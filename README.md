@@ -447,10 +447,10 @@ Pub/Sub dashboard actions are available under `/dashboard/pubsub`:
 | PostgreSQL wire endpoint | Yes | Listens on `127.0.0.1:15439` by default for local Redshift-style SQL clients. |
 | PostgreSQL simple query protocol | Yes | Covers `psql` smoke workflows. |
 | PostgreSQL extended query protocol | Partial | Supports Parse, Bind, Describe, Execute, Sync, Close, text bind parameters, portal resume, and safe unsupported errors for binary formats. |
-| PostgreSQL execution backend | Yes | Default backend is managed local PostgreSQL; explicit memory fallback remains available for development continuity. |
+| PostgreSQL execution backend | Yes | Default backend is managed local PostgreSQL; explicit memory fallback remains available for development continuity. Each SQL client connection gets its own PostgreSQL session, so temp tables, `SET`s, and transactions stay with that client and end when it disconnects. The SQL endpoint does not offer TLS (`sslmode=disable`/`prefer` clients only). |
 | Redshift SQL translation | Partial | Handles local subsets for DDL/DML, Redshift table attributes, CTAS/views/materialized-view metadata, function rewrites, COPY, and UNLOAD. |
-| COPY from local S3 | Yes | Local S3 side effect imports into the PostgreSQL-backed table path. |
-| UNLOAD to local S3 | Yes | Query results can be exported through local S3 side effects. |
+| COPY from local S3 | Partial | `COPY <table> FROM 's3://bucket/prefix'` loads every object under the prefix from the local S3 store into the PostgreSQL backend, on the client's own session (temp tables and open transactions work): default text format with `DELIMITER`, `CSV` / `FORMAT AS CSV`, `JSON 'auto'` (or `'auto ignorecase'`), `GZIP`, `IGNOREHEADER`, `NULL AS`, `EMPTYASNULL`, `BLANKSASNULL`; an empty field is NULL except in character columns, as on Redshift. `IAM_ROLE` / `CREDENTIALS` / `REGION` are accepted and ignored. Column lists, `MANIFEST`, JSONPaths, other compressions, and columnar formats are refused. The memory backend keeps its own CSV/JSON COPY. |
+| UNLOAD to local S3 | Partial | Memory backend only; the PostgreSQL backend does not run UNLOAD yet. |
 | Redshift Data API | Yes | Execute/describe/get-result/list workflows are covered by local gates. |
 | Redshift management API | Partial | Cluster, parameter group, tags, credentials, and snapshot metadata workflows are local metadata. |
 | Redshift Serverless API | Partial | Namespace and workgroup metadata are local compatibility responses. |
