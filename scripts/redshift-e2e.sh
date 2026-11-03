@@ -351,10 +351,65 @@ insert into e2e.events values (1, 'created');
 select id, payload from e2e.events where id = 1;
 SQL
 
-log "running Data API smoke"
 export AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-dev}"
 export AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-dev}"
 export AWS_DEFAULT_REGION="${AWS_DEFAULT_REGION:-us-east-1}"
+
+if [[ "${REDSHIFT_BACKEND_KIND}" == "postgres" ]]; then
+  # The statement sequence of a data load that stages through session temp
+  # tables: COPY from local S3 per format (plain and GZIP), then an upsert in
+  # one transaction. Run twice on separate connections — the second must not
+  # see the first connection's temp tables.
+  log "running COPY data load journey"
+  S3_ENDPOINT="http://${HOST}:${S3_PORT}"
+  printf '1,alice,10.5\n2,"bob, jr",20\n' >"${TMP_DIR}/d.csv"
+  printf '1\talice\t10.5\n2\tbob jr\t20\n' >"${TMP_DIR}/d.tsv"
+  printf '{"id":1,"name":"alice","amount":10.5}\n{"id":2,"name":"bob jr","amount":20}\n' >"${TMP_DIR}/d.json"
+  aws s3 mb s3://copy-e2e --endpoint-url "${S3_ENDPOINT}" >/dev/null
+  for format in csv tsv json; do
+    gzip -kf "${TMP_DIR}/d.${format}"
+    aws s3 cp "${TMP_DIR}/d.${format}" "s3://copy-e2e/plain/d.${format}" --endpoint-url "${S3_ENDPOINT}" >/dev/null
+    aws s3 cp "${TMP_DIR}/d.${format}.gz" "s3://copy-e2e/gz/d.${format}.gz" --endpoint-url "${S3_ENDPOINT}" >/dev/null
+  done
+  PGPASSWORD="${DB_PASSWORD}" psql "host=${HOST} port=${REDSHIFT_SQL_PORT} dbname=${DATABASE} user=${DB_USER} sslmode=disable" \
+    -v ON_ERROR_STOP=1 -q <<'SQL'
+create schema if not exists load;
+drop table if exists load.target;
+create table load.target (id integer, name varchar(64), amount numeric(10,2), csa_dwh_file_path varchar(1024), csa_dwh_created_at timestamp);
+insert into load.target values (1, 'old', 0, 'x', '2020-01-01 00:00:00');
+SQL
+  copy_load() {
+    local key="$1" clause="$2"
+    PGPASSWORD="${DB_PASSWORD}" psql "host=${HOST} port=${REDSHIFT_SQL_PORT} dbname=${DATABASE} user=${DB_USER} sslmode=disable" \
+      -v ON_ERROR_STOP=1 -q <<SQL
+CREATE TEMP TABLE csa_stg_file (LIKE "load"."target");
+ALTER TABLE csa_stg_file DROP COLUMN csa_dwh_file_path, DROP COLUMN csa_dwh_created_at;
+CREATE TEMP TABLE csa_stg_load (LIKE "load"."target");
+COPY csa_stg_file FROM 's3://copy-e2e/${key}' IAM_ROLE 'arn:aws:iam::000000000000:role/copy' ${clause};
+INSERT INTO csa_stg_load SELECT *, 's3://copy-e2e/${key}', TIMESTAMP '2026-11-03 12:00:00' FROM csa_stg_file;
+DELETE FROM csa_stg_file;
+BEGIN;
+DELETE FROM "load"."target" USING csa_stg_load WHERE "load"."target"."id" = csa_stg_load."id";
+INSERT INTO "load"."target" SELECT * FROM csa_stg_load;
+COMMIT;
+SQL
+    local got
+    got="$(PGPASSWORD="${DB_PASSWORD}" psql "host=${HOST} port=${REDSHIFT_SQL_PORT} dbname=${DATABASE} user=${DB_USER} sslmode=disable" \
+      -Atc "select string_agg(id || ':' || name || ':' || amount || ':' || csa_dwh_file_path, ';' order by id) from load.target")"
+    if [[ "${got}" != "1:alice:10.50:s3://copy-e2e/${key};2:bob${3}:20.00:s3://copy-e2e/${key}" ]]; then
+      echo "[FAIL] COPY ${key} (${clause}) loaded: ${got}" >&2
+      exit 1
+    fi
+  }
+  copy_load plain/d.csv "FORMAT AS CSV" ", jr"
+  copy_load gz/d.csv.gz "FORMAT AS CSV GZIP" ", jr"
+  copy_load plain/d.tsv "DELIMITER '\\t'" " jr"
+  copy_load gz/d.tsv.gz "DELIMITER '\\t' GZIP" " jr"
+  copy_load plain/d.json "FORMAT AS JSON 'auto'" " jr"
+  copy_load gz/d.json.gz "FORMAT AS JSON 'auto' GZIP" " jr"
+fi
+
+log "running Data API smoke"
 STATEMENT_ID="$(aws redshift-data execute-statement \
   --endpoint-url "${API_ENDPOINT}" \
   --region "${AWS_DEFAULT_REGION}" \

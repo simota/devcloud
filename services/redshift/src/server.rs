@@ -11,7 +11,7 @@ use std::time::SystemTime;
 
 use devcloud_s3::store::FileBucketStore;
 
-use crate::backend::{self, SqlBackend};
+use crate::backend::{self, SqlBackend, SqlSession};
 use crate::backend_memory::MemoryBackend;
 use crate::cluster::{
     cluster_snapshot_from_config, default_cluster_identifier, normalize_cluster_endpoints,
@@ -238,6 +238,20 @@ impl Server {
     /// `RedshiftTranslator` (default: passthrough), executes the backend SQL,
     /// then applies any translator metadata effects.
     pub fn execute_sql(&self, statement: &str) -> Result<QueryResult, SqlError> {
+        self.execute_sql_in(&mut None, statement)
+    }
+
+    /// [`Self::execute_sql`] on a client's own backend session, when it has
+    /// one. Redshift `COPY` is loaded by devcloud itself unless the backend
+    /// implements it (the memory engine).
+    pub fn execute_sql_in(
+        &self,
+        backend_session: &mut Option<Box<dyn SqlSession>>,
+        statement: &str,
+    ) -> Result<QueryResult, SqlError> {
+        if !self.backend.handles_copy() && crate::copy_backend::is_copy(statement) {
+            return self.copy_through_backend(backend_session, statement);
+        }
         let session = Session {
             database: default_str(&self.shared.config.database, "dev"),
             user: default_str(&self.shared.config.user, "dev"),
@@ -264,7 +278,10 @@ impl Server {
         } else {
             translated.backend_sql.as_str()
         };
-        let result = self.backend.exec(backend_sql)?;
+        let result = match backend_session.as_mut() {
+            Some(s) => s.exec(backend_sql)?,
+            None => self.backend.exec(backend_sql)?,
+        };
         self.shared
             .apply_translation_metadata_effects(&translated.metadata_effects)?;
         Ok(query_result_from_backend(result))

@@ -26,7 +26,8 @@ use tokio::net::TcpStream;
 use tokio::runtime::Runtime;
 
 use crate::backend::{
-    CatalogSnapshot, Column, ExecResult, Field, Schema, SqlBackend, SqlTransaction, Table,
+    CatalogSnapshot, Column, ExecResult, Field, Schema, SqlBackend, SqlSession, SqlTransaction,
+    Table,
 };
 use crate::errors::SqlError;
 
@@ -159,6 +160,24 @@ impl SqlBackend for Backend {
         }))
     }
 
+    /// A dedicated PostgreSQL connection for one SQL client: its temp tables
+    /// and transactions are its own and end with it, as on Redshift.
+    fn session(&self) -> Result<Option<Box<dyn SqlSession>>, SqlError> {
+        if self.conn.lock().unwrap().is_none() {
+            return Err(SqlError::new("postgres redshift backend is not open"));
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|err| wrap_error("session", err.to_string()))?;
+        let conn = drive(&runtime, PgConn::connect(&self.info))
+            .map_err(|err| wrap_error("session", err))?;
+        Ok(Some(Box::new(Session {
+            runtime: SafeRuntime::new(runtime),
+            conn: Some(conn),
+        })))
+    }
+
     /// Mirrors `Backend.Catalog`.
     fn catalog(&self) -> Result<CatalogSnapshot, SqlError> {
         if self.conn.lock().unwrap().is_none() {
@@ -176,6 +195,32 @@ impl SqlBackend for Backend {
             let _ = drive(&self.runtime, conn.terminate());
         }
         Ok(())
+    }
+}
+
+/// One client's connection (see [`SqlBackend::session`]).
+struct Session {
+    runtime: SafeRuntime,
+    conn: Option<PgConn>,
+}
+
+impl SqlSession for Session {
+    fn exec(&mut self, statement: &str) -> Result<ExecResult, SqlError> {
+        let conn = self
+            .conn
+            .as_mut()
+            .ok_or_else(|| SqlError::new("session is closed"))?;
+        drive(&self.runtime, conn.simple_query(statement)).map_err(|err| wrap_error("exec", err))
+    }
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        // Terminate tells PostgreSQL the session is over, which drops its
+        // temp tables and rolls back an open transaction.
+        if let Some(mut conn) = self.conn.take() {
+            let _ = drive(&self.runtime, conn.terminate());
+        }
     }
 }
 

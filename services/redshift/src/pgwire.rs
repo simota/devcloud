@@ -16,6 +16,7 @@ use std::time::SystemTime;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
 
+use crate::backend::SqlSession;
 use crate::engine::QueryResult;
 use crate::errors::SqlError;
 use crate::pgwire_codec::{
@@ -89,13 +90,28 @@ impl Server {
         .await?;
 
         let mut extended = ExtendedQuerySession::new();
+        // One backend connection per client, held until it disconnects.
+        match self.backend().session() {
+            Ok(session) => extended.backend_session = session,
+            Err(err) => {
+                write_buffered(conn, |buf| {
+                    write_error_response(buf, "08006", &err.to_string())
+                })
+                .await?;
+                return Ok(());
+            }
+        }
         loop {
             let mut message_type = [0u8; 1];
             conn.read_exact(&mut message_type).await?;
             let payload = read_message_payload(conn).await?;
             let mut out = Vec::new();
             match message_type[0] {
-                b'Q' => self.handle_simple_query(&mut out, &read_cstring(&payload)),
+                b'Q' => self.handle_simple_query_in(
+                    &mut extended.backend_session,
+                    &mut out,
+                    &read_cstring(&payload),
+                ),
                 b'P' => {
                     if !extended.failed {
                         extended.handle_parse(&mut out, &payload);
@@ -169,6 +185,16 @@ impl Server {
 
     /// Mirrors `handleSimpleQuery`.
     pub fn handle_simple_query(&self, w: &mut impl Write, query: &str) {
+        self.handle_simple_query_in(&mut None, w, query)
+    }
+
+    /// [`Self::handle_simple_query`] on a client's own backend session.
+    pub fn handle_simple_query_in(
+        &self,
+        session: &mut Option<Box<dyn SqlSession>>,
+        w: &mut impl Write,
+        query: &str,
+    ) {
         let statements = split_sql_statements(query);
         if statements.is_empty() {
             let _ = write_message(w, b'I', &[]);
@@ -185,7 +211,7 @@ impl Server {
                 let _ = write_error_response(w, "54000", &err.to_string());
                 break;
             }
-            match self.execute_sql(statement) {
+            match self.execute_sql_in(session, statement) {
                 Ok(result) => {
                     self.record_sql_history(statement, &result, None);
                     if !result.fields.is_empty() {

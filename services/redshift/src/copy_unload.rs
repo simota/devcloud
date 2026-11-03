@@ -472,7 +472,7 @@ fn parse_copy_csv_options(value: &str) -> Result<CopyCsvOptions, SqlError> {
 
 /// Mirrors `tokenizeSQLOptions`: whitespace/`;`-separated tokens with `'...'`
 /// string literals.
-fn tokenize_sql_options(value: &str) -> Result<Vec<String>, SqlError> {
+pub(crate) fn tokenize_sql_options(value: &str) -> Result<Vec<String>, SqlError> {
     let bytes = value.as_bytes();
     let mut tokens = Vec::new();
     let mut i = 0;
@@ -498,7 +498,7 @@ fn tokenize_sql_options(value: &str) -> Result<Vec<String>, SqlError> {
 }
 
 /// Mirrors `parseCSVDelimiter`.
-fn parse_csv_delimiter(value: &str) -> Result<char, SqlError> {
+pub(crate) fn parse_csv_delimiter(value: &str) -> Result<char, SqlError> {
     if value == "\\t" {
         return Ok('\t');
     }
