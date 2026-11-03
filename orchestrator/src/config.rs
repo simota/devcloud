@@ -272,6 +272,16 @@ pub struct RedshiftServiceConfig {
     pub data_api: RedshiftDataApiConfig,
     pub sql: RedshiftSqlConfig,
     pub copy_unload: RedshiftCopyUnloadConfig,
+    pub tls: RedshiftTlsConfig,
+}
+
+/// TLS for the Redshift SQL endpoint: PEM files the user supplies.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RedshiftTlsConfig {
+    pub cert_file: String,
+    pub key_file: String,
+    /// Refuse SQL clients that do not negotiate TLS.
+    pub require: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -581,6 +591,7 @@ pub fn default_config() -> Config {
                     enable_local_s3: true,
                     max_input_row_bytes: 4 * 1024 * 1024,
                 },
+                tls: RedshiftTlsConfig::default(),
             },
             redis: RedisServiceConfig {
                 enabled: false,
@@ -1077,6 +1088,13 @@ pub fn apply_config_value(cfg: &mut Config, path: &[String], value: &str) -> io:
         }
         "services.redshift.sql.defaultSearchPath" => {
             cfg.services.redshift.sql.default_search_path = value.to_string()
+        }
+        "services.redshift.tls.certFile" => {
+            cfg.services.redshift.tls.cert_file = trim_quotes(value)
+        }
+        "services.redshift.tls.keyFile" => cfg.services.redshift.tls.key_file = trim_quotes(value),
+        "services.redshift.tls.require" => {
+            cfg.services.redshift.tls.require = parse_bool("services.redshift.tls.require", value)?
         }
         "services.redshift.copyUnload.enableLocalS3" => {
             cfg.services.redshift.copy_unload.enable_local_s3 =

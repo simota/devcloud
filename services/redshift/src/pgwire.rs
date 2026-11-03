@@ -57,21 +57,89 @@ impl Server {
                 }
             };
             let server = Arc::clone(&self);
-            tokio::spawn(async move { server.handle_sql_conn(conn).await });
+            tokio::spawn(async move { server.negotiate_and_handle(conn).await });
+        }
+    }
+
+    /// Answers the pre-startup requests a client may send before its startup
+    /// message: `SSLRequest` (TLS when configured, else `N`) and
+    /// `GSSENCRequest` (always `N`). The first 8 bytes of anything else are
+    /// handed back to the startup reader.
+    async fn negotiate_and_handle(&self, mut conn: tokio::net::TcpStream) {
+        let mut head = [0u8; 8];
+        loop {
+            if conn.read_exact(&mut head).await.is_err() {
+                return;
+            }
+            let len = i32::from_be_bytes([head[0], head[1], head[2], head[3]]);
+            let code = i32::from_be_bytes([head[4], head[5], head[6], head[7]]);
+            if len == 8 && code == PG_SSL_REQUEST_CODE {
+                if let Some(tls) = &self.sql_tls {
+                    if conn.write_all(b"S").await.is_err() {
+                        return;
+                    }
+                    // A failed handshake (the client does not trust the
+                    // certificate, or its name does not match) just ends
+                    // the connection.
+                    if let Ok(stream) = tls.acceptor.accept(conn).await {
+                        self.handle_sql_conn_secured(stream, true).await;
+                    }
+                    return;
+                }
+                if conn.write_all(b"N").await.is_err() {
+                    return;
+                }
+                continue;
+            }
+            if len == 8 && code == PG_GSSENC_REQUEST_CODE {
+                if conn.write_all(b"N").await.is_err() {
+                    return;
+                }
+                continue;
+            }
+            let replay = Prefixed {
+                prefix: head,
+                pos: 0,
+                inner: conn,
+            };
+            self.handle_sql_conn_secured(replay, false).await;
+            return;
         }
     }
 
     /// Mirrors `handleSQLConn`: any read/write error tears the connection down
     /// silently, exactly like legacy bare `return`s.
-    pub async fn handle_sql_conn<S: AsyncRead + AsyncWrite + Unpin>(&self, mut conn: S) {
-        let _ = self.handle_sql_conn_inner(&mut conn).await;
+    pub async fn handle_sql_conn<S: AsyncRead + AsyncWrite + Unpin>(&self, conn: S) {
+        self.handle_sql_conn_secured(conn, false).await
+    }
+
+    /// [`Self::handle_sql_conn`] for a stream that is (`tls`) or is not
+    /// encrypted; when TLS is required, a plain stream is refused.
+    async fn handle_sql_conn_secured<S: AsyncRead + AsyncWrite + Unpin>(
+        &self,
+        mut conn: S,
+        tls: bool,
+    ) {
+        let _ = self.handle_sql_conn_inner(&mut conn, tls).await;
     }
 
     async fn handle_sql_conn_inner<S: AsyncRead + AsyncWrite + Unpin>(
         &self,
         conn: &mut S,
+        tls: bool,
     ) -> std::io::Result<()> {
         let params = self.read_startup(conn).await?;
+        if !tls && self.sql_tls.as_ref().is_some_and(|t| t.require) {
+            write_buffered(conn, |buf| {
+                write_error_response(
+                    buf,
+                    "28000",
+                    "this devcloud Redshift endpoint requires TLS (connect with sslmode=require or stricter)",
+                )
+            })
+            .await?;
+            return Ok(());
+        }
         write_buffered(conn, |buf| write_auth_cleartext_password(buf)).await?;
         let password = read_password_message(conn).await?;
         if !self.password_allowed(&password) {
@@ -320,4 +388,56 @@ where
 
 fn invalid_data(message: &str) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, message)
+}
+
+/// GSSAPI encryption request (`GSSENCRequest`); devcloud always declines.
+const PG_GSSENC_REQUEST_CODE: i32 = 80877104;
+
+/// A stream whose first bytes were already read: they are returned again
+/// before the rest of `inner`.
+struct Prefixed<S> {
+    prefix: [u8; 8],
+    pos: usize,
+    inner: S,
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for Prefixed<S> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        if self.pos < self.prefix.len() {
+            let n = (self.prefix.len() - self.pos).min(buf.remaining());
+            let start = self.pos;
+            buf.put_slice(&self.prefix[start..start + n]);
+            self.pos += n;
+            return std::task::Poll::Ready(Ok(()));
+        }
+        std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for Prefixed<S> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        data: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.inner).poll_write(cx, data)
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
 }
