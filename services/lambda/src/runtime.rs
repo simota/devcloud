@@ -979,9 +979,22 @@ fn spawn(
 /// environment's work directory.
 pub(crate) const INIT_ERROR_FILE: &str = "init-error.json";
 
+/// Custom runtimes rely on Unix pipes and process groups.
+#[cfg(not(unix))]
+async fn spawn_provided(
+    _inv: &Invocation,
+    _pool: &Pool,
+    _code: Box<dyn Send>,
+) -> Result<Result<Environment, Completed>, RuntimeError> {
+    Err(RuntimeError::Spawn(
+        "custom runtimes (provided*) need a Unix host".to_string(),
+    ))
+}
+
 /// Starts a `provided*` function's `bootstrap` with its own Runtime API.
 /// `Err(Completed)` is a failed invocation (no usable bootstrap), reported to
 /// the caller as a function error the way Lambda does.
+#[cfg(unix)]
 async fn spawn_provided(
     inv: &Invocation,
     pool: &Pool,
@@ -1050,18 +1063,15 @@ async fn spawn_provided(
         .stdout(Stdio::from(child_out))
         .stderr(Stdio::null())
         .kill_on_drop(true);
-    #[cfg(unix)]
-    {
-        cmd.process_group(0);
-        // SAFETY: dup2 is async-signal-safe; fd 1 is the output pipe by now.
-        unsafe {
-            cmd.pre_exec(|| {
-                if libc::dup2(1, 2) < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
+    cmd.process_group(0);
+    // SAFETY: dup2 is async-signal-safe; fd 1 is the output pipe by now.
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::dup2(1, 2) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
     }
     // A binary for another OS would otherwise be handed to /bin/sh by
     // execvp's ENOEXEC fallback and fail as an obscure shell error.
@@ -1121,6 +1131,7 @@ async fn spawn_provided(
 }
 
 /// Lambda's answer when a custom runtime has no runnable bootstrap.
+#[cfg(unix)]
 fn invalid_entrypoint(inv: &Invocation, reason: &str, log: &str, init: Duration) -> Completed {
     Completed {
         outcome: Outcome::FunctionError(error_doc(
@@ -1141,6 +1152,7 @@ fn invalid_entrypoint(inv: &Invocation, reason: &str, log: &str, init: Duration)
 }
 
 /// An OS error without Rust's ` (os error N)` suffix, as Go prints it.
+#[cfg(unix)]
 fn os_error_text(e: &std::io::Error) -> String {
     match e.raw_os_error() {
         Some(libc::ENOEXEC) => "exec format error".to_string(),
@@ -1157,6 +1169,7 @@ fn os_error_text(e: &std::io::Error) -> String {
 
 /// Names the executable format of `path` when it is one this host's OS
 /// cannot run: an ELF binary off Linux, or a Mach-O binary off macOS.
+#[cfg(unix)]
 fn foreign_executable(path: &Path) -> Option<&'static str> {
     let mut magic = [0u8; 4];
     use std::io::Read;
@@ -1179,6 +1192,7 @@ fn foreign_executable(path: &Path) -> Option<&'static str> {
 }
 
 /// `std::env::consts::OS` in Go's `GOOS` spelling.
+#[cfg(unix)]
 fn go_os() -> &'static str {
     match std::env::consts::OS {
         "macos" => "darwin",
@@ -1187,6 +1201,7 @@ fn go_os() -> &'static str {
 }
 
 /// `std::env::consts::ARCH` in Go's `GOARCH` spelling.
+#[cfg(unix)]
 fn go_arch() -> &'static str {
     match std::env::consts::ARCH {
         "x86_64" => "amd64",
