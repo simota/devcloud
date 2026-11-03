@@ -2,7 +2,7 @@
 
 Local cloud service emulator for development and E2E inspection.
 
-`devcloud` runs a local dashboard plus compatible development endpoints for Mail, S3, GCS, DynamoDB, BigQuery, SQS, Google Cloud Pub/Sub, Redshift, Redis, Application Auto Scaling, AWS Lambda, and Cloud Run. It is designed for deterministic local tests and manual inspection, not for production workloads or full cloud-provider parity.
+`devcloud` runs a local dashboard plus compatible development endpoints for Mail, S3, GCS, DynamoDB, BigQuery, SQS, Google Cloud Pub/Sub, Redshift, Redis, Application Auto Scaling, SSM Parameter Store, STS, AWS Lambda, and Cloud Run. It is designed for deterministic local tests and manual inspection, not for production workloads or full cloud-provider parity.
 
 ## Quick Start
 
@@ -36,6 +36,8 @@ Default local endpoints:
 | Redshift API | `http://127.0.0.1:19099` | `http://127.0.0.1:18025/dashboard/redshift` |
 | Redis | `redis://127.0.0.1:16379` | `http://127.0.0.1:18025/dashboard/redis` |
 | Application Auto Scaling | `http://127.0.0.1:18030` | `http://127.0.0.1:18025/dashboard/applicationautoscaling` |
+| SSM Parameter Store | `http://127.0.0.1:18031` | `http://127.0.0.1:18025/dashboard/ssm` |
+| STS | `http://127.0.0.1:18032` | `http://127.0.0.1:18025/dashboard/sts` |
 | Lambda | `http://127.0.0.1:19010` | `http://127.0.0.1:18025/dashboard/lambda` |
 | Cloud Run | `http://127.0.0.1:18095` (services: `http://<svc>.<region>.<project>.run.localhost:18095`) | `http://127.0.0.1:18025/dashboard/cloudrun` |
 
@@ -98,6 +100,8 @@ server:
   redisPort: 16379
   redisHttpPort: 16380
   appAutoScalingPort: 18030
+  ssmPort: 18031
+  stsPort: 18032
   lambdaPort: 19010
   cloudRunPort: 18095
 
@@ -141,6 +145,16 @@ auth:
     mode: relaxed
     password: ""
   appAutoScaling:
+    mode: relaxed
+    accessKeyId: dev
+    secretAccessKey: dev
+    accountId: "000000000000"
+  ssm:
+    mode: relaxed
+    accessKeyId: dev
+    secretAccessKey: dev
+    accountId: "000000000000"
+  sts:
     mode: relaxed
     accessKeyId: dev
     secretAccessKey: dev
@@ -250,6 +264,12 @@ services:
     maxMemoryMB: 256
     appendOnly: false
   appAutoScaling:
+    enabled: true
+    region: us-east-1
+  ssm:
+    enabled: true
+    region: us-east-1
+  sts:
     enabled: true
     region: us-east-1
   lambda:
@@ -472,6 +492,24 @@ Pub/Sub dashboard actions are available under `/dashboard/pubsub`:
 | Auth | Partial | `relaxed`, `signed-relaxed`, and `strict` SigV4 (service `lambda`), like Application Auto Scaling. `strict` requires the credential scope's date to match `X-Amz-Date` and accepts a signature over the path either normalized as most SDKs sign it (`//x` and dot segments collapsed) or exactly as sent; there is no clock-skew check, so requests signed with fixed timestamps keep working. |
 | Browser (CSRF) guard | Yes | Non-GET requests carrying a non-loopback `Origin` (or `Sec-Fetch-Site: cross-site`) are rejected with 403, so a web page cannot create or invoke functions; SDKs/CLIs (no `Origin`) and loopback front-ends are unaffected. The dashboard's test invoke applies the same rule. Requests whose `Host` is a public DNS name are refused too (DNS rebinding; see the Dashboard API notes). |
 
+### SSM Parameter Store-Compatible API
+
+| Feature | Status | Notes |
+| --- | --- | --- |
+| Parameters | Partial | `PutParameter` (`String`, `StringList`, `SecureString`; `Overwrite`; `Standard`/`Advanced` value limits), `GetParameter` (with a `:<version>` selector for the current version only), `DeleteParameter`, and `DescribeParameters` (`MaxResults`/`NextToken`; filters are rejected). AWS JSON 1.1 under `X-Amz-Target: AmazonSSM.<Op>`. Persisted to `.devcloud/data/ssm/state.json`. |
+| `SecureString` | Partial | No KMS: values are stored in plaintext in `state.json`. `GetParameter` returns the value only with `WithDecryption: true`; without it the value is an opaque placeholder, never the plaintext. |
+| Not supported | No | `GetParameters`, `GetParametersByPath`, labels, version history, tags, policies. |
+| Auth | Partial | `relaxed` / `signed-relaxed` / `strict` SigV4 (service `ssm`). `strict` only accepts `auth.ssm` credentials, so STS temporary credentials are rejected there. |
+| Dashboard | Partial | `/dashboard/ssm` lists names, types, and versions through `DescribeParameters`; values never reach the dashboard. |
+
+### STS-Compatible API
+
+| Feature | Status | Notes |
+| --- | --- | --- |
+| `AssumeRole` | Partial | AWS Query protocol (form `POST /` or `GET /?Action=`), XML responses. Validates `RoleArn`, `RoleSessionName`, and `DurationSeconds` (900–43200), and issues new `ASIA…` temporary credentials per call. An inline session `Policy` must be JSON of at most 2048 characters; it is accepted but not evaluated. Stateless. |
+| `GetCallerIdentity` | Partial | Always reports the configured account's root identity, not the assumed role. |
+| Auth | Partial | `relaxed` / `signed-relaxed` / `strict` SigV4 (service `sts`). |
+
 ### Cloud Run-Compatible API
 
 | Feature | Status | Notes |
@@ -585,6 +623,8 @@ Run before claiming a service MVP is complete or when investigating a service-le
 | Redshift SQL translator | `scripts/redshift-translator-e2e.sh` | `psql`, `aws`, and `postgres` server binary on `PATH` |
 | Redis | `scripts/redis-e2e.sh` | `redis-cli` |
 | Application Auto Scaling | `scripts/applicationautoscaling-e2e.sh` | none |
+| SSM Parameter Store | `scripts/ssm-e2e.sh` | none |
+| STS | `scripts/sts-e2e.sh` | none |
 | Lambda | `scripts/lambda-e2e.sh` | `python3` (handler runtime) |
 | Cloud Run | `scripts/cloudrun-e2e.sh` | `python3` (sample service) |
 
@@ -609,6 +649,8 @@ Useful env vars:
 | `services/pubsub` | Google Cloud Pub/Sub-compatible REST and gRPC service. |
 | `services/redshift` | Redshift SQL, Data API, and management API service. |
 | `services/applicationautoscaling` | Application Auto Scaling-compatible JSON API service. |
+| `services/ssm` | SSM Parameter Store-compatible JSON API service. |
+| `services/sts` | STS-compatible Query API service (`AssumeRole`, `GetCallerIdentity`). |
 | `services/lambda` | AWS Lambda-compatible REST API with local python/node handler execution. |
 | `services/cloudrun` | Cloud Run Admin API v2 plus a reverse proxy to locally run service processes. |
 | `services/dashboard` | Local Web UI, embedded React assets, and dashboard APIs. |
