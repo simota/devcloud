@@ -174,12 +174,12 @@ services:
     enabled: false
   cloudRun:
     enabled: true
+    project: ${PROJECT}
+    region: ${REGION}
   ssm:
     enabled: false
   sts:
     enabled: false
-    project: ${PROJECT}
-    region: ${REGION}
 EOF
 
   run_check "devcloud binary builds" devcloud_build "${TMP_DIR}/devcloud"
