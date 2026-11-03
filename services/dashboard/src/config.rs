@@ -81,6 +81,15 @@ pub struct Config {
     pub app_auto_scaling_storage_path: String,
     pub app_auto_scaling_region: String,
 
+    pub ssm_base: String,
+    pub ssm_endpoint: String,
+    pub ssm_storage_path: String,
+    pub ssm_region: String,
+
+    pub sts_base: String,
+    pub sts_endpoint: String,
+    pub sts_region: String,
+
     pub lambda_base: String,
     pub lambda_endpoint: String,
     pub lambda_storage_path: String,
@@ -189,6 +198,15 @@ impl Config {
                 "DEVCLOUD_DASHBOARD_APPAUTOSCALING_REGION",
                 "us-east-1",
             ),
+
+            ssm_base: env("DEVCLOUD_DASHBOARD_SSM_BASE"),
+            ssm_endpoint: env_or("DEVCLOUD_DASHBOARD_SSM_ENDPOINT", "http://127.0.0.1:18031"),
+            ssm_storage_path: env_or("DEVCLOUD_DASHBOARD_SSM_STORAGE", ".devcloud/data/ssm"),
+            ssm_region: env_or("DEVCLOUD_DASHBOARD_SSM_REGION", "us-east-1"),
+
+            sts_base: env("DEVCLOUD_DASHBOARD_STS_BASE"),
+            sts_endpoint: env_or("DEVCLOUD_DASHBOARD_STS_ENDPOINT", "http://127.0.0.1:18032"),
+            sts_region: env_or("DEVCLOUD_DASHBOARD_STS_REGION", "us-east-1"),
 
             lambda_base: env("DEVCLOUD_DASHBOARD_LAMBDA_BASE"),
             lambda_endpoint: env_or(

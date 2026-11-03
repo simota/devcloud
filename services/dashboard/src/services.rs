@@ -158,6 +158,26 @@ fn build(c: &Config) -> Vec<DashboardService> {
                 "Inspect local Application Auto Scaling targets, policies, and scheduled actions.",
         },
         DashboardService {
+            id: "ssm",
+            name: "SSM Parameter Store",
+            path: "/dashboard/ssm",
+            status: status(!c.ssm_base.is_empty()),
+            endpoint: c.ssm_endpoint.clone(),
+            storage_path: c.ssm_storage_path.clone(),
+            description:
+                "Inspect local SSM parameter names, types, and versions (values stay hidden).",
+        },
+        DashboardService {
+            id: "sts",
+            name: "STS",
+            path: "/dashboard/sts",
+            status: status(!c.sts_base.is_empty()),
+            endpoint: c.sts_endpoint.clone(),
+            storage_path: String::new(),
+            description:
+                "Check the local STS endpoint that issues temporary credentials for AssumeRole.",
+        },
+        DashboardService {
             id: "lambda",
             name: "Lambda",
             path: "/dashboard/lambda",
@@ -230,6 +250,8 @@ mod tests {
                 "sqs",
                 "pubsub",
                 "applicationautoscaling",
+                "ssm",
+                "sts",
                 "lambda",
                 "cloudrun"
             ]

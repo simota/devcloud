@@ -36,5 +36,7 @@ pub mod s3;
 pub mod services;
 pub mod sigv4;
 pub mod sqs;
+pub mod ssm;
+pub mod sts;
 
 pub use config::Config;

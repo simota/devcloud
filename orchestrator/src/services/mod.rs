@@ -20,4 +20,6 @@ pub mod redis;
 pub mod redshift;
 pub mod s3;
 pub mod sqs;
+pub mod ssm;
+pub mod sts;
 pub mod util;
