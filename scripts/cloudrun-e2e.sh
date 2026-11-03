@@ -213,6 +213,10 @@ services:
     enabled: false
   cloudRun:
     enabled: true
+  ssm:
+    enabled: false
+  sts:
+    enabled: false
     project: ${PROJECT}
     region: ${REGION}
 EOF
