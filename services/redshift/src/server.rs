@@ -53,12 +53,15 @@ pub struct Config {
     /// Daemon seam only: when true, Data API mutations print `DEVCLOUD_EVENT`
     /// lines on stdout. legacy tests run with a nil publisher (off).
     pub events_enabled: bool,
+    /// TLS for the SQL endpoint; `None` answers every SSLRequest with `N`.
+    pub sql_tls: Option<crate::tls::SqlTls>,
 }
 
 pub struct Server {
     pub(crate) shared: Arc<ServerShared>,
     backend: Arc<dyn SqlBackend>,
     translator: Arc<dyn RedshiftTranslator>,
+    pub(crate) sql_tls: Option<crate::tls::SqlTls>,
 }
 
 pub struct ServerShared {
@@ -142,6 +145,7 @@ impl Server {
     /// legacy), seeds the `public` schema and the default cluster, normalizes
     /// restored cluster endpoints, and wires the memory backend unless injected.
     pub fn new(cfg: Config) -> Server {
+        let sql_tls = cfg.sql_tls.clone();
         let config = SharedConfig {
             sql_addr: cfg.sql_addr,
             region: cfg.region,
@@ -231,6 +235,7 @@ impl Server {
             shared,
             backend,
             translator,
+            sql_tls,
         }
     }
 
