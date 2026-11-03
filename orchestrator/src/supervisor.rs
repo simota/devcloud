@@ -111,6 +111,16 @@ pub async fn run(cfg: Config) -> Result<(), String> {
         let sd = shutdown_future(rx.clone());
         set.spawn(async move { services::applicationautoscaling::run(&c, sd).await });
     }
+    if cfg.services.ssm.enabled {
+        let c = cfg.clone();
+        let sd = shutdown_future(rx.clone());
+        set.spawn(async move { services::ssm::run(&c, sd).await });
+    }
+    if cfg.services.sts.enabled {
+        let c = cfg.clone();
+        let sd = shutdown_future(rx.clone());
+        set.spawn(async move { services::sts::run(&c, sd).await });
+    }
     if cfg.services.lambda.enabled {
         let c = cfg.clone();
         let sd = shutdown_future(rx.clone());

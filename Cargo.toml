@@ -22,4 +22,6 @@ members = [
   "services/redshift",
   "services/s3",
   "services/sqs",
+  "services/ssm",
+  "services/sts",
 ]

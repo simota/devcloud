@@ -20,7 +20,7 @@ use tokio::net::{TcpListener, TcpStream};
 use crate::config::Config;
 use crate::{
     applicationautoscaling, assets, bigquery, cloudrun, dynamodb, events, gcs, lambda, mail,
-    pubsub, redis, redshift, s3, services, sqs,
+    pubsub, redis, redshift, s3, services, sqs, ssm, sts,
 };
 
 const MAX_HEADER_BYTES: usize = 64 * 1024;
@@ -334,6 +334,20 @@ pub async fn route(config: &Config, req: &Request) -> Response {
     }
     if path.starts_with("/api/pubsub/messages/") {
         return pubsub::handle_message(config, req).await;
+    }
+
+    // SSM / STS.
+    if path == "/api/ssm/status" {
+        return ssm::handle_status(config, req).await;
+    }
+    if path == "/api/ssm/parameters" {
+        return ssm::handle_parameters(config, req).await;
+    }
+    if path == "/api/sts/status" {
+        return sts::handle_status(config, req).await;
+    }
+    if path == "/api/sts/caller-identity" {
+        return sts::handle_caller_identity(config, req).await;
     }
 
     // Application Auto Scaling.

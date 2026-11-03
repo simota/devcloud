@@ -53,6 +53,8 @@ pub struct ServerConfig {
     pub pubsub_grpc_port: i32,
     pub pubsub_rest_port: i32,
     pub app_auto_scaling_port: i32,
+    pub ssm_port: i32,
+    pub sts_port: i32,
     pub lambda_port: i32,
     pub cloud_run_port: i32,
 }
@@ -69,6 +71,8 @@ pub struct AuthConfig {
     pub sqs: SqsAuthConfig,
     pub pubsub: PubSubAuthConfig,
     pub app_auto_scaling: AppAutoScalingAuthConfig,
+    pub ssm: AwsAuthConfig,
+    pub sts: AwsAuthConfig,
     pub lambda: LambdaAuthConfig,
     pub cloud_run: CloudRunAuthConfig,
 }
@@ -147,6 +151,15 @@ pub struct AppAutoScalingAuthConfig {
     pub account_id: String,
 }
 
+/// SigV4 auth settings for the AWS services added after the legacy port (SSM, STS).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AwsAuthConfig {
+    pub mode: String,
+    pub access_key_id: String,
+    pub secret_access_key: String,
+    pub account_id: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct LambdaAuthConfig {
     pub mode: String,
@@ -178,6 +191,8 @@ pub struct ServicesConfig {
     pub sqs: SqsServiceConfig,
     pub pubsub: PubSubServiceConfig,
     pub app_auto_scaling: AppAutoScalingServiceConfig,
+    pub ssm: AwsServiceConfig,
+    pub sts: AwsServiceConfig,
     pub lambda: LambdaServiceConfig,
     pub cloud_run: CloudRunServiceConfig,
 }
@@ -321,6 +336,13 @@ pub struct AppAutoScalingServiceConfig {
     pub region: String,
 }
 
+/// Enabled flag + region for SSM and STS.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AwsServiceConfig {
+    pub enabled: bool,
+    pub region: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct LambdaServiceConfig {
     pub enabled: bool,
@@ -399,6 +421,8 @@ pub fn default_config() -> Config {
             pubsub_grpc_port: 18085,
             pubsub_rest_port: 18086,
             app_auto_scaling_port: 18030,
+            ssm_port: 18031,
+            sts_port: 18032,
             lambda_port: 19010,
             cloud_run_port: 18095,
         },
@@ -452,6 +476,18 @@ pub fn default_config() -> Config {
                 bearer_token: "dev".to_string(),
             },
             app_auto_scaling: AppAutoScalingAuthConfig {
+                mode: "relaxed".to_string(),
+                access_key_id: "dev".to_string(),
+                secret_access_key: "dev".to_string(),
+                account_id: "000000000000".to_string(),
+            },
+            ssm: AwsAuthConfig {
+                mode: "relaxed".to_string(),
+                access_key_id: "dev".to_string(),
+                secret_access_key: "dev".to_string(),
+                account_id: "000000000000".to_string(),
+            },
+            sts: AwsAuthConfig {
                 mode: "relaxed".to_string(),
                 access_key_id: "dev".to_string(),
                 secret_access_key: "dev".to_string(),
@@ -583,6 +619,14 @@ pub fn default_config() -> Config {
                 enable_push: false,
             },
             app_auto_scaling: AppAutoScalingServiceConfig {
+                enabled: true,
+                region: "us-east-1".to_string(),
+            },
+            ssm: AwsServiceConfig {
+                enabled: true,
+                region: "us-east-1".to_string(),
+            },
+            sts: AwsServiceConfig {
                 enabled: true,
                 region: "us-east-1".to_string(),
             },
@@ -775,6 +819,8 @@ pub fn apply_config_value(cfg: &mut Config, path: &[String], value: &str) -> io:
         "server.appAutoScalingPort" => {
             cfg.server.app_auto_scaling_port = parse_int("server.appAutoScalingPort", value)?
         }
+        "server.ssmPort" => cfg.server.ssm_port = parse_int("server.ssmPort", value)?,
+        "server.stsPort" => cfg.server.sts_port = parse_int("server.stsPort", value)?,
         "server.lambdaPort" => cfg.server.lambda_port = parse_int("server.lambdaPort", value)?,
         "server.cloudRunPort" => {
             cfg.server.cloud_run_port = parse_int("server.cloudRunPort", value)?
@@ -821,6 +867,14 @@ pub fn apply_config_value(cfg: &mut Config, path: &[String], value: &str) -> io:
         "auth.appAutoScaling.accountId" => {
             cfg.auth.app_auto_scaling.account_id = trim_quotes(value)
         }
+        "auth.ssm.mode" => cfg.auth.ssm.mode = value.to_string(),
+        "auth.ssm.accessKeyId" => cfg.auth.ssm.access_key_id = value.to_string(),
+        "auth.ssm.secretAccessKey" => cfg.auth.ssm.secret_access_key = value.to_string(),
+        "auth.ssm.accountId" => cfg.auth.ssm.account_id = trim_quotes(value),
+        "auth.sts.mode" => cfg.auth.sts.mode = value.to_string(),
+        "auth.sts.accessKeyId" => cfg.auth.sts.access_key_id = value.to_string(),
+        "auth.sts.secretAccessKey" => cfg.auth.sts.secret_access_key = value.to_string(),
+        "auth.sts.accountId" => cfg.auth.sts.account_id = trim_quotes(value),
         "auth.lambda.mode" => cfg.auth.lambda.mode = value.to_string(),
         "auth.lambda.accessKeyId" => cfg.auth.lambda.access_key_id = value.to_string(),
         "auth.lambda.secretAccessKey" => cfg.auth.lambda.secret_access_key = value.to_string(),
@@ -1181,6 +1235,14 @@ pub fn apply_config_value(cfg: &mut Config, path: &[String], value: &str) -> io:
         "services.appAutoScaling.region" => {
             cfg.services.app_auto_scaling.region = value.to_string()
         }
+        "services.ssm.enabled" => {
+            cfg.services.ssm.enabled = parse_bool("services.ssm.enabled", value)?
+        }
+        "services.ssm.region" => cfg.services.ssm.region = value.to_string(),
+        "services.sts.enabled" => {
+            cfg.services.sts.enabled = parse_bool("services.sts.enabled", value)?
+        }
+        "services.sts.region" => cfg.services.sts.region = value.to_string(),
         "services.lambda.enabled" => {
             cfg.services.lambda.enabled = parse_bool("services.lambda.enabled", value)?
         }
@@ -1398,6 +1460,8 @@ pub fn default_config_yaml(cfg: &Config) -> String {
             "  pubsubGrpcPort: {pubsub_grpc_port}\n",
             "  pubsubRestPort: {pubsub_rest_port}\n",
             "  appAutoScalingPort: {app_auto_scaling_port}\n",
+            "  ssmPort: {ssm_port}\n",
+            "  stsPort: {sts_port}\n",
             "  lambdaPort: {lambda_port}\n",
             "  cloudRunPort: {cloud_run_port}\n",
             "\n",
@@ -1445,6 +1509,16 @@ pub fn default_config_yaml(cfg: &Config) -> String {
             "    accessKeyId: {aas_access_key_id}\n",
             "    secretAccessKey: {aas_secret_access_key}\n",
             "    accountId: \"{aas_account_id}\"\n",
+            "  ssm:\n",
+            "    mode: {ssm_auth_mode}\n",
+            "    accessKeyId: {ssm_access_key_id}\n",
+            "    secretAccessKey: {ssm_secret_access_key}\n",
+            "    accountId: \"{ssm_account_id}\"\n",
+            "  sts:\n",
+            "    mode: {sts_auth_mode}\n",
+            "    accessKeyId: {sts_access_key_id}\n",
+            "    secretAccessKey: {sts_secret_access_key}\n",
+            "    accountId: \"{sts_account_id}\"\n",
             "  lambda:\n",
             "    mode: {lambda_auth_mode}\n",
             "    accessKeyId: {lambda_access_key_id}\n",
@@ -1556,6 +1630,12 @@ pub fn default_config_yaml(cfg: &Config) -> String {
             "  appAutoScaling:\n",
             "    enabled: {aas_enabled}\n",
             "    region: {aas_region}\n",
+            "  ssm:\n",
+            "    enabled: {ssm_enabled}\n",
+            "    region: {ssm_region}\n",
+            "  sts:\n",
+            "    enabled: {sts_enabled}\n",
+            "    region: {sts_region}\n",
             "  lambda:\n",
             "    enabled: {lambda_enabled}\n",
             "    region: {lambda_region}\n",
@@ -1583,6 +1663,8 @@ pub fn default_config_yaml(cfg: &Config) -> String {
         pubsub_grpc_port = s.pubsub_grpc_port,
         pubsub_rest_port = s.pubsub_rest_port,
         app_auto_scaling_port = s.app_auto_scaling_port,
+        ssm_port = s.ssm_port,
+        sts_port = s.sts_port,
         lambda_port = s.lambda_port,
         cloud_run_port = s.cloud_run_port,
         smtp_mode = a.smtp.mode,
@@ -1618,6 +1700,14 @@ pub fn default_config_yaml(cfg: &Config) -> String {
         aas_access_key_id = a.app_auto_scaling.access_key_id,
         aas_secret_access_key = a.app_auto_scaling.secret_access_key,
         aas_account_id = a.app_auto_scaling.account_id,
+        ssm_auth_mode = a.ssm.mode,
+        ssm_access_key_id = a.ssm.access_key_id,
+        ssm_secret_access_key = a.ssm.secret_access_key,
+        ssm_account_id = a.ssm.account_id,
+        sts_auth_mode = a.sts.mode,
+        sts_access_key_id = a.sts.access_key_id,
+        sts_secret_access_key = a.sts.secret_access_key,
+        sts_account_id = a.sts.account_id,
         lambda_auth_mode = a.lambda.mode,
         lambda_access_key_id = a.lambda.access_key_id,
         lambda_secret_access_key = a.lambda.secret_access_key,
@@ -1709,6 +1799,10 @@ pub fn default_config_yaml(cfg: &Config) -> String {
         pubsub_enable_push = fmt_bool(sv.pubsub.enable_push),
         aas_enabled = fmt_bool(sv.app_auto_scaling.enabled),
         aas_region = sv.app_auto_scaling.region,
+        ssm_enabled = fmt_bool(sv.ssm.enabled),
+        ssm_region = sv.ssm.region,
+        sts_enabled = fmt_bool(sv.sts.enabled),
+        sts_region = sv.sts.region,
         lambda_enabled = fmt_bool(sv.lambda.enabled),
         lambda_region = sv.lambda.region,
         lambda_optional = lambda_optional_lines(&sv.lambda),
@@ -1832,6 +1926,7 @@ pub fn init_workspace(cfg: &Config) -> io::Result<()> {
         &path_join(&cfg.storage.path, "applicationautoscaling"),
         "create applicationautoscaling storage",
     )?;
+    mkdir_all(&path_join(&cfg.storage.path, "ssm"), "create ssm storage")?;
     mkdir_all(
         &path_join(&cfg.storage.path, "lambda"),
         "create lambda storage",
@@ -1910,6 +2005,8 @@ const SERVICE_TOGGLES: &[&str] = &[
     "sqs",
     "pubsub",
     "appautoscaling",
+    "ssm",
+    "sts",
     "lambda",
     "cloudrun",
 ];
@@ -1934,6 +2031,8 @@ fn set_service_enabled(cfg: &mut Config, name: &str, v: bool) {
         "sqs" => cfg.services.sqs.enabled = v,
         "pubsub" => cfg.services.pubsub.enabled = v,
         "appautoscaling" => cfg.services.app_auto_scaling.enabled = v,
+        "ssm" => cfg.services.ssm.enabled = v,
+        "sts" => cfg.services.sts.enabled = v,
         "lambda" => cfg.services.lambda.enabled = v,
         "cloudrun" => cfg.services.cloud_run.enabled = v,
         _ => {}
@@ -1961,6 +2060,9 @@ fn service_aliases() -> HashMap<&'static str, &'static str> {
         ("app-autoscaling", "appautoscaling"),
         ("app_autoscaling", "appautoscaling"),
         ("applicationautoscaling", "appautoscaling"),
+        ("ssm", "ssm"),
+        ("parameterstore", "ssm"),
+        ("sts", "sts"),
         ("lambda", "lambda"),
         ("cloudrun", "cloudrun"),
         ("cloud-run", "cloudrun"),
@@ -2045,6 +2147,8 @@ mod tests {
         "server.pubsubGrpcPort",
         "server.pubsubRestPort",
         "server.appAutoScalingPort",
+        "server.ssmPort",
+        "server.stsPort",
         "server.lambdaPort",
         "server.cloudRunPort",
         "services.dynamodb.maxTables",
@@ -2199,6 +2303,8 @@ mod tests {
                 "redshift",
                 "s3",
                 "sqs",
+                "ssm",
+                "sts",
             ]
         );
     }

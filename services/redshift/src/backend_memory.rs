@@ -84,6 +84,10 @@ impl SqlBackend for MemoryBackend {
         self.inner.exec(statement)
     }
 
+    fn handles_copy(&self) -> bool {
+        true
+    }
+
     fn begin(&self) -> Result<Box<dyn SqlTransaction>, SqlError> {
         self.inner.ready()?;
         let snapshot = self.inner.snapshot.as_ref().map(|snapshot| snapshot());

@@ -32,7 +32,8 @@ const LOG_TAIL_BYTES: usize = 4096;
 const MAX_INVOCATION_RECORDS: usize = 100;
 const DEFAULT_LIST_MAX_ITEMS: usize = 50;
 
-/// Runtime identifiers devcloud accepts. Python/Node execute locally; the
+/// Runtime identifiers devcloud accepts. Python/Node and `provided*` (the
+/// package's own `bootstrap`) execute locally; the
 /// remaining families are accepted for control-plane compatibility (IaC tools
 /// deploy them) but cannot be invoked.
 const KNOWN_RUNTIME_PREFIXES: &[&str] = &[

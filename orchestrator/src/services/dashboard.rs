@@ -99,6 +99,15 @@ fn build_config(cfg: &AppConfig) -> Config {
         app_auto_scaling_storage_path: join(s, "applicationautoscaling"),
         app_auto_scaling_region: cfg.services.app_auto_scaling.region.clone(),
 
+        ssm_base: enabled_ep(cfg.services.ssm.enabled, cfg.server.ssm_port),
+        ssm_endpoint: http_ep(cfg.server.ssm_port),
+        ssm_storage_path: join(s, "ssm"),
+        ssm_region: cfg.services.ssm.region.clone(),
+
+        sts_base: enabled_ep(cfg.services.sts.enabled, cfg.server.sts_port),
+        sts_endpoint: http_ep(cfg.server.sts_port),
+        sts_region: cfg.services.sts.region.clone(),
+
         lambda_base: enabled_ep(cfg.services.lambda.enabled, cfg.server.lambda_port),
         lambda_endpoint: http_ep(cfg.server.lambda_port),
         lambda_storage_path: join(s, "lambda"),
@@ -161,6 +170,8 @@ mod tests {
                 "applicationautoscaling",
                 "/api/applicationautoscaling/scalable-targets",
             ),
+            ("ssm", "ssm", "/api/ssm/parameters"),
+            ("sts", "sts", "/api/sts/caller-identity"),
             ("lambda", "lambda", "/api/lambda/functions"),
             ("cloudrun", "cloudrun", "/api/cloudrun/services"),
         ];

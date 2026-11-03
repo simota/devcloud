@@ -215,6 +215,10 @@ services:
     enabled: true
     project: ${PROJECT}
     region: ${REGION}
+  ssm:
+    enabled: false
+  sts:
+    enabled: false
 EOF
 }
 

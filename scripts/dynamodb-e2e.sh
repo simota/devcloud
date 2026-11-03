@@ -259,6 +259,10 @@ services:
     enabled: false
   cloudRun:
     enabled: false
+  ssm:
+    enabled: false
+  sts:
+    enabled: false
 EOF
 }
 

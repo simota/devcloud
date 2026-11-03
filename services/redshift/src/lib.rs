@@ -35,6 +35,7 @@ pub mod backend_memory;
 pub mod backend_postgres;
 pub mod catalog;
 pub mod cluster;
+mod copy_backend;
 pub mod copy_unload;
 pub mod dataapi;
 pub mod engine;

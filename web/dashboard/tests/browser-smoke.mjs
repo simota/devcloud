@@ -110,12 +110,12 @@ try {
   const registryResponse = await fetch(`${dashboard}/api/services`, { signal: AbortSignal.timeout(5000) })
   assert.equal(registryResponse.status, 200)
   const registry = await registryResponse.json()
-  assert.equal(registry.services.length, 12)
+  assert.equal(registry.services.length, 14)
   assert.deepEqual(registry.services.filter((service) => service.status === 'running').map((service) => service.id), ['gcs'],
     'devcloud up gcs must report only GCS as running')
   assert.ok(registry.services.every((service) => service.id === 'gcs' || service.status === 'disabled'),
     'unselected services must be disabled')
-  await page.getByText('1/12 running', { exact: true }).waitFor()
+  await page.getByText('1/14 running', { exact: true }).waitFor()
 
   // A provider mutation must reach the page through the real relay and proxy.
   await upload('live-event.txt')

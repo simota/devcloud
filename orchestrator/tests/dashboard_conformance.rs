@@ -53,8 +53,8 @@
 //! and the shipped product, so it is masked symmetrically. Every other service's
 //! status is asserted unmasked.
 //!
-//! Deliberate post-legacy additions: the `applicationautoscaling`, `lambda`, and
-//! `cloudrun` entries in the two registry goldens. The legacy dashboard never had
+//! Deliberate post-legacy additions: the `applicationautoscaling`, `ssm`, `sts`,
+//! `lambda`, and `cloudrun` entries in the two registry goldens. The legacy dashboard never had
 //! those services; the entries were appended when the Rust dashboard gained their
 //! pages, so the goldens track intended current behavior, not a byte-frozen
 //! legacy capture, for those rows.
@@ -733,6 +733,8 @@ fn spawn_devcloud_up(workspace: &Path) -> Child {
 \u{20}\u{20}pubsubGrpcPort: 28085\n\
 \u{20}\u{20}pubsubRestPort: 28086\n\
 \u{20}\u{20}appAutoScalingPort: 28030\n\
+\u{20}\u{20}ssmPort: 28031\n\
+\u{20}\u{20}stsPort: 28032\n\
 \u{20}\u{20}lambdaPort: 29010\n\
 \u{20}\u{20}cloudRunPort: 28095\n",
     );

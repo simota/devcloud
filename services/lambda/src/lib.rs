@@ -1,8 +1,9 @@
 //! Local AWS Lambda emulator for devcloud.
 //!
 //! Serves the Lambda REST API (`/2015-03-31/functions`, invoke, tags, account
-//! settings) and executes `python3.x` / `nodejs*` handlers from zip deployment
-//! packages as local child processes. Function state persists to `state.json`
+//! settings) and executes `python3.x` / `nodejs*` handlers and `provided*`
+//! `bootstrap` executables (through a local Lambda Runtime API) from zip
+//! deployment packages as local child processes. Function state persists to `state.json`
 //! under the configured storage path; packages may come inline (`ZipFile`) or
 //! from the shared local S3 store (`S3Bucket`/`S3Key`).
 
@@ -29,6 +30,7 @@ pub mod container;
 mod function_url;
 pub mod http;
 pub mod runtime;
+mod runtime_api;
 pub mod server;
 pub mod sigv4;
 pub mod time_fmt;
