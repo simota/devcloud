@@ -248,15 +248,15 @@ fn form_decode(value: &str) -> String {
     while i < bytes.len() {
         match bytes[i] {
             b'+' => out.push(b' '),
-            b'%' if i + 2 < bytes.len() => {
-                let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).ok();
-                match hex.and_then(|h| u8::from_str_radix(h, 16).ok()) {
-                    Some(b) => {
-                        out.push(b);
-                        i += 2;
-                    }
-                    None => out.push(b'%'),
-                }
+            // Two hex digits exactly; `from_str_radix` alone would also take
+            // a sign (`%+1`).
+            b'%' if i + 2 < bytes.len()
+                && bytes[i + 1].is_ascii_hexdigit()
+                && bytes[i + 2].is_ascii_hexdigit() =>
+            {
+                let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or_default();
+                out.push(u8::from_str_radix(hex, 16).unwrap_or_default());
+                i += 2;
             }
             b => out.push(b),
         }
@@ -380,5 +380,24 @@ mod request_framing_tests {
             "a".repeat(MAX_HEADER_BYTES)
         );
         assert!(read_request(&mut wire.as_bytes()).await.unwrap().is_none());
+    }
+}
+
+#[cfg(test)]
+mod form_tests {
+    use super::form_decode;
+
+    #[test]
+    fn decodes_escapes_and_plus() {
+        assert_eq!(form_decode("a%2Fb+c%3d"), "a/b c=");
+    }
+
+    #[test]
+    fn keeps_malformed_escapes() {
+        for raw in ["%-1", "%zz", "%2", "%", "100%"] {
+            assert_eq!(form_decode(raw), raw, "{raw}");
+        }
+        // Not an escape: the `%` stays and `+` is a space as usual.
+        assert_eq!(form_decode("%+1"), "% 1");
     }
 }
