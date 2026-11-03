@@ -11,6 +11,10 @@
 //! variables, and the function's own `Environment.Variables`), so host
 //! credentials never leak into handler code; the only credentials a handler
 //! sees are the ones configured for functions ([`FunctionCredentials`]).
+//!
+//! `provided*` (custom runtime) functions run the package's own `bootstrap`
+//! executable instead, talking to a per-environment Lambda Runtime API
+//! ([`crate::runtime_api`]) that speaks the same marker/result-file protocol.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -24,6 +28,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 
 use crate::container::{self, ImageSpec};
+use crate::runtime_api::{ApiInvocation, RuntimeApi};
 
 /// Per-stream log bytes kept while an invocation runs (the API tail is 4 KiB).
 const LOG_CAPTURE_BYTES: usize = 64 * 1024;
@@ -42,6 +47,8 @@ const NODE_BOOTSTRAP: &str = include_str!("bootstrap/node.js");
 pub enum Family {
     Python,
     Node,
+    /// `provided*`: the package's `bootstrap` executable is the runtime.
+    Provided,
 }
 
 /// Maps a Lambda `Runtime` identifier (`python3.12`, `nodejs20.x`) to the
@@ -51,6 +58,8 @@ pub fn family(runtime: &str) -> Option<Family> {
         Some(Family::Python)
     } else if runtime.starts_with("nodejs") {
         Some(Family::Node)
+    } else if runtime.starts_with("provided") {
+        Some(Family::Provided)
     } else {
         None
     }
@@ -115,6 +124,7 @@ impl Interpreters {
                 versioned.or_else(|| resolve_program(&self.python))
             }
             Family::Node => resolve_program(&self.node),
+            Family::Provided => None,
         }
     }
 }
@@ -478,6 +488,8 @@ struct Environment {
     control: Option<ControlWriter>,
     /// Set when the process is a `docker run` of an image function.
     container: Option<Container>,
+    /// Set for a `provided*` function: the bootstrap polls it for requests.
+    runtime_api: Option<RuntimeApi>,
     events: mpsc::UnboundedReceiver<StreamEvent>,
     stdout: Arc<Mutex<Scanner>>,
     stderr: Arc<Mutex<Vec<u8>>>,
@@ -684,7 +696,14 @@ pub async fn run(
         Some(env) => (env, None),
         None => {
             let started = Instant::now();
-            let mut env = spawn(family, inv, interpreters, pool, code)?;
+            let mut env = if family == Family::Provided {
+                match spawn_provided(inv, pool, code).await? {
+                    Ok(env) => env,
+                    Err(failed) => return Ok(failed),
+                }
+            } else {
+                spawn(family, inv, interpreters, pool, code)?
+            };
             // Init gets its own budget of one function timeout.
             match env.wait(tokio::time::Instant::now() + timeout).await {
                 Wait::Marker { tag, log } if tag == "ready" => {
@@ -693,7 +712,7 @@ pub async fn run(
                     }
                     (env, Some((started.elapsed(), log)))
                 }
-                other => return Ok(failed_init(inv, other, started.elapsed())),
+                other => return Ok(failed_init(inv, other, started.elapsed(), &env.work_dir)),
             }
         }
     };
@@ -717,8 +736,16 @@ pub async fn run(
     }
     let started = Instant::now();
     let deadline = tokio::time::Instant::now() + timeout;
-    // A dead environment fails the write; `wait` then reports how it ended.
-    if let Some(control) = env.control.as_mut() {
+    if let Some(api) = env.runtime_api.as_ref() {
+        api.submit(ApiInvocation {
+            request_id: inv.request_id.clone(),
+            deadline_ms: deadline_ms as u64,
+            function_arn: inv.function_arn.clone(),
+            event: inv.payload.clone(),
+            result_path: result_path.clone(),
+        });
+    } else if let Some(control) = env.control.as_mut() {
+        // A dead environment fails the write; `wait` then reports how it ended.
         let _ = tokio::time::timeout_at(deadline, control.write_all(&line)).await;
     }
     let waited = env.wait(deadline).await;
@@ -782,8 +809,14 @@ pub async fn run(
 }
 
 /// The invocation's result when the environment never became ready.
-fn failed_init(inv: &Invocation, waited: Wait, init: Duration) -> Completed {
+fn failed_init(inv: &Invocation, waited: Wait, init: Duration, work_dir: &Path) -> Completed {
     let (outcome, log, timed_out) = match waited {
+        // A custom runtime reported its init failure through the Runtime API.
+        Wait::Marker { tag, log } if tag == "initerror" => (
+            read_result(&work_dir.join(INIT_ERROR_FILE), &inv.request_id),
+            log,
+            false,
+        ),
         Wait::TimedOut { log, .. } => (timed_out_error(inv), log, true),
         Wait::Exited { crashed, log } => (
             Outcome::FunctionError(error_doc(
@@ -849,6 +882,7 @@ fn spawn(
     let bin = match family {
         Family::Python => &interpreters.python,
         Family::Node => &interpreters.node,
+        Family::Provided => unreachable!("provided runtimes start through spawn_provided"),
     };
     // Resolve the interpreter against devcloud's own PATH: the function may set
     // its own PATH, which applies to the handler, not to finding python/node.
@@ -865,6 +899,7 @@ fn spawn(
         // reach the log (a pipe would otherwise be block-buffered).
         Family::Python => cmd.arg("-u").arg("-c").arg(PYTHON_BOOTSTRAP),
         Family::Node => cmd.arg("-e").arg(NODE_BOOTSTRAP),
+        Family::Provided => unreachable!("provided runtimes start through spawn_provided"),
     };
     // Precedence: devcloud defaults < the function's Environment.Variables <
     // Lambda-reserved variables (which CreateFunction refuses to accept).
@@ -929,6 +964,7 @@ fn spawn(
         child,
         control: Some(control),
         container: None,
+        runtime_api: None,
         events,
         stdout,
         stderr,
@@ -937,6 +973,226 @@ fn spawn(
         idle_since: Instant::now(),
         _code: code,
     })
+}
+
+/// Where a custom runtime's `POST /runtime/init/error` is recorded, in the
+/// environment's work directory.
+pub(crate) const INIT_ERROR_FILE: &str = "init-error.json";
+
+/// Starts a `provided*` function's `bootstrap` with its own Runtime API.
+/// `Err(Completed)` is a failed invocation (no usable bootstrap), reported to
+/// the caller as a function error the way Lambda does.
+async fn spawn_provided(
+    inv: &Invocation,
+    pool: &Pool,
+    code: Box<dyn Send>,
+) -> Result<Result<Environment, Completed>, RuntimeError> {
+    let started = Instant::now();
+    let candidates = [
+        inv.code_dir.join("bootstrap"),
+        inv.opt_dir.join("bootstrap"),
+    ];
+    let Some(bootstrap) = candidates.iter().find(|p| p.is_file()) else {
+        let searched: Vec<String> = candidates
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        return Ok(Err(invalid_entrypoint(
+            inv,
+            &format!("Couldn't find valid bootstrap(s): [{}]", searched.join(" ")),
+            "",
+            started.elapsed(),
+        )));
+    };
+
+    let id = pool.seq.fetch_add(1, Ordering::Relaxed);
+    let work_dir = pool.work_root.join(format!("env-{id}"));
+    std::fs::create_dir_all(&work_dir).map_err(|e| RuntimeError::Spawn(e.to_string()))?;
+    let cleanup = |msg: String| {
+        let _ = std::fs::remove_dir_all(&work_dir);
+        RuntimeError::Spawn(msg)
+    };
+    let marker = new_marker(id);
+
+    // The bootstrap's stdout and stderr share one pipe; devcloud keeps a write
+    // end of it so the Runtime API can append marker lines behind the
+    // bootstrap's own output.
+    let (read, write) = new_pipe().map_err(|e| cleanup(format!("create output pipe: {e}")))?;
+    let child_out = write
+        .try_clone()
+        .map_err(|e| cleanup(format!("create output pipe: {e}")))?;
+    let api = RuntimeApi::start(
+        marker.clone(),
+        std::fs::File::from(write),
+        work_dir.join(INIT_ERROR_FILE),
+        serde_json::json!({
+            "functionName": inv.function_name,
+            "functionVersion": "$LATEST",
+            "handler": inv.handler,
+        }),
+    )
+    .await
+    .map_err(|e| cleanup(format!("start runtime api: {e}")))?;
+
+    let mut env_vars = reserved_env(inv, id);
+    // Lambda sets no AWS_EXECUTION_ENV for custom runtimes, and the
+    // _DEVCLOUD_* variables are for devcloud's own bootstraps only.
+    env_vars.retain(|(k, _)| k != "AWS_EXECUTION_ENV" && !k.starts_with("_DEVCLOUD_"));
+    env_vars.push(("AWS_LAMBDA_RUNTIME_API".into(), api.addr.clone()));
+
+    let mut cmd = tokio::process::Command::new(bootstrap);
+    cmd.env_clear()
+        .envs(default_env(Family::Provided, inv))
+        .envs(&inv.environment)
+        .envs(env_vars)
+        .current_dir(&inv.code_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(child_out))
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    {
+        cmd.process_group(0);
+        // SAFETY: dup2 is async-signal-safe; fd 1 is the output pipe by now.
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::dup2(1, 2) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+    // A binary for another OS would otherwise be handed to /bin/sh by
+    // execvp's ENOEXEC fallback and fail as an obscure shell error.
+    let spawned = match foreign_executable(bootstrap) {
+        Some(format) => Err((
+            std::io::Error::from_raw_os_error(libc::ENOEXEC),
+            format!(" ({format})"),
+        )),
+        None => cmd.spawn().map_err(|e| (e, String::new())),
+    };
+    let child = match spawned {
+        Ok(child) => child,
+        Err((e, format)) => {
+            let _ = std::fs::remove_dir_all(&work_dir);
+            let mut hint = String::new();
+            if e.raw_os_error() == Some(libc::ENOEXEC) {
+                hint = format!(
+                    "[ERROR] devcloud: {} is not an executable for this host{format}; build the bootstrap for {}/{} (Go: GOOS={} GOARCH={})\n",
+                    bootstrap.display(),
+                    std::env::consts::OS,
+                    std::env::consts::ARCH,
+                    go_os(),
+                    go_arch(),
+                );
+            }
+            return Ok(Err(invalid_entrypoint(
+                inv,
+                &format!("fork/exec {}: {}", bootstrap.display(), os_error_text(&e)),
+                &hint,
+                started.elapsed(),
+            )));
+        }
+    };
+    drop(cmd);
+
+    let reader = tokio::net::unix::pipe::Receiver::from_owned_fd(read)
+        .map_err(|e| cleanup(format!("read output pipe: {e}")))?;
+    let (tx, events) = mpsc::unbounded_channel();
+    let stdout = Arc::new(Mutex::new(Scanner::new(format!("{marker} ").into_bytes())));
+    let out_task = tokio::spawn(scan(reader, Arc::clone(&stdout), tx));
+    Ok(Ok(Environment {
+        id,
+        key: inv.env_key.clone(),
+        pgid: child.id(),
+        child,
+        control: None,
+        container: None,
+        runtime_api: Some(api),
+        events,
+        stdout,
+        stderr: Arc::new(Mutex::new(Vec::new())),
+        tasks: vec![out_task.abort_handle()],
+        work_dir,
+        idle_since: Instant::now(),
+        _code: code,
+    }))
+}
+
+/// Lambda's answer when a custom runtime has no runnable bootstrap.
+fn invalid_entrypoint(inv: &Invocation, reason: &str, log: &str, init: Duration) -> Completed {
+    Completed {
+        outcome: Outcome::FunctionError(error_doc(
+            &format!("RequestId: {} Error: {reason}", inv.request_id),
+            "Runtime.InvalidEntrypoint",
+        )),
+        log: frame_log(
+            inv,
+            Some((init, log.to_string())),
+            "",
+            Duration::ZERO,
+            false,
+            None,
+        ),
+        duration: Duration::ZERO,
+        init_duration: Some(init),
+    }
+}
+
+/// An OS error without Rust's ` (os error N)` suffix, as Go prints it.
+fn os_error_text(e: &std::io::Error) -> String {
+    match e.raw_os_error() {
+        Some(libc::ENOEXEC) => "exec format error".to_string(),
+        Some(libc::EACCES) => "permission denied".to_string(),
+        _ => {
+            let text = e.to_string();
+            match text.find(" (os error") {
+                Some(i) => text[..i].to_lowercase(),
+                None => text,
+            }
+        }
+    }
+}
+
+/// Names the executable format of `path` when it is one this host's OS
+/// cannot run: an ELF binary off Linux, or a Mach-O binary off macOS.
+fn foreign_executable(path: &Path) -> Option<&'static str> {
+    let mut magic = [0u8; 4];
+    use std::io::Read;
+    std::fs::File::open(path)
+        .ok()?
+        .read_exact(&mut magic)
+        .ok()?;
+    let elf = magic == [0x7f, b'E', b'L', b'F'];
+    let mach_o = matches!(
+        u32::from_be_bytes(magic),
+        0xfeedface | 0xfeedfacf | 0xcefaedfe | 0xcffaedfe | 0xcafebabe
+    );
+    if elf && std::env::consts::OS != "linux" {
+        Some("a Linux ELF binary")
+    } else if mach_o && std::env::consts::OS != "macos" {
+        Some("a macOS Mach-O binary")
+    } else {
+        None
+    }
+}
+
+/// `std::env::consts::OS` in Go's `GOOS` spelling.
+fn go_os() -> &'static str {
+    match std::env::consts::OS {
+        "macos" => "darwin",
+        other => other,
+    }
+}
+
+/// `std::env::consts::ARCH` in Go's `GOARCH` spelling.
+fn go_arch() -> &'static str {
+    match std::env::consts::ARCH {
+        "x86_64" => "amd64",
+        "aarch64" => "arm64",
+        other => other,
+    }
 }
 
 /// [`run`] for a container image function: the environment is a `docker run`
@@ -1157,6 +1413,7 @@ async fn start_container(
             name,
             removals: Arc::clone(&pool.removals),
         }),
+        runtime_api: None,
         events,
         stdout,
         stderr,
@@ -1378,27 +1635,8 @@ const CONTROL_FD: i32 = 3;
 /// reads its stdin would consume them (or block forever waiting for EOF).
 #[cfg(unix)]
 fn attach_control_pipe(cmd: &mut tokio::process::Command) -> std::io::Result<ControlWriter> {
-    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-    let mut fds = [0 as libc::c_int; 2];
-    // SAFETY: `fds` is a valid two-element buffer; on success both
-    // descriptors are new and owned here. FD_CLOEXEC keeps them out of other
-    // children; the dup2 below gives only this child its copy. Linux sets it
-    // atomically, so a concurrent spawn on another thread cannot inherit the
-    // pipe; macOS has no pipe2 and sets it right after.
-    #[cfg(target_os = "linux")]
-    let created = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
-    #[cfg(not(target_os = "linux"))]
-    let created = unsafe { libc::pipe(fds.as_mut_ptr()) };
-    if created != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    // SAFETY: both descriptors were just created and are owned by nobody else.
-    let (read, write) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
-    #[cfg(not(target_os = "linux"))]
-    for fd in [&read, &write] {
-        // SAFETY: plain fcntl on a descriptor we own.
-        unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) };
-    }
+    use std::os::fd::AsRawFd;
+    let (read, write) = new_pipe()?;
     let read_fd = read.as_raw_fd();
     // SAFETY: the closure only calls async-signal-safe functions (dup2,
     // fcntl) between fork and exec. `read` outlives the spawn: it moves into
@@ -1418,6 +1656,34 @@ fn attach_control_pipe(cmd: &mut tokio::process::Command) -> std::io::Result<Con
         });
     }
     tokio::net::unix::pipe::Sender::from_owned_fd(write)
+}
+
+/// A new pipe `(read, write)` with `FD_CLOEXEC` set on both ends.
+#[cfg(unix)]
+fn new_pipe() -> std::io::Result<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)> {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    let mut fds = [0 as libc::c_int; 2];
+    // SAFETY: `fds` is a valid two-element buffer; on success both
+    // descriptors are new and owned here. FD_CLOEXEC keeps them out of other
+    // children; the dup2 below gives only this child its copy. Linux sets it
+    // atomically, so a concurrent spawn on another thread cannot inherit the
+    // pipe; macOS has no pipe2 and sets it right after.
+    #[cfg(target_os = "linux")]
+    let created = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
+    #[cfg(not(target_os = "linux"))]
+    let created = unsafe { libc::pipe(fds.as_mut_ptr()) };
+    if created != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: both descriptors were just created and are owned by nobody else.
+    let (read, write) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+    #[cfg(not(target_os = "linux"))]
+    for fd in [&read, &write] {
+        use std::os::fd::AsRawFd;
+        // SAFETY: plain fcntl on a descriptor we own.
+        unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) };
+    }
+    Ok((read, write))
 }
 
 #[cfg(not(unix))]
@@ -1544,6 +1810,7 @@ fn default_env(family: Family, inv: &Invocation) -> Vec<(String, String)> {
     let opt = inv.opt_dir.to_string_lossy();
     let v = version(&inv.runtime);
     let layer_path = match (family, v) {
+        (Family::Provided, _) => return env,
         (Family::Python, Some(v)) => (
             "PYTHONPATH",
             format!("{opt}/python/lib/python{v}/site-packages:{opt}/python"),
@@ -1784,7 +2051,9 @@ mod tests {
         assert_eq!(family("python3.12"), Some(Family::Python));
         assert_eq!(family("nodejs20.x"), Some(Family::Node));
         assert_eq!(family("java21"), None);
-        assert_eq!(family("provided.al2023"), None);
+        assert_eq!(family("provided.al2023"), Some(Family::Provided));
+        assert_eq!(family("provided"), Some(Family::Provided));
+        assert_eq!(family("go1.x"), None);
     }
 
     #[test]
