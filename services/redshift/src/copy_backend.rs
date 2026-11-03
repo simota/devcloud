@@ -27,8 +27,34 @@ const INSERT_BATCH_ROWS: usize = 500;
 
 /// Whether `statement` is a COPY (Redshift has only `COPY ... FROM`).
 pub(crate) fn is_copy(statement: &str) -> bool {
-    let trimmed = statement.trim_start();
-    trimmed.len() > 5 && trimmed[..5].eq_ignore_ascii_case("copy ")
+    // Bytes, not a str slice: the statement may start with any UTF-8 text.
+    let b = statement.trim_start().as_bytes();
+    b.len() > 4 && b[..4].eq_ignore_ascii_case(b"copy") && b[4].is_ascii_whitespace()
+}
+
+/// Byte offset of the `FROM` keyword: whitespace before it, whitespace or a
+/// quote after it, and not inside a double-quoted identifier.
+fn find_from_keyword(body: &str) -> Option<usize> {
+    let b = body.as_bytes();
+    let mut in_ident = false;
+    let mut i = 0;
+    while i + 4 <= b.len() {
+        match b[i] {
+            b'"' => in_ident = !in_ident,
+            _ if !in_ident
+                && i > 0
+                && b[i - 1].is_ascii_whitespace()
+                && b[i..i + 4].eq_ignore_ascii_case(b"from")
+                && b.get(i + 4)
+                    .is_some_and(|c| c.is_ascii_whitespace() || *c == b'\'') =>
+            {
+                return Some(i);
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,21 +127,31 @@ impl Server {
             }
         };
         let columns = target_columns(&mut exec, &copy.table)?;
-        let mut count = 0usize;
+        // Every object is read and parsed before anything is written, so a
+        // bad file anywhere under the prefix loads nothing.
+        let mut rows = Vec::new();
         for data in self.read_copy_objects(&copy)? {
             let text = String::from_utf8(data)
                 .map_err(|_| SqlError::new("COPY input is not valid UTF-8"))?;
-            let rows = match copy.options.format {
+            rows.extend(match copy.options.format {
                 Format::Json { ignore_case } => json_rows(&text, &columns, ignore_case)?,
                 Format::Csv | Format::Text => delimited_rows(&text, &copy.options, &columns)?,
-            };
-            self.check_row_sizes(&rows)?;
-            for batch in rows.chunks(INSERT_BATCH_ROWS) {
-                exec(&insert_statement(&copy.table, &columns, batch))?;
-            }
-            count += rows.len();
+            });
         }
-        Ok(QueryResult::tag_only(&format!("COPY {count}")))
+        self.check_row_sizes(&rows)?;
+        if !rows.is_empty() {
+            // One simple-protocol Query: PostgreSQL runs its statements as a
+            // single implicit transaction, so a failing row (a type error)
+            // undoes the whole COPY; inside an explicit transaction the
+            // failure aborts that transaction, as a failed COPY does on
+            // Redshift.
+            let inserts: Vec<String> = rows
+                .chunks(INSERT_BATCH_ROWS)
+                .map(|batch| insert_statement(&copy.table, &columns, batch))
+                .collect();
+            exec(&inserts.join(";\n"))?;
+        }
+        Ok(QueryResult::tag_only(&format!("COPY {}", rows.len())))
     }
 
     /// The objects a COPY source names: every key under the prefix, in key
@@ -181,11 +217,8 @@ impl Server {
 
 fn parse_copy(statement: &str) -> Result<CopyStatement, SqlError> {
     let body = statement.trim().trim_end_matches(';').trim();
-    let lower = body.to_ascii_lowercase();
-    let from = lower
-        .find(" from ")
-        .ok_or_else(|| SqlError::new("COPY requires FROM"))?;
-    let table = body["copy ".len()..from].trim().to_string();
+    let from = find_from_keyword(body).ok_or_else(|| SqlError::new("COPY requires FROM"))?;
+    let table = body["copy".len()..from].trim().to_string();
     if table.is_empty() {
         return Err(SqlError::new("COPY requires a target table"));
     }
@@ -194,7 +227,7 @@ fn parse_copy(statement: &str) -> Result<CopyStatement, SqlError> {
             "COPY with a column list is not supported by devcloud",
         ));
     }
-    let after_from = body[from + " from ".len()..].trim_start();
+    let after_from = body[from + "from".len()..].trim_start();
     let (source, rest) = parse_leading_sql_string_literal(after_from)
         .map_err(|err| SqlError::new(format!("COPY requires an s3:// source: {err}")))?;
     Ok(CopyStatement {
@@ -708,7 +741,22 @@ mod tests {
     #[test]
     fn is_copy_detects_the_keyword() {
         assert!(is_copy("  copy t from 's3://b/k'"));
+        assert!(is_copy("COPY\n  t FROM 's3://b/k'"));
         assert!(!is_copy("COPYRIGHT"));
         assert!(!is_copy("select 'copy '"));
+        // Multi-byte text where a fixed-width str slice would split a char.
+        assert!(!is_copy("-- 猫\nSELECT 1;"));
+        assert!(!is_copy("猫猫"));
+    }
+
+    #[test]
+    fn from_may_follow_any_whitespace() {
+        let c = parse_copy("COPY t\nFROM\n's3://b/k'\tIAM_ROLE 'r'\tCSV").unwrap();
+        assert_eq!((c.table.as_str(), c.source.as_str()), ("t", "s3://b/k"));
+        assert_eq!(c.options.format, Format::Csv);
+        let c = parse_copy("COPY\t\"from table\" FROM's3://b/k'").unwrap();
+        assert_eq!(c.table, "\"from table\"");
+        let c = parse_copy("COPY fromage FROM 's3://b/k'").unwrap();
+        assert_eq!(c.table, "fromage");
     }
 }

@@ -407,6 +407,44 @@ SQL
   copy_load gz/d.tsv.gz "DELIMITER '\\t' GZIP" " jr"
   copy_load plain/d.json "FORMAT AS JSON 'auto'" " jr"
   copy_load gz/d.json.gz "FORMAT AS JSON 'auto' GZIP" " jr"
+
+  # A COPY is all or nothing: 600 good rows (more than one INSERT batch) in
+  # the first object and a type error in the second leave no rows behind,
+  # in autocommit and inside a transaction.
+  log "running COPY atomicity check"
+  python3 -c 'print("\n".join(f"{i},n{i}" for i in range(600)))' >"${TMP_DIR}/good.csv"
+  printf '600,ok\nnot-a-number,bad\n' >"${TMP_DIR}/bad.csv"
+  aws s3 cp "${TMP_DIR}/good.csv" s3://copy-e2e/atomic/1.csv --endpoint-url "${S3_ENDPOINT}" >/dev/null
+  aws s3 cp "${TMP_DIR}/bad.csv" s3://copy-e2e/atomic/2.csv --endpoint-url "${S3_ENDPOINT}" >/dev/null
+  PGPASSWORD="${DB_PASSWORD}" psql "host=${HOST} port=${REDSHIFT_SQL_PORT} dbname=${DATABASE} user=${DB_USER} sslmode=disable" \
+    -v ON_ERROR_STOP=1 -q -c "drop table if exists load.atomic" -c "create table load.atomic (id integer, name varchar(16))"
+  for wrap in autocommit transaction; do
+    if [[ "${wrap}" == "transaction" ]]; then begin="BEGIN;"; end="ROLLBACK;"; else begin=""; end=""; fi
+    if PGPASSWORD="${DB_PASSWORD}" psql "host=${HOST} port=${REDSHIFT_SQL_PORT} dbname=${DATABASE} user=${DB_USER} sslmode=disable" \
+      -v ON_ERROR_STOP=1 -q >/dev/null 2>&1 <<SQL
+${begin}
+COPY load.atomic
+FROM 's3://copy-e2e/atomic/'
+IAM_ROLE 'arn:aws:iam::000000000000:role/copy' CSV;
+${end}
+SQL
+    then
+      echo "[FAIL] COPY with a bad row succeeded (${wrap})" >&2
+      exit 1
+    fi
+    got="$(PGPASSWORD="${DB_PASSWORD}" psql "host=${HOST} port=${REDSHIFT_SQL_PORT} dbname=${DATABASE} user=${DB_USER} sslmode=disable" -Atc "select count(*) from load.atomic")"
+    if [[ "${got}" != "0" ]]; then
+      echo "[FAIL] failed COPY left ${got} rows (${wrap})" >&2
+      exit 1
+    fi
+  done
+  aws s3 rm s3://copy-e2e/atomic/2.csv --endpoint-url "${S3_ENDPOINT}" >/dev/null
+  got="$(PGPASSWORD="${DB_PASSWORD}" psql "host=${HOST} port=${REDSHIFT_SQL_PORT} dbname=${DATABASE} user=${DB_USER} sslmode=disable" \
+    -qAtc "COPY load.atomic FROM 's3://copy-e2e/atomic/' IAM_ROLE 'r' CSV" -c "select count(*) from load.atomic")"
+  if [[ "${got}" != "600" ]]; then
+    echo "[FAIL] COPY after removing the bad object loaded: ${got}" >&2
+    exit 1
+  fi
 fi
 
 log "running Data API smoke"
