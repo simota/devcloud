@@ -22,6 +22,7 @@ that uid first. Requests are path-style only and capped at 128 MiB.
 | `DEVCLOUD_S3_ACCESS_KEY_ID` | empty | Access key, required in strict mode |
 | `DEVCLOUD_S3_SECRET_ACCESS_KEY` | empty | Secret key, required in strict mode |
 | `DEVCLOUD_S3_REGION` | `us-east-1` | Region accepted in the SigV4 credential scope |
+| `DEVCLOUD_S3_BUCKETS` | empty | Comma-separated buckets to create at startup; existing buckets are kept |
 | `DEVCLOUD_S3_CORS_ALLOW_ORIGINS` | empty | Comma-separated origins (`*` and one-wildcard patterns allowed) for buckets without their own CORS configuration |
 | `DEVCLOUD_S3_CONSOLE_ADDR` | `0.0.0.0:9001` | Console listen address; empty disables the console |
 | `DEVCLOUD_S3_CONSOLE_ALLOWED_HOSTS` | empty | Extra comma-separated console Host names; `*` disables the check |
