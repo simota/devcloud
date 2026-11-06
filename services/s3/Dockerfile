@@ -5,11 +5,15 @@
 # Multi-arch (the build stage runs natively and cross-compiles, because rustc
 # crashes under amd64 emulation on arm64 hosts):
 #   docker buildx build --platform linux/amd64,linux/arm64 -f services/s3/Dockerfile .
-# Run:
-#   docker run --rm -p 9000:9000 -v devcloud-s3-data:/data devcloud-s3
+# Run (S3 API on 9000, web console on 9001; see services/s3/README.md):
+#   docker run --rm -p 127.0.0.1:9000:9000 -p 127.0.0.1:9001:9001 \
+#     -v devcloud-s3-data:/data devcloud-s3
 #
-# Auth defaults to relaxed. Strict auth: pass DEVCLOUD_S3_AUTH_MODE=strict together with
-# DEVCLOUD_S3_ACCESS_KEY_ID / DEVCLOUD_S3_SECRET_ACCESS_KEY / DEVCLOUD_S3_REGION.
+# Auth defaults to relaxed, which also leaves the console open. Signature
+# verification: pass DEVCLOUD_S3_AUTH_MODE=strict together with
+# DEVCLOUD_S3_ACCESS_KEY_ID / DEVCLOUD_S3_SECRET_ACCESS_KEY (and optionally
+# DEVCLOUD_S3_REGION). CORS: PutBucketCors per bucket, or
+# DEVCLOUD_S3_CORS_ALLOW_ORIGINS as a default for every bucket.
 # Create buckets at startup with a comma-separated list (existing buckets are kept):
 #   docker run --rm -p 9000:9000 -e DEVCLOUD_S3_BUCKETS=uploads,backups devcloud-s3
 
@@ -42,7 +46,8 @@ RUN useradd --system --uid 10001 --no-create-home devcloud \
 COPY --from=build /devcloud-s3 /usr/local/bin/devcloud-s3
 USER devcloud
 ENV DEVCLOUD_S3_ADDR=0.0.0.0:9000 \
+    DEVCLOUD_S3_CONSOLE_ADDR=0.0.0.0:9001 \
     DEVCLOUD_S3_STORAGE=/data
 VOLUME /data
-EXPOSE 9000
+EXPOSE 9000 9001
 ENTRYPOINT ["devcloud-s3"]

@@ -337,8 +337,9 @@ Legend:
 | CopyObject | Yes | Supports copy and metadata replacement. |
 | Content-MD5 validation | Yes | Invalid and mismatched digests return S3-style errors. |
 | Multipart upload | Yes | Create/upload/list/complete/abort local multipart flows. |
-| Presigned URL validation | Yes | Covered for local SigV4 GET. |
-| AWS SigV4 header auth | Partial | Relaxed mode is default; strict mode validates local credentials. |
+| Presigned URL validation | Yes | Strict mode validates SigV4 presigned GET and PUT, including expiry. |
+| AWS SigV4 header auth | Partial | Relaxed mode is default; strict mode validates local credentials, a 15-minute clock skew window, and `aws-chunked` chunk and trailer signatures. SigV2 and SigV4a are not implemented. |
+| CORS | Yes | PutBucketCors/GetBucketCors/DeleteBucketCors, preflight, and response headers. |
 | ACLs, bucket policy, IAM | Partial | Bucket policy and bucket/object ACL metadata endpoints are supported locally, including versionId-aware object ACL metadata; IAM enforcement is not implemented. |
 | Versioning | Partial | Bucket versioning, generated and `null` version IDs, version-aware get/delete/copy-source, delete markers, multipart-complete version IDs/ETags, and local ListObjectVersions with key/version markers are supported. |
 | Lifecycle | Partial | Bucket lifecycle metadata endpoints are supported; Enabled expiration rules for current objects are applied locally on S3 reads/lists. |
@@ -348,6 +349,8 @@ Legend:
 | Object Lock | Partial | Bucket object lock configuration, object retention/legal-hold metadata, response headers, local delete guards, and governance retention bypass are supported. |
 | S3 Select | Partial | Minimal SelectObjectContent supports `SELECT * FROM S3Object` for CSV and JSON Lines with eventstream responses; filtering and projections are not implemented. |
 | Inventory / analytics | Partial | Bucket inventory and analytics configuration metadata endpoints are supported locally; CSV-format enabled inventory configs generate deterministic local reports under bucket storage. |
+
+The standalone S3 image also ships a web console and a server-wide CORS default; see [`services/s3/README.md`](services/s3/README.md).
 
 ### GCS-Compatible JSON API
 

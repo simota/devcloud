@@ -2,7 +2,8 @@
 //!
 //! Scope: service listing, bucket CRUD, current-object PUT/GET/HEAD/DELETE,
 //! object listing, selected bucket/object sub-resources, multipart upload, and
-//! `If-None-Match` (GET/HEAD 304, conditional PUT/Copy/CompleteMultipartUpload).
+//! `If-None-Match` (GET/HEAD 304, conditional PUT/Copy/CompleteMultipartUpload),
+//! bucket CORS, and `aws-chunked` streaming uploads.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -10,9 +11,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
+use crate::aws_chunked;
+use crate::cors::{self, CorsRule};
 use crate::model::{
     AnalyticsConfiguration, AnalyticsDataExport, AnalyticsDestination, AnalyticsFilter,
     AnalyticsS3BucketDestination, DefaultRetention, InventoryConfiguration, InventoryDestination,
@@ -47,6 +50,12 @@ const MAX_BODY_BYTES: usize = 128 * 1024 * 1024;
 const MAX_POLICY_BYTES: usize = 1024 * 1024;
 const SIGV4_ALGORITHM: &str = "AWS4-HMAC-SHA256";
 const SIGV4_SERVICE: &str = "s3";
+const SIGV4_MAX_CLOCK_SKEW_SECONDS: i64 = 900;
+const SIGV4_CHUNK_ALGORITHM: &str = "AWS4-HMAC-SHA256-PAYLOAD";
+const SIGV4_TRAILER_ALGORITHM: &str = "AWS4-HMAC-SHA256-TRAILER";
+const STREAMING_SIGNED: &str = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD";
+const STREAMING_SIGNED_TRAILER: &str = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER";
+const STREAMING_UNSIGNED_TRAILER: &str = "STREAMING-UNSIGNED-PAYLOAD-TRAILER";
 const DASHBOARD_EVENT_PREFIX: &str = "DEVCLOUD_EVENT ";
 
 #[derive(Debug, Clone)]
@@ -140,15 +149,29 @@ pub async fn serve(
     serve_with_auth(listener, store, AuthConfig::default(), shutdown).await
 }
 
-/// Runs the accept loop with explicit SigV4/auth settings.
+/// Runs the accept loop with explicit SigV4/auth settings and no server-wide
+/// CORS rule; bucket CORS configurations still apply.
 pub async fn serve_with_auth(
     listener: TcpListener,
     store: Arc<Mutex<FileBucketStore>>,
     auth: AuthConfig,
     shutdown: impl std::future::Future<Output = ()>,
 ) -> std::io::Result<()> {
+    serve_with_cors(listener, store, auth, None, shutdown).await
+}
+
+/// Runs the accept loop. `default_cors` applies to buckets without their own
+/// CORS configuration and to the service root.
+pub async fn serve_with_cors(
+    listener: TcpListener,
+    store: Arc<Mutex<FileBucketStore>>,
+    auth: AuthConfig,
+    default_cors: Option<CorsRule>,
+    shutdown: impl std::future::Future<Output = ()>,
+) -> std::io::Result<()> {
     tokio::pin!(shutdown);
     let auth = Arc::new(auth);
+    let default_cors = Arc::new(default_cors);
     loop {
         tokio::select! {
             _ = &mut shutdown => return Ok(()),
@@ -159,16 +182,7 @@ pub async fn serve_with_auth(
                     // back off and keep serving instead of stopping (which
                     // would take every devcloud service down with it).
                     Err(e) => {
-                        // Only transient errors; a broken listener still stops.
-                        let transient = matches!(
-                            e.kind(),
-                            std::io::ErrorKind::ConnectionAborted
-                                | std::io::ErrorKind::ConnectionReset
-                                | std::io::ErrorKind::Interrupted
-                                | std::io::ErrorKind::WouldBlock
-                                | std::io::ErrorKind::TimedOut
-                        ) || matches!(e.raw_os_error(), Some(12 | 23 | 24)); // ENOMEM, ENFILE, EMFILE
-                        if !transient {
+                        if !is_transient_accept_error(&e) {
                             return Err(e);
                         }
                         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -177,18 +191,32 @@ pub async fn serve_with_auth(
                 };
                 let store = Arc::clone(&store);
                 let auth = Arc::clone(&auth);
+                let default_cors = Arc::clone(&default_cors);
                 tokio::spawn(async move {
-                    let _ = handle_conn(stream, store, auth).await;
+                    let _ = handle_conn(stream, store, auth, default_cors).await;
                 });
             }
         }
     }
 }
 
+/// Whether an accept failure should be retried. A broken listener still stops.
+pub(crate) fn is_transient_accept_error(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::Interrupted
+            | std::io::ErrorKind::WouldBlock
+            | std::io::ErrorKind::TimedOut
+    ) || matches!(error.raw_os_error(), Some(12 | 23 | 24)) // ENOMEM, ENFILE, EMFILE
+}
+
 async fn handle_conn(
     mut stream: TcpStream,
     store: Arc<Mutex<FileBucketStore>>,
     auth: Arc<AuthConfig>,
+    default_cors: Arc<Option<CorsRule>>,
 ) -> std::io::Result<()> {
     let request = match read_request(&mut stream).await {
         Ok(Some(req)) => req,
@@ -196,12 +224,14 @@ async fn handle_conn(
     };
     let response = {
         let store = store.lock().unwrap();
-        route_with_auth(&store, &request, &auth)
+        route_with_cors(&store, &request, &auth, default_cors.as_ref().as_ref())
     };
     write_response(&mut stream, response).await
 }
 
-async fn read_request(stream: &mut TcpStream) -> std::io::Result<Option<Request>> {
+pub(crate) async fn read_request<S: AsyncRead + Unpin>(
+    stream: &mut S,
+) -> std::io::Result<Option<Request>> {
     let mut buf = Vec::new();
     let mut tmp = [0u8; 4096];
     let header_end = loop {
@@ -229,27 +259,29 @@ async fn read_request(stream: &mut TcpStream) -> std::io::Result<Option<Request>
     let mut headers = BTreeMap::new();
     for line in lines {
         if let Some((k, v)) = line.split_once(':') {
-            headers.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
+            // Repeated headers fold with a comma, which SigV4 canonicalization also expects.
+            headers
+                .entry(k.trim().to_ascii_lowercase())
+                .and_modify(|existing: &mut String| {
+                    existing.push(',');
+                    existing.push_str(v.trim());
+                })
+                .or_insert_with(|| v.trim().to_string());
         }
     }
 
-    let content_length: usize = headers
-        .get("content-length")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
-    if content_length > MAX_BODY_BYTES {
+    let received = buf[header_end + 4..].to_vec();
+    let is_chunked = headers
+        .get("transfer-encoding")
+        .is_some_and(|v| v.to_ascii_lowercase().contains("chunked"));
+    let body = if is_chunked {
+        read_http_chunked_body(stream, received).await?
+    } else {
+        read_sized_body(stream, received, headers.get("content-length")).await?
+    };
+    let Some(body) = body else {
         return Ok(None);
-    }
-
-    let mut body = buf[header_end + 4..].to_vec();
-    while body.len() < content_length {
-        let n = stream.read(&mut tmp).await?;
-        if n == 0 {
-            break;
-        }
-        body.extend_from_slice(&tmp[..n]);
-    }
-    body.truncate(content_length);
+    };
 
     Ok(Some(Request {
         method,
@@ -260,6 +292,108 @@ async fn read_request(stream: &mut TcpStream) -> std::io::Result<Option<Request>
     }))
 }
 
+/// A repeated `Content-Length` is only valid when every value agrees (RFC 9110).
+/// Anything else is refused rather than read as an empty body, which would
+/// overwrite an object with zero bytes.
+fn parse_content_length(value: Option<&String>) -> Option<usize> {
+    let Some(value) = value else {
+        return Some(0);
+    };
+    let mut lengths = value.split(',').map(|v| v.trim().parse::<usize>().ok());
+    let first = lengths.next()??;
+    lengths.all(|v| v == Some(first)).then_some(first)
+}
+
+async fn read_sized_body<S: AsyncRead + Unpin>(
+    stream: &mut S,
+    mut body: Vec<u8>,
+    content_length: Option<&String>,
+) -> std::io::Result<Option<Vec<u8>>> {
+    let Some(content_length) = parse_content_length(content_length) else {
+        return Ok(None);
+    };
+    if content_length > MAX_BODY_BYTES {
+        return Ok(None);
+    }
+    let mut tmp = [0u8; 4096];
+    while body.len() < content_length {
+        let n = stream.read(&mut tmp).await?;
+        if n == 0 {
+            break;
+        }
+        body.extend_from_slice(&tmp[..n]);
+    }
+    body.truncate(content_length);
+    Ok(Some(body))
+}
+
+/// Reads more bytes into `raw`, returning false at end of stream.
+async fn fill<S: AsyncRead + Unpin>(stream: &mut S, raw: &mut Vec<u8>) -> std::io::Result<bool> {
+    let mut tmp = [0u8; 4096];
+    let n = stream.read(&mut tmp).await?;
+    raw.extend_from_slice(&tmp[..n]);
+    Ok(n > 0)
+}
+
+/// Removes and returns the next CRLF-terminated line; `None` at end of stream or
+/// when a line exceeds the header limit.
+async fn read_chunk_line<S: AsyncRead + Unpin>(
+    stream: &mut S,
+    raw: &mut Vec<u8>,
+) -> std::io::Result<Option<String>> {
+    loop {
+        if let Some(end) = find_subslice(raw, b"\r\n") {
+            let line = String::from_utf8_lossy(&raw[..end]).into_owned();
+            raw.drain(..end + 2);
+            return Ok(Some(line));
+        }
+        if raw.len() > MAX_HEADER_BYTES || !fill(stream, raw).await? {
+            return Ok(None);
+        }
+    }
+}
+
+/// Decodes `Transfer-Encoding: chunked`. An `aws-chunked` payload sent this way
+/// still carries its own framing, which routing decodes afterwards.
+async fn read_http_chunked_body<S: AsyncRead + Unpin>(
+    stream: &mut S,
+    mut raw: Vec<u8>,
+) -> std::io::Result<Option<Vec<u8>>> {
+    let mut body = Vec::new();
+    loop {
+        let Some(line) = read_chunk_line(stream, &mut raw).await? else {
+            return Ok(None);
+        };
+        let size = line.split(';').next().unwrap_or("").trim();
+        let Ok(size) = usize::from_str_radix(size, 16) else {
+            return Ok(None);
+        };
+        if size == 0 {
+            break;
+        }
+        if size > MAX_BODY_BYTES - body.len() {
+            return Ok(None);
+        }
+        while raw.len() < size + 2 {
+            if !fill(stream, &mut raw).await? {
+                return Ok(None);
+            }
+        }
+        if &raw[size..size + 2] != b"\r\n" {
+            return Ok(None);
+        }
+        body.extend_from_slice(&raw[..size]);
+        raw.drain(..size + 2);
+    }
+    loop {
+        match read_chunk_line(stream, &mut raw).await? {
+            Some(line) if line.is_empty() => return Ok(Some(body)),
+            Some(_) => {}
+            None => return Ok(None),
+        }
+    }
+}
+
 /// Routes a parsed request to the S3 store.
 pub fn route(store: &FileBucketStore, req: &Request) -> Response {
     route_with_auth(store, req, &AuthConfig::default())
@@ -267,9 +401,137 @@ pub fn route(store: &FileBucketStore, req: &Request) -> Response {
 
 /// Routes with SigV4 verification when `auth.auth_mode == "strict"`.
 pub fn route_with_auth(store: &FileBucketStore, req: &Request, auth: &AuthConfig) -> Response {
-    if let Err(err) = verify_signature(req, auth) {
-        return xml_error(err.status, err.code, err.code);
+    route_with_cors(store, req, auth, None)
+}
+
+/// Routes with SigV4 verification and CORS handling. Browsers never attach
+/// credentials to a preflight, so `OPTIONS` is answered before signature checks.
+pub fn route_with_cors(
+    store: &FileBucketStore,
+    req: &Request,
+    auth: &AuthConfig,
+    default_cors: Option<&CorsRule>,
+) -> Response {
+    if crate::introspect::is_introspect_path(&req.path) {
+        return route_verified(store, req, auth);
     }
+    if req.method == "OPTIONS" {
+        return cors_preflight(store, req, default_cors);
+    }
+    let origin = req.header("origin");
+    if origin.is_empty() {
+        return route_verified(store, req, auth);
+    }
+    // Read before routing: DeleteBucket removes the configuration it is answered under.
+    let rules = cors_rules(store, &req.path, default_cors);
+    let mut response = route_verified(store, req, auth);
+    if !rules.is_empty() {
+        response
+            .headers
+            .insert("Vary".to_string(), CORS_VARY.to_string());
+    }
+    if let Some(rule) = cors::find_rule(&rules, origin, &req.method, &[]) {
+        response
+            .headers
+            .extend(cors::response_headers(rule, origin));
+    }
+    response
+}
+
+const CORS_VARY: &str = "Origin, Access-Control-Request-Headers, Access-Control-Request-Method";
+
+fn cors_rules(
+    store: &FileBucketStore,
+    path: &str,
+    default_cors: Option<&CorsRule>,
+) -> Vec<CorsRule> {
+    let bucket_config = parse_path_style(path)
+        .and_then(|(bucket, _)| store.get_bucket_cors(&bucket).ok().flatten());
+    match bucket_config {
+        Some(config) => config.rules,
+        None => default_cors.cloned().into_iter().collect(),
+    }
+}
+
+fn cors_preflight(
+    store: &FileBucketStore,
+    req: &Request,
+    default_cors: Option<&CorsRule>,
+) -> Response {
+    let origin = req.header("origin");
+    if origin.is_empty() {
+        return xml_error(
+            400,
+            "BadRequest",
+            "Insufficient information. Origin request header needed.",
+        );
+    }
+    let method = req.header("access-control-request-method");
+    if method.is_empty() {
+        return xml_error(
+            400,
+            "BadRequest",
+            "Invalid Access-Control-Request-Method: null",
+        );
+    }
+    let rules = cors_rules(store, &req.path, default_cors);
+    if rules.is_empty() {
+        let bucket_missing = parse_path_style(&req.path)
+            .is_some_and(|(bucket, _)| !matches!(store.get_bucket(&bucket), Ok(Some(_))));
+        return if bucket_missing {
+            xml_error(404, "NoSuchBucket", "bucket does not exist")
+        } else {
+            xml_error(403, "CORSResponse", "CORS is not enabled for this bucket.")
+        };
+    }
+    let requested_headers: Vec<&str> = req
+        .header("access-control-request-headers")
+        .split(',')
+        .map(str::trim)
+        .filter(|h| !h.is_empty())
+        .collect();
+    let Some(rule) = cors::find_rule(&rules, origin, method, &requested_headers) else {
+        return xml_error(
+            403,
+            "CORSResponse",
+            "This CORS request is not allowed. This is usually because the evaluation of \
+             Origin, request method / Access-Control-Request-Method or \
+             Access-Control-Request-Headers are not whitelisted by the resource's CORS spec.",
+        );
+    };
+    let mut response = Response::empty(200);
+    response
+        .headers
+        .extend(cors::response_headers(rule, origin));
+    response
+        .headers
+        .insert("Vary".to_string(), CORS_VARY.to_string());
+    if !requested_headers.is_empty() {
+        response.headers.insert(
+            "Access-Control-Allow-Headers".to_string(),
+            requested_headers.join(", ").to_ascii_lowercase(),
+        );
+    }
+    response
+}
+
+fn route_verified(store: &FileBucketStore, req: &Request, auth: &AuthConfig) -> Response {
+    let chunk_signing = match verify_signature(req, auth) {
+        Ok(chunk_signing) => chunk_signing,
+        Err(err) => return xml_error(err.status, err.code, err.code),
+    };
+    // Decoded in every auth mode: otherwise the chunk framing would be stored as
+    // part of the object.
+    if req.header("x-amz-content-sha256").starts_with("STREAMING-") {
+        return match decode_streaming_request(req, chunk_signing.as_ref()) {
+            Ok(decoded) => dispatch(store, &decoded),
+            Err(err) => xml_error(err.status, err.code, err.code),
+        };
+    }
+    dispatch(store, req)
+}
+
+fn dispatch(store: &FileBucketStore, req: &Request) -> Response {
     if req.path == "/" {
         return handle_service(store, req);
     }
@@ -315,6 +577,9 @@ fn handle_bucket(store: &FileBucketStore, req: &Request, bucket: &str) -> Respon
             }
             if req.query.contains_key("policy") {
                 return put_bucket_policy(store, req, bucket);
+            }
+            if req.query.contains_key("cors") {
+                return put_bucket_cors(store, req, bucket);
             }
             if req.query.contains_key("lifecycle") {
                 return put_bucket_lifecycle(store, req, bucket);
@@ -373,6 +638,9 @@ fn handle_bucket(store: &FileBucketStore, req: &Request, bucket: &str) -> Respon
             if req.query.contains_key("policy") {
                 return get_bucket_policy(store, bucket);
             }
+            if req.query.contains_key("cors") {
+                return get_bucket_cors(store, bucket);
+            }
             if req.query.contains_key("lifecycle") {
                 return get_bucket_lifecycle(store, bucket);
             }
@@ -403,6 +671,9 @@ fn handle_bucket(store: &FileBucketStore, req: &Request, bucket: &str) -> Respon
         "DELETE" => {
             if req.query.contains_key("policy") {
                 return delete_bucket_policy(store, bucket);
+            }
+            if req.query.contains_key("cors") {
+                return delete_bucket_cors(store, bucket);
             }
             if req.query.contains_key("lifecycle") {
                 return delete_bucket_lifecycle(store, bucket);
@@ -708,6 +979,55 @@ fn get_bucket_policy(store: &FileBucketStore, bucket: &str) -> Response {
 fn delete_bucket_policy(store: &FileBucketStore, bucket: &str) -> Response {
     match store.delete_bucket_policy(bucket) {
         Ok(_) => Response::empty(204),
+        Err(StoreError::BucketNotExist) => xml_error(404, "NoSuchBucket", "bucket does not exist"),
+        Err(StoreError::InvalidBucketName) => {
+            xml_error(400, "InvalidBucketName", "invalid bucket name")
+        }
+        Err(_) => xml_error(500, "InternalError", "internal error"),
+    }
+}
+
+fn put_bucket_cors(store: &FileBucketStore, req: &Request, bucket: &str) -> Response {
+    if req.body.len() > MAX_POLICY_BYTES {
+        return xml_error(400, "MalformedXML", "CORS configuration is too large");
+    }
+    let config = match cors::parse_configuration(&req.body) {
+        Ok(config) => config,
+        Err(message) => return xml_error(400, "MalformedXML", message),
+    };
+    match store.put_bucket_cors(bucket, &config) {
+        Ok(()) => Response::empty(200),
+        Err(StoreError::BucketNotExist) => xml_error(404, "NoSuchBucket", "bucket does not exist"),
+        Err(StoreError::InvalidBucketName) => {
+            xml_error(400, "InvalidBucketName", "invalid bucket name")
+        }
+        Err(_) => xml_error(500, "InternalError", "internal error"),
+    }
+}
+
+fn get_bucket_cors(store: &FileBucketStore, bucket: &str) -> Response {
+    match store.get_bucket(bucket) {
+        Ok(Some(_)) => {}
+        Ok(None) => return xml_error(404, "NoSuchBucket", "bucket does not exist"),
+        Err(StoreError::InvalidBucketName) => {
+            return xml_error(400, "InvalidBucketName", "invalid bucket name")
+        }
+        Err(_) => return xml_error(500, "InternalError", "internal error"),
+    }
+    match store.get_bucket_cors(bucket) {
+        Ok(Some(config)) => Response::xml(200, cors::configuration_xml(&config)),
+        Ok(None) => xml_error(
+            404,
+            "NoSuchCORSConfiguration",
+            "the CORS configuration does not exist",
+        ),
+        Err(_) => xml_error(500, "InternalError", "internal error"),
+    }
+}
+
+fn delete_bucket_cors(store: &FileBucketStore, bucket: &str) -> Response {
+    match store.delete_bucket_cors(bucket) {
+        Ok(()) => Response::empty(204),
         Err(StoreError::BucketNotExist) => xml_error(404, "NoSuchBucket", "bucket does not exist"),
         Err(StoreError::InvalidBucketName) => {
             xml_error(400, "InvalidBucketName", "invalid bucket name")
@@ -1903,9 +2223,21 @@ struct SignatureError {
     status: u16,
 }
 
-fn verify_signature(req: &Request, auth: &AuthConfig) -> Result<(), SignatureError> {
+/// What `aws-chunked` verification needs from an already verified seed signature.
+struct ChunkSigning {
+    signing_key: Vec<u8>,
+    amz_date: String,
+    scope: String,
+    seed_signature: String,
+    has_trailer: bool,
+}
+
+fn verify_signature(
+    req: &Request,
+    auth: &AuthConfig,
+) -> Result<Option<ChunkSigning>, SignatureError> {
     if !auth.auth_mode.eq_ignore_ascii_case("strict") {
-        return Ok(());
+        return Ok(None);
     }
     let has_presign = req
         .query
@@ -1920,7 +2252,7 @@ fn verify_signature(req: &Request, auth: &AuthConfig) -> Result<(), SignatureErr
         });
     }
     if has_presign {
-        verify_presigned_url(req, auth)
+        verify_presigned_url(req, auth).map(|()| None)
     } else {
         verify_authorization_header(req, auth)
     }
@@ -1963,24 +2295,18 @@ fn verify_presigned_url(req: &Request, auth: &AuthConfig) -> Result<(), Signatur
             code: "AccessDenied",
             status: 403,
         })?;
-    if parse_sigv4_time(amz_date).is_none() {
+    let signed_at = parse_sigv4_time(amz_date).ok_or(SignatureError {
+        code: "AccessDenied",
+        status: 403,
+    })?;
+    let now = unix_now();
+    if now > signed_at + expires || signed_at > now + SIGV4_MAX_CLOCK_SKEW_SECONDS {
         return Err(SignatureError {
             code: "AccessDenied",
             status: 403,
         });
     }
-    if let Some(signed_at) = parse_sigv4_time(amz_date) {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
-        if now > signed_at + expires {
-            return Err(SignatureError {
-                code: "AccessDenied",
-                status: 403,
-            });
-        }
-    }
+    verify_scope_date(amz_date, date_stamp)?;
     let signed_headers = req
         .query
         .get("X-Amz-SignedHeaders")
@@ -1992,16 +2318,35 @@ fn verify_presigned_url(req: &Request, auth: &AuthConfig) -> Result<(), Signatur
             status: 400,
         });
     }
+    verify_signed_header_coverage(req, signed_headers)?;
+    let payload_hash = match req.header("x-amz-content-sha256") {
+        "" => "UNSIGNED-PAYLOAD",
+        streaming if streaming.starts_with("STREAMING-") => {
+            return Err(SignatureError {
+                code: "NotImplemented",
+                status: 501,
+            })
+        }
+        hash => {
+            verify_payload_hash(req, hash)?;
+            hash
+        }
+    };
     let expected = signature_for_request(
         req,
         auth,
         date_stamp,
         region,
         signed_headers,
-        "UNSIGNED-PAYLOAD",
+        payload_hash,
         "X-Amz-Signature",
     );
-    if req.query.get("X-Amz-Signature").map(String::as_str) != Some(expected.as_str()) {
+    let signature = req
+        .query
+        .get("X-Amz-Signature")
+        .map(String::as_str)
+        .unwrap_or("");
+    if !constant_time_eq(signature.as_bytes(), expected.as_bytes()) {
         return Err(SignatureError {
             code: "SignatureDoesNotMatch",
             status: 403,
@@ -2010,7 +2355,10 @@ fn verify_presigned_url(req: &Request, auth: &AuthConfig) -> Result<(), Signatur
     Ok(())
 }
 
-fn verify_authorization_header(req: &Request, auth: &AuthConfig) -> Result<(), SignatureError> {
+fn verify_authorization_header(
+    req: &Request,
+    auth: &AuthConfig,
+) -> Result<Option<ChunkSigning>, SignatureError> {
     let authorization = req.header("authorization");
     let Some(rest) = authorization.strip_prefix(&format!("{SIGV4_ALGORITHM} ")) else {
         return Err(SignatureError {
@@ -2042,12 +2390,25 @@ fn verify_authorization_header(req: &Request, auth: &AuthConfig) -> Result<(), S
             status: 403,
         });
     }
-    if req.header("x-amz-date").is_empty() {
+    let amz_date = req.header("x-amz-date");
+    if amz_date.is_empty() {
         return Err(SignatureError {
             code: "AuthorizationHeaderMalformed",
             status: 400,
         });
     }
+    let signed_at = parse_sigv4_time(amz_date).ok_or(SignatureError {
+        code: "AccessDenied",
+        status: 403,
+    })?;
+    if (unix_now() - signed_at).abs() > SIGV4_MAX_CLOCK_SKEW_SECONDS {
+        return Err(SignatureError {
+            code: "RequestTimeTooSkewed",
+            status: 403,
+        });
+    }
+    verify_scope_date(amz_date, date_stamp)?;
+    verify_signed_header_coverage(req, signed_headers)?;
     let payload_hash = if req.header("x-amz-content-sha256").is_empty() {
         "UNSIGNED-PAYLOAD".to_string()
     } else {
@@ -2070,7 +2431,152 @@ fn verify_authorization_header(req: &Request, auth: &AuthConfig) -> Result<(), S
             status: 403,
         });
     }
+    if payload_hash != STREAMING_SIGNED && payload_hash != STREAMING_SIGNED_TRAILER {
+        return Ok(None);
+    }
+    Ok(Some(ChunkSigning {
+        signing_key: derive_signing_key(&auth.secret_access_key, date_stamp, region),
+        amz_date: amz_date.to_string(),
+        scope: format!("{date_stamp}/{region}/{SIGV4_SERVICE}/aws4_request"),
+        seed_signature: expected,
+        has_trailer: payload_hash == STREAMING_SIGNED_TRAILER,
+    }))
+}
+
+/// Rebuilds a request with its `aws-chunked` framing removed. With `signing`
+/// present every chunk (and the trailer) must carry a valid signature chained
+/// from the header's seed signature.
+fn decode_streaming_request(
+    req: &Request,
+    signing: Option<&ChunkSigning>,
+) -> Result<Request, SignatureError> {
+    let incomplete = || SignatureError {
+        code: "IncompleteBody",
+        status: 400,
+    };
+    let parsed = aws_chunked::parse(&req.body).ok_or_else(incomplete)?;
+    if let Some(signing) = signing {
+        verify_chunk_signatures(&parsed, signing)?;
+    }
+    let body = parsed.payload();
+    let decoded_length = req.header("x-amz-decoded-content-length");
+    if !decoded_length.is_empty() && decoded_length.parse::<usize>().ok() != Some(body.len()) {
+        return Err(incomplete());
+    }
+    let mut headers = req.headers.clone();
+    let encodings: Vec<&str> = req
+        .header("content-encoding")
+        .split(',')
+        .map(str::trim)
+        .filter(|e| !e.is_empty() && !e.eq_ignore_ascii_case("aws-chunked"))
+        .collect();
+    if encodings.is_empty() {
+        headers.remove("content-encoding");
+    } else {
+        headers.insert("content-encoding".to_string(), encodings.join(", "));
+    }
+    Ok(Request {
+        method: req.method.clone(),
+        path: req.path.clone(),
+        query: req.query.clone(),
+        headers,
+        body,
+    })
+}
+
+fn verify_chunk_signatures(
+    parsed: &aws_chunked::ChunkedBody<'_>,
+    signing: &ChunkSigning,
+) -> Result<(), SignatureError> {
+    let sign = |algorithm: &str, previous: &str, parts: &[&str]| {
+        let mut fields = vec![algorithm, &signing.amz_date, &signing.scope, previous];
+        fields.extend_from_slice(parts);
+        hex::encode(hmac_sha256(
+            &signing.signing_key,
+            fields.join("\n").as_bytes(),
+        ))
+    };
+    let mismatch = || SignatureError {
+        code: "SignatureDoesNotMatch",
+        status: 403,
+    };
+    let empty_hash = sha256_hex(b"");
+    let mut previous = signing.seed_signature.clone();
+    for chunk in &parsed.chunks {
+        let expected = sign(
+            SIGV4_CHUNK_ALGORITHM,
+            &previous,
+            &[&empty_hash, &sha256_hex(chunk.data)],
+        );
+        let actual = chunk.signature.ok_or_else(mismatch)?;
+        if !constant_time_eq(actual.as_bytes(), expected.as_bytes()) {
+            return Err(mismatch());
+        }
+        previous = expected;
+    }
+    if signing.has_trailer {
+        let canonical_trailers: String = parsed
+            .trailers
+            .iter()
+            .map(|(name, value)| format!("{}:{value}\n", name.to_ascii_lowercase()))
+            .collect();
+        let expected = sign(
+            SIGV4_TRAILER_ALGORITHM,
+            &previous,
+            &[&sha256_hex(canonical_trailers.as_bytes())],
+        );
+        let actual = parsed.trailer_signature.ok_or_else(mismatch)?;
+        if !constant_time_eq(actual.as_bytes(), expected.as_bytes()) {
+            return Err(mismatch());
+        }
+    }
     Ok(())
+}
+
+fn unix_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+fn verify_scope_date(amz_date: &str, date_stamp: &str) -> Result<(), SignatureError> {
+    if amz_date.starts_with(date_stamp) && date_stamp.len() == 8 {
+        return Ok(());
+    }
+    Err(SignatureError {
+        code: "AuthorizationHeaderMalformed",
+        status: 400,
+    })
+}
+
+/// `host` and every `x-amz-*` header that changes behaviour must be signed, or a
+/// captured signature could be replayed with different semantics (for example
+/// an added `x-amz-copy-source`). `x-amz-user-agent` is exempt because browser
+/// SDKs send it unsigned and it has no effect on the request;
+/// `x-amz-content-sha256` because its value is signed as the payload hash anyway.
+fn verify_signed_header_coverage(
+    req: &Request,
+    signed_headers: &str,
+) -> Result<(), SignatureError> {
+    let signed_headers = signed_headers.to_ascii_lowercase();
+    let signed: Vec<&str> = signed_headers.split(';').map(str::trim).collect();
+    let covered = signed.contains(&"host")
+        && req
+            .headers
+            .keys()
+            .filter(|name| {
+                name.starts_with("x-amz-")
+                    && !matches!(name.as_str(), "x-amz-user-agent" | "x-amz-content-sha256")
+            })
+            .all(|name| signed.contains(&name.as_str()));
+    if covered {
+        return Ok(());
+    }
+    Err(SignatureError {
+        code: "AccessDenied",
+        status: 403,
+    })
 }
 
 fn valid_credential(auth: &AuthConfig, access_key: &str, region: &str, service: &str) -> bool {
@@ -2088,7 +2594,13 @@ fn valid_credential(auth: &AuthConfig, access_key: &str, region: &str, service: 
 }
 
 fn verify_payload_hash(req: &Request, payload_hash: &str) -> Result<(), SignatureError> {
-    if payload_hash == "UNSIGNED-PAYLOAD" {
+    if matches!(
+        payload_hash,
+        "UNSIGNED-PAYLOAD"
+            | STREAMING_SIGNED
+            | STREAMING_SIGNED_TRAILER
+            | STREAMING_UNSIGNED_TRAILER
+    ) {
         return Ok(());
     }
     if payload_hash.starts_with("STREAMING-") {
@@ -2120,7 +2632,7 @@ fn signature_for_request(
 ) -> String {
     let canonical_request = [
         req.method.clone(),
-        aws_percent_encode(&req.path, "/~"),
+        canonical_uri(&req.path),
         canonical_query_string(&req.query, ignored_query_key),
         canonical_headers(req, signed_headers),
         signed_headers.to_ascii_lowercase(),
@@ -2145,6 +2657,16 @@ fn signature_for_request(
         &derive_signing_key(&auth.secret_access_key, date_stamp, region),
         string_to_sign.as_bytes(),
     ))
+}
+
+/// `req.path` is the raw request target, so each segment is normalized through
+/// a decode/encode round trip rather than encoded a second time.
+fn canonical_uri(raw_path: &str) -> String {
+    raw_path
+        .split('/')
+        .map(|segment| aws_percent_encode(&percent_decode(segment), "~"))
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 fn parse_credential_scope(credential: &str) -> Option<(&str, &str, &str, &str)> {
@@ -2225,7 +2747,7 @@ fn sha256_hex(value: &[u8]) -> String {
     hex::encode(hasher.finalize())
 }
 
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }
@@ -2233,7 +2755,7 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 }
 
 fn parse_sigv4_time(value: &str) -> Option<i64> {
-    if value.len() != 16 || !value.ends_with('Z') {
+    if value.len() != 16 || !value.is_ascii() || !value.ends_with('Z') {
         return None;
     }
     let year = value[0..4].parse::<i32>().ok()?;
@@ -2806,7 +3328,7 @@ fn tag_text(body: &[u8], tag: &str) -> Option<String> {
     tag_text_in(xml, tag)
 }
 
-fn tag_text_in(xml: &str, tag: &str) -> Option<String> {
+pub(crate) fn tag_text_in(xml: &str, tag: &str) -> Option<String> {
     let open = format!("<{tag}>");
     let close = format!("</{tag}>");
     let start = xml.find(&open)? + open.len();
@@ -3525,7 +4047,7 @@ fn parse_target(target: &str) -> (String, BTreeMap<String, String>) {
     (path.to_string(), values)
 }
 
-fn percent_decode(value: &str) -> String {
+pub(crate) fn percent_decode(value: &str) -> String {
     let bytes = value.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
@@ -3654,7 +4176,10 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
-async fn write_response(stream: &mut TcpStream, response: Response) -> std::io::Result<()> {
+pub(crate) async fn write_response(
+    stream: &mut TcpStream,
+    response: Response,
+) -> std::io::Result<()> {
     let mut headers = response.headers;
     headers.insert("Server".to_string(), "AmazonS3".to_string());
     // A 304 carries no body, so it must not advertise a zero Content-Length
@@ -3707,4 +4232,124 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         return None;
     }
     haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Feeds `wire` through an in-memory stream in small pieces, so reads split
+    /// across chunk boundaries are exercised.
+    async fn parse_wire(wire: &[u8]) -> Option<Request> {
+        let (mut client, mut server) = tokio::io::duplex(16);
+        let wire = wire.to_vec();
+        tokio::spawn(async move {
+            let _ = client.write_all(&wire).await;
+        });
+        read_request(&mut server).await.unwrap()
+    }
+
+    fn wire(headers: &str, body: &str) -> Vec<u8> {
+        format!("PUT /data/k HTTP/1.1\r\nHost: h\r\n{headers}\r\n{body}").into_bytes()
+    }
+
+    #[tokio::test]
+    async fn repeated_content_length_must_agree() {
+        let same = parse_wire(&wire("Content-Length: 5\r\nContent-Length: 5\r\n", "hello")).await;
+        assert_eq!(same.unwrap().body, b"hello");
+        for headers in [
+            "Content-Length: 5\r\nContent-Length: 4\r\n",
+            "Content-Length: abc\r\n",
+            "Content-Length: 5,\r\n",
+        ] {
+            assert!(
+                parse_wire(&wire(headers, "hello")).await.is_none(),
+                "{headers}"
+            );
+        }
+        assert_eq!(parse_wire(&wire("", "")).await.unwrap().body, b"");
+    }
+
+    #[tokio::test]
+    async fn http_chunked_bodies_are_decoded() {
+        let te = "Transfer-Encoding: chunked\r\n";
+        let long = "x".repeat(70000);
+        let body = format!(
+            "5;ext=1\r\nhello\r\n{:x}\r\n{long}\r\n0\r\nTrailer: a\r\n\r\n",
+            long.len()
+        );
+        let parsed = parse_wire(&wire(te, &body)).await.unwrap();
+        assert_eq!(parsed.body, format!("hello{long}").into_bytes());
+        for bad in [
+            "5\r\nhello\r\n",
+            "5\r\nhelloXX0\r\n\r\n",
+            "zz\r\nx\r\n0\r\n\r\n",
+            "ffffffffffffffff\r\nx",
+            "0\r\n",
+        ] {
+            assert!(parse_wire(&wire(te, bad)).await.is_none(), "{bad}");
+        }
+    }
+
+    #[tokio::test]
+    async fn aws_chunked_payload_inside_http_chunked_reaches_the_object() {
+        let framed = "b\r\nhello world\r\n0\r\nx-amz-checksum-crc32:AAAA\r\n\r\n";
+        let body = format!("{:x}\r\n{framed}\r\n0\r\n\r\n", framed.len());
+        let headers = "Transfer-Encoding: chunked\r\nContent-Encoding: aws-chunked\r\n\
+                       x-amz-content-sha256: STREAMING-UNSIGNED-PAYLOAD-TRAILER\r\n";
+        let request = parse_wire(&wire(headers, &body)).await.unwrap();
+
+        let root = std::env::temp_dir().join(format!("devcloud-s3-te-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let store = FileBucketStore::new(&root);
+        assert_eq!(
+            route(&store, &Request::new("PUT", "/data", Vec::new())).status,
+            200
+        );
+        assert_eq!(route(&store, &request).status, 200);
+        let got = route(&store, &Request::new("GET", "/data/k", Vec::new()));
+        assert_eq!(got.body, b"hello world");
+    }
+
+    /// The worked example in AWS's "Signature Calculations for the Authorization
+    /// Header: Transferring Payload in Multiple Chunks" documentation.
+    #[test]
+    fn chunk_signatures_match_the_aws_documented_example() {
+        let date_stamp = "20130524";
+        let signing = ChunkSigning {
+            signing_key: derive_signing_key(
+                "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+                date_stamp,
+                "us-east-1",
+            ),
+            amz_date: "20130524T000000Z".to_string(),
+            scope: format!("{date_stamp}/us-east-1/s3/aws4_request"),
+            seed_signature: "4f232c4386841ef735655705268965c44a0e4690baa4adea153f7db9fa80a0a9"
+                .to_string(),
+            has_trailer: false,
+        };
+        let mut body = Vec::new();
+        for (size, signature) in [
+            (
+                65536,
+                "ad80c730a21e5b8d04586a2213dd63b9a0e99e0e2307b0ade35a65485a288648",
+            ),
+            (
+                1024,
+                "0055627c9e194cb4542bae2aa5492e3c1575bbb81b612b7d234b86a503ef5497",
+            ),
+            (
+                0,
+                "b6c6ea8a5354eaf15b3cb7646744f4275b71ea724fed81ceb9323e279d449df9",
+            ),
+        ] {
+            body.extend(format!("{size:x};chunk-signature={signature}\r\n").into_bytes());
+            body.extend(vec![b'a'; size]);
+            body.extend_from_slice(b"\r\n");
+        }
+        let parsed = aws_chunked::parse(&body).unwrap();
+        assert_eq!(parsed.payload().len(), 66560);
+        assert!(verify_chunk_signatures(&parsed, &signing).is_ok());
+    }
 }
