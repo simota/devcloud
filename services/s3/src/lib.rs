@@ -24,7 +24,10 @@ pub(crate) fn event_sink() -> Option<&'static UnboundedSender<String>> {
     EVENT_SINK.get()
 }
 
+pub mod aws_chunked;
 pub mod base64;
+pub mod console;
+pub mod cors;
 pub mod csv;
 pub mod hashes;
 pub mod http;

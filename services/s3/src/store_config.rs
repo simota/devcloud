@@ -2,6 +2,7 @@
 //! lifecycle (including expiration application), ACL, and policy. Notification,
 //! inventory, analytics, and replication land in a later part.
 
+use crate::cors::CorsConfiguration;
 use crate::model::{
     AnalyticsConfiguration, LifecycleConfiguration, NotificationConfiguration,
     NotificationEventRecord, Object, ObjectLockConfiguration, ReplicationConfiguration,
@@ -211,6 +212,37 @@ impl FileBucketStore {
         self.get_bucket(bucket)?.ok_or(StoreError::BucketNotExist)?;
         remove_if_exists(&self.bucket_path(bucket).join("policy.json"))?;
         Ok(true)
+    }
+
+    // --- CORS ---------------------------------------------------------------
+
+    /// Stores the bucket CORS configuration. Errors if the bucket is absent.
+    pub fn put_bucket_cors(&self, bucket: &str, config: &CorsConfiguration) -> Result<()> {
+        self.get_bucket(bucket)?.ok_or(StoreError::BucketNotExist)?;
+        let data = serde_json::to_vec(config).map_err(io::Error::other)?;
+        std::fs::write(self.bucket_path(bucket).join("cors.json"), data)?;
+        Ok(())
+    }
+
+    /// Reads the bucket CORS configuration; `None` if none is set.
+    pub fn get_bucket_cors(&self, bucket: &str) -> Result<Option<CorsConfiguration>> {
+        if self.get_bucket(bucket)?.is_none() {
+            return Ok(None);
+        }
+        match std::fs::read(self.bucket_path(bucket).join("cors.json")) {
+            Ok(data) => Ok(Some(
+                serde_json::from_slice(&data).map_err(io::Error::other)?,
+            )),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(StoreError::Io(e)),
+        }
+    }
+
+    /// Removes the bucket CORS configuration. Errors if the bucket is absent.
+    pub fn delete_bucket_cors(&self, bucket: &str) -> Result<()> {
+        self.get_bucket(bucket)?.ok_or(StoreError::BucketNotExist)?;
+        remove_if_exists(&self.bucket_path(bucket).join("cors.json"))?;
+        Ok(())
     }
 
     // --- ACL ----------------------------------------------------------------

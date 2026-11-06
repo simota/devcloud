@@ -69,11 +69,18 @@ fn strict_auth() -> AuthConfig {
 }
 
 fn signed_req(method: &str, target: &str, body: &[u8]) -> Request {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let timestamp = devcloud_s3::time_fmt::rfc3339_seconds_from_unix(now);
+    let amz_date = timestamp.replace(['-', ':'], "");
+    let date_stamp = &amz_date[..8];
     let mut req = Request::new(method, target, body.to_vec());
     req.headers
         .insert("host".to_string(), "example.com".to_string());
     req.headers
-        .insert("x-amz-date".to_string(), "20260430T120000Z".to_string());
+        .insert("x-amz-date".to_string(), amz_date.clone());
     let body_hash = sha256_hex(body);
     req.headers
         .insert("x-amz-content-sha256".to_string(), body_hash.clone());
@@ -82,23 +89,21 @@ fn signed_req(method: &str, target: &str, body: &[u8]) -> Request {
         method.to_string(),
         target.to_string(),
         String::new(),
-        format!(
-            "host:example.com\nx-amz-content-sha256:{body_hash}\nx-amz-date:20260430T120000Z\n"
-        ),
+        format!("host:example.com\nx-amz-content-sha256:{body_hash}\nx-amz-date:{amz_date}\n"),
         signed_headers.to_string(),
         body_hash,
     ]
     .join("\n");
-    let scope = "20260430/us-east-1/s3/aws4_request";
+    let scope = format!("{date_stamp}/us-east-1/s3/aws4_request");
     let string_to_sign = [
         "AWS4-HMAC-SHA256".to_string(),
-        "20260430T120000Z".to_string(),
-        scope.to_string(),
+        amz_date.clone(),
+        scope.clone(),
         sha256_hex(canonical_request.as_bytes()),
     ]
     .join("\n");
     let signature = hex::encode(hmac_sha256(
-        &test_signing_key("dev", "20260430", "us-east-1"),
+        &test_signing_key("dev", date_stamp, "us-east-1"),
         string_to_sign.as_bytes(),
     ));
     req.headers.insert(

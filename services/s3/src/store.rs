@@ -24,6 +24,7 @@ const SIDECAR_FILES: &[&str] = &[
     "bucket.json",
     "versioning.json",
     "policy.json",
+    "cors.json",
     "acl.json",
     "lifecycle.json",
     "notification.json",
