@@ -157,13 +157,56 @@ fn build(c: &Config) -> Vec<DashboardService> {
             description:
                 "Inspect local Application Auto Scaling targets, policies, and scheduled actions.",
         },
+        DashboardService {
+            id: "ssm",
+            name: "SSM Parameter Store",
+            path: "/dashboard/ssm",
+            status: status(!c.ssm_base.is_empty()),
+            endpoint: c.ssm_endpoint.clone(),
+            storage_path: c.ssm_storage_path.clone(),
+            description:
+                "Inspect local SSM parameter names, types, and versions (values stay hidden).",
+        },
+        DashboardService {
+            id: "sts",
+            name: "STS",
+            path: "/dashboard/sts",
+            status: status(!c.sts_base.is_empty()),
+            endpoint: c.sts_endpoint.clone(),
+            storage_path: String::new(),
+            description:
+                "Check the local STS endpoint that issues temporary credentials for AssumeRole.",
+        },
+        DashboardService {
+            id: "lambda",
+            name: "Lambda",
+            path: "/dashboard/lambda",
+            status: status(!c.lambda_base.is_empty()),
+            endpoint: c.lambda_endpoint.clone(),
+            storage_path: c.lambda_storage_path.clone(),
+            description:
+                "Inspect local Lambda functions, invoke them, and read recent invocation logs.",
+        },
+        DashboardService {
+            id: "cloudrun",
+            name: "Cloud Run",
+            path: "/dashboard/cloudrun",
+            status: status(!c.cloudrun_base.is_empty()),
+            endpoint: c.cloudrun_endpoint.clone(),
+            storage_path: c.cloudrun_storage_path.clone(),
+            description:
+                "Inspect local Cloud Run services, revisions, running instances, and logs.",
+        },
     ]
 }
 
 impl Config {
-    /// The SQS registry endpoint mirrors the legacy default of the SQS HTTP base.
-    fn sqs_endpoint_display(&self) -> String {
-        if self.sqs_base.is_empty() {
+    /// Preserve configured display metadata independently of the enabled base,
+    /// while retaining the legacy base/default fallback for standalone callers.
+    pub(crate) fn sqs_endpoint_display(&self) -> String {
+        if !self.sqs_endpoint.is_empty() {
+            self.sqs_endpoint.clone()
+        } else if self.sqs_base.is_empty() {
             "http://127.0.0.1:19324".to_string()
         } else {
             self.sqs_base.clone()
@@ -187,7 +230,7 @@ mod tests {
     }
 
     #[test]
-    fn registry_lists_ten_services_in_order() {
+    fn registry_lists_services_in_order() {
         let cfg = Config::default();
         let resp = handle(&cfg, &req());
         assert_eq!(resp.status, 200);
@@ -206,7 +249,11 @@ mod tests {
                 "redis",
                 "sqs",
                 "pubsub",
-                "applicationautoscaling"
+                "applicationautoscaling",
+                "ssm",
+                "sts",
+                "lambda",
+                "cloudrun"
             ]
         );
     }
@@ -231,7 +278,7 @@ mod tests {
     #[test]
     fn sqs_running_when_base_configured() {
         let mut cfg = Config::default();
-        cfg.sqs_base = "http://127.0.0.1:19324".to_string();
+        cfg.sqs_base = "http://127.0.0.1:29324".to_string();
         let resp = handle(&cfg, &req());
         let v: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
         let sqs = v["services"]
@@ -241,6 +288,7 @@ mod tests {
             .find(|s| s["id"] == "sqs")
             .unwrap();
         assert_eq!(sqs["status"], "running");
+        assert_eq!(sqs["endpoint"], "http://127.0.0.1:29324");
     }
 
     #[test]
@@ -255,6 +303,7 @@ mod tests {
             .find(|s| s["id"] == "sqs")
             .unwrap();
         assert_eq!(sqs["status"], "disabled");
+        assert_eq!(sqs["endpoint"], "http://127.0.0.1:19324");
     }
 
     #[test]

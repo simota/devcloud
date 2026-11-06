@@ -3,6 +3,7 @@ import { EmptyState } from '../../../ui/EmptyState'
 import { Panel } from '../../../ui/Panel'
 import { Button } from '../../../ui/Button'
 import { useDashboardEvents } from '../../api/hooks/useDashboardEvents'
+import { useLatestRequest } from '../../api/hooks/useLatestRequest'
 import type { DashboardService } from '../dashboard/types'
 import {
   createDynamoDBTable,
@@ -104,7 +105,9 @@ export function DynamoDBDashboard({ service }: DynamoDBDashboardProps): JSX.Elem
     writeRecentDynamoDBOperations(recentOperations)
   }, [recentOperations])
 
+  const startRefreshTables = useLatestRequest()
   const refreshTables = useCallback(() => {
+    const isCurrent = startRefreshTables()
     if (isDisabled) {
       setTablesState({ status: 'success', statusPayload: disabledStatus(service), tables: [] })
       setItemsState({ status: 'idle' })
@@ -116,26 +119,30 @@ export function DynamoDBDashboard({ service }: DynamoDBDashboardProps): JSX.Elem
     setTablesState({ status: 'loading' })
     Promise.all([getDynamoDBStatus(), listDynamoDBTables()])
       .then(([statusPayload, { tables }]) => {
+        if (!isCurrent()) return
         setTablesState({ status: 'success', statusPayload, tables })
         setActiveTableName((current) =>
           current && tables.some((table) => table.tableName === current) ? current : tables[0]?.tableName,
         )
       })
       .catch((error: Error) => {
+        if (!isCurrent()) return
         setTablesState({ status: 'error', message: error.message })
       })
-  }, [isDisabled, service])
+  }, [startRefreshTables, isDisabled, service])
 
   useEffect(() => {
     refreshTables()
   }, [refreshTables])
 
-  useDashboardEvents({ topics: ['dynamodb'], onEvent: refreshTables, enabled: !isDisabled })
+  useDashboardEvents({ topics: ['dynamodb'], onEvent: refreshTables, onResync: refreshTables, enabled: !isDisabled })
 
   const tables = tablesState.status === 'success' ? tablesState.tables : []
   const activeTable = tables.find((table) => table.tableName === activeTableName)
 
+  const startRefreshItems = useLatestRequest()
   const refreshItems = useCallback(() => {
+    const isCurrent = startRefreshItems()
     if (!activeTableName || isDisabled) {
       setItemsState({ status: 'idle' })
       return
@@ -143,19 +150,23 @@ export function DynamoDBDashboard({ service }: DynamoDBDashboardProps): JSX.Elem
     setItemsState({ status: 'loading' })
     listDynamoDBItems(activeTableName, normalizedItemLimit(itemLimit))
       .then(({ items }) => {
+        if (!isCurrent()) return
         setActiveItemIndex(0)
         setItemsState({ status: 'success', items })
       })
       .catch((error: Error) => {
+        if (!isCurrent()) return
         setItemsState({ status: 'error', message: error.message })
       })
-  }, [activeTableName, isDisabled, itemLimit])
+  }, [startRefreshItems, activeTableName, isDisabled, itemLimit])
 
   useEffect(() => {
     refreshItems()
   }, [refreshItems])
 
+  const startRefreshTableDetail = useLatestRequest()
   const refreshTableDetail = useCallback(() => {
+    const isCurrent = startRefreshTableDetail()
     if (!activeTableName || isDisabled) {
       setTableDetailState({ status: 'idle' })
       return
@@ -168,6 +179,7 @@ export function DynamoDBDashboard({ service }: DynamoDBDashboardProps): JSX.Elem
       getDynamoDBStreams(activeTableName),
     ])
       .then(([table, indexes, ttl, streams]) => {
+        if (!isCurrent()) return
         setTableDetailState({
           status: 'success',
           table: table.table,
@@ -178,9 +190,10 @@ export function DynamoDBDashboard({ service }: DynamoDBDashboardProps): JSX.Elem
         })
       })
       .catch((error: Error) => {
+        if (!isCurrent()) return
         setTableDetailState({ status: 'error', message: error.message })
       })
-  }, [activeTableName, isDisabled])
+  }, [startRefreshTableDetail, activeTableName, isDisabled])
 
   useEffect(() => {
     refreshTableDetail()

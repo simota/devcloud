@@ -30,6 +30,7 @@ pub(crate) fn event_sink() -> Option<&'static UnboundedSender<String>> {
 }
 
 pub mod blob;
+mod browser_guard;
 pub mod http;
 pub mod model;
 pub mod parser;

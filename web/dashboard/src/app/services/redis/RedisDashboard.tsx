@@ -5,6 +5,7 @@ import { dangerConfirm, useConfirm } from '../../../ui/Confirm'
 import { EmptyState } from '../../../ui/EmptyState'
 import { Panel } from '../../../ui/Panel'
 import { useDashboardEvents } from '../../api/hooks/useDashboardEvents'
+import { useLatestRequest } from '../../api/hooks/useLatestRequest'
 import type { DashboardService } from '../dashboard/types'
 import {
   deleteRedisKey,
@@ -40,7 +41,9 @@ export function RedisDashboard({ service }: RedisDashboardProps): JSX.Element {
   const [message, setMessage] = useState<RedisMessage>()
   const isDisabled = service?.status === 'disabled'
 
+  const startRefresh = useLatestRequest()
   const refresh = useCallback(() => {
+    const isCurrent = startRefresh()
     if (isDisabled) {
       setState({ status: 'success', statusPayload: disabledStatus(service), keys: [], nextCursor: 0 })
       setActiveKey(undefined)
@@ -50,6 +53,7 @@ export function RedisDashboard({ service }: RedisDashboardProps): JSX.Element {
     setState({ status: 'loading' })
     Promise.all([getRedisStatus(), listRedisKeys(0, match)])
       .then(([statusPayload, keysPayload]) => {
+        if (!isCurrent()) return
         setState({
           status: 'success',
           statusPayload,
@@ -60,8 +64,11 @@ export function RedisDashboard({ service }: RedisDashboardProps): JSX.Element {
           current && keysPayload.keys.some((key) => key.key === current) ? current : keysPayload.keys[0]?.key,
         )
       })
-      .catch((error: Error) => setState({ status: 'error', message: error.message }))
-  }, [isDisabled, match, service])
+      .catch((error: Error) => {
+        if (!isCurrent()) return
+        setState({ status: 'error', message: error.message })
+      })
+  }, [startRefresh, isDisabled, match, service])
 
   const loadMore = useCallback(() => {
     if (state.status !== 'success' || state.nextCursor === 0 || isDisabled) {
@@ -87,7 +94,7 @@ export function RedisDashboard({ service }: RedisDashboardProps): JSX.Element {
     refresh()
   }, [refresh])
 
-  useDashboardEvents({ topics: ['redis'], onEvent: refresh, enabled: !isDisabled })
+  useDashboardEvents({ topics: ['redis'], onEvent: refresh, onResync: refresh, enabled: !isDisabled })
 
   useEffect(() => {
     if (!activeKey || isDisabled) {

@@ -38,6 +38,70 @@ pub fn addresses(value: &str) -> Vec<Address> {
     out
 }
 
+/// Splits the raw header into addresses first, then decodes each display
+/// name: an encoded `Doe, John` must not split into two recipients.
+fn decoded_addresses(raw: &str, warnings: &mut Vec<String>) -> Vec<Address> {
+    addresses(raw)
+        .into_iter()
+        .map(|mut a| {
+            a.name = mime::decode_words(&a.name, warnings);
+            a
+        })
+        .collect()
+}
+
+/// The body text to preview and search: the text part, or for HTML-only
+/// mail a tag-stripped copy of the HTML.
+pub fn body_text(parsed: &mime::ParsedMail) -> std::borrow::Cow<'_, str> {
+    if !parsed.text.trim().is_empty() {
+        return std::borrow::Cow::Borrowed(&parsed.text);
+    }
+    let Some(html) = parsed.html.as_deref() else {
+        return std::borrow::Cow::Borrowed(&parsed.text);
+    };
+    std::borrow::Cow::Owned(strip_tags(html))
+}
+
+/// Crude HTML-to-text: drops tags, comments and script/style contents, and
+/// decodes the common entities. Only for previews and search.
+fn strip_tags(html: &str) -> String {
+    let mut out = String::with_capacity(html.len() / 2);
+    let lower = html.to_ascii_lowercase();
+    let mut i = 0;
+    while i < html.len() {
+        let rest = &lower[i..];
+        if rest.starts_with("<!--") {
+            i += rest.find("-->").map_or(rest.len(), |e| e + 3);
+            continue;
+        }
+        if rest.starts_with("<script") || rest.starts_with("<style") {
+            let close = if rest.starts_with("<script") {
+                "</script"
+            } else {
+                "</style"
+            };
+            i += rest.find(close).unwrap_or(rest.len());
+            i += lower[i..].find('>').map_or(lower.len() - i, |e| e + 1);
+            out.push(' ');
+            continue;
+        }
+        if rest.starts_with('<') {
+            i += rest.find('>').map_or(rest.len(), |e| e + 1);
+            out.push(' ');
+            continue;
+        }
+        let next = rest.find('<').unwrap_or(rest.len());
+        out.push_str(&html[i..i + next]);
+        i += next;
+    }
+    out.replace("&nbsp;", " ")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&amp;", "&")
+}
+
 fn address(value: &str) -> Address {
     let name = value
         .split_once('<')
@@ -94,19 +158,23 @@ pub fn detail(message: &Message, raw: &[u8], parsed: &mut mime::ParsedMail) -> D
         .iter()
         .map(|(k, v)| (k.clone(), mime::decode_words(v, &mut parsed.warnings)))
         .collect();
-    let from = addresses(mime::header(&headers, "From"))
+    let raw_from = mime::header(&parsed.headers, "From").to_string();
+    let raw_to = mime::header(&parsed.headers, "To").to_string();
+    let raw_cc = mime::header(&parsed.headers, "Cc").to_string();
+    let from = decoded_addresses(&raw_from, &mut parsed.warnings)
         .into_iter()
         .next()
         .unwrap_or_else(|| address(&message.from));
-    let mut to = addresses(mime::header(&headers, "To"));
+    let mut to = decoded_addresses(&raw_to, &mut parsed.warnings);
     if to.is_empty() {
         to = message.to.iter().map(|s| address(s)).collect();
     }
+    let cc = decoded_addresses(&raw_cc, &mut parsed.warnings);
     Detail {
         id: message.id.clone(),
         from,
         to,
-        cc: addresses(mime::header(&headers, "Cc")),
+        cc,
         subject: mime::header(&headers, "Subject").to_string(),
         date: mime::header(&headers, "Date").to_string(),
         received_at: message.received_at.clone().unwrap_or_default(),
@@ -134,18 +202,18 @@ pub fn summary(message: &Message, raw: &[u8], parsed: &mut mime::ParsedMail) -> 
         mime::header(&parsed.headers, "Subject"),
         &mut parsed.warnings,
     );
-    let from = mime::decode_words(mime::header(&parsed.headers, "From"), &mut parsed.warnings);
-    let to = mime::decode_words(mime::header(&parsed.headers, "To"), &mut parsed.warnings);
-    let from = addresses(&from)
+    let raw_from = mime::header(&parsed.headers, "From").to_string();
+    let raw_to = mime::header(&parsed.headers, "To").to_string();
+    let from = decoded_addresses(&raw_from, &mut parsed.warnings)
         .into_iter()
         .next()
         .unwrap_or_else(|| address(&message.from));
-    let mut to = addresses(&to);
+    let mut to = decoded_addresses(&raw_to, &mut parsed.warnings);
     if to.is_empty() {
         to = message.to.iter().map(|s| address(s)).collect();
     }
     let mut snippet = String::new();
-    for word in parsed.text.split_whitespace() {
+    for word in body_text(parsed).split_whitespace() {
         if !snippet.is_empty() {
             snippet.push(' ');
         }

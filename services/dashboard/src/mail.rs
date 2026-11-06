@@ -17,7 +17,7 @@
 //! `/api/messages` shapes stay identical.
 
 use crate::config::Config;
-use crate::forward::{forward, ForwardError, ForwardRequest, ForwardResponse};
+use crate::forward::{basic_auth_headers, forward, ForwardError, ForwardRequest, ForwardResponse};
 use crate::http::{path_segment_decode, Request, Response};
 
 /// `/api/messages` — GET lists (limit=100), DELETE clears all.
@@ -86,7 +86,11 @@ async fn introspect(config: &Config, path: &str) -> Result<ForwardResponse, Forw
         base: &config.mail_base,
         method: "GET",
         path,
-        headers: Vec::new(),
+        headers: basic_auth_headers(
+            &config.mail_auth_mode,
+            &config.mail_username,
+            &config.mail_password,
+        ),
         body: Vec::new(),
     })
     .await
@@ -102,7 +106,11 @@ async fn control(
         base: &config.mail_base,
         method,
         path,
-        headers: Vec::new(),
+        headers: basic_auth_headers(
+            &config.mail_auth_mode,
+            &config.mail_username,
+            &config.mail_password,
+        ),
         body,
     })
     .await

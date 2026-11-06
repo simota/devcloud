@@ -428,7 +428,7 @@ fn ui_list(app: &App, req: &Request) -> Response {
         let mut parsed = parsed(&message, &raw);
         let summary = ui_api::summary(&message, &raw, &mut parsed);
         if !query.is_empty() {
-            if !ui_api::matches(&summary, &parsed.text, query) {
+            if !ui_api::matches(&summary, &ui_api::body_text(&parsed), query) {
                 continue;
             }
             let position = total;

@@ -10,6 +10,7 @@
 use std::collections::HashMap;
 use std::io::Write;
 
+use crate::backend::SqlSession;
 use crate::engine::QueryResult;
 use crate::errors::SqlError;
 use crate::pgwire_codec::{
@@ -23,6 +24,9 @@ pub struct ExtendedQuerySession {
     statements: HashMap<String, ExtendedPreparedStatement>,
     portals: HashMap<String, ExtendedPortal>,
     pub failed: bool,
+    /// The client's own backend connection, when the backend keeps one per
+    /// client (see `SqlBackend::session`).
+    pub backend_session: Option<Box<dyn SqlSession>>,
 }
 
 /// Mirrors `extendedPreparedStatement`.
@@ -62,6 +66,7 @@ impl ExtendedQuerySession {
             statements: HashMap::new(),
             portals: HashMap::new(),
             failed: false,
+            backend_session: None,
         }
     }
 
@@ -253,7 +258,7 @@ impl ExtendedQuerySession {
                 .unwrap_or_default();
             let _ = write_parameter_description(w, &parameter_oids);
         }
-        match server.describe_extended_query(&statement) {
+        match server.describe_extended_query(&mut self.backend_session, &statement) {
             Some(result) if !result.fields.is_empty() => {
                 let _ = write_row_description(w, &result.fields);
             }
@@ -290,7 +295,7 @@ impl ExtendedQuerySession {
             .map(|prepared| prepared.statement.clone())
             .unwrap_or_default();
         if !portal.executed {
-            match server.execute_sql(&portal.executable_statement) {
+            match server.execute_sql_in(&mut self.backend_session, &portal.executable_statement) {
                 Ok(result) => {
                     server.record_sql_history(&prepared_statement, &result, None);
                     portal.result = result;
@@ -438,12 +443,16 @@ fn sql_literal_for_extended_bind(parameter: &ExtendedBindParameter) -> String {
 impl Server {
     /// Mirrors `describeExtendedQuery`: SELECT statements are dry-run through
     /// the engine to obtain a row description (rows discarded).
-    pub(crate) fn describe_extended_query(&self, statement: &str) -> Option<QueryResult> {
+    pub(crate) fn describe_extended_query(
+        &self,
+        session: &mut Option<Box<dyn SqlSession>>,
+        statement: &str,
+    ) -> Option<QueryResult> {
         let normalized = statement.trim_end_matches(';').trim();
         if !normalized.to_lowercase().starts_with("select ") {
             return None;
         }
-        let mut result = self.execute_sql(normalized).ok()?;
+        let mut result = self.execute_sql_in(session, normalized).ok()?;
         result.rows = Vec::new();
         Some(result)
     }

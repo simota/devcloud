@@ -2,7 +2,7 @@
 
 Local cloud service emulator for development and E2E inspection.
 
-`devcloud` runs a local dashboard plus compatible development endpoints for Mail, S3, GCS, DynamoDB, BigQuery, SQS, Google Cloud Pub/Sub, Redshift, and Redis. It is designed for deterministic local tests and manual inspection, not for production workloads or full cloud-provider parity.
+`devcloud` runs a local dashboard plus compatible development endpoints for Mail, S3, GCS, DynamoDB, BigQuery, SQS, Google Cloud Pub/Sub, Redshift, Redis, Application Auto Scaling, SSM Parameter Store, STS, AWS Lambda, and Cloud Run. It is designed for deterministic local tests and manual inspection, not for production workloads or full cloud-provider parity.
 
 ## Quick Start
 
@@ -36,6 +36,10 @@ Default local endpoints:
 | Redshift API | `http://127.0.0.1:19099` | `http://127.0.0.1:18025/dashboard/redshift` |
 | Redis | `redis://127.0.0.1:16379` | `http://127.0.0.1:18025/dashboard/redis` |
 | Application Auto Scaling | `http://127.0.0.1:18030` | `http://127.0.0.1:18025/dashboard/applicationautoscaling` |
+| SSM Parameter Store | `http://127.0.0.1:18031` | `http://127.0.0.1:18025/dashboard/ssm` |
+| STS | `http://127.0.0.1:18032` | `http://127.0.0.1:18025/dashboard/sts` |
+| Lambda | `http://127.0.0.1:19010` | `http://127.0.0.1:18025/dashboard/lambda` |
+| Cloud Run | `http://127.0.0.1:18095` (services: `http://<svc>.<region>.<project>.run.localhost:18095`) | `http://127.0.0.1:18025/dashboard/cloudrun` |
 
 Useful commands:
 
@@ -96,6 +100,10 @@ server:
   redisPort: 16379
   redisHttpPort: 16380
   appAutoScalingPort: 18030
+  ssmPort: 18031
+  stsPort: 18032
+  lambdaPort: 19010
+  cloudRunPort: 18095
 
 auth:
   smtp:
@@ -141,6 +149,24 @@ auth:
     accessKeyId: dev
     secretAccessKey: dev
     accountId: "000000000000"
+  ssm:
+    mode: relaxed
+    accessKeyId: dev
+    secretAccessKey: dev
+    accountId: "000000000000"
+  sts:
+    mode: relaxed
+    accessKeyId: dev
+    secretAccessKey: dev
+    accountId: "000000000000"
+  lambda:
+    mode: relaxed
+    accessKeyId: dev
+    secretAccessKey: dev
+    accountId: "000000000000"
+  cloudRun:
+    mode: relaxed
+    bearerToken: dev
 
 storage:
   path: .devcloud/data
@@ -240,6 +266,20 @@ services:
   appAutoScaling:
     enabled: true
     region: us-east-1
+  ssm:
+    enabled: true
+    region: us-east-1
+  sts:
+    enabled: true
+    region: us-east-1
+  lambda:
+    enabled: true
+    region: us-east-1
+  cloudRun:
+    enabled: true
+    project: devcloud
+    region: us-central1
+    docker: false
 ```
 
 ## Support Matrix
@@ -254,29 +294,31 @@ Legend:
 
 ### Service Availability
 
-| Capability | Mail | S3 | GCS | DynamoDB | BigQuery | SQS | Pub/Sub | Redshift | Redis | App Auto Scaling |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Local endpoint | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
-| Dashboard view | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
-| Dashboard mutation actions | Partial | Partial | Partial | Partial | Partial | Partial | Yes | Yes | Partial | No |
-| Persistent local storage | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
-| Configurable port | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
-| Enable/disable via config | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
-| Local relaxed auth mode | N/A | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
-| Strict cloud-grade auth/IAM | No | Partial | No | Partial | No | Partial | No | Partial | Partial | Partial |
+| Capability | Mail | S3 | GCS | DynamoDB | BigQuery | SQS | Pub/Sub | Redshift | Redis | App Auto Scaling | Lambda | Cloud Run |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Local endpoint | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
+| Dashboard view | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
+| Dashboard mutation actions | Partial | Partial | Partial | Partial | Partial | Partial | Yes | Yes | Partial | No | Partial | No |
+| Persistent local storage | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
+| Configurable port | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
+| Enable/disable via config | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
+| Local relaxed auth mode | N/A | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
+| Strict cloud-grade auth/IAM | No | Partial | No | Partial | No | Partial | No | Partial | Partial | Partial | Partial | Partial |
 
 ### Mail
 
 | Feature | Status | Notes |
 | --- | --- | --- |
-| SMTP receive | Yes | Supports local inbound SMTP for development. |
+| SMTP receive | Yes | Supports local inbound SMTP for development. A line may be up to 1 MiB, a message may have up to 1000 recipients, and each line must arrive within 5 minutes. Once a client has sent CRLF, only `<CRLF>.<CRLF>` ends DATA (a bare-LF `.` cannot smuggle a second message in); clients that only send bare LF may end with `.<LF>`. |
 | `HELO` / `EHLO`, `MAIL FROM`, `RCPT TO`, `DATA`, `RSET`, `NOOP`, `QUIT` | Yes | Core SMTP smoke path. |
 | Message parsing | Yes | Parses headers, text body, HTML body, and attachments. |
 | Raw RFC 5322 source | Yes | Available through the dashboard API. |
 | Dashboard inbox | Yes | Inspect messages and raw source. |
 | Delete messages | Yes | Single-message and clear-all paths are available through dashboard API. |
 | Outbound relay | No | devcloud is an inbox emulator, not an SMTP relay. |
-| SMTP AUTH | No | Default `auth.smtp.mode` is `off`. |
+| SMTP AUTH | Partial | `PLAIN` and `LOGIN` are available when `auth.smtp.mode` is not `off`; strict mode validates supplied credentials. `MAIL FROM` before AUTH remains accepted. The default mode is `off`. |
+| HTTP API authentication | Partial | Strict mode protects the introspection/control API with the configured SMTP Basic credentials; the dashboard forwards those credentials for reads and mutations. |
+| Browser guards | Yes | Direct introspection/control HTTP endpoints reject public DNS Host names and cross-site mutations, using the Dashboard API host allowlist. SDK/CLI requests without Origin remain supported. |
 | TLS / STARTTLS | No | Local plaintext development endpoint only. |
 | IMAP / POP3 | No | Not implemented. |
 
@@ -329,6 +371,8 @@ The standalone S3 image also ships a web console and a server-wide CORS default;
 | XML API | No | JSON API subset only. |
 | IAM/ACLs, retention, lifecycle | No | Not implemented. |
 | Pub/Sub notifications, signed URLs | No | Not implemented. |
+
+Completed resumable uploads retain a small metadata receipt and notification marker in the shared object-store root until the workspace is reset; these contain no uploaded body and let retries return the original result after restarts, overwrites, or deletions.
 
 ### BigQuery-Compatible REST API
 
@@ -405,11 +449,12 @@ Pub/Sub dashboard actions are available under `/dashboard/pubsub`:
 | --- | --- | --- |
 | PostgreSQL wire endpoint | Yes | Listens on `127.0.0.1:15439` by default for local Redshift-style SQL clients. |
 | PostgreSQL simple query protocol | Yes | Covers `psql` smoke workflows. |
+| TLS on the SQL endpoint | Yes | Off by default. Set `services.redshift.tls.certFile` and `services.redshift.tls.keyFile` (PEM; certificate chain leaf first, key in PKCS#8, PKCS#1, or SEC1; paths relative to where `devcloud up` runs) and clients that send an SSLRequest get TLS 1.2 or 1.3 with that certificate, so `sslmode=verify-full` works when the client trusts the issuing CA and the certificate names the host it connects to. devcloud does not issue certificates. Plain connections are still accepted unless `services.redshift.tls.require: true`. The standalone binary reads `DEVCLOUD_REDSHIFT_TLS_CERT_FILE`, `DEVCLOUD_REDSHIFT_TLS_KEY_FILE`, and `DEVCLOUD_REDSHIFT_TLS_REQUIRE`. |
 | PostgreSQL extended query protocol | Partial | Supports Parse, Bind, Describe, Execute, Sync, Close, text bind parameters, portal resume, and safe unsupported errors for binary formats. |
-| PostgreSQL execution backend | Yes | Default backend is managed local PostgreSQL; explicit memory fallback remains available for development continuity. |
+| PostgreSQL execution backend | Yes | Default backend is managed local PostgreSQL; explicit memory fallback remains available for development continuity. Each SQL client connection gets its own PostgreSQL session, so temp tables, `SET`s, and transactions stay with that client and end when it disconnects. See TLS below. |
 | Redshift SQL translation | Partial | Handles local subsets for DDL/DML, Redshift table attributes, CTAS/views/materialized-view metadata, function rewrites, COPY, and UNLOAD. |
-| COPY from local S3 | Yes | Local S3 side effect imports into the PostgreSQL-backed table path. |
-| UNLOAD to local S3 | Yes | Query results can be exported through local S3 side effects. |
+| COPY from local S3 | Partial | `COPY <table> FROM 's3://bucket/prefix'` loads every object under the prefix from the local S3 store into the PostgreSQL backend, on the client's own session (temp tables and open transactions work): default text format with `DELIMITER`, `CSV` / `FORMAT AS CSV`, `JSON 'auto'` (or `'auto ignorecase'`), `GZIP`, `IGNOREHEADER`, `NULL AS`, `EMPTYASNULL`, `BLANKSASNULL`; an empty field is NULL except in character columns, as on Redshift. `IAM_ROLE` / `CREDENTIALS` / `REGION` are accepted and ignored. Column lists, `MANIFEST`, JSONPaths, other compressions, and columnar formats are refused. The memory backend keeps its own CSV/JSON COPY. |
+| UNLOAD to local S3 | Partial | Memory backend only; the PostgreSQL backend does not run UNLOAD yet. |
 | Redshift Data API | Yes | Execute/describe/get-result/list workflows are covered by local gates. |
 | Redshift management API | Partial | Cluster, parameter group, tags, credentials, and snapshot metadata workflows are local metadata. |
 | Redshift Serverless API | Partial | Namespace and workgroup metadata are local compatibility responses. |
@@ -424,13 +469,64 @@ Pub/Sub dashboard actions are available under `/dashboard/pubsub`:
 | Feature | Status | Notes |
 | --- | --- | --- |
 | Redis wire endpoint | Yes | Uses a real `redis-server` child process in managed mode; devcloud does not re-implement RESP. |
-| External Redis mode | Yes | `services.redis.mode: external` validates `externalUrl` with `PING` and exposes the same dashboard surface. |
+| External Redis mode | Yes | `services.redis.mode: external` accepts `redis://[:password@]host[:port][/db]`, validates `AUTH`/`SELECT`/`PING`, and uses that target for dashboard commands. Credentials are omitted from the displayed endpoint. TLS and non-default ACL users are not supported. |
 | Managed persistence | Yes | Runtime data is kept under `.devcloud/data/redis` by default. |
 | String/hash/list/set/zset inspection | Partial | `/dashboard/redis` lists keys with SCAN and shows type-specific previews. |
 | Command runner | Partial | Dashboard commands are restricted to the Redis allowlist in `docs/design-redis-compat.md`. |
 | Destructive actions | Partial | Key delete, expire, and guarded `FLUSHDB` are supported; `FLUSHALL` and unsafe commands are rejected. |
 | Redis AUTH | Partial | Relaxed mode does not set `requirepass`; strict mode passes the configured password to managed Redis. |
+| HTTP API authentication | Partial | Strict mode protects the Redis control API with the configured Redis Basic credentials; the dashboard forwards those credentials for reads and mutations. |
+| Browser guards | Yes | Direct introspection/control HTTP endpoints reject public DNS Host names and cross-site mutations, using the Dashboard API host allowlist. SDK/CLI requests without Origin remain supported. |
 | Cluster, Sentinel, modules, RedisJSON, RediSearch | No | Out of local compatibility scope. |
+
+### AWS Lambda-Compatible API
+
+| Feature | Status | Notes |
+| --- | --- | --- |
+| Function CRUD | Yes | `CreateFunction`, `GetFunction`, `GetFunctionConfiguration`, `ListFunctions` (Marker/MaxItems), `UpdateFunctionConfiguration` (RevisionId precondition), `UpdateFunctionCode`, `DeleteFunction` on the `/2015-03-31/functions` REST API. Name, partial ARN, and full ARN identifiers are accepted. |
+| Deployment packages | Partial | Zip (`ZipFile` base64, or `S3Bucket`/`S3Key` from the local S3 store when S3 is enabled; stored + DEFLATE entries, no zip64) and container images (below). The layer APIs are not supported. As on AWS, a zip package over 250 MB unzipped is rejected (50 MB for a direct `ZipFile` upload). Unix symlinks in the zip (`zip -y`, e.g. `node_modules/.bin`) are kept as symlinks (pointing anywhere, as on AWS); an entry stored beneath a link rejects the package, since extraction never writes through a link. |
+| Container images | Partial | `PackageType: Image` with `Code.ImageUri` and `ImageConfig` (`EntryPoint`, `Command`, `WorkingDirectory`) on create/update/get; `GetFunction` returns `RepositoryType: ECR`. Invoking needs `services.lambda.docker: true` (`DEVCLOUD_LAMBDA_DOCKER=true` for `devcloud-lambda`) and the `docker` CLI: each environment is a `docker run` of the image (any local tag or pullable reference; the first run may pull it, within a 120 s start budget) with the Runtime Interface Emulator port published on loopback — or, with `services.lambda.dockerNetwork` (`DEVCLOUD_LAMBDA_DOCKER_NETWORK`) set because devcloud itself runs in a container sharing the Docker socket, joined to that network and reached by container name — so the image must start the RIE — every AWS base image (`public.ecr.aws/lambda/*`) does through its entrypoint; a custom `EntryPoint` must too. Environments stay warm like zip functions. Containers are labelled `devcloud.lambda.owner=<instance id>` (the id is kept in the Lambda storage directory as `instance-id`); on startup devcloud removes containers carrying its own id that a killed previous run left behind, and never touches other instances' containers. `MemorySize` becomes the container's `--memory` limit; `Architectures` is not mapped to `--platform` (the image's own platform runs). Variables reach the container through an owner-only `--env-file`, so a value with a line break cannot be passed. The RIE answers 200 for function errors too, so a response that is exactly a Lambda error document (`errorType`, `errorMessage`, and only error fields) is reported as `X-Amz-Function-Error: Unhandled`. `Init Duration` is the RIE's runtime init time, and a cold start's log opens with `INIT_START Image: <ImageUri>`. REPORT's `Max Memory Used` is the container's cgroup memory peak since it started (page cache included; read with `docker exec <container> cat`, so it is omitted for images without `cat`), with the same warning above `MemorySize`. The standalone `devcloud-lambda` Docker image does not include Docker (its `docker` build target does): invoking an image function without it fails with an error saying so (and `DEVCLOUD_LAMBDA_DOCKER=true` without a `docker` CLI on `PATH` is warned about at startup). |
+| Invoke | Partial | `RequestResponse`, `Event` (async, 202), and `DryRun`; `X-Amz-Function-Error: Unhandled` on handler errors; `X-Amz-Log-Type: Tail` returns the last 4 KB of the START/END/REPORT-framed log; per-function `Timeout` is enforced. **Execution environments are reused (warm starts)**: an environment is one `python3` / `node` process that loads the handler module once and then serves one invocation at a time, so module-level state and one-time initialization carry over, as on AWS. A cold start adds an `INIT_START` line, the init-phase output, and `Init Duration` in REPORT; init gets its own budget of one `Timeout`. Concurrent invocations get separate environments. An environment is stopped after `services.lambda.idleTimeoutSeconds` (default 300) without invocations, when the function's configuration or code changes or the function is deleted, after a timeout, crash, or init failure, and on shutdown; `idleTimeoutSeconds: 0` makes every invocation a cold start. Unlike AWS, an idle environment is not frozen: threads a Python handler left running keep running (Node handlers are paused between invocations). `MemorySize` is reported to the handler and in REPORT but does not limit the process's memory. On Linux, REPORT adds `Max Memory Used` (the interpreter process's peak resident memory during the invocation, init included on a cold start), and the log warns when it exceeds `MemorySize`. With `services.lambda.logInvocations: true` (`DEVCLOUD_LAMBDA_LOG_INVOCATIONS`, on by default for `devcloud-lambda`) every invocation's framed log is also printed to stdout, each line tagged `[<function>]`. |
+| Runtimes | Partial | `python3.x` and `nodejs*` handlers run as local `python3` / `node` processes (CommonJS, ESM `.mjs`, async and callback handlers). A Python runtime uses the matching `python3.<minor>` on devcloud's `PATH` when there is one (e.g. `python3.12`), otherwise `python3`; Node uses `node`. When the interpreter's version differs from the runtime (`python3.12` on Python 3.11, `nodejs20.x` on Node 22), the invocation log gets a `[WARNING] devcloud: runtime ... is running on ...` line before the handler's output (on a cold start), and devcloud's stderr repeats it once per function and runtime. The AWS-bundled SDKs (`boto3` for Python, AWS SDK v3 for Node) are not provided; ship them in the package or under the `/opt` directory. Other runtimes (`java*`, `dotnet*`, `ruby*`, `go1.x`) can be deployed but invoking them returns `InvalidRuntimeException`. |
+| Custom runtimes (`provided*`) | Partial | The package's `bootstrap` (in the code root, else in the `/opt` directory) runs as a local process against a per-environment Lambda Runtime API on loopback (`AWS_LAMBDA_RUNTIME_API`): `invocation/next`, `invocation/{id}/response` (including chunked bodies and the error trailers of streamed responses), `invocation/{id}/error`, and `init/error`. Environments are reused like interpreter runtimes; output is framed per invocation. The bootstrap must be built for the host devcloud runs on (a Go runner for macOS needs `GOOS=darwin`); a missing or foreign-OS bootstrap fails the invocation with `Runtime.InvalidEntrypoint`. Extensions may register (so `aws-lambda-go`'s `WithEnableSIGTERM` starts cleanly) but receive no events, and stopped environments are killed without SIGTERM. |
+| Handler environment | Partial | Cleared environment: `PATH`, Lambda's reserved variables (`AWS_LAMBDA_FUNCTION_NAME`, `AWS_REGION`, `LAMBDA_TASK_ROOT`, ...), and the function's `Environment.Variables`. Host credentials are never passed through. To stand in for the execution role, set `services.lambda.functionAccessKeyId` / `functionSecretAccessKey` (and optionally `functionSessionToken`) and every handler receives them as `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN`. |
+| `/opt` (layer contents) | Partial | As on AWS, the default `PYTHONPATH` is `/opt/python/lib/python<version>/site-packages:/opt/python` and the default `NODE_PATH` is `/opt/nodejs/node<major>/node_modules:/opt/nodejs/node_modules`, so dependencies placed (or mounted) there are importable without extra settings. `services.lambda.optDir` points these paths at another directory. A function that sets its own `PYTHONPATH` / `NODE_PATH` replaces the default, as on AWS. |
+| Tags / account settings | Yes | `/2017-03-31/tags/{arn}` list/tag/untag and `GetAccountSettings`. |
+| Function URLs | Partial | `CreateFunctionUrlConfig` / `GetFunctionUrlConfig` / `UpdateFunctionUrlConfig` / `DeleteFunctionUrlConfig` / `ListFunctionUrlConfigs` under `/2021-10-31/functions/{name}/url` (`$LATEST` only). The returned `FunctionUrl` is `http://<url-id>.lambda-url.<region>.localhost:<lambdaPort>/`, where `<url-id>` is derived from the account, region, and function name, so it stays the same when the URL, the function, or the data directory is recreated. Clients that cannot use that host can call `http://127.0.0.1:<lambdaPort>/_url/<url-id>/<path>`, or address the URL by function name: `http://127.0.0.1:<lambdaPort>/urls/<function>/<path>`. Requests reach the handler as a payload format 2.0 event through the same synchronous invoke path as `Invoke` (recorded in recent invocations), and the result is mapped like AWS: an object with `statusCode` sets status, `headers`, `multiValueHeaders`, `cookies` (`Set-Cookie`), `body`, and `isBase64Encoded`; any other JSON value becomes a `200` `application/json` body; a function error is `502`. `Cors` answers preflight requests itself and replaces the function's `Access-Control-*` headers. `AuthType: AWS_IAM` refuses unsigned requests (`403`) in every auth mode; `strict` verifies the SigV4 signature (service `lambda`) against `auth.lambda` credentials, `relaxed` / `signed-relaxed` only check that it is well formed. The mode is `auth.lambda.mode` unless `services.lambda.urlAuthMode` (`DEVCLOUD_LAMBDA_URL_AUTH_MODE`) sets one for URLs alone, e.g. `strict` URLs with a `relaxed` API. `AuthType: NONE` is public: resource-based policies are not evaluated, so no `AddPermission` is needed, and URLs bypass the API's browser (CSRF) guard. `InvokeMode: RESPONSE_STREAM` is accepted but served buffered. `sourceIp` is always `127.0.0.1`. |
+| Versions, aliases, layers, event source mappings, concurrency | No | Only `$LATEST` exists. The layer APIs (`PublishLayerVersion`, `Layers`) are not supported; put the layer contents in the `/opt` directory instead. |
+| Auth | Partial | `relaxed`, `signed-relaxed`, and `strict` SigV4 (service `lambda`), like Application Auto Scaling. `strict` requires the credential scope's date to match `X-Amz-Date` and accepts a signature over the path either normalized as most SDKs sign it (`//x` and dot segments collapsed) or exactly as sent; there is no clock-skew check, so requests signed with fixed timestamps keep working. |
+| Browser (CSRF) guard | Yes | Non-GET requests carrying a non-loopback `Origin` (or `Sec-Fetch-Site: cross-site`) are rejected with 403, so a web page cannot create or invoke functions; SDKs/CLIs (no `Origin`) and loopback front-ends are unaffected. The dashboard's test invoke applies the same rule. Requests whose `Host` is a public DNS name are refused too (DNS rebinding; see the Dashboard API notes). |
+
+### SSM Parameter Store-Compatible API
+
+| Feature | Status | Notes |
+| --- | --- | --- |
+| Parameters | Partial | `PutParameter` (`String`, `StringList`, `SecureString`; `Overwrite`; `Standard`/`Advanced` value limits), `GetParameter` (with a `:<version>` selector for the current version only), `DeleteParameter`, and `DescribeParameters` (`MaxResults`/`NextToken`; filters are rejected). AWS JSON 1.1 under `X-Amz-Target: AmazonSSM.<Op>`. Persisted to `.devcloud/data/ssm/state.json`. |
+| `SecureString` | Partial | No KMS: values are stored in plaintext in `state.json`. `GetParameter` returns the value only with `WithDecryption: true`; without it the value is an opaque placeholder, never the plaintext. |
+| Not supported | No | `GetParameters`, `GetParametersByPath`, labels, version history, tags, policies. |
+| Auth | Partial | `relaxed` / `signed-relaxed` / `strict` SigV4 (service `ssm`). `strict` only accepts `auth.ssm` credentials, so STS temporary credentials are rejected there. |
+| Dashboard | Partial | `/dashboard/ssm` lists names, types, and versions through `DescribeParameters`; values never reach the dashboard. |
+
+### STS-Compatible API
+
+| Feature | Status | Notes |
+| --- | --- | --- |
+| `AssumeRole` | Partial | AWS Query protocol (form `POST /` or `GET /?Action=`), XML responses. Validates `RoleArn`, `RoleSessionName`, and `DurationSeconds` (900–43200), and issues new `ASIA…` temporary credentials per call. An inline session `Policy` must be JSON of at most 2048 characters; it is accepted but not evaluated. Stateless. |
+| `GetCallerIdentity` | Partial | Always reports the configured account's root identity, not the assumed role. |
+| Auth | Partial | `relaxed` / `signed-relaxed` / `strict` SigV4 (service `sts`). |
+
+### Cloud Run-Compatible API
+
+| Feature | Status | Notes |
+| --- | --- | --- |
+| Admin API v2 services | Yes | Create (`serviceId`, `validateOnly`), get, list (including location `-`), patch (`updateMask`, `allowMissing`, etag check), delete under `/v2/projects/{p}/locations/{l}/services`. |
+| Revisions | Yes | A template change creates a `<svc>-<generation>-<suffix>` revision; list/get/delete (the latest revision cannot be deleted). |
+| Long-running operations | Partial | Every mutation completes synchronously and returns a `done: true` Operation; operations are kept in memory (get/list/delete/`:wait`). |
+| IAM policy | Partial | `getIamPolicy`, `setIamPolicy`, `testIamPermissions` per service. Strict mode enforces a bearer token on the Admin API and on service requests unless the service grants `allUsers` `roles/run.invoker` or sets `invokerIamDisabled`. |
+| Serving requests | Partial | Requests with `Host: <svc>.<location>.<project>.run.localhost[:port]` (the service `uri`) or under `/_run/<project>/<location>/<svc>/` (in `urls`) are reverse-proxied to the latest revision. Traffic splitting is not emulated: the latest revision always serves. |
+| Container execution | Partial | `containers[0].command` + `args` run as a local process with `PORT` set to a free loopback port plus `K_SERVICE`/`K_REVISION`/`K_CONFIGURATION` and the container `env` values (`valueSource` secrets are not resolved). Image-only containers run with `docker run` when `services.cloudRun.docker: true`, otherwise requests return 503. One instance per service, started on first request, replaced on a new revision, stopped on delete/shutdown. |
+| Browser (CSRF) guard | Yes | Non-GET Admin API requests with a non-loopback `Origin` (or `Sec-Fetch-Site: cross-site`) are rejected with 403; service (data-plane) requests are not restricted. Requests on either plane whose `Host` is a public DNS name are refused (DNS rebinding; see the Dashboard API notes). In `strict` mode `/_introspect/*` needs the bearer token. |
+| Jobs, domain mappings, v1 (Knative) API | No | Out of local compatibility scope. |
 
 ### Dashboard API
 
@@ -445,16 +541,52 @@ Pub/Sub dashboard actions are available under `/dashboard/pubsub`:
 | Pub/Sub dashboard API | Yes | Status, topics, subscriptions, publish, pull, ack, and message metadata. |
 | Redshift dashboard API | Yes | Status, clusters, catalog, table detail, query runner, and statement history. |
 | Redis dashboard API | Yes | Status, SCAN-based keys, key inspector, allowlisted command runner, delete, expire, and guarded `FLUSHDB`. |
+| Lambda dashboard API | Yes | Status, functions, recent invocations with log tails, and test invoke through the Invoke API. |
+| Cloud Run dashboard API | Yes | Status, services, revisions, running instances, and instance logs. |
+| Browser guards | Yes | `/api/*` mutations from another site (a non-loopback `Origin` that is not the dashboard's own, or `Sec-Fetch-Site: cross-site`) are refused with 403; scripts and CLIs send no `Origin` and are unaffected. Every request whose `Host` is a public DNS name is refused (a DNS-rebinding page keeps its own domain as `Host`); IP addresses, single-label names (`localhost`, docker-compose service names) and `.localhost`, `.internal`, `.local`, `.test`, `.example`, `.invalid`, `.home.arpa` names are accepted. Set `DEVCLOUD_ALLOWED_HOSTS` (comma-separated; `.suffix` for a domain, `*` for any) to reach devcloud through another name. Lambda and Cloud Run apply the same Host rule. WebSocket handshakes (`/api/events`, and the event relay itself) are refused from other sites' origins too, since WebSockets get no CORS protection. |
 | Common React dashboard shell | Yes | All service pages are served under `/dashboard/<svc>` from the shared React shell; compatibility `/mail`, `/s3`, `/gcs`, `/dynamodb`, `/bigquery`, `/redis` paths return 301 redirects. |
 
 ## Verification
 
 ### Local build and test
 
+Install a current stable Rust toolchain, Node.js 22 or later, and the Protocol
+Buffers compiler (`protoc`, including its standard `.proto` files). Pub/Sub's
+build script uses `protoc`; on Debian/Ubuntu, install `protobuf-compiler`.
+
 ```bash
-cargo build --workspace
-cargo test --workspace
+cd web/dashboard
+npm ci
+npm test
+npm run build
+cd ../..
+cargo build --locked --workspace
+cargo test --locked --workspace
 ```
+
+The dashboard build writes the assets embedded by the Rust dashboard crate.
+Commit the generated bundle with dashboard changes. `npm test` exercises the
+event relay frame contract, reconnects, resynchronization, subscription cleanup,
+and stale React responses without requiring a browser.
+
+To exercise the built CLI and dashboard together in Chromium:
+
+```bash
+cargo build --locked -p devcloud-orchestrator
+cd web/dashboard
+npx playwright install --with-deps chromium
+npm run test:browser
+```
+
+The browser test starts an isolated GCS workspace and verifies that provider
+mutations appear through the live event stream, including a snapshot refresh
+after a disconnected interval. Its screenshot and result are written to
+`target/dashboard-browser/` and uploaded as a CI artifact.
+
+Pull requests run `.github/workflows/ci.yml`: Rust formatting, individual service
+builds, workspace tests and Clippy, dashboard tests and bundle consistency,
+the Chromium smoke test, and Rust/npm dependency audits. Individual builds catch missing Cargo features that
+can otherwise be hidden by workspace-wide feature unification.
 
 Service acceptance gates and E2E scripts are run locally because they require service-specific external tooling (`awscli-local`, `postgres` server binaries, `aws` CLI, etc.).
 
@@ -473,6 +605,8 @@ Run before claiming a service MVP is complete or when investigating a service-le
 | Pub/Sub MVP | `VERIFY_STAGE=full bash scripts/pubsub-autoloop/verify.sh` |
 | Redis MVP | `VERIFY_STAGE=full bash scripts/redis-autoloop/verify.sh` |
 | Application Auto Scaling MVP | `VERIFY_STAGE=full bash scripts/applicationautoscaling-autoloop/verify.sh` |
+| Lambda MVP | `VERIFY_STAGE=full bash scripts/lambda-autoloop/verify.sh` |
+| Cloud Run MVP | `VERIFY_STAGE=full bash scripts/cloudrun-autoloop/verify.sh` |
 | GCS SDK compat | `VERIFY_STAGE=full-sdk-compat bash scripts/gcs-sdk-compat-autoloop/verify.sh` |
 | BigQuery SDK compat | `VERIFY_STAGE=full-sdk-compat bash scripts/bigquery-sdk-compat-autoloop/verify.sh` |
 | Pub/Sub full compat | `VERIFY_STAGE=full-compat bash scripts/pubsub-full-compat-autoloop/verify.sh` |
@@ -494,6 +628,10 @@ Run before claiming a service MVP is complete or when investigating a service-le
 | Redshift SQL translator | `scripts/redshift-translator-e2e.sh` | `psql`, `aws`, and `postgres` server binary on `PATH` |
 | Redis | `scripts/redis-e2e.sh` | `redis-cli` |
 | Application Auto Scaling | `scripts/applicationautoscaling-e2e.sh` | none |
+| SSM Parameter Store | `scripts/ssm-e2e.sh` | none |
+| STS | `scripts/sts-e2e.sh` | none |
+| Lambda | `scripts/lambda-e2e.sh` | `python3` (handler runtime) |
+| Cloud Run | `scripts/cloudrun-e2e.sh` | `python3` (sample service) |
 
 Useful env vars:
 
@@ -515,6 +653,11 @@ Useful env vars:
 | `services/sqs` | SQS-compatible JSON and Query API service. |
 | `services/pubsub` | Google Cloud Pub/Sub-compatible REST and gRPC service. |
 | `services/redshift` | Redshift SQL, Data API, and management API service. |
+| `services/applicationautoscaling` | Application Auto Scaling-compatible JSON API service. |
+| `services/ssm` | SSM Parameter Store-compatible JSON API service. |
+| `services/sts` | STS-compatible Query API service (`AssumeRole`, `GetCallerIdentity`). |
+| `services/lambda` | AWS Lambda-compatible REST API with local python/node handler execution. |
+| `services/cloudrun` | Cloud Run Admin API v2 plus a reverse proxy to locally run service processes. |
 | `services/dashboard` | Local Web UI, embedded React assets, and dashboard APIs. |
 | `docs/` | Product and compatibility designs. |
 | `mock/` | UI design mocks. |

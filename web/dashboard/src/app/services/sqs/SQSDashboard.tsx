@@ -3,6 +3,7 @@ import { Button } from '../../../ui/Button'
 import { EmptyState } from '../../../ui/EmptyState'
 import { Panel } from '../../../ui/Panel'
 import { useDashboardEvents } from '../../api/hooks/useDashboardEvents'
+import { useLatestRequest } from '../../api/hooks/useLatestRequest'
 import type { DashboardService } from '../dashboard/types'
 import {
   changeSQSMessageVisibility,
@@ -78,7 +79,9 @@ export function SQSDashboard({ service }: SQSDashboardProps): JSX.Element {
   const [purgeError, setPurgeError] = useState<string>()
   const isDisabled = service?.status === 'disabled'
 
+  const startRefreshQueues = useLatestRequest()
   const refreshQueues = useCallback(() => {
+    const isCurrent = startRefreshQueues()
     if (isDisabled) {
       setQueuesState({ status: 'success', statusPayload: disabledStatus(service), queues: [] })
       setDetailState({ status: 'idle' })
@@ -89,26 +92,30 @@ export function SQSDashboard({ service }: SQSDashboardProps): JSX.Element {
     setQueuesState({ status: 'loading' })
     Promise.all([getSQSStatus(), listSQSQueues()])
       .then(([statusPayload, { queues }]) => {
+        if (!isCurrent()) return
         setQueuesState({ status: 'success', statusPayload, queues })
         setActiveQueueName((current) =>
           current && queues.some((queue) => queue.name === current) ? current : queues[0]?.name,
         )
       })
       .catch((error: Error) => {
+        if (!isCurrent()) return
         setQueuesState({ status: 'error', message: error.message })
       })
-  }, [isDisabled, service])
+  }, [startRefreshQueues, isDisabled, service])
 
   useEffect(() => {
     refreshQueues()
   }, [refreshQueues])
 
-  useDashboardEvents({ topics: ['sqs'], onEvent: refreshQueues, enabled: !isDisabled })
+  useDashboardEvents({ topics: ['sqs'], onEvent: refreshQueues, onResync: refreshQueues, enabled: !isDisabled })
 
   const queues = queuesState.status === 'success' ? queuesState.queues : []
   const activeQueue = queues.find((queue) => queue.name === activeQueueName)
 
+  const startRefreshDetail = useLatestRequest()
   const refreshDetail = useCallback(() => {
+    const isCurrent = startRefreshDetail()
     if (!activeQueueName || isDisabled) {
       setDetailState({ status: 'idle' })
       return
@@ -116,13 +123,15 @@ export function SQSDashboard({ service }: SQSDashboardProps): JSX.Element {
     setDetailState({ status: 'loading' })
     Promise.all([listSQSMessages(activeQueueName), listSQSLeases(activeQueueName), getSQSDeadLetter(activeQueueName)])
       .then(([messages, leases, dlq]) => {
+        if (!isCurrent()) return
         setActiveMessageIndex(0)
         setDetailState({ status: 'success', messages: messages.messages, leases: leases.leases, dlq })
       })
       .catch((error: Error) => {
+        if (!isCurrent()) return
         setDetailState({ status: 'error', message: error.message })
       })
-  }, [activeQueueName, isDisabled])
+  }, [startRefreshDetail, activeQueueName, isDisabled])
 
   useEffect(() => {
     refreshDetail()

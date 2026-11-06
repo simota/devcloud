@@ -38,7 +38,7 @@ pub fn parse(raw: &[u8]) -> ParsedMail {
     std::panic::catch_unwind(|| {
         let mut mail = ParsedMail::default();
         let mut count = 0;
-        walk(raw, 0, &mut count, &mut mail);
+        walk(raw, 0, &mut count, &mut mail, false);
         mail
     })
     .unwrap_or_else(|_| ParsedMail {
@@ -100,7 +100,10 @@ pub fn headers<'a>(raw: &'a [u8], warnings: &mut Vec<String>) -> (Headers, &'a [
     (out, &raw[raw.len()..])
 }
 
-fn walk(raw: &[u8], depth: usize, count: &mut usize, mail: &mut ParsedMail) {
+/// `suppress_text`: an earlier branch of an enclosing `multipart/alternative`
+/// already produced the body text, so this part (at any depth) is another
+/// rendering of it and adds none.
+fn walk(raw: &[u8], depth: usize, count: &mut usize, mail: &mut ParsedMail, suppress_text: bool) {
     if *count >= MAX_PARTS {
         warn(&mut mail.warnings, "MIME part limit reached");
         return;
@@ -130,8 +133,15 @@ fn walk(raw: &[u8], depth: usize, count: &mut usize, mail: &mut ParsedMail) {
             if capped {
                 warn(&mut mail.warnings, "MIME part limit reached");
             }
+            let alternative = kind == "multipart/alternative";
+            let mut suppress = suppress_text;
             for part in parts {
-                walk(part, depth + 1, count, mail);
+                let before = mail.text.len();
+                walk(part, depth + 1, count, mail, suppress);
+                // The first branch with text wins; its siblings are renderings.
+                if alternative && mail.text.len() != before {
+                    suppress = true;
+                }
             }
             return;
         } else {
@@ -168,8 +178,15 @@ fn walk(raw: &[u8], depth: usize, count: &mut usize, mail: &mut ParsedMail) {
             if mail.html.is_none() {
                 mail.html = Some(text);
             }
+        } else if suppress_text {
+            // Another rendering of a body an alternative already provided.
         } else if mail.text.is_empty() {
             mail.text = text;
+        } else {
+            // Several inline text parts (e.g. text, image, text from Apple
+            // Mail) are all body text.
+            mail.text.push_str("\n\n");
+            mail.text.push_str(&text);
         }
     }
 }
@@ -470,12 +487,17 @@ pub fn decode_qp(bytes: &[u8], warnings: &mut Vec<String>) -> Vec<u8> {
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'=' {
-            if bytes.get(i + 1) == Some(&b'\n') {
-                i += 2;
+            // Soft line break; RFC 2045 allows trailing spaces/tabs before it.
+            let mut j = i + 1;
+            while matches!(bytes.get(j), Some(b' ' | b'\t')) {
+                j += 1;
+            }
+            if bytes.get(j) == Some(&b'\n') {
+                i = j + 1;
                 continue;
             }
-            if bytes.get(i + 1..i + 3) == Some(b"\r\n") {
-                i += 3;
+            if bytes.get(j..j + 2) == Some(b"\r\n") {
+                i = j + 2;
                 continue;
             }
             if i + 2 < bytes.len() {
@@ -497,6 +519,15 @@ pub fn decode_words(value: &str, warnings: &mut Vec<String>) -> String {
     let mut out = String::new();
     let mut rest = value;
     let mut previous_encoded = false;
+    // Adjacent encoded words in one charset are decoded together: some
+    // mailers split a multibyte character across two of them.
+    let mut pending: Option<(String, Vec<u8>)> = None;
+    let flush =
+        |out: &mut String, pending: &mut Option<(String, Vec<u8>)>, warnings: &mut Vec<String>| {
+            if let Some((label, bytes)) = pending.take() {
+                out.push_str(&charset_decode(&bytes, &label, warnings));
+            }
+        };
     while let Some(start) = rest.find("=?") {
         let prefix = &rest[..start];
         let word = &rest[start + 2..];
@@ -510,12 +541,15 @@ pub fn decode_words(value: &str, warnings: &mut Vec<String>) -> String {
             break;
         };
         if !matches!(kind, "B" | "b" | "Q" | "q") {
+            flush(&mut out, &mut pending, warnings);
             out.push_str(&rest[..start + 2]);
             rest = &rest[start + 2..];
             previous_encoded = false;
             continue;
         }
-        if !previous_encoded || !prefix.chars().all(char::is_whitespace) {
+        let adjacent = previous_encoded && prefix.chars().all(char::is_whitespace);
+        if !adjacent {
+            flush(&mut out, &mut pending, warnings);
             out.push_str(prefix);
         }
         let bytes = if kind.eq_ignore_ascii_case("B") {
@@ -523,10 +557,19 @@ pub fn decode_words(value: &str, warnings: &mut Vec<String>) -> String {
         } else {
             decode_qp(payload.replace('_', " ").as_bytes(), warnings)
         };
-        out.push_str(&charset_decode(&bytes, label, warnings));
+        match pending.as_mut() {
+            Some((pending_label, pending_bytes)) if pending_label.eq_ignore_ascii_case(label) => {
+                pending_bytes.extend_from_slice(&bytes);
+            }
+            _ => {
+                flush(&mut out, &mut pending, warnings);
+                pending = Some((label.to_string(), bytes));
+            }
+        }
         previous_encoded = true;
         rest = tail;
     }
+    flush(&mut out, &mut pending, warnings);
     out.push_str(rest);
     out
 }

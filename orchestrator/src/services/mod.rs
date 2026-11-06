@@ -8,9 +8,11 @@
 
 pub mod applicationautoscaling;
 pub mod bigquery;
+pub mod cloudrun;
 pub mod dashboard;
 pub mod dynamodb;
 pub mod gcs;
+pub mod lambda;
 pub mod mail;
 pub mod managed_postgres;
 pub mod pubsub;
@@ -18,4 +20,6 @@ pub mod redis;
 pub mod redshift;
 pub mod s3;
 pub mod sqs;
+pub mod ssm;
+pub mod sts;
 pub mod util;

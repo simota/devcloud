@@ -3,6 +3,7 @@ import { Button } from '../../../ui/Button'
 import { EmptyState } from '../../../ui/EmptyState'
 import { Panel } from '../../../ui/Panel'
 import { useDashboardEvents } from '../../api/hooks/useDashboardEvents'
+import { useLatestRequest } from '../../api/hooks/useLatestRequest'
 import type { DashboardService } from '../dashboard/types'
 import {
   ackPubSubMessages,
@@ -51,7 +52,9 @@ export function PubSubDashboard({ service }: PubSubDashboardProps): JSX.Element 
   const [busyAction, setBusyAction] = useState<string>()
   const isDisabled = service?.status === 'disabled'
 
+  const startRefresh = useLatestRequest()
   const refresh = useCallback(() => {
+    const isCurrent = startRefresh()
     if (isDisabled) {
       setState({ status: 'success', statusPayload: disabledStatus(service), topics: [], subscriptions: [] })
       setActiveSubscriptionName(undefined)
@@ -61,6 +64,7 @@ export function PubSubDashboard({ service }: PubSubDashboardProps): JSX.Element 
     setState({ status: 'loading' })
     Promise.all([getPubSubStatus(), listPubSubTopics(), listPubSubSubscriptions()])
       .then(([statusPayload, topics, subscriptions]) => {
+        if (!isCurrent()) return
         setState({
           status: 'success',
           statusPayload,
@@ -76,15 +80,16 @@ export function PubSubDashboard({ service }: PubSubDashboardProps): JSX.Element 
         )
       })
       .catch((error: Error) => {
+        if (!isCurrent()) return
         setState({ status: 'error', message: error.message })
       })
-  }, [isDisabled, service])
+  }, [startRefresh, isDisabled, service])
 
   useEffect(() => {
     refresh()
   }, [refresh])
 
-  useDashboardEvents({ topics: ['pubsub'], onEvent: refresh, enabled: !isDisabled })
+  useDashboardEvents({ topics: ['pubsub'], onEvent: refresh, onResync: refresh, enabled: !isDisabled })
 
   const topics = state.status === 'success' ? state.topics : []
   const subscriptions = state.status === 'success' ? state.subscriptions : []

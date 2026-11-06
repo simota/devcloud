@@ -166,7 +166,17 @@ mod tests {
             super::install_panic_hook();
             panic!("private-panic-payload-marker");
         }
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
+        // Linux containers without /proc cannot resolve current_exe, but the
+        // test runner still provides the executable path in argv[0].
+        let executable = std::env::current_exe()
+            .or_else(|err| {
+                std::env::args_os()
+                    .next()
+                    .map(std::path::PathBuf::from)
+                    .ok_or(err)
+            })
+            .unwrap();
+        let output = std::process::Command::new(executable)
             .args(["--exact", "tests::panic_hook_omits_payload", "--nocapture"])
             .env("MAILBOX_PANIC_HOOK_PROBE", "1")
             .output()

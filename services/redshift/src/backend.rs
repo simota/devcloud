@@ -16,6 +16,24 @@ pub trait SqlBackend: Send + Sync {
     fn begin(&self) -> Result<Box<dyn SqlTransaction>, SqlError>;
     fn catalog(&self) -> Result<CatalogSnapshot, SqlError>;
     fn close(&self) -> Result<(), SqlError>;
+
+    /// A connection of its own for one SQL client, so session state (temp
+    /// tables, an open transaction, `SET`s) stays with that client and ends
+    /// when it disconnects. `None`: statements go through [`Self::exec`].
+    fn session(&self) -> Result<Option<Box<dyn SqlSession>>, SqlError> {
+        Ok(None)
+    }
+
+    /// Whether `exec` implements Redshift `COPY` itself (the memory engine
+    /// does); otherwise the server loads COPY data through the backend.
+    fn handles_copy(&self) -> bool {
+        false
+    }
+}
+
+/// One client's backend connection; dropping it ends the session.
+pub trait SqlSession: Send {
+    fn exec(&mut self, statement: &str) -> Result<ExecResult, SqlError>;
 }
 
 pub trait SqlTransaction: Send {

@@ -14,6 +14,12 @@ path = "src/main.rs"
 
 [dependencies]
 devcloud-s3 = { path = "../s3" }
+# gzip COPY sources (pure-Rust backend; miniz_oxide is already in the tree).
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+# TLS on the SQL endpoint (pure-Rust rustls with the ring provider; no
+# OpenSSL or CMake needed). Certificates come from files the user supplies.
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rustls-pki-types = { version = "1", features = ["std"] }
 md-5 = "0.10"
 sha2 = "0.10"
 hmac = "0.12"
@@ -22,4 +28,8 @@ serde = { version = "1", features = ["derive"] }
 # serde_json's default Map is a BTreeMap (sorted keys), matching legacy sorted-key
 # map marshaling. Do NOT enable preserve_order.
 serde_json = "1"
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "io-util", "signal", "sync"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "io-util", "signal", "time", "sync"] }
+
+[dev-dependencies]
+# Test-only: issues a throwaway CA and server certificate for the TLS tests.
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }

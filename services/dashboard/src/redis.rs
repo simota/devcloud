@@ -23,7 +23,7 @@
 use serde_json::Value;
 
 use crate::config::Config;
-use crate::forward::{forward, ForwardError, ForwardRequest, ForwardResponse};
+use crate::forward::{basic_auth_headers, forward, ForwardError, ForwardRequest, ForwardResponse};
 use crate::http::{path_segment_decode, Request, Response};
 
 /// `GET /api/redis/status` — reads `/_introspect/status` and merges `storagePath`.
@@ -185,7 +185,7 @@ async fn introspect(config: &Config, path: &str) -> Result<ForwardResponse, Forw
         base: &config.redis_base,
         method: "GET",
         path,
-        headers: Vec::new(),
+        headers: basic_auth_headers(&config.redis_auth_mode, "dev", &config.redis_password),
         body: Vec::new(),
     })
     .await
@@ -197,11 +197,13 @@ async fn control(
     path: &str,
     body: Vec<u8>,
 ) -> Result<ForwardResponse, ForwardError> {
+    let mut headers = basic_auth_headers(&config.redis_auth_mode, "dev", &config.redis_password);
+    headers.push(("Content-Type".to_string(), "application/json".to_string()));
     forward(ForwardRequest {
         base: &config.redis_base,
         method,
         path,
-        headers: vec![("Content-Type".to_string(), "application/json".to_string())],
+        headers,
         body,
     })
     .await

@@ -100,6 +100,11 @@ pub async fn run(
     let sql_addr = format!("127.0.0.1:{}", cfg.server.redshift_port);
     let api_addr = format!("127.0.0.1:{}", cfg.server.redshift_api_port);
 
+    let tls = &cfg.services.redshift.tls;
+    let sql_tls =
+        devcloud_redshift::tls::sql_tls_from_files(&tls.cert_file, &tls.key_file, tls.require)
+            .map_err(|e| format!("redshift: {e}"))?;
+
     let server = Arc::new(Server::new(Config {
         sql_addr: sql_addr.clone(),
         api_addr: api_addr.clone(),
@@ -125,6 +130,7 @@ pub async fn run(
         sql_backend,
         translator,
         events_enabled: true,
+        sql_tls,
     }));
 
     let sql_listener = TcpListener::bind(&sql_addr)

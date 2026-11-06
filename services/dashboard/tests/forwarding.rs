@@ -111,6 +111,69 @@ fn req_q(method: &str, path: &str, query: &str, body: &[u8]) -> Request {
 // ── Redis: a `/_control/` mutation service ──────────────────────────────────
 
 #[tokio::test]
+async fn strict_mail_and_redis_forward_credentials_for_reads_and_mutations() {
+    use base64::Engine;
+    for (service, method, path) in [
+        ("mail", "GET", "/api/messages"),
+        ("mail", "DELETE", "/api/messages/one"),
+        ("redis", "GET", "/api/redis/keys"),
+        ("redis", "POST", "/api/redis/command"),
+    ] {
+        let (base, record) = mock_upstream(200, "{}").await;
+        let cfg = Config {
+            mail_base: base.clone(),
+            mail_auth_mode: " STRICT ".into(),
+            mail_username: "mail-user".into(),
+            mail_password: "mail:password".into(),
+            redis_base: base,
+            redis_auth_mode: "strict".into(),
+            redis_password: "redis:password".into(),
+            ..Config::default()
+        };
+        assert_eq!(route(&cfg, &req(method, path, b"{}")).await.status, 200);
+        let record = record.lock().unwrap();
+        let header = record
+            .headers
+            .get("authorization")
+            .expect("strict forwarding requires authentication");
+        let encoded = header
+            .strip_prefix("Basic ")
+            .expect("local control APIs require Basic authentication");
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .unwrap();
+        let expected = if service == "mail" {
+            b"mail-user:mail:password".as_slice()
+        } else {
+            b"dev:redis:password".as_slice()
+        };
+        assert!(
+            bytes == expected,
+            "forwarding must use the configured service credentials"
+        );
+    }
+}
+
+#[tokio::test]
+async fn relaxed_mail_and_redis_do_not_send_configured_credentials() {
+    for path in ["/api/messages", "/api/redis/keys"] {
+        let (base, record) = mock_upstream(200, "{}").await;
+        let cfg = Config {
+            mail_base: base.clone(),
+            mail_auth_mode: "relaxed".into(),
+            mail_username: "unused-user".into(),
+            mail_password: "unused-password".into(),
+            redis_base: base,
+            redis_auth_mode: "relaxed".into(),
+            redis_password: "unused-password".into(),
+            ..Config::default()
+        };
+        assert_eq!(route(&cfg, &req("GET", path, b"")).await.status, 200);
+        assert!(!record.lock().unwrap().headers.contains_key("authorization"));
+    }
+}
+
+#[tokio::test]
 async fn redis_command_forwards_to_control_exec() {
     let (base, record) =
         mock_upstream(200, r#"{"command":"GET","class":"read","rows":["v"]}"#).await;
@@ -460,6 +523,107 @@ async fn applicationautoscaling_scheduled_actions_forwards_describe_action() {
     );
     let v: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
     assert_eq!(v["scheduledActions"].as_array().unwrap().len(), 0);
+}
+
+// ── Lambda: provider-protocol reads + test invoke ───────────────────────────
+
+#[tokio::test]
+async fn lambda_functions_forwards_list_functions() {
+    let (base, record) = mock_upstream(
+        200,
+        r#"{"Functions":[{"FunctionName":"f","Runtime":"python3.12"}]}"#,
+    )
+    .await;
+    let cfg = Config {
+        lambda_base: base,
+        ..Config::default()
+    };
+    let resp = route(&cfg, &req("GET", "/api/lambda/functions", b"")).await;
+    assert_eq!(resp.status, 200);
+    let rec = record.lock().unwrap().clone();
+    assert_eq!(rec.method, "GET");
+    assert_eq!(rec.target, "/2015-03-31/functions/");
+    let v: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+    assert_eq!(v["functions"][0]["FunctionName"], "f");
+}
+
+#[tokio::test]
+async fn lambda_invoke_forwards_to_invoke_api_with_tail_logs() {
+    let (base, record) = mock_upstream(200, r#"{"ok":true}"#).await;
+    let cfg = Config {
+        lambda_base: base,
+        ..Config::default()
+    };
+    let resp = route(
+        &cfg,
+        &req("POST", "/api/lambda/functions/my-fn/invoke", br#"{"a":1}"#),
+    )
+    .await;
+    assert_eq!(resp.status, 200);
+    let rec = record.lock().unwrap().clone();
+    assert_eq!(rec.method, "POST");
+    assert_eq!(rec.target, "/2015-03-31/functions/my-fn/invocations");
+    assert_eq!(
+        rec.headers.get("x-amz-log-type").map(String::as_str),
+        Some("Tail")
+    );
+    assert_eq!(rec.body, br#"{"a":1}"#);
+    let v: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+    assert_eq!(v["payload"], r#"{"ok":true}"#);
+    assert!(v["functionError"].is_null());
+}
+
+#[tokio::test]
+async fn lambda_status_reports_disabled_without_base() {
+    let resp = route(&Config::default(), &req("GET", "/api/lambda/status", b"")).await;
+    let v: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+    assert_eq!(v["status"], "disabled");
+}
+
+// ── Cloud Run: introspection + revisions reads ──────────────────────────────
+
+#[tokio::test]
+async fn cloudrun_services_forwards_introspection() {
+    let (base, record) = mock_upstream(
+        200,
+        r#"{"services":[{"name":"projects/p/locations/l/services/s"}]}"#,
+    )
+    .await;
+    let cfg = Config {
+        cloudrun_base: base,
+        ..Config::default()
+    };
+    let resp = route(&cfg, &req("GET", "/api/cloudrun/services", b"")).await;
+    assert_eq!(resp.status, 200);
+    assert_eq!(record.lock().unwrap().target, "/_introspect/services");
+    let v: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+    assert_eq!(
+        v["services"][0]["name"],
+        "projects/p/locations/l/services/s"
+    );
+}
+
+#[tokio::test]
+async fn cloudrun_revisions_forwards_admin_api() {
+    let (base, record) = mock_upstream(200, r#"{"revisions":[{"name":"r"}]}"#).await;
+    let cfg = Config {
+        cloudrun_base: base,
+        ..Config::default()
+    };
+    let resp = route(
+        &cfg,
+        &req(
+            "GET",
+            "/api/cloudrun/services/p/us-central1/web/revisions",
+            b"",
+        ),
+    )
+    .await;
+    assert_eq!(resp.status, 200);
+    assert_eq!(
+        record.lock().unwrap().target,
+        "/v2/projects/p/locations/us-central1/services/web/revisions"
+    );
 }
 
 // ── Pub/Sub: snapshot read re-wrap ──────────────────────────────────────────

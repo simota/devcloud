@@ -253,6 +253,16 @@ services:
     enabled: false
   redshift:
     enabled: false
+# Lambda / Cloud Run are not exercised here; keep them off their default ports.
+services:
+  lambda:
+    enabled: false
+  cloudRun:
+    enabled: false
+  ssm:
+    enabled: false
+  sts:
+    enabled: false
 EOF
 }
 

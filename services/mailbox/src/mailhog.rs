@@ -210,8 +210,10 @@ fn content(raw: &[u8], depth: usize, count: &mut usize, remaining: &mut usize) -
         None
     };
     let mut map = BTreeMap::new();
+    // Repeated headers (Received, To, Cc) keep every value, as MailHog's
+    // map[string][]string does.
     for (name, value) in headers {
-        map.insert(name, vec![value]);
+        map.entry(name).or_insert_with(Vec::new).push(value);
     }
     Content {
         headers: map,

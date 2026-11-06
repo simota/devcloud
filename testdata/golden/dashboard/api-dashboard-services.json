@@ -96,6 +96,41 @@
         "path": "\u003cPATH\u003e",
         "status": "running",
         "storagePath": "\u003cPATH\u003e"
+      },
+      {
+        "description": "Inspect local SSM parameter names, types, and versions (values stay hidden).",
+        "endpoint": "http://\u003cADDR\u003e",
+        "id": "\u003cID\u003e",
+        "name": "SSM Parameter Store",
+        "path": "\u003cPATH\u003e",
+        "status": "running",
+        "storagePath": "\u003cPATH\u003e"
+      },
+      {
+        "description": "Check the local STS endpoint that issues temporary credentials for AssumeRole.",
+        "endpoint": "http://\u003cADDR\u003e",
+        "id": "\u003cID\u003e",
+        "name": "STS",
+        "path": "\u003cPATH\u003e",
+        "status": "running"
+      },
+      {
+        "description": "Inspect local Lambda functions, invoke them, and read recent invocation logs.",
+        "endpoint": "http://\u003cADDR\u003e",
+        "id": "\u003cID\u003e",
+        "name": "Lambda",
+        "path": "\u003cPATH\u003e",
+        "status": "running",
+        "storagePath": "\u003cPATH\u003e"
+      },
+      {
+        "description": "Inspect local Cloud Run services, revisions, running instances, and logs.",
+        "endpoint": "http://\u003cADDR\u003e",
+        "id": "\u003cID\u003e",
+        "name": "Cloud Run",
+        "path": "\u003cPATH\u003e",
+        "status": "running",
+        "storagePath": "\u003cPATH\u003e"
       }
     ]
   }

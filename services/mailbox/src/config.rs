@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::{BufRead, Write};
+use std::io::Write;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -199,18 +199,23 @@ fn probe(directory: &Path) -> Result<(), String> {
 }
 
 pub fn check_log(path: &Path) -> Result<(), String> {
-    let file = match fs::File::open(path) {
-        Ok(file) => file,
+    let data = match fs::read(path) {
+        Ok(data) => data,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(_) => return Err("Cannot read mail/messages.jsonl; check storage permissions".into()),
     };
-    for (line_number, line) in std::io::BufReader::new(file).split(b'\n').enumerate() {
-        let line =
-            line.map_err(|_| "Cannot read mail/messages.jsonl; check storage permissions")?;
+    let lines: Vec<&[u8]> = data.split(|&b| b == b'\n').collect();
+    let last = lines.len() - 1;
+    for (line_number, line) in lines.into_iter().enumerate() {
         if line.is_empty() {
             continue;
         }
-        if serde_json::from_slice::<Message>(&line).is_err() {
+        // An unterminated last line is a torn append, which the store
+        // ignores and repairs; only complete lines must parse.
+        if line_number == last {
+            continue;
+        }
+        if serde_json::from_slice::<Message>(line).is_err() {
             return Err(format!(
                 "Corrupt mail/messages.jsonl at line {}; restore or remove the metadata log",
                 line_number + 1
@@ -222,6 +227,23 @@ pub fn check_log(path: &Path) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_torn_last_record_does_not_block_startup_but_a_corrupt_one_does() {
+        let dir = std::env::temp_dir().join(format!(
+            "devcloud-mailbox-checklog-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("messages.jsonl");
+        let ok = r#"{"id":"m1","from":"a@x","to":[],"subject":"s","raw":"r"}"#;
+        std::fs::write(&path, format!("{ok}\n{{\"id\":\"torn")).unwrap();
+        assert!(super::check_log(&path).is_ok());
+        std::fs::write(&path, format!("{{broken\n{ok}\n")).unwrap();
+        assert!(super::check_log(&path).unwrap_err().contains("line 1"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     use super::Config;
 
     #[test]

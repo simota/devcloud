@@ -42,7 +42,7 @@ use tokio::net::TcpListener;
 use tokio::sync::mpsc::{self, UnboundedReceiver};
 use tokio::time::{self, Duration};
 use tokio_tungstenite::tungstenite::handshake::server::{
-    Request as WsRequest, Response as WsResponse,
+    ErrorResponse, Request as WsRequest, Response as WsResponse,
 };
 use tokio_tungstenite::tungstenite::Message;
 
@@ -56,6 +56,7 @@ const CLIENT_QUEUE_SIZE: usize = 256;
 
 /// Keepalive ping interval — mirrors legacy `pingInterval = 15 * time.Second`.
 const PING_INTERVAL: Duration = Duration::from_secs(15);
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 // ---------------------------------------------------------------------------
 // Frame (wire format)
@@ -394,18 +395,6 @@ async fn serve_client(
     // Skip the first immediate tick — we just sent the hello frame.
     ping_interval.tick().await;
 
-    // Drain inbound frames so close frames are observed (mirrors legacy drain goroutine).
-    let (client_closed_tx, mut client_closed_rx) = mpsc::channel::<()>(1);
-    tokio::spawn(async move {
-        while let Some(msg) = ws_rx.next().await {
-            match msg {
-                Ok(Message::Close(_)) | Err(_) => break,
-                _ => {}
-            }
-        }
-        let _ = client_closed_tx.send(()).await;
-    });
-
     loop {
         tokio::select! {
             // Shutdown signal.
@@ -415,9 +404,12 @@ async fn serve_client(
                     break;
                 }
             }
-            // Client disconnected.
-            _ = client_closed_rx.recv() => {
-                break;
+            // Keep both socket halves in this task so cancellation closes the
+            // whole connection instead of leaving a detached reader alive.
+            incoming = ws_rx.next() => {
+                if matches!(incoming, None | Some(Ok(Message::Close(_))) | Some(Err(_))) {
+                    break;
+                }
             }
             // Keepalive ping.
             _ = ping_interval.tick() => {
@@ -475,13 +467,21 @@ async fn serve_client(
 /// be bound.
 pub async fn run(
     addr: String,
-    mut events: UnboundedReceiver<String>,
+    events: UnboundedReceiver<String>,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> Result<(), String> {
     let listener = TcpListener::bind(&addr)
         .await
         .map_err(|e| format!("event-relay: bind {addr}: {e}"))?;
 
+    run_listener(listener, events, shutdown).await
+}
+
+async fn run_listener(
+    listener: TcpListener,
+    mut events: UnboundedReceiver<String>,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) -> Result<(), String> {
     let state = RelayState::new();
 
     // Shutdown watch channel — broadcast `true` when the shutdown future resolves.
@@ -530,15 +530,35 @@ pub async fn run(
     // the HTTP upgrade request during the handshake (mirrors legacy parseTopics
     // call inside ServeHTTP).
     let mut srx_accept = shutdown_rx.clone();
+    let mut clients = tokio::task::JoinSet::new();
     loop {
         tokio::select! {
             _ = srx_accept.changed() => {
                 if *srx_accept.borrow() { break; }
             }
+            _ = clients.join_next(), if !clients.is_empty() => {}
             accepted = listener.accept() => {
                 let (stream, _): (tokio::net::TcpStream, SocketAddr) = match accepted {
                     Ok(p) => p,
-                    Err(_) => break,
+                    // Out of descriptors, or a peer gone before the accept:
+                    // back off and keep serving instead of stopping (which
+                    // would take every devcloud service down with it).
+                    Err(e) => {
+                        // Only transient errors; a broken listener still stops.
+                        let transient = matches!(
+                            e.kind(),
+                            std::io::ErrorKind::ConnectionAborted
+                                | std::io::ErrorKind::ConnectionReset
+                                | std::io::ErrorKind::Interrupted
+                                | std::io::ErrorKind::WouldBlock
+                                | std::io::ErrorKind::TimedOut
+                        ) || matches!(e.raw_os_error(), Some(12 | 23 | 24)); // ENOMEM, ENFILE, EMFILE
+                        if !transient {
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        continue;
+                    }
                 };
 
                 // Capture the topics query param during the WS handshake via the
@@ -549,6 +569,23 @@ pub async fn run(
                 let topics_inner = Arc::clone(&topics_cell);
 
                 let callback = move |req: &WsRequest, resp: WsResponse| {
+                    // WebSockets are not subject to CORS: refuse browser pages
+                    // from other sites (their Origin) and DNS-rebinding pages
+                    // (their Host). The dashboard connects server-side.
+                    let header = |name: &str| {
+                        req.headers()
+                            .get(name)
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("")
+                    };
+                    if !trusted_host(header("host")) || !loopback_origin(header("origin")) {
+                        let mut refused = ErrorResponse::new(Some(
+                            "cross-site WebSocket connections are not allowed".into(),
+                        ));
+                        *refused.status_mut() =
+                            tokio_tungstenite::tungstenite::http::StatusCode::FORBIDDEN;
+                        return Err(refused);
+                    }
                     let uri = req.uri();
                     let query = uri.query().unwrap_or("");
                     let raw_topics = query_param(query, "topics");
@@ -556,20 +593,113 @@ pub async fn run(
                     Ok(resp)
                 };
 
-                let ws = match tokio_tungstenite::accept_hdr_async(stream, callback).await {
-                    Ok(ws) => ws,
-                    Err(_) => continue, // bad handshake — skip
-                };
-
-                let topics = topics_cell.lock().unwrap().clone();
                 let state_clone = Arc::clone(&state);
                 let srx = shutdown_rx.clone();
-                tokio::spawn(serve_client(ws, state_clone, topics, srx));
+                // A peer that opens TCP without sending an upgrade must not
+                // block every other client or prevent shutdown of the relay.
+                clients.spawn(async move {
+                    let ws = match time::timeout(
+                        HANDSHAKE_TIMEOUT,
+                        tokio_tungstenite::accept_hdr_async(stream, callback),
+                    ).await {
+                        Ok(Ok(ws)) => ws,
+                        _ => return,
+                    };
+                    let topics = topics_cell.lock().unwrap().clone();
+                    serve_client(ws, state_clone, topics, srx).await;
+                });
             }
         }
     }
 
+    clients.abort_all();
+    while clients.join_next().await.is_some() {}
+
     Ok(())
+}
+
+/// No `Origin` (non-browser clients, the dashboard's server-side proxy) or a
+/// loopback one.
+fn loopback_origin(origin: &str) -> bool {
+    if origin.is_empty() {
+        return true;
+    }
+    let Some((scheme, rest)) = origin.split_once("://") else {
+        return false;
+    };
+    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+        return false;
+    }
+    let host = if let Some(v6) = rest.strip_prefix('[') {
+        match v6.split_once(']') {
+            Some((h, _)) => h.to_string(),
+            None => return false,
+        }
+    } else {
+        rest.rsplit_once(':')
+            .map(|(h, _)| h)
+            .unwrap_or(rest)
+            .to_ascii_lowercase()
+    };
+    host == "localhost" || host == "127.0.0.1" || host == "::1" || host.ends_with(".localhost")
+}
+
+/// DNS-rebinding guard. A page on `http://evil.example` whose name is
+/// re-pointed at 127.0.0.1 makes same-origin requests (no `Origin`, so the
+/// CSRF guard cannot tell), but its `Host` still names the attacker's domain.
+/// Trusted: no `Host` (HTTP/1.0, in-process callers), IP literals, single-label
+/// names (`localhost`, docker-compose service names), and names under
+/// suffixes no public DNS answers for (`.localhost`, `.internal` as in
+/// `host.docker.internal`, `.local`, `.test`, `.example`, `.invalid`,
+/// `.home.arpa`). `DEVCLOUD_ALLOWED_HOSTS` adds names (comma-separated; a
+/// leading `.` allows a suffix, `*` allows any host).
+pub fn trusted_host(host: &str) -> bool {
+    let host = host.trim();
+    if host.is_empty() {
+        return true;
+    }
+    let name = if let Some(v6) = host.strip_prefix('[') {
+        return v6
+            .split_once(']')
+            .is_some_and(|(ip, _)| ip.parse::<std::net::Ipv6Addr>().is_ok());
+    } else {
+        match host.rsplit_once(':') {
+            Some((name, port)) if port.bytes().all(|b| b.is_ascii_digit()) => name,
+            _ => host,
+        }
+    };
+    let name = name.trim_end_matches('.').to_ascii_lowercase();
+    if name.parse::<std::net::Ipv4Addr>().is_ok() || !name.contains('.') {
+        return !name.is_empty();
+    }
+    const PRIVATE_SUFFIXES: [&str; 7] = [
+        ".localhost",
+        ".internal",
+        ".local",
+        ".test",
+        ".example",
+        ".invalid",
+        ".home.arpa",
+    ];
+    if PRIVATE_SUFFIXES.iter().any(|s| name.ends_with(s)) {
+        return true;
+    }
+    allowed_hosts(
+        &std::env::var("DEVCLOUD_ALLOWED_HOSTS").unwrap_or_default(),
+        &name,
+    )
+}
+
+/// Whether `name` (lowercase, no port) is in a `DEVCLOUD_ALLOWED_HOSTS` list.
+fn allowed_hosts(list: &str, name: &str) -> bool {
+    list.split(',')
+        .map(|entry| entry.trim().trim_end_matches('.').to_ascii_lowercase())
+        .filter(|entry| !entry.is_empty())
+        .any(|entry| {
+            entry == "*"
+                || entry == name
+                || (entry.starts_with('.') && (name.ends_with(&entry) || name == &entry[1..]))
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -579,6 +709,78 @@ pub async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn incomplete_handshake_does_not_block_events_or_shutdown() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (events_tx, events_rx) = mpsc::unbounded_channel();
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+        let relay = tokio::spawn(run_listener(listener, events_rx, async move {
+            let _ = stop_rx.await;
+        }));
+
+        let mut idle = tokio::net::TcpStream::connect(addr).await.unwrap();
+        idle.write_all(b"GET /_events HTTP/1.1\r\n").await.unwrap();
+        let (mut ws, _) = time::timeout(
+            Duration::from_secs(2),
+            tokio_tungstenite::connect_async(format!("ws://{addr}/_events?topics=mail")),
+        )
+        .await
+        .expect("an idle handshake must not block later connections")
+        .unwrap();
+        let hello = time::timeout(Duration::from_secs(2), ws.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let hello: serde_json::Value = serde_json::from_str(hello.to_text().unwrap()).unwrap();
+        assert_eq!(hello["type"], "hello");
+
+        events_tx
+            .send(r#"{"type":"s3.object.put","service":"s3"}"#.into())
+            .unwrap();
+        events_tx
+            .send(
+                r#"{"type":"mail.received","service":"mail","payload":{"messageID":"one"}}"#.into(),
+            )
+            .unwrap();
+        let frame = time::timeout(Duration::from_secs(2), ws.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let frame: serde_json::Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+        assert_eq!(frame["type"], "event");
+        assert_eq!(frame["event"]["service"], "mail");
+        assert_eq!(frame["event"]["payload"]["messageID"], "one");
+        assert!(frame["event"]["timestamp"].is_string());
+
+        stop_tx.send(()).unwrap();
+        time::timeout(Duration::from_secs(2), relay)
+            .await
+            .expect("shutdown must cancel pending handshakes")
+            .unwrap()
+            .unwrap();
+        let mut byte = [0u8; 1];
+        let closed = time::timeout(Duration::from_secs(2), idle.read(&mut byte))
+            .await
+            .unwrap();
+        assert!(matches!(closed, Ok(0)) || closed.is_err());
+    }
+
+    #[test]
+    fn websocket_handshakes_from_other_sites_are_refused() {
+        assert!(loopback_origin(""));
+        assert!(loopback_origin("http://127.0.0.1:18025"));
+        assert!(loopback_origin("http://localhost:5173"));
+        assert!(!loopback_origin("https://evil.example.com"));
+        assert!(!loopback_origin("null"));
+        assert!(trusted_host("127.0.0.1:18027"));
+        assert!(!trusted_host("evil.example.com:18027"));
+    }
 
     #[test]
     fn parse_topics_empty_string_returns_all() {

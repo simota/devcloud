@@ -1,5 +1,31 @@
 use std::net::ToSocketAddrs;
 use std::path::PathBuf;
+#[cfg(unix)]
+use std::time::Duration;
+
+/// Gives managed Redis time to save its RDB snapshot before forcing shutdown.
+/// Callers must spawn with `kill_on_drop(true)` so cancellation of this wait
+/// also terminates the owned child. Every completed path reaps the process.
+pub async fn stop_child(child: &mut tokio::process::Child) -> std::io::Result<()> {
+    if child.try_wait()?.is_some() {
+        return Ok(());
+    }
+    #[cfg(unix)]
+    if let Some(pid) = child.id() {
+        extern "C" {
+            fn kill(pid: std::os::raw::c_int, signal: std::os::raw::c_int) -> std::os::raw::c_int;
+        }
+        let signal = tokio::signal::unix::SignalKind::terminate().as_raw_value();
+        // SAFETY: the PID belongs to the child we still own, and `kill` does
+        // not access Rust memory. An unreaped child cannot have its PID reused.
+        if unsafe { kill(pid as std::os::raw::c_int, signal) } == 0 {
+            if let Ok(result) = tokio::time::timeout(Duration::from_secs(5), child.wait()).await {
+                return result.map(|_| ());
+            }
+        }
+    }
+    child.kill().await
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {

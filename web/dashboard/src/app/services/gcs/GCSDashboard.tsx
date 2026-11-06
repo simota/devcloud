@@ -4,6 +4,7 @@ import { Panel } from '../../../ui/Panel'
 import { Button } from '../../../ui/Button'
 import { dangerConfirm, useConfirm } from '../../../ui/Confirm'
 import { useDashboardEvents } from '../../api/hooks/useDashboardEvents'
+import { useLatestRequest } from '../../api/hooks/useLatestRequest'
 import type { DashboardService } from '../dashboard/types'
 import {
   createGCSBucket,
@@ -38,24 +39,30 @@ export function GCSDashboard({ service }: GCSDashboardProps): JSX.Element {
   const [objectsState, setObjectsState] = useState<ObjectsState>({ status: 'idle' })
   const [activeBucket, setActiveBucket] = useState<string>()
   const [activeObject, setActiveObject] = useState<GCSObjectSummary>()
+  const [inspectionTarget, setInspectionTarget] = useState<{ bucket: string; name: string }>()
   const [prefix, setPrefix] = useState('')
   const [bucketName, setBucketName] = useState('')
   const [message, setMessage] = useState<string>()
   const [objectsRefreshNonce, setObjectsRefreshNonce] = useState(0)
   const isDisabled = service?.status === 'disabled'
   const confirm = useConfirm()
+  const inspectedObjectName = inspectionTarget?.bucket === activeBucket ? inspectionTarget?.name : undefined
 
+  const startRefresh = useLatestRequest()
   const refresh = useCallback(() => {
+    const isCurrent = startRefresh()
     if (isDisabled) {
       setDashboardState({ status: 'success', statusPayload: disabledStatus(service), buckets: [], sessions: [] })
       setObjectsState({ status: 'idle' })
       setActiveBucket(undefined)
       setActiveObject(undefined)
+      setInspectionTarget(undefined)
       return
     }
     setDashboardState({ status: 'loading' })
     Promise.all([getGCSStatus(), listGCSBuckets(), listGCSUploadSessions()])
       .then(([statusPayload, bucketsResponse, sessionsResponse]) => {
+        if (!isCurrent()) return
         setDashboardState({
           status: 'success',
           statusPayload,
@@ -69,9 +76,10 @@ export function GCSDashboard({ service }: GCSDashboardProps): JSX.Element {
         )
       })
       .catch((error: Error) => {
+        if (!isCurrent()) return
         setDashboardState({ status: 'error', message: error.message })
       })
-  }, [isDisabled, service])
+  }, [startRefresh, isDisabled, service])
 
   useEffect(() => {
     refresh()
@@ -87,10 +95,19 @@ export function GCSDashboard({ service }: GCSDashboardProps): JSX.Element {
     [refresh],
   )
 
-  useDashboardEvents({ topics: ['gcs'], onEvent: onGCSEvent, enabled: !isDisabled })
+  useDashboardEvents({
+    topics: ['gcs'],
+    onEvent: onGCSEvent,
+    onResync: () => {
+      refresh()
+      setObjectsRefreshNonce((n) => n + 1)
+    },
+    enabled: !isDisabled,
+  })
 
   useEffect(() => {
     setActiveObject(undefined)
+    setInspectionTarget(undefined)
     if (!activeBucket || isDisabled) {
       setObjectsState({ status: 'idle' })
       return
@@ -113,6 +130,24 @@ export function GCSDashboard({ service }: GCSDashboardProps): JSX.Element {
     }
   }, [activeBucket, isDisabled, prefix, objectsRefreshNonce])
 
+  useEffect(() => {
+    setActiveObject(undefined)
+    if (!inspectionTarget || inspectionTarget.bucket !== activeBucket || isDisabled) {
+      return
+    }
+    let cancelled = false
+    getGCSObject(inspectionTarget.bucket, inspectionTarget.name)
+      .then((object) => {
+        if (!cancelled) setActiveObject(object)
+      })
+      .catch((error: Error) => {
+        if (!cancelled) setMessage(error.message)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [activeBucket, inspectionTarget, isDisabled])
+
   const buckets = dashboardState.status === 'success' ? dashboardState.buckets : []
   const sessions = dashboardState.status === 'success' ? dashboardState.sessions : []
   const statusPayload = dashboardState.status === 'success' ? dashboardState.statusPayload : undefined
@@ -120,15 +155,14 @@ export function GCSDashboard({ service }: GCSDashboardProps): JSX.Element {
   function selectBucket(bucket: string): void {
     setActiveBucket(bucket)
     setActiveObject(undefined)
+    setInspectionTarget(undefined)
   }
 
   function inspectObject(object: GCSObjectSummary): void {
     if (!activeBucket) {
       return
     }
-    getGCSObject(activeBucket, object.name)
-      .then(setActiveObject)
-      .catch((error: Error) => setMessage(error.message))
+    setInspectionTarget({ bucket: activeBucket, name: object.name })
   }
 
   function createBucket(): void {
@@ -184,9 +218,10 @@ export function GCSDashboard({ service }: GCSDashboardProps): JSX.Element {
     deleteGCSObject(activeBucket, object.name)
       .then(() => {
         setMessage(`Deleted object ${object.gcsUri}`)
-        setActiveObject(undefined)
-        setPrefix((current) => current)
-        refreshObjects(activeBucket, prefix, setObjectsState)
+        // A different bucket may be selected while deletion is in flight.
+        // Reload through the effect for the current selection, which also
+        // cancels obsolete list and inspector requests.
+        setObjectsRefreshNonce((n) => n + 1)
       })
       .catch((error: Error) => setMessage(error.message))
   }
@@ -250,7 +285,7 @@ export function GCSDashboard({ service }: GCSDashboardProps): JSX.Element {
 
       <Panel title="Objects">
         <ObjectBrowser
-          activeObjectName={activeObject?.name}
+          activeObjectName={inspectedObjectName}
           bucketName={activeBucket}
           disabled={isDisabled}
           objectsState={objectsState}
@@ -566,13 +601,6 @@ function UploadSessions({ disabled, onDeleteSession, sessions }: UploadSessionsP
       </table>
     </div>
   )
-}
-
-function refreshObjects(bucket: string, prefix: string, setObjectsState: (state: ObjectsState) => void): void {
-  setObjectsState({ status: 'loading' })
-  listGCSObjects(bucket, prefix.trim())
-    .then(({ objects }) => setObjectsState({ status: 'success', objects }))
-    .catch((error: Error) => setObjectsState({ status: 'error', message: error.message }))
 }
 
 function disabledStatus(service?: DashboardService): GCSStatus {

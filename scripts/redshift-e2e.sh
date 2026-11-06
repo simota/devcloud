@@ -314,6 +314,16 @@ services:
       mode: ${REDSHIFT_BACKEND_MODE}
       externalDsn: ${REDSHIFT_BACKEND_EXTERNAL_DSN}
       managed: ${REDSHIFT_BACKEND_MANAGED}
+# Lambda / Cloud Run are not exercised here; keep them off their default ports.
+services:
+  lambda:
+    enabled: false
+  cloudRun:
+    enabled: false
+  ssm:
+    enabled: false
+  sts:
+    enabled: false
 EOF
 
 log "building devcloud"
@@ -341,10 +351,103 @@ insert into e2e.events values (1, 'created');
 select id, payload from e2e.events where id = 1;
 SQL
 
-log "running Data API smoke"
 export AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-dev}"
 export AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-dev}"
 export AWS_DEFAULT_REGION="${AWS_DEFAULT_REGION:-us-east-1}"
+
+if [[ "${REDSHIFT_BACKEND_KIND}" == "postgres" ]]; then
+  # The statement sequence of a data load that stages through session temp
+  # tables: COPY from local S3 per format (plain and GZIP), then an upsert in
+  # one transaction. Run twice on separate connections — the second must not
+  # see the first connection's temp tables.
+  log "running COPY data load journey"
+  S3_ENDPOINT="http://${HOST}:${S3_PORT}"
+  printf '1,alice,10.5\n2,"bob, jr",20\n' >"${TMP_DIR}/d.csv"
+  printf '1\talice\t10.5\n2\tbob jr\t20\n' >"${TMP_DIR}/d.tsv"
+  printf '{"id":1,"name":"alice","amount":10.5}\n{"id":2,"name":"bob jr","amount":20}\n' >"${TMP_DIR}/d.json"
+  aws s3 mb s3://copy-e2e --endpoint-url "${S3_ENDPOINT}" >/dev/null
+  for format in csv tsv json; do
+    gzip -kf "${TMP_DIR}/d.${format}"
+    aws s3 cp "${TMP_DIR}/d.${format}" "s3://copy-e2e/plain/d.${format}" --endpoint-url "${S3_ENDPOINT}" >/dev/null
+    aws s3 cp "${TMP_DIR}/d.${format}.gz" "s3://copy-e2e/gz/d.${format}.gz" --endpoint-url "${S3_ENDPOINT}" >/dev/null
+  done
+  PGPASSWORD="${DB_PASSWORD}" psql "host=${HOST} port=${REDSHIFT_SQL_PORT} dbname=${DATABASE} user=${DB_USER} sslmode=disable" \
+    -v ON_ERROR_STOP=1 -q <<'SQL'
+create schema if not exists load;
+drop table if exists load.target;
+create table load.target (id integer, name varchar(64), amount numeric(10,2), csa_dwh_file_path varchar(1024), csa_dwh_created_at timestamp);
+insert into load.target values (1, 'old', 0, 'x', '2020-01-01 00:00:00');
+SQL
+  copy_load() {
+    local key="$1" clause="$2"
+    PGPASSWORD="${DB_PASSWORD}" psql "host=${HOST} port=${REDSHIFT_SQL_PORT} dbname=${DATABASE} user=${DB_USER} sslmode=disable" \
+      -v ON_ERROR_STOP=1 -q <<SQL
+CREATE TEMP TABLE csa_stg_file (LIKE "load"."target");
+ALTER TABLE csa_stg_file DROP COLUMN csa_dwh_file_path, DROP COLUMN csa_dwh_created_at;
+CREATE TEMP TABLE csa_stg_load (LIKE "load"."target");
+COPY csa_stg_file FROM 's3://copy-e2e/${key}' IAM_ROLE 'arn:aws:iam::000000000000:role/copy' ${clause};
+INSERT INTO csa_stg_load SELECT *, 's3://copy-e2e/${key}', TIMESTAMP '2026-11-03 12:00:00' FROM csa_stg_file;
+DELETE FROM csa_stg_file;
+BEGIN;
+DELETE FROM "load"."target" USING csa_stg_load WHERE "load"."target"."id" = csa_stg_load."id";
+INSERT INTO "load"."target" SELECT * FROM csa_stg_load;
+COMMIT;
+SQL
+    local got
+    got="$(PGPASSWORD="${DB_PASSWORD}" psql "host=${HOST} port=${REDSHIFT_SQL_PORT} dbname=${DATABASE} user=${DB_USER} sslmode=disable" \
+      -Atc "select string_agg(id || ':' || name || ':' || amount || ':' || csa_dwh_file_path, ';' order by id) from load.target")"
+    if [[ "${got}" != "1:alice:10.50:s3://copy-e2e/${key};2:bob${3}:20.00:s3://copy-e2e/${key}" ]]; then
+      echo "[FAIL] COPY ${key} (${clause}) loaded: ${got}" >&2
+      exit 1
+    fi
+  }
+  copy_load plain/d.csv "FORMAT AS CSV" ", jr"
+  copy_load gz/d.csv.gz "FORMAT AS CSV GZIP" ", jr"
+  copy_load plain/d.tsv "DELIMITER '\\t'" " jr"
+  copy_load gz/d.tsv.gz "DELIMITER '\\t' GZIP" " jr"
+  copy_load plain/d.json "FORMAT AS JSON 'auto'" " jr"
+  copy_load gz/d.json.gz "FORMAT AS JSON 'auto' GZIP" " jr"
+
+  # A COPY is all or nothing: 600 good rows (more than one INSERT batch) in
+  # the first object and a type error in the second leave no rows behind,
+  # in autocommit and inside a transaction.
+  log "running COPY atomicity check"
+  python3 -c 'print("\n".join(f"{i},n{i}" for i in range(600)))' >"${TMP_DIR}/good.csv"
+  printf '600,ok\nnot-a-number,bad\n' >"${TMP_DIR}/bad.csv"
+  aws s3 cp "${TMP_DIR}/good.csv" s3://copy-e2e/atomic/1.csv --endpoint-url "${S3_ENDPOINT}" >/dev/null
+  aws s3 cp "${TMP_DIR}/bad.csv" s3://copy-e2e/atomic/2.csv --endpoint-url "${S3_ENDPOINT}" >/dev/null
+  PGPASSWORD="${DB_PASSWORD}" psql "host=${HOST} port=${REDSHIFT_SQL_PORT} dbname=${DATABASE} user=${DB_USER} sslmode=disable" \
+    -v ON_ERROR_STOP=1 -q -c "drop table if exists load.atomic" -c "create table load.atomic (id integer, name varchar(16))"
+  for wrap in autocommit transaction; do
+    if [[ "${wrap}" == "transaction" ]]; then begin="BEGIN;"; end="ROLLBACK;"; else begin=""; end=""; fi
+    if PGPASSWORD="${DB_PASSWORD}" psql "host=${HOST} port=${REDSHIFT_SQL_PORT} dbname=${DATABASE} user=${DB_USER} sslmode=disable" \
+      -v ON_ERROR_STOP=1 -q >/dev/null 2>&1 <<SQL
+${begin}
+COPY load.atomic
+FROM 's3://copy-e2e/atomic/'
+IAM_ROLE 'arn:aws:iam::000000000000:role/copy' CSV;
+${end}
+SQL
+    then
+      echo "[FAIL] COPY with a bad row succeeded (${wrap})" >&2
+      exit 1
+    fi
+    got="$(PGPASSWORD="${DB_PASSWORD}" psql "host=${HOST} port=${REDSHIFT_SQL_PORT} dbname=${DATABASE} user=${DB_USER} sslmode=disable" -Atc "select count(*) from load.atomic")"
+    if [[ "${got}" != "0" ]]; then
+      echo "[FAIL] failed COPY left ${got} rows (${wrap})" >&2
+      exit 1
+    fi
+  done
+  aws s3 rm s3://copy-e2e/atomic/2.csv --endpoint-url "${S3_ENDPOINT}" >/dev/null
+  got="$(PGPASSWORD="${DB_PASSWORD}" psql "host=${HOST} port=${REDSHIFT_SQL_PORT} dbname=${DATABASE} user=${DB_USER} sslmode=disable" \
+    -qAtc "COPY load.atomic FROM 's3://copy-e2e/atomic/' IAM_ROLE 'r' CSV" -c "select count(*) from load.atomic")"
+  if [[ "${got}" != "600" ]]; then
+    echo "[FAIL] COPY after removing the bad object loaded: ${got}" >&2
+    exit 1
+  fi
+fi
+
+log "running Data API smoke"
 STATEMENT_ID="$(aws redshift-data execute-statement \
   --endpoint-url "${API_ENDPOINT}" \
   --region "${AWS_DEFAULT_REGION}" \

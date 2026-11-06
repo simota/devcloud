@@ -98,6 +98,24 @@ fn bucket_crud_matches_oracle() {
 }
 
 #[test]
+fn create_bucket_recovers_directory_left_before_metadata_was_committed() {
+    let root = tempdir();
+    let store = FileBucketStore::new(&root);
+    // A failed write (or process interruption) after mkdir leaves this exact
+    // state. Retrying must persist a real bucket instead of returning a blank
+    // default resource and a false success.
+    std::fs::create_dir_all(store.bucket_path("retry-bucket")).unwrap();
+    let (bucket, created) = store.create_bucket("retry-bucket").unwrap();
+    assert!(created);
+    assert_eq!(bucket.name, "retry-bucket");
+    let persisted = store.get_bucket("retry-bucket").unwrap().unwrap();
+    assert_eq!(persisted.name, bucket.name);
+    assert_eq!(persisted.created_at, bucket.created_at);
+    assert!(!store.create_bucket("retry-bucket").unwrap().1);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn delete_rejects_non_empty_bucket() {
     let root = tempdir();
     let store = FileBucketStore::new(&root);

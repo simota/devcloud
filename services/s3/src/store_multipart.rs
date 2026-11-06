@@ -37,6 +37,7 @@ impl FileBucketStore {
         &self,
         input: CreateMultipartUploadInput,
     ) -> Result<MultipartUpload> {
+        let _guard = self.lock_object_writes();
         self.require_bucket_and_key(&input.bucket, &input.key)?;
         let mut upload = MultipartUpload {
             bucket: input.bucket.clone(),

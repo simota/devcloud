@@ -27,6 +27,7 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc::UnboundedSender;
 
+mod browser_guard;
 mod command_allowlist;
 mod http;
 mod resp;
@@ -41,11 +42,12 @@ pub use command_allowlist::CommandClass;
 /// | field            | orchestrator source                                  |
 /// |------------------|------------------------------------------------------|
 /// | `http_addr`      | loopback + `cfg.server.redis_http_port`              |
-/// | `redis_addr`     | loopback + `cfg.server.redis_port` (data plane)     |
-/// | `redis_password` | `cfg.auth.redis.password`                            |
+/// | `redis_addr`     | managed loopback or external URL host/port          |
+/// | `redis_password` | managed strict password or external URL password    |
 /// | `control_auth_mode` | `cfg.auth.redis.mode` ("relaxed" | "strict")     |
-/// | `control_password`  | `cfg.auth.redis.password` (legacy reuses it)         |
+/// | `control_password`  | `cfg.auth.redis.password` for HTTP Basic             |
 /// | `mode`           | redis mode display string ("managed" | "external")  |
+/// | `initial_db`     | external URL database, otherwise 0                  |
 /// | `database_count` | 0 = probe via `CONFIG GET databases` (default 16)   |
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -53,15 +55,17 @@ pub struct Config {
     pub http_addr: String,
     /// `host:port` of the upstream redis data plane.
     pub redis_addr: String,
-    /// Upstream redis password (sent via `AUTH`; never logged). Empty in relaxed.
+    /// Upstream redis password (sent via `AUTH`; never logged).
     pub redis_password: String,
     /// Control-surface auth mode: "relaxed" (open) or "strict" (HTTP Basic).
     pub control_auth_mode: String,
-    /// Control-surface password checked in strict mode (HTTP Basic). The legacy
-    /// reference reuses the redis password; the orchestrator passes the same.
+    /// Control-surface password checked in strict mode (HTTP Basic). External
+    /// Redis may use a different password, supplied through its URL.
     pub control_password: String,
     /// Display-only mode string for the status response ("managed"/"external").
     pub mode: String,
+    /// Initial database from the external URL (managed mode uses 0).
+    pub initial_db: i64,
     /// Database count; 0 probes the upstream (`CONFIG GET databases`, default 16).
     pub database_count: i64,
     /// Optional in-process dashboard event sink. When set, mutation events are
@@ -77,6 +81,14 @@ impl Config {
             password: self.control_password.clone(),
         }
     }
+}
+
+/// Validates the configured external upstream with AUTH, SELECT and PING.
+/// Keeps the RESP transport private while allowing the orchestrator's external
+/// lifecycle to fail clearly when the configured endpoint is unavailable.
+pub async fn validate_upstream(addr: &str, password: &str, database: i64) -> Result<(), String> {
+    let mut conn = resp::RespConn::connect(addr, password, database).await?;
+    conn.command(&["PING"]).await.map(|_| ())
 }
 
 /// Runs the redis control/introspection HTTP surface until `shutdown` resolves.
@@ -108,6 +120,11 @@ pub async fn run(
     // upstream is not fatal here — reads/mutations surface 502 per request, same
     // as the legacy listener which always runs regardless of upstream liveness.
     server.refresh_database_count().await;
+    if cfg.initial_db != 0 {
+        server.set_initial_db(cfg.initial_db).await.map_err(|_| {
+            "redis control: failed to select the configured initial database".to_string()
+        })?;
+    }
 
     http::serve(listener, server, auth, shutdown)
         .await

@@ -45,6 +45,14 @@ pub async fn shutdown_future(mut rx: watch::Receiver<bool>) {
 /// Starts all enabled services and blocks until they all exit (clean shutdown)
 /// or the first one errors. Returns the first service error, if any.
 pub async fn run(cfg: Config) -> Result<(), String> {
+    // Resolve external Redis before launching tasks, so invalid URL settings
+    // cannot partially start the daemon or silently select the managed port.
+    let redis_target = cfg
+        .services
+        .redis
+        .enabled
+        .then(|| services::redis::connection_target(&cfg))
+        .transpose()?;
     let (tx, rx) = watch::channel(false);
     let mut set: JoinSet<Result<(), String>> = JoinSet::new();
 
@@ -59,6 +67,8 @@ pub async fn run(cfg: Config) -> Result<(), String> {
     devcloud_gcs::set_event_sink(event_tx.clone());
     devcloud_bigquery::set_event_sink(event_tx.clone());
     devcloud_redshift::set_event_sink(event_tx.clone());
+    devcloud_lambda::set_event_sink(event_tx.clone());
+    devcloud_cloudrun::set_event_sink(event_tx.clone());
     {
         let addr = format!("127.0.0.1:{}", cfg.server.event_relay_port);
         let sd = shutdown_future(rx.clone());
@@ -101,6 +111,26 @@ pub async fn run(cfg: Config) -> Result<(), String> {
         let sd = shutdown_future(rx.clone());
         set.spawn(async move { services::applicationautoscaling::run(&c, sd).await });
     }
+    if cfg.services.ssm.enabled {
+        let c = cfg.clone();
+        let sd = shutdown_future(rx.clone());
+        set.spawn(async move { services::ssm::run(&c, sd).await });
+    }
+    if cfg.services.sts.enabled {
+        let c = cfg.clone();
+        let sd = shutdown_future(rx.clone());
+        set.spawn(async move { services::sts::run(&c, sd).await });
+    }
+    if cfg.services.lambda.enabled {
+        let c = cfg.clone();
+        let sd = shutdown_future(rx.clone());
+        set.spawn(async move { services::lambda::run(&c, sd).await });
+    }
+    if cfg.services.cloud_run.enabled {
+        let c = cfg.clone();
+        let sd = shutdown_future(rx.clone());
+        set.spawn(async move { services::cloudrun::run(&c, sd).await });
+    }
     if cfg.services.pubsub.enabled {
         let c = cfg.clone();
         let sd = shutdown_future(rx.clone());
@@ -111,7 +141,7 @@ pub async fn run(cfg: Config) -> Result<(), String> {
         let sd = shutdown_future(rx.clone());
         set.spawn(async move { services::redshift::run(&c, sd).await });
     }
-    if cfg.services.redis.enabled {
+    if let Some(redis_target) = redis_target {
         let c = cfg.clone();
         let sd = shutdown_future(rx.clone());
         set.spawn(async move { services::redis::run(&c, sd).await });
@@ -120,23 +150,14 @@ pub async fn run(cfg: Config) -> Result<(), String> {
         // in-process even when the upstream redis-server is absent (reads/mutations
         // surface 502), mirroring the legacy listener which always runs when redis is
         // enabled. Feeds redis mutation events into the same relay channel.
-        let redis_mode = {
-            let m = cfg.services.redis.mode.trim().to_lowercase();
-            if !m.is_empty() {
-                m
-            } else if !cfg.services.redis.external_url.trim().is_empty() {
-                "external".to_string()
-            } else {
-                "managed".to_string()
-            }
-        };
         let rc_cfg = devcloud_redis_control::Config {
             http_addr: format!("127.0.0.1:{}", cfg.server.redis_http_port),
-            redis_addr: format!("127.0.0.1:{}", cfg.server.redis_port),
-            redis_password: cfg.auth.redis.password.clone(),
+            redis_addr: redis_target.addr,
+            redis_password: redis_target.password,
             control_auth_mode: cfg.auth.redis.mode.clone(),
             control_password: cfg.auth.redis.password.clone(),
-            mode: redis_mode,
+            mode: redis_target.mode,
+            initial_db: redis_target.database,
             database_count: 0,
             event_sink: Some(event_tx.clone()),
         };

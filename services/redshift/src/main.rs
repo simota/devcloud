@@ -24,6 +24,9 @@
 //!   DEVCLOUD_REDSHIFT_BACKEND_KIND     memory | postgres
 //!   DEVCLOUD_REDSHIFT_BACKEND_MODE     managed | external | memory | embedded
 //!   DEVCLOUD_REDSHIFT_DSN              postgres DSN (managed: daemon-provided)
+//!   DEVCLOUD_REDSHIFT_TLS_CERT_FILE    PEM certificate chain for SQL TLS (optional)
+//!   DEVCLOUD_REDSHIFT_TLS_KEY_FILE     PEM private key for SQL TLS (optional)
+//!   DEVCLOUD_REDSHIFT_TLS_REQUIRE      true: refuse SQL clients without TLS
 //!
 //! The daemon owns the managed-PostgreSQL lifecycle (managed_postgres.rs); this
 //! binary only connects to the DSN. Successful Data API mutations print
@@ -82,6 +85,18 @@ fn main() {
         Some(Arc::new(FileBucketStore::new(object_store_root)))
     };
 
+    let sql_tls = match devcloud_redshift::tls::sql_tls_from_files(
+        &env("DEVCLOUD_REDSHIFT_TLS_CERT_FILE"),
+        &env("DEVCLOUD_REDSHIFT_TLS_KEY_FILE"),
+        env("DEVCLOUD_REDSHIFT_TLS_REQUIRE").eq_ignore_ascii_case("true"),
+    ) {
+        Ok(tls) => tls,
+        Err(e) => {
+            eprintln!("devcloud-redshift: {e}");
+            std::process::exit(2);
+        }
+    };
+
     let server = Server::new(Config {
         sql_addr: sql_addr.clone(),
         api_addr: api_addr.clone(),
@@ -103,6 +118,7 @@ fn main() {
         sql_backend,
         translator,
         events_enabled: true,
+        sql_tls,
     });
 
     let runtime = tokio::runtime::Builder::new_multi_thread()

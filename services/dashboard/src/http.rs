@@ -14,13 +14,13 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::config::Config;
 use crate::{
-    applicationautoscaling, assets, bigquery, dynamodb, events, gcs, mail, pubsub, redis, redshift,
-    s3, services, sqs,
+    applicationautoscaling, assets, bigquery, cloudrun, dynamodb, events, gcs, lambda, mail,
+    pubsub, redis, redshift, s3, services, sqs, ssm, sts,
 };
 
 const MAX_HEADER_BYTES: usize = 64 * 1024;
@@ -113,7 +113,28 @@ pub async fn serve(
         tokio::select! {
             _ = &mut shutdown => return Ok(()),
             accepted = listener.accept() => {
-                let (stream, _) = accepted?;
+                let (stream, _) = match accepted {
+                    Ok(a) => a,
+                    // Out of descriptors, or a peer gone before the accept:
+                    // back off and keep serving instead of stopping (which
+                    // would take every devcloud service down with it).
+                    Err(e) => {
+                        // Only transient errors; a broken listener still stops.
+                        let transient = matches!(
+                            e.kind(),
+                            std::io::ErrorKind::ConnectionAborted
+                                | std::io::ErrorKind::ConnectionReset
+                                | std::io::ErrorKind::Interrupted
+                                | std::io::ErrorKind::WouldBlock
+                                | std::io::ErrorKind::TimedOut
+                        ) || matches!(e.raw_os_error(), Some(12 | 23 | 24)); // ENOMEM, ENFILE, EMFILE
+                        if !transient {
+                            return Err(e);
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        continue;
+                    }
+                };
                 let config = Arc::clone(&config);
                 tokio::spawn(async move {
                     let _ = handle_conn(stream, config).await;
@@ -131,6 +152,19 @@ async fn handle_conn(mut stream: TcpStream, config: Arc<Config>) -> std::io::Res
     // `/api/events` is a WebSocket upgrade, not a request/response route: hijack
     // the stream and hand it to the events proxy (it never returns a Response).
     if events::is_events_upgrade(&request) {
+        // WebSockets are not subject to CORS, and the events carry mail
+        // metadata and resource activity: the same Host guard as `route`,
+        // plus the Origin check every cross-site page would otherwise pass.
+        let host = request.header("host");
+        let origin = request.header("origin");
+        let allowed = trusted_host(host)
+            && (trusted_origin(origin, request.header("sec-fetch-site"))
+                || same_origin(origin, host));
+        if !allowed {
+            let refused =
+                Response::text_error(403, "cross-site WebSocket connections are not allowed");
+            return write_response(&mut stream, refused).await;
+        }
         events::handle(stream, &request, Arc::clone(&config)).await;
         return Ok(());
     }
@@ -142,6 +176,21 @@ async fn handle_conn(mut stream: TcpStream, config: Arc<Config>) -> std::io::Res
 /// router directly without a socket.
 pub async fn route(config: &Config, req: &Request) -> Response {
     let path = req.path.as_str();
+    if !trusted_host(req.header("host")) {
+        return Response::text_error(
+            403,
+            "untrusted Host header (DNS rebinding guard); add the name to DEVCLOUD_ALLOWED_HOSTS to allow it",
+        );
+    }
+    // CSRF guard for every API mutation: a cross-site page can send a
+    // "simple" POST (text/plain or form body) without any CORS preflight.
+    if path.starts_with("/api/")
+        && !matches!(req.method.as_str(), "GET" | "HEAD" | "OPTIONS")
+        && !trusted_origin(req.header("origin"), req.header("sec-fetch-site"))
+        && !same_origin(req.header("origin"), req.header("host"))
+    {
+        return Response::text_error(403, "cross-origin requests are not allowed");
+    }
 
     if path == "/" {
         return index_response(req);
@@ -287,6 +336,20 @@ pub async fn route(config: &Config, req: &Request) -> Response {
         return pubsub::handle_message(config, req).await;
     }
 
+    // SSM / STS.
+    if path == "/api/ssm/status" {
+        return ssm::handle_status(config, req).await;
+    }
+    if path == "/api/ssm/parameters" {
+        return ssm::handle_parameters(config, req).await;
+    }
+    if path == "/api/sts/status" {
+        return sts::handle_status(config, req).await;
+    }
+    if path == "/api/sts/caller-identity" {
+        return sts::handle_caller_identity(config, req).await;
+    }
+
     // Application Auto Scaling.
     if path == "/api/applicationautoscaling/status" {
         return applicationautoscaling::handle_status(config, req).await;
@@ -299,6 +362,34 @@ pub async fn route(config: &Config, req: &Request) -> Response {
     }
     if path == "/api/applicationautoscaling/scheduled-actions" {
         return applicationautoscaling::handle_scheduled_actions(config, req).await;
+    }
+
+    // Lambda.
+    if path == "/api/lambda/status" {
+        return lambda::handle_status(config, req).await;
+    }
+    if path == "/api/lambda/functions" {
+        return lambda::handle_functions(config, req).await;
+    }
+    if path == "/api/lambda/invocations" {
+        return lambda::handle_invocations(config, req).await;
+    }
+    if path.starts_with("/api/lambda/functions/") && path.ends_with("/invoke") {
+        return lambda::handle_invoke(config, req).await;
+    }
+
+    // Cloud Run.
+    if path == "/api/cloudrun/status" {
+        return cloudrun::handle_status(config, req).await;
+    }
+    if path == "/api/cloudrun/services" {
+        return cloudrun::handle_services(config, req).await;
+    }
+    if path == "/api/cloudrun/instances" {
+        return cloudrun::handle_instances(config, req).await;
+    }
+    if path.starts_with("/api/cloudrun/services/") {
+        return cloudrun::handle_service(config, req).await;
     }
 
     Response::text_error(404, "404 page not found")
@@ -322,11 +413,14 @@ fn legacy_redirect(req: &Request, target: &str) -> Response {
     Response::redirect(301, target)
 }
 
-async fn read_request(stream: &mut TcpStream) -> std::io::Result<Option<Request>> {
+async fn read_request<S: AsyncRead + Unpin>(stream: &mut S) -> std::io::Result<Option<Request>> {
     let mut buf = Vec::new();
     let mut tmp = [0u8; 4096];
     let header_end = loop {
         if let Some(pos) = find_subslice(&buf, b"\r\n\r\n") {
+            if pos + 4 > MAX_HEADER_BYTES {
+                return Ok(None);
+            }
             break pos;
         }
         if buf.len() > MAX_HEADER_BYTES {
@@ -354,14 +448,26 @@ async fn read_request(stream: &mut TcpStream) -> std::io::Result<Option<Request>
     let mut headers = HashMap::new();
     for line in lines {
         if let Some((k, v)) = line.split_once(':') {
-            headers.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
+            let name = k.trim().to_ascii_lowercase();
+            if name == "content-length" && headers.contains_key(&name) {
+                return Ok(None);
+            }
+            headers.insert(name, v.trim().to_string());
         }
     }
 
-    let content_length: usize = headers
-        .get("content-length")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
+    // These one-shot endpoints support fixed-length bodies only. Reject
+    // ambiguous framing before a mutation can see a partial or empty body.
+    if headers.contains_key("transfer-encoding") {
+        return Ok(None);
+    }
+    let content_length = match headers.get("content-length") {
+        None => 0,
+        Some(raw) => match raw.parse::<usize>() {
+            Ok(length) if raw.bytes().all(|b| b.is_ascii_digit()) => length,
+            _ => return Ok(None),
+        },
+    };
     if content_length > MAX_BODY_BYTES {
         return Ok(None);
     }
@@ -370,7 +476,7 @@ async fn read_request(stream: &mut TcpStream) -> std::io::Result<Option<Request>
     while body.len() < content_length {
         let n = stream.read(&mut tmp).await?;
         if n == 0 {
-            break;
+            return Ok(None);
         }
         body.extend_from_slice(&tmp[..n]);
     }
@@ -469,6 +575,107 @@ pub fn path_segment_decode(raw: &str) -> Option<String> {
     Some(decoded)
 }
 
+/// CSRF guard for state-changing / code-executing requests. AWS SDKs, CLIs and
+/// other non-browser clients send no `Origin`; a browser always does on a
+/// cross-origin POST — including "simple" `text/plain` ones that CORS never
+/// blocks from being sent. Only loopback origins (local front-ends, the
+/// devcloud dashboard) are trusted; a DNS-rebinding page keeps its own
+/// non-loopback origin and is refused too.
+pub fn trusted_origin(origin: &str, sec_fetch_site: &str) -> bool {
+    if origin.is_empty() {
+        return !sec_fetch_site.eq_ignore_ascii_case("cross-site");
+    }
+    let Some((scheme, rest)) = origin.split_once("://") else {
+        return false; // includes the opaque `null` origin
+    };
+    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+        return false;
+    }
+    let host = if let Some(v6) = rest.strip_prefix('[') {
+        match v6.split_once(']') {
+            Some((h, _)) => h.to_string(),
+            None => return false,
+        }
+    } else {
+        rest.rsplit_once(':')
+            .map(|(h, _)| h)
+            .unwrap_or(rest)
+            .to_ascii_lowercase()
+    };
+    host == "localhost" || host == "127.0.0.1" || host == "::1" || host.ends_with(".localhost")
+}
+
+/// The SPA opened through a non-loopback address (a LAN IP, a compose
+/// service name): its `Origin` names the very host it is served from, which
+/// the Host guard has already accepted.
+fn same_origin(origin: &str, host: &str) -> bool {
+    let Some((scheme, authority)) = origin.split_once("://") else {
+        return false;
+    };
+    (scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https"))
+        && !host.is_empty()
+        && authority.eq_ignore_ascii_case(host.trim())
+        && trusted_host(host)
+}
+
+/// DNS-rebinding guard. A page on `http://evil.example` whose name is
+/// re-pointed at 127.0.0.1 makes same-origin requests (no `Origin`, so the
+/// CSRF guard cannot tell), but its `Host` still names the attacker's domain.
+/// Trusted: no `Host` (HTTP/1.0, in-process callers), IP literals, single-label
+/// names (`localhost`, docker-compose service names), and names under
+/// suffixes no public DNS answers for (`.localhost`, `.internal` as in
+/// `host.docker.internal`, `.local`, `.test`, `.example`, `.invalid`,
+/// `.home.arpa`). `DEVCLOUD_ALLOWED_HOSTS` adds names (comma-separated; a
+/// leading `.` allows a suffix, `*` allows any host).
+pub fn trusted_host(host: &str) -> bool {
+    let host = host.trim();
+    if host.is_empty() {
+        return true;
+    }
+    let name = if let Some(v6) = host.strip_prefix('[') {
+        return v6
+            .split_once(']')
+            .is_some_and(|(ip, _)| ip.parse::<std::net::Ipv6Addr>().is_ok());
+    } else {
+        match host.rsplit_once(':') {
+            Some((name, port)) if port.bytes().all(|b| b.is_ascii_digit()) => name,
+            _ => host,
+        }
+    };
+    let name = name.trim_end_matches('.').to_ascii_lowercase();
+    if name.parse::<std::net::Ipv4Addr>().is_ok() || !name.contains('.') {
+        return !name.is_empty();
+    }
+    const PRIVATE_SUFFIXES: [&str; 7] = [
+        ".localhost",
+        ".internal",
+        ".local",
+        ".test",
+        ".example",
+        ".invalid",
+        ".home.arpa",
+    ];
+    if PRIVATE_SUFFIXES.iter().any(|s| name.ends_with(s)) {
+        return true;
+    }
+    allowed_hosts(
+        &std::env::var("DEVCLOUD_ALLOWED_HOSTS").unwrap_or_default(),
+        &name,
+    )
+}
+
+/// Whether `name` (lowercase, no port) is in a `DEVCLOUD_ALLOWED_HOSTS` list.
+fn allowed_hosts(list: &str, name: &str) -> bool {
+    list.split(',')
+        .map(|entry| entry.trim().trim_end_matches('.').to_ascii_lowercase())
+        .filter(|entry| !entry.is_empty())
+        .any(|entry| {
+            entry == "*"
+                || entry == name
+                || (entry.starts_with('.') && (name.ends_with(&entry) || name == &entry[1..]))
+        })
+}
+
 fn hex_val(b: u8) -> Option<u8> {
     match b {
         b'0'..=b'9' => Some(b - b'0'),
@@ -481,6 +688,143 @@ fn hex_val(b: u8) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn transport_rejects_incomplete_or_ambiguous_bodies() {
+        for raw in [
+            "POST / HTTP/1.1\r\nContent-Length: 5\r\n\r\nabc",
+            "POST / HTTP/1.1\r\nContent-Length: invalid\r\n\r\n",
+            "POST / HTTP/1.1\r\nContent-Length: +3\r\n\r\nabc",
+            "POST / HTTP/1.1\r\nContent-Length: \r\n\r\n",
+            "POST / HTTP/1.1\r\nContent-Length: 99999999999999999999999999\r\n\r\n",
+            "POST / HTTP/1.1\r\nContent-Length: 3\r\nContent-Length: 0\r\n\r\nabc",
+            "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+            "POST / HTTP/1.1\r\nContent-Length: 0\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+        ] {
+            assert!(read_request(&mut raw.as_bytes()).await.unwrap().is_none());
+        }
+        let oversized = format!(
+            "POST / HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
+            MAX_BODY_BYTES + 1
+        );
+        assert!(read_request(&mut oversized.as_bytes())
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn transport_accepts_complete_bodies_and_enforces_the_header_boundary() {
+        for raw in [
+            "POST / HTTP/1.1\r\nContent-Length: 3\r\n\r\nabc",
+            "GET / HTTP/1.1\r\n\r\n",
+        ] {
+            assert!(read_request(&mut raw.as_bytes()).await.unwrap().is_some());
+        }
+        // The terminator arrives in the read that crosses the cap. Checking
+        // only the buffer length before looking for it misses this case.
+        let mut oversized = b"GET / HTTP/1.1\r\nX-Large: ".to_vec();
+        oversized.resize(MAX_HEADER_BYTES - 1, b'a');
+        oversized.extend_from_slice(b"\r\n\r\n");
+        assert!(read_request(&mut oversized.as_slice())
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn api_mutations_and_rebinding_hosts_are_refused() {
+        let cfg = Config::default();
+        let with = |method: &str, path: &str, headers: &[(&str, &str)]| {
+            let mut r = req(method, path);
+            for (k, v) in headers {
+                r.headers.insert(k.to_string(), v.to_string());
+            }
+            r
+        };
+        // A cross-site "simple" POST never needs a preflight.
+        let csrf = with(
+            "POST",
+            "/api/dynamodb/tables",
+            &[
+                ("origin", "https://evil.example.com"),
+                ("sec-fetch-site", "cross-site"),
+            ],
+        );
+        assert_eq!(route(&cfg, &csrf).await.status, 403);
+        let no_origin_cross_site = with(
+            "POST",
+            "/api/s3/buckets",
+            &[("sec-fetch-site", "cross-site")],
+        );
+        assert_eq!(route(&cfg, &no_origin_cross_site).await.status, 403);
+        // Reads stay open to any origin; the SPA itself is same-origin.
+        let read = with(
+            "GET",
+            "/api/services",
+            &[("origin", "https://evil.example.com")],
+        );
+        assert_ne!(route(&cfg, &read).await.status, 403);
+        // A rebinding page keeps its own Host, on reads too.
+        let rebound = with(
+            "GET",
+            "/api/services",
+            &[("host", "evil.example.com:18025")],
+        );
+        assert_eq!(route(&cfg, &rebound).await.status, 403);
+        let local = with("GET", "/api/services", &[("host", "127.0.0.1:18025")]);
+        assert_eq!(route(&cfg, &local).await.status, 200);
+        // The SPA opened from a LAN address posts with its own origin.
+        assert!(same_origin(
+            "http://192.168.1.20:18025",
+            "192.168.1.20:18025"
+        ));
+        assert!(!same_origin(
+            "http://192.168.1.20:18025",
+            "192.168.1.21:18025"
+        ));
+        assert!(!same_origin("http://evil.example.com", "evil.example.com"));
+        assert!(!same_origin("null", "devcloud:18025"));
+    }
+
+    #[test]
+    fn host_guard_refuses_rebinding_names() {
+        for ok in [
+            "",
+            "127.0.0.1:18025",
+            "localhost",
+            "localhost:9000",
+            "[::1]:8080",
+            "192.168.1.20:18025",
+            "devcloud:18025",
+            "host.docker.internal:18025",
+            "abc.lambda-url.us-east-1.localhost:19010",
+            "mymac.local",
+            "devcloud.test",
+            "LOCALHOST.",
+        ] {
+            assert!(trusted_host(ok), "{ok}");
+        }
+        for bad in [
+            "evil.example.com",
+            "evil.example.com:18025",
+            "127.0.0.1.nip.io",
+            "localhost.evil.com",
+            "[not-an-ip]",
+            ":80",
+        ] {
+            assert!(!trusted_host(bad), "{bad}");
+        }
+        assert!(allowed_hosts(
+            "devcloud.corp.dev, .lan.example.org",
+            "devcloud.corp.dev"
+        ));
+        assert!(allowed_hosts(".lan.example.org", "box.lan.example.org"));
+        assert!(allowed_hosts(".lan.example.org", "lan.example.org"));
+        assert!(!allowed_hosts(".lan.example.org", "evillan.example.org"));
+        assert!(allowed_hosts("*", "anything.com"));
+        assert!(!allowed_hosts("", "anything.com"));
+    }
 
     fn req(method: &str, path: &str) -> Request {
         Request {

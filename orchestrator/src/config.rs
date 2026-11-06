@@ -20,7 +20,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::io::{self, BufRead};
-use std::path::{PathBuf, MAIN_SEPARATOR};
+use std::path::{Component, Path, PathBuf, MAIN_SEPARATOR};
 
 // ---------------------------------------------------------------------------
 // Config struct types (legacy config.rs lines ~12-274)
@@ -53,6 +53,10 @@ pub struct ServerConfig {
     pub pubsub_grpc_port: i32,
     pub pubsub_rest_port: i32,
     pub app_auto_scaling_port: i32,
+    pub ssm_port: i32,
+    pub sts_port: i32,
+    pub lambda_port: i32,
+    pub cloud_run_port: i32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -67,6 +71,10 @@ pub struct AuthConfig {
     pub sqs: SqsAuthConfig,
     pub pubsub: PubSubAuthConfig,
     pub app_auto_scaling: AppAutoScalingAuthConfig,
+    pub ssm: AwsAuthConfig,
+    pub sts: AwsAuthConfig,
+    pub lambda: LambdaAuthConfig,
+    pub cloud_run: CloudRunAuthConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -143,6 +151,29 @@ pub struct AppAutoScalingAuthConfig {
     pub account_id: String,
 }
 
+/// SigV4 auth settings for the AWS services added after the legacy port (SSM, STS).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AwsAuthConfig {
+    pub mode: String,
+    pub access_key_id: String,
+    pub secret_access_key: String,
+    pub account_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct LambdaAuthConfig {
+    pub mode: String,
+    pub access_key_id: String,
+    pub secret_access_key: String,
+    pub account_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CloudRunAuthConfig {
+    pub mode: String,
+    pub bearer_token: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct StorageConfig {
     pub path: String,
@@ -160,6 +191,10 @@ pub struct ServicesConfig {
     pub sqs: SqsServiceConfig,
     pub pubsub: PubSubServiceConfig,
     pub app_auto_scaling: AppAutoScalingServiceConfig,
+    pub ssm: AwsServiceConfig,
+    pub sts: AwsServiceConfig,
+    pub lambda: LambdaServiceConfig,
+    pub cloud_run: CloudRunServiceConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -237,6 +272,16 @@ pub struct RedshiftServiceConfig {
     pub data_api: RedshiftDataApiConfig,
     pub sql: RedshiftSqlConfig,
     pub copy_unload: RedshiftCopyUnloadConfig,
+    pub tls: RedshiftTlsConfig,
+}
+
+/// TLS for the Redshift SQL endpoint: PEM files the user supplies.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RedshiftTlsConfig {
+    pub cert_file: String,
+    pub key_file: String,
+    /// Refuse SQL clients that do not negotiate TLS.
+    pub require: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -301,6 +346,46 @@ pub struct AppAutoScalingServiceConfig {
     pub region: String,
 }
 
+/// Enabled flag + region for SSM and STS.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AwsServiceConfig {
+    pub enabled: bool,
+    pub region: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct LambdaServiceConfig {
+    pub enabled: bool,
+    pub region: String,
+    /// Credentials handed to every handler (`AWS_ACCESS_KEY_ID` & co.). Empty
+    /// key id / secret = none.
+    pub function_access_key_id: String,
+    pub function_secret_access_key: String,
+    pub function_session_token: String,
+    /// Stand-in for Lambda's `/opt` (layer contents). Empty = `/opt`.
+    pub opt_dir: String,
+    /// Seconds an idle execution environment stays warm; `None` = the
+    /// service default, 0 = every invocation is a cold start.
+    pub idle_timeout_seconds: Option<u32>,
+    /// Run `PackageType: Image` functions with `docker run`.
+    pub docker: bool,
+    /// Docker network devcloud runs on (when devcloud itself is a container).
+    pub docker_network: String,
+    /// Auth mode for `AWS_IAM` function URLs; empty follows `auth.lambda.mode`.
+    pub url_auth_mode: String,
+    /// Print every invocation's log to devcloud's stdout.
+    pub log_invocations: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CloudRunServiceConfig {
+    pub enabled: bool,
+    pub project: String,
+    pub region: String,
+    /// Run image-only containers (no `command`) with `docker run`.
+    pub docker: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct PubSubServiceConfig {
     pub enabled: bool,
@@ -346,6 +431,10 @@ pub fn default_config() -> Config {
             pubsub_grpc_port: 18085,
             pubsub_rest_port: 18086,
             app_auto_scaling_port: 18030,
+            ssm_port: 18031,
+            sts_port: 18032,
+            lambda_port: 19010,
+            cloud_run_port: 18095,
         },
         auth: AuthConfig {
             smtp: SmtpAuthConfig {
@@ -401,6 +490,28 @@ pub fn default_config() -> Config {
                 access_key_id: "dev".to_string(),
                 secret_access_key: "dev".to_string(),
                 account_id: "000000000000".to_string(),
+            },
+            ssm: AwsAuthConfig {
+                mode: "relaxed".to_string(),
+                access_key_id: "dev".to_string(),
+                secret_access_key: "dev".to_string(),
+                account_id: "000000000000".to_string(),
+            },
+            sts: AwsAuthConfig {
+                mode: "relaxed".to_string(),
+                access_key_id: "dev".to_string(),
+                secret_access_key: "dev".to_string(),
+                account_id: "000000000000".to_string(),
+            },
+            lambda: LambdaAuthConfig {
+                mode: "relaxed".to_string(),
+                access_key_id: "dev".to_string(),
+                secret_access_key: "dev".to_string(),
+                account_id: "000000000000".to_string(),
+            },
+            cloud_run: CloudRunAuthConfig {
+                mode: "relaxed".to_string(),
+                bearer_token: "dev".to_string(),
             },
         },
         storage: StorageConfig {
@@ -480,6 +591,7 @@ pub fn default_config() -> Config {
                     enable_local_s3: true,
                     max_input_row_bytes: 4 * 1024 * 1024,
                 },
+                tls: RedshiftTlsConfig::default(),
             },
             redis: RedisServiceConfig {
                 enabled: false,
@@ -520,6 +632,25 @@ pub fn default_config() -> Config {
             app_auto_scaling: AppAutoScalingServiceConfig {
                 enabled: true,
                 region: "us-east-1".to_string(),
+            },
+            ssm: AwsServiceConfig {
+                enabled: true,
+                region: "us-east-1".to_string(),
+            },
+            sts: AwsServiceConfig {
+                enabled: true,
+                region: "us-east-1".to_string(),
+            },
+            lambda: LambdaServiceConfig {
+                enabled: true,
+                region: "us-east-1".to_string(),
+                ..Default::default()
+            },
+            cloud_run: CloudRunServiceConfig {
+                enabled: true,
+                project: "devcloud".to_string(),
+                region: "us-central1".to_string(),
+                docker: false,
             },
         },
     }
@@ -699,6 +830,12 @@ pub fn apply_config_value(cfg: &mut Config, path: &[String], value: &str) -> io:
         "server.appAutoScalingPort" => {
             cfg.server.app_auto_scaling_port = parse_int("server.appAutoScalingPort", value)?
         }
+        "server.ssmPort" => cfg.server.ssm_port = parse_int("server.ssmPort", value)?,
+        "server.stsPort" => cfg.server.sts_port = parse_int("server.stsPort", value)?,
+        "server.lambdaPort" => cfg.server.lambda_port = parse_int("server.lambdaPort", value)?,
+        "server.cloudRunPort" => {
+            cfg.server.cloud_run_port = parse_int("server.cloudRunPort", value)?
+        }
         "auth.smtp.mode" => cfg.auth.smtp.mode = value.to_string(),
         "auth.smtp.user" => cfg.auth.smtp.username = value.to_string(),
         "auth.smtp.password" => cfg.auth.smtp.password = value.to_string(),
@@ -741,6 +878,20 @@ pub fn apply_config_value(cfg: &mut Config, path: &[String], value: &str) -> io:
         "auth.appAutoScaling.accountId" => {
             cfg.auth.app_auto_scaling.account_id = trim_quotes(value)
         }
+        "auth.ssm.mode" => cfg.auth.ssm.mode = value.to_string(),
+        "auth.ssm.accessKeyId" => cfg.auth.ssm.access_key_id = value.to_string(),
+        "auth.ssm.secretAccessKey" => cfg.auth.ssm.secret_access_key = value.to_string(),
+        "auth.ssm.accountId" => cfg.auth.ssm.account_id = trim_quotes(value),
+        "auth.sts.mode" => cfg.auth.sts.mode = value.to_string(),
+        "auth.sts.accessKeyId" => cfg.auth.sts.access_key_id = value.to_string(),
+        "auth.sts.secretAccessKey" => cfg.auth.sts.secret_access_key = value.to_string(),
+        "auth.sts.accountId" => cfg.auth.sts.account_id = trim_quotes(value),
+        "auth.lambda.mode" => cfg.auth.lambda.mode = value.to_string(),
+        "auth.lambda.accessKeyId" => cfg.auth.lambda.access_key_id = value.to_string(),
+        "auth.lambda.secretAccessKey" => cfg.auth.lambda.secret_access_key = value.to_string(),
+        "auth.lambda.accountId" => cfg.auth.lambda.account_id = trim_quotes(value),
+        "auth.cloudRun.mode" => cfg.auth.cloud_run.mode = value.to_string(),
+        "auth.cloudRun.bearerToken" => cfg.auth.cloud_run.bearer_token = value.to_string(),
         "storage.path" => cfg.storage.path = value.to_string(),
         "services.mail.enabled" => {
             cfg.services.mail.enabled = parse_bool("services.mail.enabled", value)?
@@ -938,6 +1089,13 @@ pub fn apply_config_value(cfg: &mut Config, path: &[String], value: &str) -> io:
         "services.redshift.sql.defaultSearchPath" => {
             cfg.services.redshift.sql.default_search_path = value.to_string()
         }
+        "services.redshift.tls.certFile" => {
+            cfg.services.redshift.tls.cert_file = trim_quotes(value)
+        }
+        "services.redshift.tls.keyFile" => cfg.services.redshift.tls.key_file = trim_quotes(value),
+        "services.redshift.tls.require" => {
+            cfg.services.redshift.tls.require = parse_bool("services.redshift.tls.require", value)?
+        }
         "services.redshift.copyUnload.enableLocalS3" => {
             cfg.services.redshift.copy_unload.enable_local_s3 =
                 parse_bool("services.redshift.copyUnload.enableLocalS3", value)?
@@ -1095,6 +1253,49 @@ pub fn apply_config_value(cfg: &mut Config, path: &[String], value: &str) -> io:
         "services.appAutoScaling.region" => {
             cfg.services.app_auto_scaling.region = value.to_string()
         }
+        "services.ssm.enabled" => {
+            cfg.services.ssm.enabled = parse_bool("services.ssm.enabled", value)?
+        }
+        "services.ssm.region" => cfg.services.ssm.region = value.to_string(),
+        "services.sts.enabled" => {
+            cfg.services.sts.enabled = parse_bool("services.sts.enabled", value)?
+        }
+        "services.sts.region" => cfg.services.sts.region = value.to_string(),
+        "services.lambda.enabled" => {
+            cfg.services.lambda.enabled = parse_bool("services.lambda.enabled", value)?
+        }
+        "services.lambda.region" => cfg.services.lambda.region = value.to_string(),
+        "services.lambda.functionAccessKeyId" => {
+            cfg.services.lambda.function_access_key_id = value.to_string()
+        }
+        "services.lambda.functionSecretAccessKey" => {
+            cfg.services.lambda.function_secret_access_key = value.to_string()
+        }
+        "services.lambda.functionSessionToken" => {
+            cfg.services.lambda.function_session_token = value.to_string()
+        }
+        "services.lambda.optDir" => cfg.services.lambda.opt_dir = value.to_string(),
+        "services.lambda.docker" => {
+            cfg.services.lambda.docker = parse_bool("services.lambda.docker", value)?
+        }
+        "services.lambda.dockerNetwork" => cfg.services.lambda.docker_network = value.to_string(),
+        "services.lambda.urlAuthMode" => cfg.services.lambda.url_auth_mode = value.to_string(),
+        "services.lambda.logInvocations" => {
+            cfg.services.lambda.log_invocations =
+                parse_bool("services.lambda.logInvocations", value)?
+        }
+        "services.lambda.idleTimeoutSeconds" => {
+            cfg.services.lambda.idle_timeout_seconds =
+                Some(parse_int("services.lambda.idleTimeoutSeconds", value)?);
+        }
+        "services.cloudRun.enabled" => {
+            cfg.services.cloud_run.enabled = parse_bool("services.cloudRun.enabled", value)?
+        }
+        "services.cloudRun.project" => cfg.services.cloud_run.project = value.to_string(),
+        "services.cloudRun.region" => cfg.services.cloud_run.region = value.to_string(),
+        "services.cloudRun.docker" => {
+            cfg.services.cloud_run.docker = parse_bool("services.cloudRun.docker", value)?
+        }
         // legacy default: unknown key → silently ignored (return nil).
         _ => {}
     }
@@ -1219,6 +1420,32 @@ fn fmt_bool(b: bool) -> &'static str {
     }
 }
 
+/// The optional `services.lambda` keys, rendered only when set so the default
+/// output stays unchanged.
+fn lambda_optional_lines(l: &LambdaServiceConfig) -> String {
+    let idle = l
+        .idle_timeout_seconds
+        .map(|s| s.to_string())
+        .unwrap_or_default();
+    let docker = if l.docker { "true" } else { "" }.to_string();
+    let log_invocations = if l.log_invocations { "true" } else { "" }.to_string();
+    [
+        ("functionAccessKeyId", &l.function_access_key_id),
+        ("functionSecretAccessKey", &l.function_secret_access_key),
+        ("functionSessionToken", &l.function_session_token),
+        ("optDir", &l.opt_dir),
+        ("idleTimeoutSeconds", &idle),
+        ("docker", &docker),
+        ("dockerNetwork", &l.docker_network),
+        ("urlAuthMode", &l.url_auth_mode),
+        ("logInvocations", &log_invocations),
+    ]
+    .into_iter()
+    .filter(|(_, v)| !v.is_empty())
+    .map(|(k, v)| format!("    {k}: {v}\n"))
+    .collect()
+}
+
 /// Replicate legacy `defaultConfigYAML(cfg)`. The output MUST be byte-identical to
 /// the legacy version — same comments (none), spacing, ordering, formatting. This
 /// string is written verbatim to `.devcloud/config.yaml` by `init`.
@@ -1251,6 +1478,10 @@ pub fn default_config_yaml(cfg: &Config) -> String {
             "  pubsubGrpcPort: {pubsub_grpc_port}\n",
             "  pubsubRestPort: {pubsub_rest_port}\n",
             "  appAutoScalingPort: {app_auto_scaling_port}\n",
+            "  ssmPort: {ssm_port}\n",
+            "  stsPort: {sts_port}\n",
+            "  lambdaPort: {lambda_port}\n",
+            "  cloudRunPort: {cloud_run_port}\n",
             "\n",
             "auth:\n",
             "  smtp:\n",
@@ -1296,6 +1527,24 @@ pub fn default_config_yaml(cfg: &Config) -> String {
             "    accessKeyId: {aas_access_key_id}\n",
             "    secretAccessKey: {aas_secret_access_key}\n",
             "    accountId: \"{aas_account_id}\"\n",
+            "  ssm:\n",
+            "    mode: {ssm_auth_mode}\n",
+            "    accessKeyId: {ssm_access_key_id}\n",
+            "    secretAccessKey: {ssm_secret_access_key}\n",
+            "    accountId: \"{ssm_account_id}\"\n",
+            "  sts:\n",
+            "    mode: {sts_auth_mode}\n",
+            "    accessKeyId: {sts_access_key_id}\n",
+            "    secretAccessKey: {sts_secret_access_key}\n",
+            "    accountId: \"{sts_account_id}\"\n",
+            "  lambda:\n",
+            "    mode: {lambda_auth_mode}\n",
+            "    accessKeyId: {lambda_access_key_id}\n",
+            "    secretAccessKey: {lambda_secret_access_key}\n",
+            "    accountId: \"{lambda_account_id}\"\n",
+            "  cloudRun:\n",
+            "    mode: {cloud_run_auth_mode}\n",
+            "    bearerToken: {cloud_run_bearer_token}\n",
             "\n",
             "storage:\n",
             "  path: {storage_path}\n",
@@ -1399,6 +1648,21 @@ pub fn default_config_yaml(cfg: &Config) -> String {
             "  appAutoScaling:\n",
             "    enabled: {aas_enabled}\n",
             "    region: {aas_region}\n",
+            "  ssm:\n",
+            "    enabled: {ssm_enabled}\n",
+            "    region: {ssm_region}\n",
+            "  sts:\n",
+            "    enabled: {sts_enabled}\n",
+            "    region: {sts_region}\n",
+            "  lambda:\n",
+            "    enabled: {lambda_enabled}\n",
+            "    region: {lambda_region}\n",
+            "{lambda_optional}",
+            "  cloudRun:\n",
+            "    enabled: {cloud_run_enabled}\n",
+            "    project: {cloud_run_project}\n",
+            "    region: {cloud_run_region}\n",
+            "    docker: {cloud_run_docker}\n",
         ),
         project = cfg.project,
         smtp_port = s.smtp_port,
@@ -1417,6 +1681,10 @@ pub fn default_config_yaml(cfg: &Config) -> String {
         pubsub_grpc_port = s.pubsub_grpc_port,
         pubsub_rest_port = s.pubsub_rest_port,
         app_auto_scaling_port = s.app_auto_scaling_port,
+        ssm_port = s.ssm_port,
+        sts_port = s.sts_port,
+        lambda_port = s.lambda_port,
+        cloud_run_port = s.cloud_run_port,
         smtp_mode = a.smtp.mode,
         smtp_user = a.smtp.username,
         smtp_password = a.smtp.password,
@@ -1450,6 +1718,20 @@ pub fn default_config_yaml(cfg: &Config) -> String {
         aas_access_key_id = a.app_auto_scaling.access_key_id,
         aas_secret_access_key = a.app_auto_scaling.secret_access_key,
         aas_account_id = a.app_auto_scaling.account_id,
+        ssm_auth_mode = a.ssm.mode,
+        ssm_access_key_id = a.ssm.access_key_id,
+        ssm_secret_access_key = a.ssm.secret_access_key,
+        ssm_account_id = a.ssm.account_id,
+        sts_auth_mode = a.sts.mode,
+        sts_access_key_id = a.sts.access_key_id,
+        sts_secret_access_key = a.sts.secret_access_key,
+        sts_account_id = a.sts.account_id,
+        lambda_auth_mode = a.lambda.mode,
+        lambda_access_key_id = a.lambda.access_key_id,
+        lambda_secret_access_key = a.lambda.secret_access_key,
+        lambda_account_id = a.lambda.account_id,
+        cloud_run_auth_mode = a.cloud_run.mode,
+        cloud_run_bearer_token = a.cloud_run.bearer_token,
         storage_path = cfg.storage.path,
         mail_enabled = fmt_bool(sv.mail.enabled),
         mail_max_message_bytes = sv.mail.max_message_bytes,
@@ -1535,6 +1817,17 @@ pub fn default_config_yaml(cfg: &Config) -> String {
         pubsub_enable_push = fmt_bool(sv.pubsub.enable_push),
         aas_enabled = fmt_bool(sv.app_auto_scaling.enabled),
         aas_region = sv.app_auto_scaling.region,
+        ssm_enabled = fmt_bool(sv.ssm.enabled),
+        ssm_region = sv.ssm.region,
+        sts_enabled = fmt_bool(sv.sts.enabled),
+        sts_region = sv.sts.region,
+        lambda_enabled = fmt_bool(sv.lambda.enabled),
+        lambda_region = sv.lambda.region,
+        lambda_optional = lambda_optional_lines(&sv.lambda),
+        cloud_run_enabled = fmt_bool(sv.cloud_run.enabled),
+        cloud_run_project = sv.cloud_run.project,
+        cloud_run_region = sv.cloud_run.region,
+        cloud_run_docker = fmt_bool(sv.cloud_run.docker),
     )
 }
 
@@ -1542,21 +1835,47 @@ pub fn default_config_yaml(cfg: &Config) -> String {
 // InitWorkspace / ResetWorkspace (legacy config.rs lines ~513-637)
 // ---------------------------------------------------------------------------
 
-/// legacy `validateStoragePath`: path must be under `.devcloud`.
+/// Storage operations must stay inside the workspace's `.devcloud` directory.
+/// Check components instead of a string prefix: `PathBuf` does not resolve
+/// `..`, and an intermediate symbolic link could redirect a reset elsewhere.
 fn validate_storage_path(path: &str) -> io::Result<()> {
-    let clean = clean_path(path);
-    let prefix = format!(".devcloud{MAIN_SEPARATOR}");
-    if clean == ".devcloud" || clean.starts_with(&prefix) {
-        return Ok(());
+    let invalid = || {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("storage.path must be under .devcloud without parent traversal: {path}"),
+        )
+    };
+    let mut components = Path::new(path)
+        .components()
+        .filter(|component| *component != Component::CurDir);
+    if components.next() != Some(Component::Normal(".devcloud".as_ref()))
+        || components.any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(invalid());
     }
-    Err(io::Error::new(
-        io::ErrorKind::InvalidInput,
-        format!("storage.path must be under .devcloud: {path}"),
-    ))
+
+    let mut ancestor = PathBuf::new();
+    for component in Path::new(path).components() {
+        ancestor.push(component.as_os_str());
+        match fs::symlink_metadata(&ancestor) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("storage.path must not follow symbolic links: {path}"),
+                ));
+            }
+            Ok(_) => {}
+            // Descendants cannot exist before this directory is created.
+            Err(err) if err.kind() == io::ErrorKind::NotFound => break,
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(())
 }
 
 /// legacy `ensureFile`: write `data` only if `path` does not already exist.
 fn ensure_file(path: &str, data: &[u8]) -> io::Result<()> {
+    validate_storage_path(path)?;
     match fs::metadata(path) {
         Ok(_) => Ok(()),
         Err(err) if err.kind() == io::ErrorKind::NotFound => fs::write(path, data),
@@ -1565,6 +1884,8 @@ fn ensure_file(path: &str, data: &[u8]) -> io::Result<()> {
 }
 
 fn mkdir_all(path: &str, ctx: &str) -> io::Result<()> {
+    validate_storage_path(path)
+        .map_err(|err| io::Error::new(err.kind(), format!("{ctx}: {err}")))?;
     fs::create_dir_all(path).map_err(|err| io::Error::new(err.kind(), format!("{ctx}: {err}")))
 }
 
@@ -1622,6 +1943,15 @@ pub fn init_workspace(cfg: &Config) -> io::Result<()> {
     mkdir_all(
         &path_join(&cfg.storage.path, "applicationautoscaling"),
         "create applicationautoscaling storage",
+    )?;
+    mkdir_all(&path_join(&cfg.storage.path, "ssm"), "create ssm storage")?;
+    mkdir_all(
+        &path_join(&cfg.storage.path, "lambda"),
+        "create lambda storage",
+    )?;
+    mkdir_all(
+        &path_join(&cfg.storage.path, "cloudrun"),
+        "create cloudrun storage",
     )?;
     mkdir_all(&pubsub_data_dir(cfg), "create pubsub storage")?;
     mkdir_all(&pubsub_message_data_dir(cfg), "create message storage")?;
@@ -1693,6 +2023,10 @@ const SERVICE_TOGGLES: &[&str] = &[
     "sqs",
     "pubsub",
     "appautoscaling",
+    "ssm",
+    "sts",
+    "lambda",
+    "cloudrun",
 ];
 
 /// legacy `ServiceNames`: canonical service identifiers, alphabetically sorted.
@@ -1715,6 +2049,10 @@ fn set_service_enabled(cfg: &mut Config, name: &str, v: bool) {
         "sqs" => cfg.services.sqs.enabled = v,
         "pubsub" => cfg.services.pubsub.enabled = v,
         "appautoscaling" => cfg.services.app_auto_scaling.enabled = v,
+        "ssm" => cfg.services.ssm.enabled = v,
+        "sts" => cfg.services.sts.enabled = v,
+        "lambda" => cfg.services.lambda.enabled = v,
+        "cloudrun" => cfg.services.cloud_run.enabled = v,
         _ => {}
     }
 }
@@ -1740,6 +2078,14 @@ fn service_aliases() -> HashMap<&'static str, &'static str> {
         ("app-autoscaling", "appautoscaling"),
         ("app_autoscaling", "appautoscaling"),
         ("applicationautoscaling", "appautoscaling"),
+        ("ssm", "ssm"),
+        ("parameterstore", "ssm"),
+        ("sts", "sts"),
+        ("lambda", "lambda"),
+        ("cloudrun", "cloudrun"),
+        ("cloud-run", "cloudrun"),
+        ("cloud_run", "cloudrun"),
+        ("run", "cloudrun"),
     ])
 }
 
@@ -1819,6 +2165,10 @@ mod tests {
         "server.pubsubGrpcPort",
         "server.pubsubRestPort",
         "server.appAutoScalingPort",
+        "server.ssmPort",
+        "server.stsPort",
+        "server.lambdaPort",
+        "server.cloudRunPort",
         "services.dynamodb.maxTables",
         "services.dynamodb.ttl.schedulerIntervalSeconds",
         "services.bigquery.query.maxResultRows",
@@ -1920,10 +2270,32 @@ mod tests {
     }
 
     #[test]
+    fn lambda_optional_keys_round_trip_and_stay_out_of_the_default_yaml() {
+        let mut cfg = default_config();
+        assert!(!default_config_yaml(&cfg).contains("functionAccessKeyId"));
+        cfg.services.lambda.function_access_key_id = "AKIDLOCAL".into();
+        cfg.services.lambda.function_secret_access_key = "local-secret".into();
+        cfg.services.lambda.opt_dir = "/srv/lambda-opt".into();
+        cfg.services.lambda.idle_timeout_seconds = Some(0);
+        cfg.services.lambda.docker = true;
+        cfg.services.lambda.docker_network = "app_default".into();
+        cfg.services.lambda.url_auth_mode = "strict".into();
+        cfg.services.lambda.log_invocations = true;
+        let yaml = default_config_yaml(&cfg);
+        assert!(yaml.contains(
+            "  lambda:\n    enabled: true\n    region: us-east-1\n    functionAccessKeyId: AKIDLOCAL\n    functionSecretAccessKey: local-secret\n    optDir: /srv/lambda-opt\n    idleTimeoutSeconds: 0\n    docker: true\n    dockerNetwork: app_default\n    urlAuthMode: strict\n    logInvocations: true\n  cloudRun:\n"
+        ));
+        let parsed = parse_yaml_in_memory(&yaml).expect("parse yaml");
+        assert_eq!(parsed.services.lambda, cfg.services.lambda);
+    }
+
+    #[test]
     fn default_yaml_first_and_last_lines() {
         let yaml = default_config_yaml(&default_config());
         assert!(yaml.starts_with("project: dev\n\nserver:\n"));
-        assert!(yaml.ends_with("  appAutoScaling:\n    enabled: true\n    region: us-east-1\n"));
+        assert!(yaml.ends_with(
+            "  cloudRun:\n    enabled: true\n    project: devcloud\n    region: us-central1\n    docker: false\n"
+        ));
     }
 
     #[test]
@@ -1939,14 +2311,18 @@ mod tests {
             vec![
                 "appautoscaling",
                 "bigquery",
+                "cloudrun",
                 "dynamodb",
                 "gcs",
+                "lambda",
                 "mail",
                 "pubsub",
                 "redis",
                 "redshift",
                 "s3",
                 "sqs",
+                "ssm",
+                "sts",
             ]
         );
     }

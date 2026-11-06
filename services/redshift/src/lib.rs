@@ -35,6 +35,7 @@ pub mod backend_memory;
 pub mod backend_postgres;
 pub mod catalog;
 pub mod cluster;
+mod copy_backend;
 pub mod copy_unload;
 pub mod dataapi;
 pub mod engine;
@@ -51,6 +52,7 @@ pub mod snapshot;
 pub mod sql_parse;
 pub mod sql_predicates;
 pub mod storage;
+pub mod tls;
 pub mod translator;
 
 pub use backend::{SqlBackend, SqlTransaction};

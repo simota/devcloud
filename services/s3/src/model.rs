@@ -139,6 +139,13 @@ pub struct Object {
     pub retention: ObjectRetention,
     #[serde(rename = "legalHold")]
     pub legal_hold: ObjectLegalHold,
+    /// Internal commit identity for GCS resumable uploads. This is persisted
+    /// with object metadata, never added to provider-visible user metadata.
+    #[serde(
+        rename = "_resumableUploadId",
+        skip_serializing_if = "String::is_empty"
+    )]
+    pub resumable_upload_id: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]

@@ -109,6 +109,16 @@ services:
     enabled: false
   pubsub:
     enabled: false
+# Lambda / Cloud Run are not exercised here; keep them off their default ports.
+services:
+  lambda:
+    enabled: false
+  cloudRun:
+    enabled: false
+  ssm:
+    enabled: false
+  sts:
+    enabled: false
 EOF
 }
 
@@ -153,6 +163,8 @@ def request(path, method="GET"):
     req = urllib.request.Request(f"{base_url}{path}", method=method)
     with urllib.request.urlopen(req, timeout=5) as response:
         data = response.read()
+        if response.status == 204:
+            return None
         content_type = response.headers.get("Content-Type", "")
         if "application/json" in content_type:
             return json.loads(data.decode("utf-8"))

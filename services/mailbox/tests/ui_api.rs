@@ -94,3 +94,25 @@ fn malformed_message_does_not_block_lists_detail_search_events_or_delete() {
     f.app.publish(&message.id);
     assert!(receiver.try_recv().is_err());
 }
+
+#[test]
+fn encoded_commas_stay_in_names_and_html_only_mail_has_a_snippet() {
+    let f = Fixture::new();
+    let raw = b"From: =?UTF-8?Q?Doe=2C_John?= <john@x.test>\r\nTo: =?UTF-8?Q?Smith=2C_Ann?= <ann@x.test>, bob@x.test\r\nSubject: html only\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<html><head><style>p{color:red}</style></head><body><p>Hello invoice&nbsp;42 &amp; more</p></body></html>\r\n";
+    let message = f.receive(raw);
+    let detail = json(&request(
+        &f.app,
+        "GET",
+        &format!("/api/mailbox/messages/{}", message.id),
+    ));
+    assert_eq!(
+        detail["from"],
+        serde_json::json!({"name":"Doe, John","address":"john@x.test"})
+    );
+    assert_eq!(detail["to"].as_array().unwrap().len(), 2);
+    assert_eq!(detail["to"][0]["name"], "Smith, Ann");
+    let list = json(&request(&f.app, "GET", "/api/mailbox/messages?q=invoice"));
+    assert_eq!(list["total"], 1);
+    assert_eq!(list["items"][0]["snippet"], "Hello invoice 42 & more");
+    assert_eq!(list["items"][0]["from"]["name"], "Doe, John");
+}

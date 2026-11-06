@@ -37,3 +37,7 @@ scripts/**/prompt-*.*
 
 # Agent runtime logs and journals
 .agents/
+
+# Python bytecode
+__pycache__/
+*.pyc

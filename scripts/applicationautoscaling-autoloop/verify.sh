@@ -187,6 +187,16 @@ services:
   appAutoScaling:
     enabled: true
     region: ${REGION}
+# Lambda / Cloud Run are not exercised here; keep them off their default ports.
+services:
+  lambda:
+    enabled: false
+  cloudRun:
+    enabled: false
+  ssm:
+    enabled: false
+  sts:
+    enabled: false
 EOF
 
   run_check "devcloud binary builds" devcloud_build "${TMP_DIR}/devcloud"

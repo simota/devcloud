@@ -4,6 +4,7 @@ import { Panel } from '../../../ui/Panel'
 import { Button } from '../../../ui/Button'
 import { dangerConfirm, useConfirm } from '../../../ui/Confirm'
 import { useDashboardEvents } from '../../api/hooks/useDashboardEvents'
+import { useLatestRequest } from '../../api/hooks/useLatestRequest'
 import type { DashboardService } from '../dashboard/types'
 import { BucketSidebar } from './BucketSidebar'
 import { ObjectBrowser } from './ObjectBrowser'
@@ -30,7 +31,9 @@ export function S3Dashboard({ service }: S3DashboardProps): JSX.Element {
   const isDisabled = service?.status === 'disabled'
   const confirm = useConfirm()
 
+  const startRefreshBuckets = useLatestRequest()
   const refreshBuckets = useCallback(() => {
+    const isCurrent = startRefreshBuckets()
     if (isDisabled) {
       setBucketsState({ status: 'success', buckets: [] })
       setActiveBucket(undefined)
@@ -40,15 +43,17 @@ export function S3Dashboard({ service }: S3DashboardProps): JSX.Element {
     setBucketsState({ status: 'loading' })
     listS3Buckets()
       .then(({ buckets }) => {
+        if (!isCurrent()) return
         setBucketsState({ status: 'success', buckets })
         setActiveBucket((current) =>
           current && buckets.some((bucket) => bucket.name === current) ? current : buckets[0]?.name,
         )
       })
       .catch((error: Error) => {
+        if (!isCurrent()) return
         setBucketsState({ status: 'error', message: error.message })
       })
-  }, [isDisabled])
+  }, [startRefreshBuckets, isDisabled])
 
   useEffect(() => {
     refreshBuckets()
@@ -66,7 +71,15 @@ export function S3Dashboard({ service }: S3DashboardProps): JSX.Element {
     [refreshBuckets],
   )
 
-  useDashboardEvents({ topics: ['s3'], onEvent: onS3Event, enabled: !isDisabled })
+  useDashboardEvents({
+    topics: ['s3'],
+    onEvent: onS3Event,
+    onResync: () => {
+      refreshBuckets()
+      setObjectsRefreshNonce((n) => n + 1)
+    },
+    enabled: !isDisabled,
+  })
 
   const buckets = bucketsState.status === 'success' ? bucketsState.buckets : []
   const selectedBucket = buckets.find((bucket) => bucket.name === activeBucket)?.name

@@ -4,6 +4,7 @@ import { dangerConfirm, useConfirm } from '../../../ui/Confirm'
 import { EmptyState } from '../../../ui/EmptyState'
 import { Panel } from '../../../ui/Panel'
 import { useDashboardEvents } from '../../api/hooks/useDashboardEvents'
+import { useLatestRequest } from '../../api/hooks/useLatestRequest'
 import type { DashboardService } from '../dashboard/types'
 import { deleteAllMailMessages, getMailMessageRaw, listMailMessages } from './api'
 import { decodeMimeAddress, decodeMimeEncodedWord } from './mimeDecoder'
@@ -25,7 +26,9 @@ export function MailDashboard({ service }: MailDashboardProps): JSX.Element {
   const [filter, setFilter] = useState('')
   const isDisabled = service?.status === 'disabled'
 
+  const startRefreshMessages = useLatestRequest()
   const refreshMessages = useCallback((): void => {
+    const isCurrent = startRefreshMessages()
     if (isDisabled) {
       setMessagesState({ status: 'success', messages: [] })
       return
@@ -33,15 +36,17 @@ export function MailDashboard({ service }: MailDashboardProps): JSX.Element {
     setMessagesState({ status: 'loading' })
     listMailMessages()
       .then(({ messages }) => {
+        if (!isCurrent()) return
         setMessagesState({ status: 'success', messages })
         setSelectedID((current) => current ?? messages[0]?.id)
       })
       .catch((error: Error) => {
+        if (!isCurrent()) return
         setMessagesState({ status: 'error', message: error.message })
       })
-  }, [isDisabled])
+  }, [startRefreshMessages, isDisabled])
 
-  useDashboardEvents({ topics: ['mail'], onEvent: refreshMessages, enabled: !isDisabled })
+  useDashboardEvents({ topics: ['mail'], onEvent: refreshMessages, onResync: refreshMessages, enabled: !isDisabled })
 
   async function clearMessages(): Promise<void> {
     if (isDisabled) {
