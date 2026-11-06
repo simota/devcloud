@@ -182,16 +182,7 @@ pub async fn serve_with_cors(
                     // back off and keep serving instead of stopping (which
                     // would take every devcloud service down with it).
                     Err(e) => {
-                        // Only transient errors; a broken listener still stops.
-                        let transient = matches!(
-                            e.kind(),
-                            std::io::ErrorKind::ConnectionAborted
-                                | std::io::ErrorKind::ConnectionReset
-                                | std::io::ErrorKind::Interrupted
-                                | std::io::ErrorKind::WouldBlock
-                                | std::io::ErrorKind::TimedOut
-                        ) || matches!(e.raw_os_error(), Some(12 | 23 | 24)); // ENOMEM, ENFILE, EMFILE
-                        if !transient {
+                        if !is_transient_accept_error(&e) {
                             return Err(e);
                         }
                         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -207,6 +198,18 @@ pub async fn serve_with_cors(
             }
         }
     }
+}
+
+/// Whether an accept failure should be retried. A broken listener still stops.
+pub(crate) fn is_transient_accept_error(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::Interrupted
+            | std::io::ErrorKind::WouldBlock
+            | std::io::ErrorKind::TimedOut
+    ) || matches!(error.raw_os_error(), Some(12 | 23 | 24)) // ENOMEM, ENFILE, EMFILE
 }
 
 async fn handle_conn(

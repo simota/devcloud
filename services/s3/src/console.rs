@@ -13,8 +13,8 @@ use include_dir::{include_dir, Dir};
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::http::{
-    constant_time_eq, percent_decode, read_request, route, tag_text_in, write_response, AuthConfig,
-    Request, Response,
+    constant_time_eq, is_transient_accept_error, percent_decode, read_request, route, tag_text_in,
+    write_response, AuthConfig, Request, Response,
 };
 use crate::percent::aws_percent_encode;
 use crate::store::FileBucketStore;
@@ -47,7 +47,14 @@ pub async fn serve(
         tokio::select! {
             _ = &mut shutdown => return Ok(()),
             accepted = listener.accept() => {
-                let (stream, _) = accepted?;
+                let (stream, _) = match accepted {
+                    Ok(accepted) => accepted,
+                    Err(e) if is_transient_accept_error(&e) => {
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                };
                 let store = Arc::clone(&store);
                 let config = Arc::clone(&config);
                 tokio::spawn(async move {
