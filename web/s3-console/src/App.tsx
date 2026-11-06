@@ -145,8 +145,14 @@ export function App() {
 
   const listing = useMemo(() => groupByFolder(objects, prefix), [objects, prefix])
   const crumbs = useMemo(() => {
-    const parts = prefix.split('/').filter(Boolean)
-    return parts.map((part, index) => ({ label: part, prefix: `${parts.slice(0, index + 1).join('/')}/` }))
+    // Cut from the original prefix: `a//b/` and `a/b/` are different locations.
+    const result: { label: string; prefix: string }[] = []
+    let start = 0
+    for (let slash = prefix.indexOf('/'); slash !== -1; slash = prefix.indexOf('/', start)) {
+      result.push({ label: prefix.slice(start, slash) || '(empty)', prefix: prefix.slice(0, slash + 1) })
+      start = slash + 1
+    }
+    return result
   }, [prefix])
   const isEmpty = listing.folders.length === 0 && listing.objects.length === 0
 

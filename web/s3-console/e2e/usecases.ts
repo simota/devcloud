@@ -382,11 +382,20 @@ export async function consoleManagesObjects(recorder: Recorder, page: Page): Pro
     await page.getByRole('button', { name: 'Delete', exact: true }).click()
     await page.getByRole('button', { name: 'Confirm', exact: true }).click()
     await expect(page.getByText('This location is empty.')).toBeVisible()
-    await recorder.step({ system: 'console', screen: 'dots', title: 'Key with dot segments deleted', checkpoint: 'CP-004', action: { kind: 'click', label: 'Switch bucket' } }, true)
+    await recorder.step({ system: 'console', screen: 'dots', title: 'Key with dot segments deleted', checkpoint: 'CP-004', action: { kind: 'click', label: 'Follow a breadcrumb' } }, true)
+    const dottedDeleted = (await raw(s3Port, 'GET', `/${dots}/x/../y`)).status === 404
+    const otherKept = (await raw(s3Port, 'GET', `/${dots}/y`)).body.toString() === 'plain'
+
+    // An empty path segment is part of the location a breadcrumb leads to.
+    await raw(s3Port, 'PUT', `/${dots}/a//b/c/z`, {}, 'nested')
+    await page.goto(`${consoleUrl}?bucket=${dots}&prefix=${encodeURIComponent('a//b/c/')}`)
+    await page.getByRole('navigation', { name: 'Path' }).getByRole('button', { name: 'b', exact: true }).click()
+    const breadcrumbPrefix = new URL(page.url()).searchParams.get('prefix')
     await recorder.ui('CP-004', {
-      dotted_deleted: (await raw(s3Port, 'GET', `/${dots}/x/../y`)).status === 404,
-      other_kept: (await raw(s3Port, 'GET', `/${dots}/y`)).body.toString() === 'plain',
-    }, { dotted_deleted: true, other_kept: true })
+      dotted_deleted: dottedDeleted,
+      other_kept: otherKept,
+      breadcrumb_prefix: breadcrumbPrefix,
+    }, { dotted_deleted: true, other_kept: true, breadcrumb_prefix: 'a//b/' })
 
     // CP-005: a late listing from the previous bucket
     const first = recorder.id('aaa')
