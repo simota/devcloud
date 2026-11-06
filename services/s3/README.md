@@ -89,3 +89,10 @@ like API calls.
 
 The UI source is `web/s3-console`. `npm run build` there writes
 `services/s3/assets/console`, which is committed and embedded into the binary.
+
+## End-to-end tests
+
+`npm run test:e2e` in `web/s3-console` builds this image and tests it through real
+sockets, a real browser, and the AWS SDK for JavaScript. It needs Docker and
+Playwright's Chromium (`npx playwright install chromium`), and writes under
+`web/s3-console/dist/e2e`.
