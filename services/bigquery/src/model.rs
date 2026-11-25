@@ -893,6 +893,240 @@ pub struct QueryStatistics {
     pub cache_hit: bool,
     #[serde(rename = "dryRun", default, skip_serializing_if = "is_false")]
     pub dry_run: bool,
+    #[serde(
+        rename = "biEngineStatistics",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub bi_engine_statistics: Option<BiEngineStatistics>,
+}
+
+// --- BigQuery ML Models -----------------------------------------------------
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ModelReference {
+    #[serde(rename = "projectId", default)]
+    pub project_id: String,
+    #[serde(rename = "datasetId", default)]
+    pub dataset_id: String,
+    #[serde(rename = "modelId", default)]
+    pub model_id: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ModelResource {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub etag: String,
+    #[serde(rename = "modelReference", default)]
+    pub model_reference: ModelReference,
+    #[serde(
+        rename = "creationTime",
+        default,
+        skip_serializing_if = "String::is_empty"
+    )]
+    pub creation_time: String,
+    #[serde(
+        rename = "lastModifiedTime",
+        default,
+        skip_serializing_if = "String::is_empty"
+    )]
+    pub last_modified_time: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    #[serde(
+        rename = "friendlyName",
+        default,
+        skip_serializing_if = "String::is_empty"
+    )]
+    pub friendly_name: String,
+    #[serde(default, skip_serializing_if = "labels_empty")]
+    pub labels: Option<BTreeMap<String, String>>,
+    #[serde(
+        rename = "expirationTime",
+        default,
+        skip_serializing_if = "String::is_empty"
+    )]
+    pub expiration_time: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub location: String,
+    #[serde(
+        rename = "modelType",
+        default,
+        skip_serializing_if = "String::is_empty"
+    )]
+    pub model_type: String,
+    #[serde(
+        rename = "trainingRuns",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub training_runs: Vec<TrainingRun>,
+    #[serde(
+        rename = "featureColumns",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub feature_columns: Vec<StandardSqlField>,
+    #[serde(
+        rename = "labelColumns",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub label_columns: Vec<StandardSqlField>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TrainingRun {
+    #[serde(
+        rename = "trainingOptions",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub training_options: Option<TrainingOptions>,
+    #[serde(
+        rename = "startTime",
+        default,
+        skip_serializing_if = "String::is_empty"
+    )]
+    pub start_time: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub results: Vec<IterationResult>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TrainingOptions {
+    #[serde(rename = "maxIterations", default, skip_serializing_if = "is_zero")]
+    pub max_iterations: i64,
+    #[serde(rename = "lossType", default, skip_serializing_if = "String::is_empty")]
+    pub loss_type: String,
+    #[serde(
+        rename = "inputLabelColumns",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub input_label_columns: Vec<String>,
+    #[serde(
+        rename = "l2Regularization",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub l2_regularization: Option<f64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct IterationResult {
+    #[serde(default)]
+    pub index: i64,
+    #[serde(
+        rename = "durationMs",
+        default,
+        skip_serializing_if = "String::is_empty"
+    )]
+    pub duration_ms: String,
+    #[serde(
+        rename = "trainingLoss",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub training_loss: Option<f64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ModelsListResponse {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub models: Vec<ModelResource>,
+    #[serde(
+        rename = "nextPageToken",
+        default,
+        skip_serializing_if = "String::is_empty"
+    )]
+    pub next_page_token: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ModelWeights {
+    #[serde(default)]
+    pub model_type: String,
+    #[serde(default)]
+    pub label_column: String,
+    #[serde(default)]
+    pub feature_columns: Vec<String>,
+    #[serde(default)]
+    pub intercept: f64,
+    #[serde(default)]
+    pub weights: Vec<f64>,
+    #[serde(default)]
+    pub label_type: String,
+}
+
+// --- BigQuery BI Engine -----------------------------------------------------
+
+fn deserialize_string_or_int<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    match value {
+        serde_json::Value::Null => Ok(String::new()),
+        serde_json::Value::String(s) => Ok(s),
+        serde_json::Value::Number(n) => Ok(n.to_string()),
+        _ => Err(serde::de::Error::custom("expected string or integer")),
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BiReservation {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
+    #[serde(
+        rename = "updateTime",
+        default,
+        skip_serializing_if = "String::is_empty"
+    )]
+    pub update_time: String,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_string_or_int",
+        skip_serializing_if = "String::is_empty"
+    )]
+    pub size: String,
+    #[serde(
+        rename = "preferredTables",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub preferred_tables: Vec<TableReference>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BiEngineStatistics {
+    #[serde(
+        rename = "biEngineMode",
+        default,
+        skip_serializing_if = "String::is_empty"
+    )]
+    pub bi_engine_mode: String,
+    #[serde(
+        rename = "accelerationMode",
+        default,
+        skip_serializing_if = "String::is_empty"
+    )]
+    pub acceleration_mode: String,
+    #[serde(
+        rename = "biEngineReasons",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub bi_engine_reasons: Vec<BiEngineReason>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BiEngineReason {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub code: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub message: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

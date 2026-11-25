@@ -23,7 +23,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::model::{
-    DatasetResource, IamPolicy, QueryJobRecord, RawJson, RoutineResource, StoredRow, TableResource,
+    BiReservation, DatasetResource, IamPolicy, ModelResource, ModelWeights, QueryJobRecord,
+    RawJson, RoutineResource, StoredRow, TableResource,
 };
 use crate::responses::{
     dataset_etag, default_iam_policy, normalize_iam_policy, unix_millis_string,
@@ -121,6 +122,36 @@ impl Server {
     pub fn routine_path(&self, project_id: &str, dataset_id: &str, routine_id: &str) -> PathBuf {
         self.routine_dir(project_id, dataset_id, routine_id)
             .join("routine.json")
+    }
+
+    pub fn model_dir(&self, project_id: &str, dataset_id: &str, model_id: &str) -> PathBuf {
+        self.dataset_dir(project_id, dataset_id)
+            .join("models")
+            .join(model_id)
+    }
+
+    pub fn model_path(&self, project_id: &str, dataset_id: &str, model_id: &str) -> PathBuf {
+        self.model_dir(project_id, dataset_id, model_id)
+            .join("model.json")
+    }
+
+    pub fn model_weights_path(
+        &self,
+        project_id: &str,
+        dataset_id: &str,
+        model_id: &str,
+    ) -> PathBuf {
+        self.model_dir(project_id, dataset_id, model_id)
+            .join("weights.json")
+    }
+
+    pub fn bi_reservation_path(&self, project_id: &str, location: &str) -> PathBuf {
+        self.storage_root()
+            .join("projects")
+            .join(project_id)
+            .join("locations")
+            .join(location)
+            .join("bi-reservation.json")
     }
 
     pub fn rows_path(&self, project_id: &str, dataset_id: &str, table_id: &str) -> PathBuf {
@@ -267,6 +298,82 @@ impl Server {
             &routine.routine_reference.routine_id,
         );
         write_atomic(&path, &wire_json::to_vec_indent(routine))
+    }
+
+    // --- models (BigQuery ML) -----------------------------------------------
+
+    pub fn read_model(
+        &self,
+        project_id: &str,
+        dataset_id: &str,
+        model_id: &str,
+    ) -> StorageResult<Option<ModelResource>> {
+        read_json_resource(&self.model_path(project_id, dataset_id, model_id))
+    }
+
+    pub fn read_models(
+        &self,
+        project_id: &str,
+        dataset_id: &str,
+    ) -> StorageResult<Vec<ModelResource>> {
+        let root = self.dataset_dir(project_id, dataset_id).join("models");
+        let mut models: Vec<ModelResource> = Vec::new();
+        for name in read_subdir_names(&root)? {
+            if let Some(model) = self.read_model(project_id, dataset_id, &name)? {
+                models.push(model);
+            }
+        }
+        models.sort_by(|a, b| a.model_reference.model_id.cmp(&b.model_reference.model_id));
+        Ok(models)
+    }
+
+    pub fn write_model(&self, model: &ModelResource) -> StorageResult<()> {
+        let path = self.model_path(
+            &model.model_reference.project_id,
+            &model.model_reference.dataset_id,
+            &model.model_reference.model_id,
+        );
+        write_atomic(&path, &wire_json::to_vec_indent(model))
+    }
+
+    pub fn read_model_weights(
+        &self,
+        project_id: &str,
+        dataset_id: &str,
+        model_id: &str,
+    ) -> StorageResult<Option<ModelWeights>> {
+        read_json_resource(&self.model_weights_path(project_id, dataset_id, model_id))
+    }
+
+    pub fn write_model_weights(
+        &self,
+        project_id: &str,
+        dataset_id: &str,
+        model_id: &str,
+        weights: &ModelWeights,
+    ) -> StorageResult<()> {
+        let path = self.model_weights_path(project_id, dataset_id, model_id);
+        write_atomic(&path, &wire_json::to_vec_indent(weights))
+    }
+
+    // --- BI Engine reservations ---------------------------------------------
+
+    pub fn read_bi_reservation(
+        &self,
+        project_id: &str,
+        location: &str,
+    ) -> StorageResult<Option<BiReservation>> {
+        read_json_resource(&self.bi_reservation_path(project_id, location))
+    }
+
+    pub fn write_bi_reservation(
+        &self,
+        project_id: &str,
+        location: &str,
+        reservation: &BiReservation,
+    ) -> StorageResult<()> {
+        let path = self.bi_reservation_path(project_id, location);
+        write_atomic(&path, &wire_json::to_vec_indent(reservation))
     }
 
     // --- streaming buffer ---------------------------------------------------

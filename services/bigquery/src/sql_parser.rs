@@ -22,8 +22,51 @@
 use crate::model::{QueryParameter, TableFieldSchema, TableSchema};
 use crate::responses::default_string;
 use crate::sql_eval::{aggregate_numeric_type, is_numeric_field};
+use crate::sql_expr::{find_top_level_keyword, parse_expr, split_top_level_commas, SqlExpr};
 use crate::validation::validate_resource_id;
 use crate::wire_json;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MlTableFunctionKind {
+    Predict,
+    Evaluate,
+    Weights,
+}
+
+#[derive(Debug, Clone, Default)]
+pub enum FromSource {
+    #[default]
+    None,
+    Table {
+        project_id: String,
+        dataset_id: String,
+        table_id: String,
+    },
+    TableValuedFunction {
+        name_parts: Vec<String>,
+        args: Vec<SqlExpr>,
+    },
+    MlTableFunction {
+        kind: MlTableFunctionKind,
+        model_project_id: String,
+        model_dataset_id: String,
+        model_id: String,
+        input_sql: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub enum SelectItem {
+    Star,
+    Field {
+        name: String,
+        alias: Option<String>,
+    },
+    Expr {
+        expr: SqlExpr,
+        alias: Option<String>,
+    },
+}
 
 /// legacy `simpleSelectQuery`.
 #[derive(Debug, Clone, Default)]
@@ -31,15 +74,29 @@ pub struct SimpleSelectQuery {
     pub project_id: String,
     pub dataset_id: String,
     pub table_id: String,
+    pub from_source: FromSource,
     pub selected_fields: Vec<String>,
+    pub select_items: Vec<SelectItem>,
     pub aggregate: Option<AggregateSelection>,
     pub where_condition_groups: Vec<Vec<WhereCondition>>,
+    pub where_expr: Option<SqlExpr>,
     pub group_by: String,
     pub order_by: String,
     pub order_desc: bool,
     /// `-1` ≙ no LIMIT clause (legacy initializes `Limit: -1`).
     pub limit: i64,
     pub offset: i64,
+}
+
+impl SimpleSelectQuery {
+    pub fn has_computed_select(&self) -> bool {
+        self.select_items.iter().any(|item| {
+            matches!(
+                item,
+                SelectItem::Expr { .. } | SelectItem::Field { alias: Some(_), .. }
+            )
+        })
+    }
 }
 
 /// legacy `aggregateSelection` (`Function: ""` ≙ `Option::None` at the use site).
@@ -115,34 +172,58 @@ pub fn parse_simple_select(
     if !upper.starts_with("SELECT ") {
         return Err("only SELECT queries are supported".to_string());
     }
-    let Some(from_index) = upper.find(" FROM ") else {
-        return Err("SELECT query requires FROM".to_string());
+    let Some(from_index) = find_top_level_keyword(query, " FROM ") else {
+        return parse_scalar_select(query);
     };
     let selected = query["SELECT ".len()..from_index].trim();
     if selected.is_empty() {
         return Err("SELECT list is required".to_string());
     }
     let rest = query[from_index + " FROM ".len()..].trim();
-    let (table_expr, rest) = next_query_token(rest);
-    let (project_id, dataset_id, table_id) =
-        parse_table_identifier(table_expr, default_project_id)?;
+    let (from_source, rest) = parse_from_source(rest, default_project_id)?;
+    let (project_id, dataset_id, table_id) = match &from_source {
+        FromSource::Table {
+            project_id,
+            dataset_id,
+            table_id,
+        } => (project_id.clone(), dataset_id.clone(), table_id.clone()),
+        _ => (String::new(), String::new(), String::new()),
+    };
     let mut parsed = SimpleSelectQuery {
         project_id,
         dataset_id,
         table_id,
-        selected_fields: parse_selected_fields(selected),
+        from_source,
         limit: -1,
         ..Default::default()
     };
-    if parsed.selected_fields.is_empty() {
-        return Err("SELECT list is required".to_string());
-    }
     if let Some(aggregate) = parse_aggregate_selection(selected)? {
         parsed.aggregate = Some(aggregate);
-        parsed.selected_fields = Vec::new();
     } else if let Some((group_field, aggregate)) = parse_grouped_aggregate_selection(selected)? {
         parsed.aggregate = Some(aggregate);
         parsed.selected_fields = vec![group_field];
+    } else {
+        let items = parse_select_items(selected)?;
+        if items.is_empty() {
+            return Err("SELECT list is required".to_string());
+        }
+        let all_plain = items.iter().all(|item| {
+            matches!(
+                item,
+                SelectItem::Star | SelectItem::Field { alias: None, .. }
+            )
+        });
+        if all_plain {
+            parsed.selected_fields = items
+                .iter()
+                .map(|item| match item {
+                    SelectItem::Star => "*".to_string(),
+                    SelectItem::Field { name, .. } => name.clone(),
+                    SelectItem::Expr { .. } => unreachable!(),
+                })
+                .collect();
+        }
+        parsed.select_items = items;
     }
     let mut rest = rest.trim();
     while !rest.is_empty() {
@@ -150,14 +231,21 @@ pub fn parse_simple_select(
         if upper_rest.starts_with("WHERE ") {
             let mut condition_end = rest.len();
             for marker in [" GROUP BY ", " ORDER BY ", " LIMIT ", " OFFSET "] {
-                if let Some(idx) = upper_rest.find(marker) {
+                if let Some(idx) = find_top_level_keyword(rest, marker) {
                     if idx < condition_end {
                         condition_end = idx;
                     }
                 }
             }
             let condition = rest["WHERE ".len()..condition_end].trim();
-            parsed.where_condition_groups = parse_simple_condition_groups(condition)?;
+            if condition.is_empty() {
+                return Err("WHERE condition is required".to_string());
+            }
+            if condition.contains('(') || condition.contains(')') {
+                parsed.where_expr = Some(parse_expr(condition)?);
+            } else {
+                parsed.where_condition_groups = parse_simple_condition_groups(condition)?;
+            }
             rest = rest[condition_end..].trim();
         } else if upper_rest.starts_with("GROUP BY ") {
             let value = rest["GROUP BY ".len()..].trim();
@@ -392,12 +480,7 @@ pub(crate) fn parse_aggregate_selection(
         .find(|candidate| upper.starts_with(&format!("{}(", candidate.name())));
     let function = match function {
         Some(function) if expr.ends_with(')') => function,
-        _ => {
-            if upper.contains('(') || upper.contains(')') {
-                return Err("unsupported aggregate expression".to_string());
-            }
-            return Ok(None);
-        }
+        _ => return Ok(None),
     };
     let field = expr[function.name().len() + 1..expr.len() - 1]
         .trim()
@@ -420,14 +503,14 @@ pub(crate) fn parse_aggregate_selection(
 pub(crate) fn parse_grouped_aggregate_selection(
     selected: &str,
 ) -> Result<Option<(String, AggregateSelection)>, String> {
-    let parts: Vec<&str> = selected.split(',').collect();
+    let parts = split_top_level_commas(selected)?;
     if parts.len() != 2 {
         return Ok(None);
     }
     let mut group_field = String::new();
     let mut aggregate: Option<AggregateSelection> = None;
     let mut group_field_count = 0;
-    for part in parts {
+    for part in &parts {
         let expr = part.trim();
         if let Some(parsed_aggregate) = parse_aggregate_selection(expr)? {
             if aggregate.is_some() {
@@ -437,7 +520,10 @@ pub(crate) fn parse_grouped_aggregate_selection(
             continue;
         }
         if expr.contains(['(', ')']) {
-            return Err("unsupported grouped SELECT expression".to_string());
+            if aggregate.is_some() {
+                return Err("unsupported grouped SELECT expression".to_string());
+            }
+            return Ok(None);
         }
         if group_field_count > 0 && aggregate.is_some() {
             return Err("GROUP BY supports one selected field".to_string());
@@ -546,7 +632,7 @@ fn next_query_token(value: &str) -> (&str, &str) {
 }
 
 /// legacy `parseTableIdentifier`.
-fn parse_table_identifier(
+pub(crate) fn parse_table_identifier(
     identifier: &str,
     default_project_id: &str,
 ) -> Result<(String, String, String), String> {
@@ -568,17 +654,313 @@ fn parse_table_identifier(
     }
 }
 
-/// legacy `parseSelectedFields`.
-fn parse_selected_fields(selected: &str) -> Vec<String> {
-    if selected.trim() == "*" {
-        return vec!["*".to_string()];
+fn parse_scalar_select(query: &str) -> Result<SimpleSelectQuery, String> {
+    let body = query["SELECT ".len()..].trim();
+    if body.is_empty() {
+        return Err("SELECT list is required".to_string());
     }
-    selected
-        .split(',')
-        .map(|part| part.trim().trim_matches('`'))
-        .filter(|field| !field.is_empty())
-        .map(str::to_string)
-        .collect()
+    let mut select_end = body.len();
+    for marker in [" WHERE ", " GROUP BY ", " ORDER BY ", " LIMIT ", " OFFSET "] {
+        if let Some(idx) = find_top_level_keyword(body, marker) {
+            if idx < select_end {
+                select_end = idx;
+            }
+        }
+    }
+    let selected = body[..select_end].trim();
+    let mut rest = body[select_end..].trim();
+    if selected.is_empty() {
+        return Err("SELECT list is required".to_string());
+    }
+    let items = parse_select_items(selected)?;
+    if items.iter().any(|item| matches!(item, SelectItem::Star)) {
+        return Err("SELECT * requires FROM".to_string());
+    }
+    let mut parsed = SimpleSelectQuery {
+        from_source: FromSource::None,
+        select_items: items,
+        limit: -1,
+        ..Default::default()
+    };
+    while !rest.is_empty() {
+        let upper_rest = rest.to_ascii_uppercase();
+        if upper_rest.starts_with("LIMIT ") {
+            let (value, suffix) = next_query_token(rest["LIMIT ".len()..].trim());
+            match value.parse::<i64>() {
+                Ok(limit) if limit >= 0 => parsed.limit = limit,
+                _ => return Err("LIMIT must be a non-negative integer".to_string()),
+            }
+            rest = suffix.trim();
+        } else if upper_rest.starts_with("OFFSET ") {
+            let (value, suffix) = next_query_token(rest["OFFSET ".len()..].trim());
+            match value.parse::<i64>() {
+                Ok(offset) if offset >= 0 => parsed.offset = offset,
+                _ => return Err("OFFSET must be a non-negative integer".to_string()),
+            }
+            rest = suffix.trim();
+        } else {
+            return Err("SELECT query requires FROM".to_string());
+        }
+    }
+    Ok(parsed)
+}
+
+fn parse_from_source<'a>(
+    rest: &'a str,
+    default_project_id: &str,
+) -> Result<(FromSource, &'a str), String> {
+    let rest = rest.trim();
+    // Check for ML.PREDICT / ML.EVALUATE / ML.WEIGHTS table-valued functions.
+    let upper = rest.to_ascii_uppercase();
+    for (prefix, kind) in [
+        ("ML.PREDICT", MlTableFunctionKind::Predict),
+        ("ML.EVALUATE", MlTableFunctionKind::Evaluate),
+        ("ML.WEIGHTS", MlTableFunctionKind::Weights),
+    ] {
+        if upper.starts_with(prefix) {
+            let after_prefix = rest[prefix.len()..].trim_start();
+            if after_prefix.starts_with('(') {
+                let (inner, trailing) = consume_balanced_parens(after_prefix)?;
+                let source = parse_ml_table_function(kind, inner, default_project_id)?;
+                return Ok((source, trailing.trim()));
+            }
+        }
+    }
+    // Check for SQL TVF call: `[project.]dataset.routine(...)` or `` `project.dataset.routine`(...) ``
+    if let Some((call_text, trailing)) = split_leading_function_call(rest)? {
+        let expr = parse_expr(call_text)?;
+        if let SqlExpr::FunctionCall { name_parts, args } = expr {
+            if name_parts.len() == 2 || name_parts.len() == 3 {
+                return Ok((
+                    FromSource::TableValuedFunction { name_parts, args },
+                    trailing.trim(),
+                ));
+            }
+        }
+        return Err("unsupported FROM table function".to_string());
+    }
+    let (table_expr, trailing) = next_query_token(rest);
+    let (project_id, dataset_id, table_id) =
+        parse_table_identifier(table_expr, default_project_id)?;
+    Ok((
+        FromSource::Table {
+            project_id,
+            dataset_id,
+            table_id,
+        },
+        trailing,
+    ))
+}
+
+fn parse_ml_table_function(
+    kind: MlTableFunctionKind,
+    inner: &str,
+    default_project_id: &str,
+) -> Result<FromSource, String> {
+    let args = split_top_level_commas(inner)?;
+    let expected_args = match kind {
+        MlTableFunctionKind::Weights => 1,
+        MlTableFunctionKind::Predict | MlTableFunctionKind::Evaluate => 2,
+    };
+    if args.len() != expected_args {
+        return Err("invalid ML table function arguments".to_string());
+    }
+    let model_arg = args[0].trim();
+    let upper_model = model_arg.to_ascii_uppercase();
+    if !upper_model.starts_with("MODEL ") {
+        return Err("ML table function requires MODEL <model_name>".to_string());
+    }
+    let model_ident = model_arg["MODEL ".len()..].trim();
+    let (model_project_id, model_dataset_id, model_id) =
+        parse_table_identifier(model_ident, default_project_id)?;
+    let input_sql = if expected_args == 2 {
+        let second = args[1].trim();
+        let upper_second = second.to_ascii_uppercase();
+        if second.starts_with('(') && second.ends_with(')') {
+            Some(second[1..second.len() - 1].trim().to_string())
+        } else if upper_second.starts_with("TABLE ") {
+            let table_ident = second["TABLE ".len()..].trim();
+            let (p, d, t) = parse_table_identifier(table_ident, default_project_id)?;
+            Some(format!("SELECT * FROM `{p}.{d}.{t}`"))
+        } else {
+            return Err(
+                "ML table function input must be (SELECT ...) or TABLE <table>".to_string(),
+            );
+        }
+    } else {
+        None
+    };
+    Ok(FromSource::MlTableFunction {
+        kind,
+        model_project_id,
+        model_dataset_id,
+        model_id,
+        input_sql,
+    })
+}
+
+/// If `rest` begins with `<ident-or-backtick-path>(...)`, returns the full call
+/// text and the remaining slice after `)`.
+fn split_leading_function_call<'a>(rest: &'a str) -> Result<Option<(&'a str, &'a str)>, String> {
+    let bytes = rest.as_bytes();
+    let mut i = 0usize;
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    if bytes[i] == b'`' {
+        let Some(end) = rest[1..].find('`') else {
+            return Ok(None);
+        };
+        i = end + 2;
+    } else if bytes[i].is_ascii_alphabetic() || bytes[i] == b'_' {
+        while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+            i += 1;
+        }
+    } else {
+        return Ok(None);
+    }
+    while i < bytes.len() && bytes[i] == b'.' {
+        i += 1;
+        if i >= bytes.len() {
+            return Ok(None);
+        }
+        if bytes[i] == b'`' {
+            let Some(end) = rest[i + 1..].find('`') else {
+                return Ok(None);
+            };
+            i += end + 2;
+        } else if bytes[i].is_ascii_alphabetic() || bytes[i] == b'_' {
+            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                i += 1;
+            }
+        } else {
+            return Ok(None);
+        }
+    }
+    let after_name = rest[i..].trim_start();
+    if !after_name.starts_with('(') {
+        return Ok(None);
+    }
+    let paren_offset = rest.len() - after_name.len();
+    let (inner, trailing) = consume_balanced_parens(after_name)?;
+    let call_end = paren_offset + 1 + inner.len() + 1;
+    Ok(Some((&rest[..call_end], trailing)))
+}
+
+/// Given a slice starting with `(`, returns `(inside_parens, slice_after_closing_paren)`.
+pub(crate) fn consume_balanced_parens(input: &str) -> Result<(&str, &str), String> {
+    let bytes = input.as_bytes();
+    if bytes.first() != Some(&b'(') {
+        return Err("expected '('".to_string());
+    }
+    let mut depth = 0i32;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut in_backtick = false;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_single {
+            if b == b'\\' {
+                i += 2;
+                continue;
+            }
+            if b == b'\'' {
+                in_single = false;
+            }
+        } else if in_double {
+            if b == b'\\' {
+                i += 2;
+                continue;
+            }
+            if b == b'"' {
+                in_double = false;
+            }
+        } else if in_backtick {
+            if b == b'`' {
+                in_backtick = false;
+            }
+        } else {
+            match b {
+                b'\'' => in_single = true,
+                b'"' => in_double = true,
+                b'`' => in_backtick = true,
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Ok((&input[1..i], &input[i + 1..]));
+                    }
+                }
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    Err("unbalanced parentheses in SQL query".to_string())
+}
+
+fn parse_select_items(selected: &str) -> Result<Vec<SelectItem>, String> {
+    let raw_parts = split_top_level_commas(selected)?;
+    let mut items = Vec::with_capacity(raw_parts.len());
+    for part in raw_parts {
+        let trimmed = part.trim();
+        if trimmed.is_empty() {
+            return Err("SELECT list contains an empty item".to_string());
+        }
+        if trimmed == "*" {
+            items.push(SelectItem::Star);
+            continue;
+        }
+        let (expr_text, alias) = split_select_alias(trimmed)?;
+        if is_simple_column_ident(expr_text) {
+            items.push(SelectItem::Field {
+                name: expr_text.trim_matches('`').to_string(),
+                alias,
+            });
+        } else {
+            let expr = parse_expr(expr_text)?;
+            items.push(SelectItem::Expr { expr, alias });
+        }
+    }
+    Ok(items)
+}
+
+fn split_select_alias(item: &str) -> Result<(&str, Option<String>), String> {
+    if let Some(idx) = find_top_level_keyword(item, " AS ") {
+        let expr_part = item[..idx].trim();
+        let alias_raw = item[idx + " AS ".len()..].trim();
+        let alias = alias_raw.trim_matches('`').to_string();
+        if expr_part.is_empty() || alias.is_empty() {
+            return Err("SELECT alias is empty".to_string());
+        }
+        validate_resource_id(&alias, "field")?;
+        return Ok((expr_part, Some(alias)));
+    }
+    Ok((item, None))
+}
+
+fn is_simple_column_ident(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let upper = trimmed.to_ascii_uppercase();
+    if matches!(upper.as_str(), "NULL" | "TRUE" | "FALSE") {
+        return false;
+    }
+    if trimmed.starts_with('`') && trimmed.ends_with('`') && trimmed.len() >= 2 {
+        let inner = &trimmed[1..trimmed.len() - 1];
+        return !inner.is_empty() && !inner.contains('`') && !inner.contains('.');
+    }
+    let mut chars = trimmed.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// legacy `parseSimpleConditions`.
