@@ -58,9 +58,10 @@ def _devcloud_main():
         identity = None
         client_context = None
 
-        def __init__(self, request_id, deadline_ms):
+        def __init__(self, request_id, deadline_ms, invoked_arn):
             self.aws_request_id = request_id
             self._deadline_ms = deadline_ms
+            self.invoked_function_arn = invoked_arn
 
         def get_remaining_time_in_millis(self):
             return max(0, self._deadline_ms - int(time.time() * 1000))
@@ -108,7 +109,7 @@ def _devcloud_main():
             return
         event = json.loads(req["event"] or "{}")
         try:
-            result = handler(event, LambdaContext(request_id, req["deadlineMs"]))
+            result = handler(event, LambdaContext(request_id, req["deadlineMs"], req.get("invokedFunctionArn", function_arn)))
         except Exception as e:
             frames = traceback.extract_tb(e.__traceback__)[1:]
             print("[ERROR] %s: %s" % (type(e).__name__, e))

@@ -467,6 +467,9 @@ pub(crate) fn map_response(invoke: Reply) -> Reply {
     if invoke.status == 413 {
         return message_reply(413, "Request Too Long");
     }
+    if invoke.status == 429 {
+        return message_reply(429, "Rate Exceeded.");
+    }
     let function_error = invoke
         .headers
         .iter()

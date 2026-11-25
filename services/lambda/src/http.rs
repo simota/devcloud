@@ -217,12 +217,25 @@ pub async fn process(server: &Arc<Server>, req: &Request) -> Reply {
     let query = parse_query(&req.query);
 
     // devcloud-only surface: unsigned and read-only, like the presigned URL
-    // AWS hands out as `Code.Location`.
+    // AWS hands out as `Code.Location` / `Content.Location`.
     if let ("GET", ["_devcloud", "functions", name, "code.zip"]) =
         (req.method.as_str(), seg.as_slice())
     {
         let (name, sha) = (name.to_string(), query.get("CodeSha256").cloned());
         return blocking(server, move |s| s.code_package(&name, sha.as_deref())).await;
+    }
+    if let ("GET", ["_devcloud", "layers", name, "versions", version, "code.zip"]) =
+        (req.method.as_str(), seg.as_slice())
+    {
+        let (name, version, sha) = (
+            name.to_string(),
+            version.to_string(),
+            query.get("CodeSha256").cloned(),
+        );
+        return blocking(server, move |s| {
+            s.layer_code_package(&name, &version, sha.as_deref())
+        })
+        .await;
     }
 
     if !matches!(req.method.as_str(), "GET" | "HEAD")
@@ -284,6 +297,74 @@ pub async fn process(server: &Arc<Server>, req: &Request) -> Reply {
                     )
                     .await
             }
+            _ => method_not_allowed(),
+        },
+        ["2015-03-31", "functions", id, "versions"] => match m {
+            "POST" => server.publish_version(id, &req.body),
+            "GET" => server.list_versions_by_function(id, &query),
+            _ => method_not_allowed(),
+        },
+        ["2015-03-31", "functions", id, "aliases"] => match m {
+            "POST" => server.create_alias(id, &req.body),
+            "GET" => server.list_aliases(id, &query),
+            _ => method_not_allowed(),
+        },
+        ["2015-03-31", "functions", id, "aliases", alias] => match m {
+            "GET" => server.get_alias(id, alias),
+            "PUT" => server.update_alias(id, alias, &req.body),
+            "DELETE" => server.delete_alias(id, alias),
+            _ => method_not_allowed(),
+        },
+        ["2018-10-31", "layers"] | ["2018-10-31", "layers", ""] => match m {
+            "GET" => {
+                if query.get("find").map(String::as_str) == Some("LayerVersion") {
+                    server.get_layer_version_by_arn(&query)
+                } else {
+                    server.list_layers(&query)
+                }
+            }
+            _ => method_not_allowed(),
+        },
+        ["2018-10-31", "layers", name, "versions"] => match m {
+            "POST" => {
+                let (name, body) = (name.to_string(), req.body.clone());
+                blocking(server, move |s| s.publish_layer_version(&name, &body)).await
+            }
+            "GET" => server.list_layer_versions(name, &query),
+            _ => method_not_allowed(),
+        },
+        ["2018-10-31", "layers", name, "versions", version] => match m {
+            "GET" => server.get_layer_version(name, version),
+            "DELETE" => server.delete_layer_version(name, version),
+            _ => method_not_allowed(),
+        },
+        ["2015-03-31", "event-source-mappings"] | ["2015-03-31", "event-source-mappings", ""] => {
+            match m {
+                "POST" => server.create_event_source_mapping(&req.body),
+                "GET" => server.list_event_source_mappings(&query),
+                _ => method_not_allowed(),
+            }
+        }
+        ["2015-03-31", "event-source-mappings", uuid] => match m {
+            "GET" => server.get_event_source_mapping(uuid),
+            "PUT" => server.update_event_source_mapping(uuid, &req.body),
+            "DELETE" => server.delete_event_source_mapping(uuid),
+            _ => method_not_allowed(),
+        },
+        ["2017-10-31", "functions", id, "concurrency"] => match m {
+            "PUT" => server.put_function_concurrency(id, &req.body),
+            "DELETE" => server.delete_function_concurrency(id),
+            "GET" => server.get_function_concurrency(id),
+            _ => method_not_allowed(),
+        },
+        ["2019-09-30", "functions", id, "concurrency"] => match m {
+            "GET" => server.get_function_concurrency(id),
+            _ => method_not_allowed(),
+        },
+        ["2019-09-30", "functions", id, "provisioned-concurrency"] => match m {
+            "PUT" => server.put_provisioned_concurrency_config(id, &query, &req.body),
+            "GET" => server.get_or_list_provisioned_concurrency(id, &query),
+            "DELETE" => server.delete_provisioned_concurrency_config(id, &query),
             _ => method_not_allowed(),
         },
         ["2021-10-31", "functions", id, "url"] => match m {
@@ -487,6 +568,7 @@ fn reason(status: u16) -> &'static str {
         410 => "Gone",
         412 => "Precondition Failed",
         413 => "Payload Too Large",
+        429 => "Too Many Requests",
         500 => "Internal Server Error",
         501 => "Not Implemented",
         502 => "Bad Gateway",

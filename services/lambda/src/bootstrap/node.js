@@ -214,7 +214,7 @@ const invoke = async (req) => {
   const context = {
     functionName: process.env.AWS_LAMBDA_FUNCTION_NAME,
     functionVersion: process.env.AWS_LAMBDA_FUNCTION_VERSION,
-    invokedFunctionArn: functionArn,
+    invokedFunctionArn: req.invokedFunctionArn || functionArn,
     memoryLimitInMB: process.env.AWS_LAMBDA_FUNCTION_MEMORY_SIZE,
     awsRequestId: req.requestId,
     logGroupName: process.env.AWS_LAMBDA_LOG_GROUP_NAME,
