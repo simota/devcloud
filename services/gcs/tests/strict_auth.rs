@@ -166,7 +166,7 @@ fn strict_principals_are_bound_by_bucket_iam() {
 }
 
 #[test]
-fn strict_honors_all_users_domain_and_ignores_conditional_bindings() {
+fn strict_honors_all_users_domain_and_false_conditional_bindings() {
     let mut f = Fixture::new("strict");
     setup_bucket(
         &mut f,
@@ -239,4 +239,109 @@ fn non_strict_modes_ignore_principals_and_bucket_iam() {
         status(s, "GET", "/storage/v1/b/dev/o/a.txt", "", ALICE),
         401
     );
+}
+
+#[test]
+fn strict_evaluates_conditional_bindings() {
+    let mut f = Fixture::new("strict");
+    setup_bucket(
+        &mut f,
+        "cond",
+        r#"[{"role":"roles/storage.objectViewer","members":["user:alice@example.com"],
+             "condition":{"title":"reports","expression":"resource.name.startsWith(\"projects/_/buckets/cond/objects/reports/\")"}},
+            {"role":"roles/storage.objectCreator","members":["user:alice@example.com"],
+             "condition":{"title":"until-july","expression":"request.time < timestamp(\"2026-07-01T00:00:00Z\") && resource.type == \"storage.googleapis.com/Object\""}},
+            {"role":"roles/storage.objectAdmin","members":["serviceAccount:bob@other.test"],
+             "condition":{"title":"unsupported","expression":"resource.labels.env == \"prod\""}}]"#,
+    );
+    let s = &mut f.server;
+    s.set_fixed_now("2026-06-01T12:00:00Z");
+    let up = "/upload/storage/v1/b/cond/o?uploadType=media&name=reports%2Fq1.csv";
+    assert_eq!(status(s, "POST", up, "1,2", OWNER), 200);
+
+    // The resource-name condition grants reads under reports/ only.
+    assert_eq!(
+        status(s, "GET", "/storage/v1/b/cond/o/reports%2Fq1.csv", "", ALICE),
+        200
+    );
+    assert_eq!(status(s, "GET", "/cond/reports/q1.csv", "", ALICE), 200);
+    assert_eq!(
+        status(
+            s,
+            "GET",
+            "/download/storage/v1/b/cond/o/reports%2Fq1.csv?alt=media",
+            "",
+            ALICE
+        ),
+        200
+    );
+    assert_eq!(status(s, "GET", "/cond/a.txt", "", ALICE), 403);
+    // Listing is checked on the bucket resource, which the condition excludes.
+    assert_eq!(status(s, "GET", "/storage/v1/b/cond/o", "", ALICE), 403);
+
+    // The time-bounded creator binding expires.
+    assert_eq!(status(s, "PUT", "/cond/new.txt", "x", ALICE), 200);
+    let named_upload = "/upload/storage/v1/b/cond/o?uploadType=media&name=named.txt";
+    assert_eq!(status(s, "POST", named_upload, "x", ALICE), 200);
+    s.set_fixed_now("2026-08-01T00:00:00Z");
+    assert_eq!(status(s, "PUT", "/cond/later.txt", "x", ALICE), 403);
+
+    // Unsupported expressions never grant.
+    assert_eq!(status(s, "GET", "/cond/a.txt", "", BOB), 403);
+}
+
+#[test]
+fn strict_honors_legacy_acls_unless_uniform_access_is_enabled() {
+    let mut f = Fixture::new("strict");
+    setup_bucket(&mut f, "legacy", "[]");
+    let s = &mut f.server;
+    let grant = |s: &mut Server, target: &str, entity: &str, role: &str| {
+        let body = format!(r#"{{"entity":"{entity}","role":"{role}"}}"#);
+        assert_eq!(status(s, "POST", target, &body, OWNER), 200);
+    };
+    grant(
+        s,
+        "/storage/v1/b/legacy/acl",
+        "user-alice@example.com",
+        "WRITER",
+    );
+    grant(
+        s,
+        "/storage/v1/b/legacy/o/a.txt/acl",
+        "domain-other.test",
+        "READER",
+    );
+    let mut req = Request::new("PUT", "/legacy/public.txt", b"pub".to_vec());
+    req.headers
+        .insert("authorization".to_string(), format!("Bearer {OWNER}"));
+    req.headers
+        .insert("x-goog-acl".to_string(), "publicRead".to_string());
+    assert_eq!(route(s, &req).status, 200);
+
+    // Bucket WRITER: list, bucket metadata, create, delete; no object reads or IAM.
+    assert_eq!(status(s, "GET", "/storage/v1/b/legacy/o", "", ALICE), 200);
+    assert_eq!(status(s, "GET", "/storage/v1/b/legacy", "", ALICE), 200);
+    assert_eq!(status(s, "PUT", "/legacy/b.txt", "x", ALICE), 200);
+    assert_eq!(status(s, "DELETE", "/legacy/b.txt", "", ALICE), 204);
+    assert_eq!(status(s, "GET", "/legacy/a.txt", "", ALICE), 403);
+    assert_eq!(status(s, "GET", "/storage/v1/b/legacy/iam", "", ALICE), 403);
+
+    // Object READER via domain-: Bob reads a.txt only.
+    assert_eq!(status(s, "GET", "/legacy/a.txt", "", BOB), 200);
+    assert_eq!(status(s, "GET", "/storage/v1/b/legacy/o", "", BOB), 403);
+    assert_eq!(
+        status(s, "PATCH", "/storage/v1/b/legacy/o/a.txt", "{}", BOB),
+        403
+    );
+    // project-* entities have no local members.
+    assert_eq!(status(s, "GET", "/legacy/b.txt", "", BOB), 403);
+    // allUsers READER from x-goog-acl: publicRead.
+    assert_eq!(status(s, "GET", "/legacy/public.txt", "", ""), 200);
+
+    // Uniform bucket-level access turns legacy ACLs off.
+    let ubla = r#"{"iamConfiguration":{"uniformBucketLevelAccess":{"enabled":true}}}"#;
+    assert_eq!(status(s, "PATCH", "/storage/v1/b/legacy", ubla, OWNER), 200);
+    assert_eq!(status(s, "PUT", "/legacy/c.txt", "x", ALICE), 403);
+    assert_eq!(status(s, "GET", "/legacy/a.txt", "", BOB), 403);
+    assert_eq!(status(s, "GET", "/legacy/public.txt", "", ""), 401);
 }

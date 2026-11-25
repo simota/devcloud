@@ -193,6 +193,20 @@ pub struct GcsObjectMeta {
     pub retention: Option<GcsObjectRetention>,
 }
 
+/// Object settings captured from XML multipart initiate headers
+/// (`x-goog-acl`, `x-goog-storage-class`, `x-goog-object-retention-*`) and
+/// applied to the object when the upload completes.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GcsMultipartInit {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub acl: Option<Vec<AccessControlEntry>>,
+    #[serde(rename = "storageClass", skip_serializing_if = "String::is_empty")]
+    pub storage_class: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retention: Option<GcsObjectRetention>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct IamCondition {
@@ -337,6 +351,15 @@ fn object_meta_path(store: &FileBucketStore, bucket: &str, key: &str) -> PathBuf
         .join(format!("{}.json", base64::raw_url_encode(key.as_bytes())))
 }
 
+fn multipart_init_path(store: &FileBucketStore, bucket: &str, upload_id: &str) -> PathBuf {
+    gcs_dir(store, bucket)
+        .join("multipart_uploads")
+        .join(format!(
+            "{}.json",
+            base64::raw_url_encode(upload_id.as_bytes())
+        ))
+}
+
 fn notifications_path(store: &FileBucketStore, bucket: &str) -> PathBuf {
     gcs_dir(store, bucket).join("notifications.json")
 }
@@ -470,6 +493,31 @@ pub fn write_object_meta(
     meta: &GcsObjectMeta,
 ) -> io::Result<()> {
     write_json_atomic(&object_meta_path(store, bucket, key), meta)
+}
+
+pub fn read_multipart_init(
+    store: &FileBucketStore,
+    bucket: &str,
+    upload_id: &str,
+) -> io::Result<GcsMultipartInit> {
+    Ok(read_json_opt(&multipart_init_path(store, bucket, upload_id))?.unwrap_or_default())
+}
+
+pub fn write_multipart_init(
+    store: &FileBucketStore,
+    bucket: &str,
+    upload_id: &str,
+    init: &GcsMultipartInit,
+) -> io::Result<()> {
+    write_json_atomic(&multipart_init_path(store, bucket, upload_id), init)
+}
+
+pub fn delete_multipart_init(
+    store: &FileBucketStore,
+    bucket: &str,
+    upload_id: &str,
+) -> io::Result<()> {
+    remove_if_exists(&multipart_init_path(store, bucket, upload_id))
 }
 
 pub fn delete_object_sidecars(store: &FileBucketStore, bucket: &str, key: &str) -> io::Result<()> {

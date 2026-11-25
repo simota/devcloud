@@ -670,7 +670,7 @@ pub fn route(server: &mut Server, req: &Request) -> Response {
         || req.path.starts_with("/download/storage/v1/");
 
     let principal = match verify_signed_url(server, req) {
-        SignedUrlCheck::Valid => Principal::from_signer(server, signed_url_signer(req)),
+        SignedUrlCheck::Valid => Principal::from_signer(server, signed_url_signer(server, req)),
         SignedUrlCheck::Invalid {
             status,
             code,
