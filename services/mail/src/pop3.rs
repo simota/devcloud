@@ -435,7 +435,7 @@ where
                 let Some(user) = user else {
                     return self.err("send USER first").await;
                 };
-                self.complete_login(&user, arg).await
+                self.complete_login("", &user, arg).await
             }
             "AUTH" => {
                 if self.tls_required() {
@@ -482,20 +482,27 @@ where
         if parts.len() != 3 {
             return self.err("malformed PLAIN credentials").await;
         }
-        self.complete_login(parts[1], parts[2]).await
+        self.complete_login(parts[0], parts[1], parts[2]).await
     }
 
-    async fn complete_login(&mut self, user: &str, pass: &str) -> bool {
-        if !self.config.verify_credentials(user, pass) {
+    async fn complete_login(&mut self, authzid: &str, user: &str, pass: &str) -> bool {
+        let service = if let Some(accounts) = self.service.accounts(&self.config.auth_mode) {
+            let Some(account) = accounts.authenticate(authzid, user, pass) else {
+                return self.err("authentication failed").await;
+            };
+            Arc::clone(&account.mailbox)
+        } else if self.config.verify_credentials(user, pass) {
+            Arc::clone(&self.service)
+        } else {
             return self.err("authentication failed").await;
-        }
-        let snapshot = match self.service.list_mailbox() {
+        };
+        let snapshot = match service.list_mailbox() {
             Ok(s) => s,
             Err(_) => return self.err("failed to open mailbox").await,
         };
         let mut entries = Vec::with_capacity(snapshot.messages.len());
         for item in snapshot.messages {
-            let raw = match self.service.get_raw(&item.message.id) {
+            let raw = match service.get_raw(&item.message.id) {
                 Ok(Some(bytes)) => bytes,
                 Ok(None) => continue,
                 Err(_) => return self.err("failed to read mailbox").await,
@@ -509,6 +516,7 @@ where
             });
         }
         let count = entries.len();
+        self.service = service;
         self.state = Pop3State::Transaction { entries };
         self.ok(&format!("mailbox ready ({count} messages)")).await
     }

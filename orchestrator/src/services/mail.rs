@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use devcloud_mail::{
     mail_tls_from_config, BlobStore, FileBlobStore, FileStore, ImapConfig, ImapServer, Pop3Config,
-    Pop3Server, Service, SmtpConfig, SmtpServer, Store,
+    Pop3Server, Service, SmtpConfig, SmtpServer,
 };
 use tokio::net::TcpListener;
 use tokio::task::JoinSet;
@@ -27,8 +27,12 @@ pub async fn run(
 ) -> Result<(), String> {
     let root = Path::new(&cfg.storage.path);
     let blobs: Arc<dyn BlobStore> = Arc::new(FileBlobStore::new(root.join("blobs")));
-    let store: Arc<dyn Store> = Arc::new(FileStore::new(root.join("mail"), blobs));
-    let service = Arc::new(Service::new(store));
+    let store = Arc::new(FileStore::new(root.join("mail"), blobs));
+    let auth = &cfg.auth.smtp;
+    let service = Arc::new(
+        Service::with_accounts(store, &auth.mode, &auth.accounts)
+            .map_err(|e| format!("mail: {e}"))?,
+    );
 
     let any_implicit_tls =
         cfg.server.smtps_port > 0 || cfg.server.imaps_port > 0 || cfg.server.pop3s_port > 0;

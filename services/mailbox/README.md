@@ -39,8 +39,10 @@ messages; deleting tombstones metadata and does not reclaim raw blobs.
 
 Docker overrides both bind defaults to `0.0.0.0`. Strict mode requires both
 credentials at startup and gates the entire HTTP port, including static files
-and SSE. SMTP AUTH uses the existing devcloud behavior; strict SMTP still accepts
-MAIL before AUTH. Configuration logging masks credentials and never logs requests
+and SSE. Strict SMTP requires AUTH before `MAIL FROM`. This executable uses a
+single shared inbox and one credential pair. Named mailboxes and envelope sender
+allowlists are available in the orchestrator and standalone `devcloud-mail`.
+Configuration logging masks credentials and never logs requests
 or mail contents. Startup checks both storage directories for writability and
 checks the metadata log; corrupt metadata errors identify only the line number.
 SIGINT/SIGTERM cancel listeners and SSE with a drain bounded to three seconds.

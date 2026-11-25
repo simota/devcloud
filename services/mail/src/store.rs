@@ -159,6 +159,12 @@ struct StoredMessage {
     #[serde(flatten)]
     message: Message,
     #[serde(
+        rename = "mailboxOwner",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    owner: Option<String>,
+    #[serde(
         rename = "imapFolder",
         default,
         skip_serializing_if = "Option::is_none"
@@ -186,7 +192,7 @@ impl StoredMessage {
 #[derive(Default)]
 struct Index {
     messages: Option<Vec<StoredMessage>>,
-    folders: Option<BTreeSet<String>>,
+    folders: BTreeMap<Option<String>, BTreeSet<String>>,
 }
 
 pub struct FileStore {
@@ -194,16 +200,42 @@ pub struct FileStore {
     blobs: Arc<dyn BlobStore>,
     /// Serializes all file access AND guards the in-memory index, mirroring the
     /// legacy store's `sync.Mutex`.
-    index: Mutex<Index>,
+    index: Arc<Mutex<Index>>,
+    owner: Option<String>,
+    folders_path: PathBuf,
 }
 
 impl FileStore {
     pub fn new(root: impl Into<PathBuf>, blobs: Arc<dyn BlobStore>) -> Self {
+        let root = root.into();
         Self {
-            root: root.into(),
+            folders_path: root.join("imap-folders.json"),
+            root,
             blobs,
-            index: Mutex::new(Index::default()),
+            index: Arc::new(Mutex::new(Index::default())),
+            owner: None,
         }
+    }
+
+    pub(crate) fn account_store(&self) -> Self {
+        Self::new(self.root.join("accounts"), Arc::clone(&self.blobs))
+    }
+
+    pub(crate) fn for_user(&self, username: &str) -> Self {
+        use sha2::{Digest, Sha256};
+
+        let key = format!("{:x}", Sha256::digest(username.as_bytes()));
+        Self {
+            root: self.root.clone(),
+            blobs: Arc::clone(&self.blobs),
+            index: Arc::clone(&self.index),
+            owner: Some(username.to_string()),
+            folders_path: self.root.join(format!("imap-folders-{key}.json")),
+        }
+    }
+
+    fn owns(&self, record: &StoredMessage) -> bool {
+        record.owner == self.owner
     }
 
     pub fn messages_path(&self) -> PathBuf {
@@ -251,18 +283,18 @@ impl FileStore {
     }
 
     fn load_folders<'a>(&self, guard: &'a mut Index) -> Result<&'a mut BTreeSet<String>, String> {
-        if guard.folders.is_none() {
-            let mut folders: BTreeSet<String> =
-                match fs::read(self.root.join("imap-folders.json")) {
-                    Ok(data) => serde_json::from_slice(&data)
-                        .map_err(|_| "decode IMAP folders".to_string())?,
-                    Err(e) if e.kind() == io::ErrorKind::NotFound => BTreeSet::new(),
-                    Err(e) => return Err(format!("read IMAP folders: {e}")),
-                };
+        if !guard.folders.contains_key(&self.owner) {
+            let mut folders: BTreeSet<String> = match fs::read(&self.folders_path) {
+                Ok(data) => {
+                    serde_json::from_slice(&data).map_err(|_| "decode IMAP folders".to_string())?
+                }
+                Err(e) if e.kind() == io::ErrorKind::NotFound => BTreeSet::new(),
+                Err(e) => return Err(format!("read IMAP folders: {e}")),
+            };
             folders.insert(INBOX.to_string());
-            guard.folders = Some(folders);
+            guard.folders.insert(self.owner.clone(), folders);
         }
-        Ok(guard.folders.as_mut().unwrap())
+        Ok(guard.folders.get_mut(&self.owner).unwrap())
     }
 
     /// Apply changes to a copy so the index advances only after the atomic rename.
@@ -271,11 +303,21 @@ impl FileStore {
         let mut messages = self.ensure_loaded(&mut guard)?.clone();
         let mut changed = false;
         for record in &mut messages {
-            changed |= mutate(record);
+            if self.owns(record) {
+                changed |= mutate(record);
+            }
         }
         if !changed {
             return Ok(());
         }
+        self.replace_log(&mut guard, messages)
+    }
+
+    fn replace_log(
+        &self,
+        guard: &mut Index,
+        mut messages: Vec<StoredMessage>,
+    ) -> Result<(), String> {
         fs::create_dir_all(&self.root).map_err(|e| format!("create mail store: {e}"))?;
 
         let tmp = self.root.join(format!(
@@ -303,6 +345,26 @@ impl FileStore {
             .map_err(|e| format!("replace messages log: {e}"))?;
         guard.messages = Some(messages);
         Ok(())
+    }
+
+    pub(crate) fn deliver(
+        &self,
+        deliveries: Vec<(String, Message)>,
+        raw: &[u8],
+    ) -> Result<(), String> {
+        let raw_id = self.blobs.put(raw).map_err(|e| format!("put blob: {e}"))?;
+        let mut guard = self.index.lock().unwrap();
+        let mut records = self.ensure_loaded(&mut guard)?.clone();
+        records.extend(deliveries.into_iter().map(|(owner, mut message)| {
+            message.raw = raw_id.clone();
+            StoredMessage {
+                message,
+                owner: Some(owner),
+                folder: None,
+                flags: BTreeSet::new(),
+            }
+        }));
+        self.replace_log(&mut guard, records)
     }
 
     fn append_record(&self, mut record: StoredMessage, raw: &[u8]) -> Result<Message, String> {
@@ -345,6 +407,7 @@ impl Store for FileStore {
         self.append_record(
             StoredMessage {
                 message,
+                owner: self.owner.clone(),
                 folder: None,
                 flags: BTreeSet::new(),
             },
@@ -357,6 +420,7 @@ impl Store for FileStore {
         let mut messages: Vec<Message> = self
             .ensure_loaded(&mut guard)?
             .iter()
+            .filter(|record| self.owns(record))
             .map(|record| &record.message)
             .filter(|m| m.deleted_at.is_none())
             .cloned()
@@ -384,6 +448,7 @@ impl Store for FileStore {
         Ok(self
             .ensure_loaded(&mut guard)?
             .iter()
+            .filter(|record| self.owns(record))
             .map(|record| &record.message)
             .find(|m| m.deleted_at.is_none() && m.id == id)
             .cloned())
@@ -394,6 +459,7 @@ impl Store for FileStore {
         let mut messages: Vec<_> = self
             .ensure_loaded(&mut guard)?
             .iter()
+            .filter(|record| self.owns(record))
             .map(|record| &record.message)
             .filter(|m| m.deleted_at.is_none())
             .map(|m| MessageEntry {
@@ -427,8 +493,8 @@ impl Store for FileStore {
         fs::create_dir_all(&self.root).map_err(|e| format!("create mail store: {e}"))?;
         let data = serde_json::to_vec(&folders).map_err(|_| "encode IMAP folders".to_string())?;
         write_atomic(
-            &self.root.join("imap-folders.tmp"),
-            &self.root.join("imap-folders.json"),
+            &self.folders_path.with_extension("tmp"),
+            &self.folders_path,
             &data,
         )
         .map_err(|e| format!("save IMAP folders: {e}"))?;
@@ -442,9 +508,9 @@ impl Store for FileStore {
             return Ok(None);
         }
         let records = self.ensure_loaded(&mut guard)?;
-        let uid_next = (records.len() as u32).saturating_add(1).max(1);
-        let messages = records
-            .iter()
+        let owned = records.iter().filter(|record| self.owns(record));
+        let uid_next = (owned.clone().count() as u32).saturating_add(1).max(1);
+        let messages = owned
             .enumerate()
             .filter(|(_, record)| record.folder() == name && record.message.deleted_at.is_none())
             .map(|(idx, record)| MailboxMessage {
@@ -469,6 +535,7 @@ impl Store for FileStore {
         self.append_record(
             StoredMessage {
                 message,
+                owner: self.owner.clone(),
                 folder: (name != INBOX).then(|| name.to_string()),
                 flags,
             },
@@ -481,7 +548,9 @@ impl Store for FileStore {
         Ok(self
             .ensure_loaded(&mut guard)?
             .iter()
-            .find(|record| record.message.id == id && record.message.deleted_at.is_none())
+            .find(|record| {
+                self.owns(record) && record.message.id == id && record.message.deleted_at.is_none()
+            })
             .map(|record| record.flags.clone())
             .unwrap_or_default())
     }

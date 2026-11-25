@@ -17,7 +17,7 @@ use tokio::io::{
 use tokio::net::TcpListener;
 
 use crate::model::Envelope;
-use crate::service::Service;
+use crate::service::{Account, Service};
 use crate::tls::{accept_tls, constant_time_eq, is_transient_accept_error, MailTls, MaybeTls};
 
 pub const SMTP_AUTH_OFF: &str = "off";
@@ -234,6 +234,7 @@ impl SmtpServer {
             greeted: false,
             has_mail_from: false,
             authenticated: false,
+            account: None,
             crlf_seen: false,
             last_crlf: false,
             envelope: Envelope::default(),
@@ -291,6 +292,7 @@ where
     greeted: bool,
     has_mail_from: bool,
     authenticated: bool,
+    account: Option<Arc<Account>>,
     /// Whether the client has ended a line with CRLF. Once it has, a bare-LF
     /// `.` line inside DATA is content, not the end of the message: treating
     /// `\n.\n` as the terminator lets one message smuggle in another.
@@ -422,6 +424,14 @@ where
                 match parse_mail_from_arg(&arg) {
                     None => self.reply(500, "syntax error").await,
                     Some((from, size, has_size)) => {
+                        if self
+                            .account
+                            .as_ref()
+                            .is_some_and(|account| !account.allows_sender(&from))
+                        {
+                            self.reset_envelope();
+                            return self.reply(550, "5.7.1 Sender address not authorized").await;
+                        }
                         let max = self.config.max_message_bytes;
                         if has_size && max > 0 && size > max {
                             self.reset_envelope();
@@ -446,6 +456,13 @@ where
                 match parse_address_arg(&arg, "TO:") {
                     None => self.reply(500, "syntax error").await,
                     Some(to) => {
+                        if self
+                            .service
+                            .accounts(&self.config.auth_mode)
+                            .is_some_and(|accounts| !accounts.accepts_recipient(&to))
+                        {
+                            return self.reply(550, "5.1.1 Unknown local recipient").await;
+                        }
                         if self.limits.max_recipients > 0
                             && self.envelope.to.len() >= self.limits.max_recipients
                         {
@@ -545,6 +562,7 @@ where
         self.greeted = false;
         self.helo.clear();
         self.authenticated = false;
+        self.account = None;
         self.crlf_seen = false;
         self.last_crlf = false;
         self.reset_envelope();
@@ -598,11 +616,14 @@ where
         }
 
         let envelope = self.envelope.clone();
-        let received = if self.envelope_capture {
+        let received = if let Some(accounts) = self.service.accounts(&self.config.auth_mode) {
+            accounts.deliver(&envelope, &self.helo, &raw)
+        } else if self.envelope_capture {
             self.service
                 .receive_from_session(envelope, &self.helo, &raw)
+                .map(|_| ())
         } else {
-            self.service.receive(envelope, &raw)
+            self.service.receive(envelope, &raw).map(|_| ())
         };
         match received {
             Err(_) => {
@@ -690,7 +711,7 @@ where
         }
         let username = parts[1].to_string();
         let password = parts[2].to_string();
-        self.complete_auth(&username, &password).await
+        self.complete_auth(parts[0], &username, &password).await
     }
 
     async fn handle_auth_login(&mut self, initial: &str) -> bool {
@@ -702,7 +723,7 @@ where
             Some(p) => p,
             None => return false,
         };
-        self.complete_auth(&username, &password).await
+        self.complete_auth("", &username, &password).await
     }
 
     /// Returns `None` when the flow must abort (already replied to the client).
@@ -730,12 +751,18 @@ where
         }
     }
 
-    async fn complete_auth(&mut self, username: &str, password: &str) -> bool {
-        // Both compared in full, in constant time, so timing reveals neither.
-        let user_ok = constant_time_eq(username.as_bytes(), self.config.username.as_bytes());
-        let pass_ok = constant_time_eq(password.as_bytes(), self.config.password.as_bytes());
-        if self.config.auth_mode_normalized() == SMTP_AUTH_STRICT && !(user_ok & pass_ok) {
-            return self.reply(535, "authentication failed").await;
+    async fn complete_auth(&mut self, authzid: &str, username: &str, password: &str) -> bool {
+        if let Some(accounts) = self.service.accounts(&self.config.auth_mode) {
+            self.account = accounts.authenticate(authzid, username, password);
+            if self.account.is_none() {
+                return self.reply(535, "authentication failed").await;
+            }
+        } else if self.config.auth_mode_normalized() == SMTP_AUTH_STRICT {
+            let user_ok = constant_time_eq(username.as_bytes(), self.config.username.as_bytes());
+            let pass_ok = constant_time_eq(password.as_bytes(), self.config.password.as_bytes());
+            if !(user_ok & pass_ok) {
+                return self.reply(535, "authentication failed").await;
+            }
         }
         self.authenticated = true;
         self.reply(235, "authentication succeeded").await
