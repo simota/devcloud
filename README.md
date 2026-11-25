@@ -337,17 +337,18 @@ Legend:
 | CopyObject | Yes | Supports copy and metadata replacement. |
 | Content-MD5 validation | Yes | Invalid and mismatched digests return S3-style errors. |
 | Multipart upload | Yes | Create/upload/list/complete/abort local multipart flows. |
-| Presigned URL validation | Yes | Strict mode validates SigV4 presigned GET and PUT, including expiry. |
-| AWS SigV4 header auth | Partial | Relaxed mode is default; strict mode validates local credentials, a 15-minute clock skew window, and `aws-chunked` chunk and trailer signatures. SigV2 and SigV4a are not implemented. |
+| Presigned URL validation | Yes | Strict mode validates SigV4, SigV4a, and SigV2 presigned URLs, including expiry. |
+| AWS SigV4 / SigV4a / SigV2 auth | Partial | Relaxed mode is default; strict mode validates SigV4 (including `aws-chunked` chunk and trailer signatures), SigV4a (`AWS4-ECDSA-P256-SHA256` with `x-amz-region-set` / `X-Amz-Region-Set`), and SigV2 (`Authorization: AWS ...` and query-string presigned URLs), with a 15-minute clock skew window. SigV4a streaming chunked payloads remain unimplemented. |
+| Conditional writes (`If-None-Match`) | Yes | PutObject, CopyObject, and CompleteMultipartUpload enforce `If-None-Match` for both `*` and specific ETag values/lists atomically. |
 | CORS | Yes | PutBucketCors/GetBucketCors/DeleteBucketCors, preflight, and response headers. |
-| ACLs, bucket policy, IAM | Partial | Bucket policy and bucket/object ACL metadata endpoints are supported locally, including versionId-aware object ACL metadata; IAM enforcement is not implemented. |
+| ACLs, bucket policy, IAM | Partial | Bucket policy and bucket/object ACL metadata endpoints (including versionId-aware object ACLs) are supported. In strict mode, bucket policies (`Allow`/`Deny`, `Principal`/`NotPrincipal`, `Action`/`NotAction`, `Resource`/`NotResource`, common `Condition` operators) and canned ACLs (`public-read`, `public-read-write`) are enforced locally; multi-account IAM users/roles and STS session policies are not emulated. |
 | Versioning | Partial | Bucket versioning, generated and `null` version IDs, version-aware get/delete/copy-source, delete markers, multipart-complete version IDs/ETags, and local ListObjectVersions with key/version markers are supported. |
-| Lifecycle | Partial | Bucket lifecycle metadata endpoints are supported; Enabled expiration rules for current objects are applied locally on S3 reads/lists. |
+| Lifecycle | Partial | Bucket lifecycle metadata endpoints and local evaluation on reads/lists support `Expiration` (`Days`, `Date`, `ExpiredObjectDeleteMarker`), `Transition` (`Days`, `Date`, `StorageClass`), `NoncurrentVersionExpiration`, `NoncurrentVersionTransition`, and `AbortIncompleteMultipartUpload`. |
 | Notifications | Partial | Bucket notification configuration metadata, including EventBridge metadata, is supported; matching local object create/delete flows append local event records. |
-| SSE/KMS | Partial | SSE-S3 and SSE-KMS request metadata is stored locally and exposed through object read/write response headers; real KMS and SSE-C are not implemented. |
+| SSE/KMS | Partial | SSE-S3 (`AES256`) and SSE-KMS (`aws:kms`, `aws:kms:dsse`) metadata round-trips locally; SSE-C (`AES256` customer-provided keys) validates keys/MD5 and encrypts objects at rest without persisting the key across Put/Get/Head/Range/Copy/Multipart/Select. Real AWS KMS integration is not emulated. |
 | Replication | Partial | Bucket replication configuration metadata is supported; enabled prefix rules replicate local object write/copy/multipart-complete flows and enabled delete marker replication to existing local destination buckets. |
 | Object Lock | Partial | Bucket object lock configuration, object retention/legal-hold metadata, response headers, local delete guards, and governance retention bypass are supported. |
-| S3 Select | Partial | Minimal SelectObjectContent supports `SELECT * FROM S3Object` for CSV and JSON Lines with eventstream responses; filtering and projections are not implemented. |
+| S3 Select | Partial | SelectObjectContent supports `SELECT` projections, aliases, `WHERE` filters (`AND`/`OR`/`NOT`, comparisons, `LIKE`, `IN`, `BETWEEN`, `IS [NOT] NULL`), `LIMIT`, `CAST`, scalar functions, and aggregates (`COUNT`/`SUM`/`AVG`/`MIN`/`MAX`) over CSV (`USE`/`IGNORE`/`NONE`) and JSON (`LINES`/`DOCUMENT`) with CSV or JSON output in eventstream responses. `GROUP BY`/`ORDER BY`/`JOIN` remain unimplemented. |
 | Inventory / analytics | Partial | Bucket inventory and analytics configuration metadata endpoints are supported locally; CSV-format enabled inventory configs generate deterministic local reports under bucket storage. |
 
 The standalone S3 image also ships a web console and a server-wide CORS default; see [`services/s3/README.md`](services/s3/README.md).

@@ -122,14 +122,65 @@ pub fn lifecycle_configuration(config: &LifecycleConfiguration) -> Vec<u8> {
                 rule_el.child(Element::new("Filter").text_child("Prefix", &rule.filter.prefix));
         }
         rule_el = rule_el.text_child("Status", &rule.status);
-        let mut expiration = Element::new("Expiration");
-        if let Some(days) = rule.expiration.days {
-            expiration = expiration.text_child("Days", &days.to_string());
+        if rule.expiration.days.is_some()
+            || !rule.expiration.date.is_empty()
+            || rule.expiration.expired_object_delete_marker.is_some()
+        {
+            let mut expiration = Element::new("Expiration");
+            if let Some(days) = rule.expiration.days {
+                expiration = expiration.text_child("Days", &days.to_string());
+            }
+            if !rule.expiration.date.is_empty() {
+                expiration = expiration.text_child("Date", &rule.expiration.date);
+            }
+            if let Some(marker) = rule.expiration.expired_object_delete_marker {
+                expiration = expiration.text_child("ExpiredObjectDeleteMarker", &bool_str(marker));
+            }
+            rule_el = rule_el.child(expiration);
         }
-        if !rule.expiration.date.is_empty() {
-            expiration = expiration.text_child("Date", &rule.expiration.date);
+        for transition in &rule.transitions {
+            let mut t_el = Element::new("Transition");
+            if let Some(days) = transition.days {
+                t_el = t_el.text_child("Days", &days.to_string());
+            }
+            if !transition.date.is_empty() {
+                t_el = t_el.text_child("Date", &transition.date);
+            }
+            if !transition.storage_class.is_empty() {
+                t_el = t_el.text_child("StorageClass", &transition.storage_class);
+            }
+            rule_el = rule_el.child(t_el);
         }
-        el = el.child(rule_el.child(expiration));
+        if let Some(ncv_exp) = &rule.noncurrent_version_expiration {
+            let mut ncv_el = Element::new("NoncurrentVersionExpiration");
+            if let Some(days) = ncv_exp.noncurrent_days {
+                ncv_el = ncv_el.text_child("NoncurrentDays", &days.to_string());
+            }
+            if let Some(newer) = ncv_exp.newer_noncurrent_versions {
+                ncv_el = ncv_el.text_child("NewerNoncurrentVersions", &newer.to_string());
+            }
+            rule_el = rule_el.child(ncv_el);
+        }
+        for ncv_tr in &rule.noncurrent_version_transitions {
+            let mut tr_el = Element::new("NoncurrentVersionTransition");
+            if let Some(days) = ncv_tr.noncurrent_days {
+                tr_el = tr_el.text_child("NoncurrentDays", &days.to_string());
+            }
+            if let Some(newer) = ncv_tr.newer_noncurrent_versions {
+                tr_el = tr_el.text_child("NewerNoncurrentVersions", &newer.to_string());
+            }
+            if !ncv_tr.storage_class.is_empty() {
+                tr_el = tr_el.text_child("StorageClass", &ncv_tr.storage_class);
+            }
+            rule_el = rule_el.child(tr_el);
+        }
+        if let Some(abort) = &rule.abort_incomplete_multipart_upload {
+            rule_el = rule_el.child(Element::new("AbortIncompleteMultipartUpload").text_child(
+                "DaysAfterInitiation",
+                &abort.days_after_initiation.to_string(),
+            ));
+        }
+        el = el.child(rule_el);
     }
     encode(&el)
 }

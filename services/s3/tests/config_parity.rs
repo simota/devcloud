@@ -66,13 +66,16 @@ fn lifecycle_json_matches_oracle() {
                 expiration: LifecycleExpiration {
                     days: Some(30),
                     date: String::new(),
+                    ..Default::default()
                 },
+                ..Default::default()
             },
             LifecycleRule {
                 status: "Disabled".to_string(),
                 expiration: LifecycleExpiration {
                     days: None,
                     date: "2027-01-01T00:00:00Z".to_string(),
+                    ..Default::default()
                 },
                 ..Default::default()
             },
@@ -100,6 +103,7 @@ fn lifecycle_apply_expires_matching_objects() {
                     expiration: LifecycleExpiration {
                         days: Some(1),
                         date: String::new(),
+                        ..Default::default()
                     },
                     ..Default::default()
                 }],

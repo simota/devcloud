@@ -39,18 +39,29 @@ docker run --rm -p 127.0.0.1:9000:9000 -p 127.0.0.1:9001:9001 \
   devcloud-s3
 ```
 
-Strict mode checks header-signed requests, presigned URLs (GET and PUT, including
-expiry), the payload hash, and `aws-chunked` uploads
-(`STREAMING-AWS4-HMAC-SHA256-PAYLOAD[-TRAILER]`, whose chunks and trailer are each
-verified, and `STREAMING-UNSIGNED-PAYLOAD-TRAILER`). It also requires:
+Strict mode checks header-signed and presigned requests for SigV4
+(`AWS4-HMAC-SHA256`), SigV4a (`AWS4-ECDSA-P256-SHA256` with `x-amz-region-set` /
+`X-Amz-Region-Set`), and SigV2 (`Authorization: AWS ...` and query-string
+`AWSAccessKeyId`/`Expires`/`Signature`), the payload hash, and SigV4
+`aws-chunked` uploads (`STREAMING-AWS4-HMAC-SHA256-PAYLOAD[-TRAILER]`, whose
+chunks and trailer are each verified, and `STREAMING-UNSIGNED-PAYLOAD-TRAILER`).
+It also requires:
 
-- `x-amz-date` within 15 minutes of the server clock (`RequestTimeTooSkewed`)
-- `host` and every `x-amz-*` header to be signed, except `x-amz-user-agent` and
-  `x-amz-content-sha256` (whose value is signed as the payload hash)
-- the credential scope to match the configured access key, region, and request date
+- `x-amz-date` (or `Date` for SigV2) within 15 minutes of the server clock
+  (`RequestTimeTooSkewed`)
+- `host` and every `x-amz-*` header to be signed (for SigV4/SigV4a), except
+  `x-amz-user-agent` and `x-amz-content-sha256` (whose value is signed as the
+  payload hash)
+- the credential scope (and SigV4a region set) to match the configured access
+  key, region, and request date
 
+Strict mode also evaluates bucket policies (`Allow`/`Deny`, `Principal`,
+`Action`, `Resource`, common `Condition` operators) and canned bucket/object
+ACLs (`public-read`, `public-read-write`), allowing anonymous public access when
+granted and enforcing explicit `Deny` statements even on authenticated requests.
 Trailer checksums such as `x-amz-checksum-crc32` are accepted but not validated.
-SigV2 and SigV4a are not implemented.
+SigV4a streaming chunked payloads and multi-account IAM/STS session policies are
+not implemented.
 
 ## CORS
 

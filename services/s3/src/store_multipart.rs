@@ -9,7 +9,8 @@ use crate::objops::{
     clean_metadata, clean_server_side_encryption, CreateMultipartUploadInput, PutObjectInput,
 };
 use crate::store::{
-    remove_dir_all_ignoring_missing, write_atomic, FileBucketStore, Result, StoreError,
+    remove_dir_all_ignoring_missing, write_atomic, ConditionalError, FileBucketStore, Result,
+    StoreError,
 };
 use crate::validation::valid_upload_id;
 use std::fs;
@@ -70,6 +71,21 @@ impl FileBucketStore {
         body: &[u8],
         content_md5: &str,
     ) -> Result<MultipartPart> {
+        self.upload_part_with_sse_c(bucket, key, upload_id, part_number, body, content_md5, None)
+    }
+
+    /// Uploads one part, encrypting the stored part bytes when `sse_c_key` is
+    /// provided.
+    pub fn upload_part_with_sse_c(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+        part_number: i64,
+        body: &[u8],
+        content_md5: &str,
+        sse_c_key: Option<&[u8; 32]>,
+    ) -> Result<MultipartPart> {
         if !(1..=10000).contains(&part_number) {
             return Err(StoreError::InvalidPartNumber);
         }
@@ -89,11 +105,25 @@ impl FileBucketStore {
             size: body.len() as i64,
             last_modified: self.now(),
         };
+        let disk_body = match sse_c_key {
+            Some(key) => crate::sse_c::encrypt_frame(key, body),
+            None => body.to_vec(),
+        };
         let path = self.multipart_part_path(bucket, upload_id, part_number);
         fs::create_dir_all(&path)?;
-        write_atomic(&path.join("body"), body)?;
+        write_atomic(&path.join("body"), &disk_body)?;
         Self::write_json(&path.join("part.json"), &part)?;
         Ok(part)
+    }
+
+    /// Reads an upload's metadata if it exists for `(bucket, key)`.
+    pub fn get_multipart_upload_metadata(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+    ) -> Result<Option<MultipartUpload>> {
+        self.get_multipart_upload(bucket, key, upload_id)
     }
 
     /// Lists an upload's parts (sorted by part number) with its metadata. `None`
@@ -138,8 +168,10 @@ impl FileBucketStore {
             Some(u) => u,
             None => return Ok(None),
         };
+        let is_sse_c = upload.encryption.is_sse_c();
         let mut combined: Vec<u8> = Vec::new();
         let mut part_etags: Vec<String> = Vec::with_capacity(part_numbers.len());
+        let mut total_plaintext_size: i64 = 0;
         for &part_number in part_numbers {
             let part_path = self.multipart_part_path(bucket, upload_id, part_number);
             let part: MultipartPart = read_json(&part_path.join("part.json"))?
@@ -151,13 +183,18 @@ impl FileBucketStore {
                 }
                 Err(e) => return Err(StoreError::Io(e)),
             };
-            if body.len() as i64 != part.size {
+            if is_sse_c {
+                if crate::sse_c::framed_plaintext_len(&body).map(|n| n as i64) != Some(part.size) {
+                    return Err(StoreError::InvalidPart(part_number));
+                }
+            } else if body.len() as i64 != part.size {
                 return Err(StoreError::InvalidPart(part_number));
             }
+            total_plaintext_size += part.size;
             combined.extend_from_slice(&body);
             part_etags.push(part.etag);
         }
-        let mut object = self.put_object_locked(PutObjectInput {
+        let put_input = PutObjectInput {
             bucket: upload.bucket.clone(),
             key: upload.key.clone(),
             body: combined.clone(),
@@ -168,7 +205,12 @@ impl FileBucketStore {
             metadata: upload.metadata.clone(),
             encryption: upload.encryption.clone(),
             ..Default::default()
-        })?;
+        };
+        let mut object = if is_sse_c {
+            self.put_pre_encrypted_object_locked(put_input, total_plaintext_size)?
+        } else {
+            self.put_object_locked(put_input)?
+        };
         object.etag = multipart_etag(&part_etags);
         let object_path = self.object_path(&upload.bucket, &upload.key);
         Self::write_json(&object_path.join("object.json"), &object)?;
@@ -190,14 +232,36 @@ impl FileBucketStore {
         upload_id: &str,
         part_numbers: &[i64],
     ) -> Result<Option<Object>> {
+        match self.complete_multipart_upload_if(bucket, key, upload_id, part_numbers, |current| {
+            if current.is_some() {
+                Err(())
+            } else {
+                Ok(())
+            }
+        }) {
+            Ok(v) => Ok(v),
+            Err(ConditionalError::Condition(())) => Err(StoreError::PreconditionFailed),
+            Err(ConditionalError::Store(e)) => Err(e),
+        }
+    }
+
+    /// Checks the current object under the root write lock and completes the
+    /// multipart upload if `predicate` succeeds. Leaves the upload intact on
+    /// condition failure.
+    pub fn complete_multipart_upload_if<E>(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+        part_numbers: &[i64],
+        predicate: impl FnOnce(Option<&Object>) -> std::result::Result<(), E>,
+    ) -> std::result::Result<Option<Object>, ConditionalError<E>> {
         let _guard = self.lock_object_writes();
         if self.get_multipart_upload(bucket, key, upload_id)?.is_none() {
             return Ok(None);
         }
-        if self.current_object_exists(bucket, key)? {
-            return Err(StoreError::PreconditionFailed);
-        }
-        self.complete_multipart_upload_locked(bucket, key, upload_id, part_numbers)
+        self.check_current_object_locked(bucket, key, predicate)?;
+        Ok(self.complete_multipart_upload_locked(bucket, key, upload_id, part_numbers)?)
     }
 
     /// Aborts an upload, discarding its parts. `true` if it existed.

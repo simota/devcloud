@@ -81,6 +81,16 @@ pub struct ServerSideEncryption {
     pub kms_key_id: String,
     #[serde(rename = "bucketKeyEnabled", skip_serializing_if = "Option::is_none")]
     pub bucket_key_enabled: Option<bool>,
+    #[serde(rename = "customerAlgorithm", skip_serializing_if = "String::is_empty")]
+    pub customer_algorithm: String,
+    #[serde(rename = "customerKeyMd5", skip_serializing_if = "String::is_empty")]
+    pub customer_key_md5: String,
+}
+
+impl ServerSideEncryption {
+    pub fn is_sse_c(&self) -> bool {
+        !self.customer_algorithm.is_empty()
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -146,6 +156,18 @@ pub struct Object {
         skip_serializing_if = "String::is_empty"
     )]
     pub resumable_upload_id: String,
+    #[serde(rename = "storageClass", skip_serializing_if = "String::is_empty")]
+    pub storage_class: String,
+}
+
+impl Object {
+    pub fn effective_storage_class(&self) -> &str {
+        if self.storage_class.is_empty() {
+            "STANDARD"
+        } else {
+            &self.storage_class
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -191,6 +213,23 @@ pub struct LifecycleRule {
     pub filter: LifecycleFilter,
     pub status: String,
     pub expiration: LifecycleExpiration,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub transitions: Vec<LifecycleTransition>,
+    #[serde(
+        rename = "noncurrentVersionExpiration",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub noncurrent_version_expiration: Option<LifecycleNoncurrentVersionExpiration>,
+    #[serde(
+        rename = "noncurrentVersionTransitions",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub noncurrent_version_transitions: Vec<LifecycleNoncurrentVersionTransition>,
+    #[serde(
+        rename = "abortIncompleteMultipartUpload",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub abort_incomplete_multipart_upload: Option<LifecycleAbortIncompleteMultipartUpload>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -207,6 +246,55 @@ pub struct LifecycleExpiration {
     pub days: Option<i64>,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub date: String,
+    #[serde(
+        rename = "expiredObjectDeleteMarker",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub expired_object_delete_marker: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LifecycleTransition {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub days: Option<i64>,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub date: String,
+    #[serde(rename = "storageClass", skip_serializing_if = "String::is_empty")]
+    pub storage_class: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LifecycleNoncurrentVersionExpiration {
+    #[serde(rename = "noncurrentDays", skip_serializing_if = "Option::is_none")]
+    pub noncurrent_days: Option<i64>,
+    #[serde(
+        rename = "newerNoncurrentVersions",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub newer_noncurrent_versions: Option<i64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LifecycleNoncurrentVersionTransition {
+    #[serde(rename = "noncurrentDays", skip_serializing_if = "Option::is_none")]
+    pub noncurrent_days: Option<i64>,
+    #[serde(
+        rename = "newerNoncurrentVersions",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub newer_noncurrent_versions: Option<i64>,
+    #[serde(rename = "storageClass", skip_serializing_if = "String::is_empty")]
+    pub storage_class: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LifecycleAbortIncompleteMultipartUpload {
+    #[serde(rename = "daysAfterInitiation")]
+    pub days_after_initiation: i64,
 }
 
 // --- notification ----------------------------------------------------------

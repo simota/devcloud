@@ -156,33 +156,160 @@ impl FileBucketStore {
         Ok(true)
     }
 
-    /// Applies expiration rules at `now` (RFC3339 UTC), deleting expired objects.
-    /// Returns `(expired_count, bucket_exists)`. Object-locked objects are skipped.
+    /// Applies enabled lifecycle rules at `now` (RFC3339 UTC):
+    /// - Current object `Expiration` (`Days` / `Date`) and `Transition`
+    /// - `ExpiredObjectDeleteMarker` cleanup for lone delete markers
+    /// - `NoncurrentVersionExpiration` and `NoncurrentVersionTransition`
+    /// - `AbortIncompleteMultipartUpload`
+    /// Returns `(affected_count, bucket_exists)`. Object-locked objects are skipped.
     pub fn apply_bucket_lifecycle(&self, bucket: &str, now: &str) -> Result<(i64, bool)> {
         let config = match self.get_bucket_lifecycle(bucket)? {
             None => return Ok((0, false)),
             Some((_, false)) => return Ok((0, true)),
             Some((config, true)) => config,
         };
+        let Some((now_secs, _)) = parse_rfc3339(now) else {
+            return Ok((0, true));
+        };
         let objects = match self.list_objects(bucket, "")? {
             None => return Ok((0, false)),
             Some(objects) => objects,
         };
-        let mut expired = 0;
+        let mut affected = 0;
+
+        // 1. Current object expiration and transitions.
         for object in objects {
-            if lifecycle_expires_object(&config, &object, now) {
+            if lifecycle_expires_object(&config, &object, now_secs) {
                 match self.delete_object_with_result(&object.bucket, &object.key, false) {
                     Ok((_, deleted)) => {
                         if deleted {
-                            expired += 1;
+                            affected += 1;
                         }
                     }
                     Err(StoreError::ObjectLocked) => continue,
                     Err(e) => return Err(e),
                 }
+                continue;
+            }
+            if let Some(target_class) =
+                lifecycle_transition_storage_class(&config, &object, now_secs)
+            {
+                if self.update_object_storage_class(
+                    &object.bucket,
+                    &object.key,
+                    &object.version_id,
+                    &target_class,
+                )? {
+                    affected += 1;
+                }
             }
         }
-        Ok((expired, true))
+
+        // 2. Noncurrent version expiration/transitions and ExpiredObjectDeleteMarker.
+        let has_version_rules = config.rules.iter().any(|r| {
+            r.status == "Enabled"
+                && (r.noncurrent_version_expiration.is_some()
+                    || !r.noncurrent_version_transitions.is_empty()
+                    || r.expiration.expired_object_delete_marker == Some(true))
+        });
+        if has_version_rules {
+            if let Some(versions) = self.list_object_versions(bucket, "")? {
+                let mut by_key: std::collections::BTreeMap<String, Vec<Object>> =
+                    std::collections::BTreeMap::new();
+                for v in versions {
+                    by_key.entry(v.key.clone()).or_default().push(v);
+                }
+                for (key, key_versions) in by_key {
+                    // Versions are already ordered newest -> oldest.
+                    for (idx, version) in key_versions.iter().enumerate().skip(1) {
+                        let noncurrent_rank = idx as i64; // 1 = newest noncurrent version
+                        let became_noncurrent_at =
+                            parse_rfc3339(&key_versions[idx - 1].last_modified)
+                                .map(|(s, _)| s)
+                                .unwrap_or(i64::MAX);
+                        if lifecycle_expires_noncurrent_version(
+                            &config,
+                            &key,
+                            noncurrent_rank,
+                            became_noncurrent_at,
+                            now_secs,
+                        ) {
+                            let vid = crate::objops::object_version_id(version);
+                            match self.delete_object_version(bucket, &key, &vid, false) {
+                                Ok((_, true)) => affected += 1,
+                                Ok((_, false)) => {}
+                                Err(StoreError::ObjectLocked) => continue,
+                                Err(e) => return Err(e),
+                            }
+                            continue;
+                        }
+                        if !version.delete_marker {
+                            if let Some(target_class) =
+                                lifecycle_noncurrent_transition_storage_class(
+                                    &config,
+                                    &key,
+                                    noncurrent_rank,
+                                    became_noncurrent_at,
+                                    now_secs,
+                                )
+                            {
+                                let vid = crate::objops::object_version_id(version);
+                                if self.update_object_storage_class(
+                                    bucket,
+                                    &key,
+                                    &vid,
+                                    &target_class,
+                                )? {
+                                    affected += 1;
+                                }
+                            }
+                        }
+                    }
+
+                    // Re-check for ExpiredObjectDeleteMarker: if only delete marker(s) remain.
+                    if lifecycle_removes_expired_delete_marker(&config, &key) {
+                        if let Some(remaining) = self.list_object_versions(bucket, &key)? {
+                            let key_only: Vec<Object> =
+                                remaining.into_iter().filter(|o| o.key == key).collect();
+                            if !key_only.is_empty() && key_only.iter().all(|o| o.delete_marker) {
+                                for dm in key_only {
+                                    let vid = crate::objops::object_version_id(&dm);
+                                    if let Ok((_, true)) =
+                                        self.delete_object_version(bucket, &key, &vid, false)
+                                    {
+                                        affected += 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3. Abort incomplete multipart uploads.
+        let has_abort_rules = config
+            .rules
+            .iter()
+            .any(|r| r.status == "Enabled" && r.abort_incomplete_multipart_upload.is_some());
+        if has_abort_rules {
+            if let Some(uploads) = self.list_multipart_uploads(bucket)? {
+                for upload in uploads {
+                    if lifecycle_aborts_multipart(
+                        &config,
+                        &upload.key,
+                        &upload.created_at,
+                        now_secs,
+                    ) {
+                        if self.abort_multipart_upload(bucket, &upload.key, &upload.upload_id)? {
+                            affected += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok((affected, true))
     }
 
     // --- policy -------------------------------------------------------------
@@ -454,23 +581,26 @@ pub(crate) fn read_config_dir<T: serde::de::DeserializeOwned>(
     Ok(configs)
 }
 
-/// Whether any enabled lifecycle rule expires `object` at `now` (RFC3339 UTC).
-/// Mirrors the legacy `lifecycleExpiresObject`.
-fn lifecycle_expires_object(config: &LifecycleConfiguration, object: &Object, now: &str) -> bool {
-    let now_secs = match parse_rfc3339(now) {
-        Some((secs, _)) => secs,
-        None => return false,
+fn rule_matches_key(rule: &crate::model::LifecycleRule, key: &str) -> bool {
+    if rule.status != "Enabled" {
+        return false;
+    }
+    let prefix = if !rule.filter.prefix.is_empty() {
+        &rule.filter.prefix
+    } else {
+        &rule.prefix
     };
+    prefix.is_empty() || key.starts_with(prefix.as_str())
+}
+
+/// Whether any enabled lifecycle rule expires `object` at `now_secs`.
+fn lifecycle_expires_object(
+    config: &LifecycleConfiguration,
+    object: &Object,
+    now_secs: i64,
+) -> bool {
     for rule in &config.rules {
-        if rule.status != "Enabled" {
-            continue;
-        }
-        let prefix = if !rule.filter.prefix.is_empty() {
-            &rule.filter.prefix
-        } else {
-            &rule.prefix
-        };
-        if !prefix.is_empty() && !object.key.starts_with(prefix.as_str()) {
+        if !rule_matches_key(rule, &object.key) {
             continue;
         }
         if let Some(days) = rule.expiration.days {
@@ -486,6 +616,127 @@ fn lifecycle_expires_object(config: &LifecycleConfiguration, object: &Object, no
                 if expires_at <= now_secs {
                     return true;
                 }
+            }
+        }
+    }
+    false
+}
+
+/// Returns the latest applicable transitioned storage class for `object` at `now_secs`.
+fn lifecycle_transition_storage_class(
+    config: &LifecycleConfiguration,
+    object: &Object,
+    now_secs: i64,
+) -> Option<String> {
+    let modified = parse_rfc3339(&object.last_modified).map(|(s, _)| s);
+    let mut best: Option<(i64, String)> = None;
+    for rule in &config.rules {
+        if !rule_matches_key(rule, &object.key) {
+            continue;
+        }
+        for tr in &rule.transitions {
+            if tr.storage_class.is_empty() {
+                continue;
+            }
+            let trigger_at = if let Some(days) = tr.days {
+                modified.map(|m| m + days * 86_400)
+            } else if !tr.date.is_empty() {
+                parse_lifecycle_date(&tr.date)
+            } else {
+                None
+            };
+            if let Some(at) = trigger_at {
+                if at <= now_secs && best.as_ref().is_none_or(|(prev, _)| at >= *prev) {
+                    best = Some((at, tr.storage_class.clone()));
+                }
+            }
+        }
+    }
+    best.map(|(_, class)| class)
+}
+
+fn lifecycle_expires_noncurrent_version(
+    config: &LifecycleConfiguration,
+    key: &str,
+    noncurrent_rank: i64,
+    became_noncurrent_at: i64,
+    now_secs: i64,
+) -> bool {
+    for rule in &config.rules {
+        if !rule_matches_key(rule, key) {
+            continue;
+        }
+        let Some(exp) = &rule.noncurrent_version_expiration else {
+            continue;
+        };
+        if let Some(keep) = exp.newer_noncurrent_versions {
+            if noncurrent_rank <= keep {
+                continue;
+            }
+        }
+        if let Some(days) = exp.noncurrent_days {
+            if became_noncurrent_at.saturating_add(days * 86_400) <= now_secs {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn lifecycle_noncurrent_transition_storage_class(
+    config: &LifecycleConfiguration,
+    key: &str,
+    noncurrent_rank: i64,
+    became_noncurrent_at: i64,
+    now_secs: i64,
+) -> Option<String> {
+    let mut best: Option<(i64, String)> = None;
+    for rule in &config.rules {
+        if !rule_matches_key(rule, key) {
+            continue;
+        }
+        for tr in &rule.noncurrent_version_transitions {
+            if tr.storage_class.is_empty() {
+                continue;
+            }
+            if let Some(keep) = tr.newer_noncurrent_versions {
+                if noncurrent_rank <= keep {
+                    continue;
+                }
+            }
+            if let Some(days) = tr.noncurrent_days {
+                let at = became_noncurrent_at.saturating_add(days * 86_400);
+                if at <= now_secs && best.as_ref().is_none_or(|(prev, _)| at >= *prev) {
+                    best = Some((at, tr.storage_class.clone()));
+                }
+            }
+        }
+    }
+    best.map(|(_, class)| class)
+}
+
+fn lifecycle_removes_expired_delete_marker(config: &LifecycleConfiguration, key: &str) -> bool {
+    config.rules.iter().any(|r| {
+        rule_matches_key(r, key) && r.expiration.expired_object_delete_marker == Some(true)
+    })
+}
+
+fn lifecycle_aborts_multipart(
+    config: &LifecycleConfiguration,
+    key: &str,
+    created_at: &str,
+    now_secs: i64,
+) -> bool {
+    let Some((created_secs, _)) = parse_rfc3339(created_at) else {
+        return false;
+    };
+    for rule in &config.rules {
+        if !rule_matches_key(rule, key) {
+            continue;
+        }
+        if let Some(abort) = &rule.abort_incomplete_multipart_upload {
+            if created_secs + abort.days_after_initiation * 86_400 <= now_secs {
+                return true;
             }
         }
     }

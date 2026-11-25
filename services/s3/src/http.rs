@@ -14,14 +14,18 @@ use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
+use crate::auth;
 use crate::aws_chunked;
 use crate::cors::{self, CorsRule};
+use crate::iam;
 use crate::model::{
     AnalyticsConfiguration, AnalyticsDataExport, AnalyticsDestination, AnalyticsFilter,
     AnalyticsS3BucketDestination, DefaultRetention, InventoryConfiguration, InventoryDestination,
-    InventoryS3BucketDestination, InventorySchedule, LifecycleConfiguration, LifecycleExpiration,
-    LifecycleFilter, LifecycleRule, NotificationConfiguration, NotificationEventRecord,
-    NotificationFilter, NotificationFilterRule, NotificationLambdaConfig, NotificationQueueConfig,
+    InventoryS3BucketDestination, InventorySchedule, LifecycleAbortIncompleteMultipartUpload,
+    LifecycleConfiguration, LifecycleExpiration, LifecycleFilter,
+    LifecycleNoncurrentVersionExpiration, LifecycleNoncurrentVersionTransition, LifecycleRule,
+    LifecycleTransition, NotificationConfiguration, NotificationEventRecord, NotificationFilter,
+    NotificationFilterRule, NotificationLambdaConfig, NotificationQueueConfig,
     NotificationS3KeyFilter, NotificationTopicConfig, Object, ObjectLegalHold,
     ObjectLockConfiguration, ObjectLockRule, ObjectRetention, ReplicationConfiguration,
     ReplicationDeleteMarkerSetting, ReplicationDestination, ReplicationFilter, ReplicationRule,
@@ -41,7 +45,11 @@ use crate::responses::{
     replication_configuration, versioning_configuration, DeleteMarkerElement, ListBucketResult,
     ListVersionsResult, ObjectElement, VersionElement,
 };
-use crate::store::{FileBucketStore, StoreError};
+use crate::select::{
+    self, SelectCsvSerialization, SelectError, SelectJsonSerialization, SelectObjectContent,
+};
+use crate::sse_c::{self, SseCustomerKey};
+use crate::store::{ConditionalError, FileBucketStore, StoreError};
 use crate::time_fmt::{parse_lifecycle_date, parse_rfc3339, rfc3339_seconds_from_unix};
 use crate::validation::valid_bucket_name;
 
@@ -516,10 +524,13 @@ fn cors_preflight(
 }
 
 fn route_verified(store: &FileBucketStore, req: &Request, auth: &AuthConfig) -> Response {
-    let chunk_signing = match verify_signature(req, auth) {
-        Ok(chunk_signing) => chunk_signing,
+    let (chunk_signing, caller) = match authenticate_request(req, auth) {
+        Ok(res) => res,
         Err(err) => return xml_error(err.status, err.code, err.code),
     };
+    if iam::authorize_request(store, req, auth, caller).is_err() {
+        return xml_error(403, "AccessDenied", "Access Denied");
+    }
     // Decoded in every auth mode: otherwise the chunk framing would be stored as
     // part of the object.
     if req.header("x-amz-content-sha256").starts_with("STREAMING-") {
@@ -599,8 +610,15 @@ fn handle_bucket(store: &FileBucketStore, req: &Request, bucket: &str) -> Respon
             if req.query.contains_key("replication") {
                 return put_bucket_replication(store, req, bucket);
             }
+            let canned_acl = req.header("x-amz-acl").trim();
+            if !canned_acl.is_empty() && !supported_acl(canned_acl) {
+                return xml_error(400, "InvalidArgument", "bucket ACL is invalid");
+            }
             match store.create_bucket(bucket) {
                 Ok((_, true)) => {
+                    if !canned_acl.is_empty() && store.put_bucket_acl(bucket, canned_acl).is_err() {
+                        return xml_error(500, "InternalError", "internal error");
+                    }
                     emit_dashboard_event(
                         "s3.bucket.created",
                         serde_json::json!({ "bucket": bucket }),
@@ -1039,9 +1057,6 @@ fn delete_bucket_cors(store: &FileBucketStore, bucket: &str) -> Response {
 fn put_bucket_lifecycle(store: &FileBucketStore, req: &Request, bucket: &str) -> Response {
     let lifecycle = match parse_lifecycle_configuration(&req.body) {
         Ok(config) => config,
-        Err(LifecycleParseError::Unsupported) => {
-            return xml_error(501, "NotImplemented", "unsupported lifecycle rule action");
-        }
         Err(LifecycleParseError::Malformed) => {
             return xml_error(400, "MalformedXML", "lifecycle configuration is malformed");
         }
@@ -1530,7 +1545,7 @@ fn create_multipart_upload(
     bucket: &str,
     key: &str,
 ) -> Response {
-    let encryption = match server_side_encryption_from_headers(req) {
+    let (encryption, _) = match server_side_encryption_from_headers(req) {
         Ok(encryption) => encryption,
         Err(err) => return server_side_encryption_error(err),
     };
@@ -1546,10 +1561,14 @@ fn create_multipart_upload(
         ..Default::default()
     };
     match store.create_multipart_upload(input) {
-        Ok(upload) => Response::xml(
-            200,
-            initiate_multipart_upload_result(&upload.bucket, &upload.key, &upload.upload_id),
-        ),
+        Ok(upload) => {
+            let mut r = Response::xml(
+                200,
+                initiate_multipart_upload_result(&upload.bucket, &upload.key, &upload.upload_id),
+            );
+            write_encryption_headers(&mut r, &upload.encryption);
+            r
+        }
         Err(StoreError::BucketNotExist) => xml_error(404, "NoSuchBucket", "bucket does not exist"),
         Err(StoreError::InvalidBucketName) | Err(StoreError::InvalidObjectKey) => {
             xml_error(400, "InvalidArgument", "invalid object key")
@@ -1573,17 +1592,71 @@ fn upload_part(
         Some(n) if (1..=10000).contains(&n) => n,
         _ => return xml_error(400, "InvalidArgument", "invalid part number"),
     };
-    match store.upload_part(
+    let upload = match store.get_multipart_upload_metadata(bucket, key, upload_id) {
+        Ok(Some(u)) => u,
+        Ok(None) => return xml_error(404, "NoSuchUpload", "multipart upload does not exist"),
+        Err(StoreError::BucketNotExist) => {
+            return xml_error(404, "NoSuchBucket", "bucket does not exist")
+        }
+        Err(StoreError::InvalidUploadId) => {
+            return xml_error(404, "NoSuchUpload", "multipart upload does not exist")
+        }
+        Err(StoreError::InvalidBucketName) | Err(StoreError::InvalidObjectKey) => {
+            return xml_error(400, "InvalidArgument", "invalid object key")
+        }
+        Err(_) => return xml_error(500, "InternalError", "internal error"),
+    };
+    let sse_c_key = match sse_c::parse_customer_key(req) {
+        Ok(key) => key,
+        Err(_) => {
+            return xml_error(
+                400,
+                "InvalidArgument",
+                "server-side encryption headers are invalid",
+            );
+        }
+    };
+    if upload.encryption.is_sse_c() {
+        let Some(ref key) = sse_c_key else {
+            return xml_error(
+                400,
+                "InvalidRequest",
+                "The multipart upload was initiated with SSE-C; customer encryption headers are required",
+            );
+        };
+        if !constant_time_eq(
+            key.key_md5.as_bytes(),
+            upload.encryption.customer_key_md5.as_bytes(),
+        ) {
+            return xml_error(
+                403,
+                "AccessDenied",
+                "SSE-C customer key does not match multipart upload",
+            );
+        }
+    } else if sse_c_key.is_some() {
+        return xml_error(
+            400,
+            "InvalidArgument",
+            "SSE-C headers are not valid for a non-SSE-C multipart upload",
+        );
+    }
+
+    match store.upload_part_with_sse_c(
         bucket,
         key,
         upload_id,
         part_number,
         &req.body,
         req.header("content-md5"),
+        sse_c_key.as_ref().map(|k| &k.key),
     ) {
         Ok(part) => {
             let mut r = Response::empty(200);
             r.headers.insert("ETag".to_string(), part.etag);
+            if upload.encryption.is_sse_c() {
+                write_encryption_headers(&mut r, &upload.encryption);
+            }
             r
         }
         Err(StoreError::InvalidContentMd5) => xml_error(
@@ -1660,10 +1733,7 @@ fn complete_multipart_upload(
     key: &str,
     upload_id: &str,
 ) -> Response {
-    let if_none_match = match if_none_match_write(req) {
-        Ok(v) => v,
-        Err(r) => return r,
-    };
+    let if_none_match = if_none_match_write(req);
     let Some(part_numbers) = parse_complete_multipart_parts(&req.body) else {
         return xml_error(400, "MalformedXML", "request body is malformed");
     };
@@ -1684,8 +1754,18 @@ fn complete_multipart_upload(
         }
         previous = *part_number;
     }
-    let completed = if if_none_match {
-        store.complete_multipart_upload_if_absent(bucket, key, upload_id, &part_numbers)
+    let completed = if let Some(condition) = if_none_match {
+        match store.complete_multipart_upload_if(bucket, key, upload_id, &part_numbers, |current| {
+            if current.is_some_and(|obj| etag_list_matches(&condition, &obj.etag)) {
+                Err(())
+            } else {
+                Ok(())
+            }
+        }) {
+            Ok(v) => Ok(v),
+            Err(ConditionalError::Condition(())) => Err(StoreError::PreconditionFailed),
+            Err(ConditionalError::Store(e)) => Err(e),
+        }
     } else {
         store.complete_multipart_upload(bucket, key, upload_id, &part_numbers)
     };
@@ -1695,6 +1775,7 @@ fn complete_multipart_upload(
                 200,
                 complete_multipart_upload_result(bucket, key, &object.etag),
             );
+            write_server_side_encryption_headers(&mut r, &object);
             if record_object_event(
                 store,
                 bucket,
@@ -1756,6 +1837,9 @@ fn abort_multipart_upload(
 }
 
 fn list_multipart_uploads(store: &FileBucketStore, bucket: &str) -> Response {
+    if store.apply_bucket_lifecycle(bucket, &store.now()).is_err() {
+        return xml_error(500, "InternalError", "internal error");
+    }
     match store.list_multipart_uploads(bucket) {
         Ok(Some(uploads)) => Response::xml(200, list_multipart_uploads_result(bucket, &uploads)),
         Ok(None) => xml_error(404, "NoSuchBucket", "bucket does not exist"),
@@ -1767,14 +1851,15 @@ fn list_multipart_uploads(store: &FileBucketStore, bucket: &str) -> Response {
 }
 
 fn put_object(store: &FileBucketStore, req: &Request, bucket: &str, key: &str) -> Response {
-    let if_none_match = match if_none_match_write(req) {
-        Ok(v) => v,
-        Err(r) => return r,
-    };
-    let encryption = match server_side_encryption_from_headers(req) {
+    let if_none_match = if_none_match_write(req);
+    let (encryption, sse_c_key) = match server_side_encryption_from_headers(req) {
         Ok(encryption) => encryption,
         Err(err) => return server_side_encryption_error(err),
     };
+    let canned_acl = req.header("x-amz-acl").trim();
+    if !canned_acl.is_empty() && !supported_acl(canned_acl) {
+        return xml_error(400, "InvalidArgument", "object ACL is invalid");
+    }
     let Some((retention, legal_hold)) = object_lock_from_headers(req) else {
         return xml_error(400, "InvalidArgument", "object lock headers are invalid");
     };
@@ -1793,13 +1878,33 @@ fn put_object(store: &FileBucketStore, req: &Request, bucket: &str, key: &str) -
         legal_hold,
         ..Default::default()
     };
-    let stored = if if_none_match {
-        store.put_object_if_absent(input)
+    let key_ref = sse_c_key.as_ref().map(|k| &k.key);
+    let stored = if let Some(condition) = if_none_match {
+        match store.put_object_if_with_sse_c(input, key_ref, |current| {
+            if current.is_some_and(|obj| etag_list_matches(&condition, &obj.etag)) {
+                Err(())
+            } else {
+                Ok(())
+            }
+        }) {
+            Ok(o) => Ok(o),
+            Err(ConditionalError::Condition(())) => Err(StoreError::PreconditionFailed),
+            Err(ConditionalError::Store(e)) => Err(e),
+        }
+    } else if let Some(key_bytes) = key_ref {
+        store.put_object_with_sse_c(input, key_bytes)
     } else {
         store.put_object(input)
     };
     match stored {
         Ok(object) => {
+            if !canned_acl.is_empty()
+                && store
+                    .put_object_acl(bucket, key, &object.version_id, canned_acl)
+                    .is_err()
+            {
+                return xml_error(500, "InternalError", "internal error");
+            }
             let mut r = Response::empty(200);
             write_object_lock_headers(&mut r, &object);
             write_server_side_encryption_headers(&mut r, &object);
@@ -1839,16 +1944,13 @@ fn put_object(store: &FileBucketStore, req: &Request, bucket: &str, key: &str) -
 }
 
 fn copy_object(store: &FileBucketStore, req: &Request, bucket: &str, key: &str) -> Response {
-    let if_none_match = match if_none_match_write(req) {
-        Ok(v) => v,
-        Err(r) => return r,
-    };
+    let if_none_match = if_none_match_write(req);
     let Some((source_bucket, source_key, source_version_id)) =
         parse_copy_source(req.header("x-amz-copy-source"))
     else {
         return xml_error(400, "InvalidArgument", "invalid copy source");
     };
-    let (source_object, body) =
+    let (source_object, raw_body) =
         match store.get_object_version(&source_bucket, &source_key, &source_version_id) {
             Ok(Some(found)) => found,
             Ok(None) => return xml_error(404, "NoSuchKey", "source object does not exist"),
@@ -1863,6 +1965,14 @@ fn copy_object(store: &FileBucketStore, req: &Request, bucket: &str, key: &str) 
             }
             Err(_) => return xml_error(500, "InternalError", "internal error"),
         };
+    let body = match decrypt_sse_c_body(
+        &source_object,
+        raw_body,
+        sse_c::parse_copy_source_customer_key(req),
+    ) {
+        Ok(plaintext) => plaintext,
+        Err(resp) => return resp,
+    };
     if etag_list_matches(
         req.header("x-amz-copy-source-if-none-match"),
         &source_object.etag,
@@ -1870,6 +1980,11 @@ fn copy_object(store: &FileBucketStore, req: &Request, bucket: &str, key: &str) 
         return precondition_failed();
     }
 
+    let inherited_encryption = if source_object.encryption.is_sse_c() {
+        ServerSideEncryption::default()
+    } else {
+        source_object.encryption
+    };
     let mut input = PutObjectInput {
         bucket: bucket.to_string(),
         key: key.to_string(),
@@ -1879,7 +1994,7 @@ fn copy_object(store: &FileBucketStore, req: &Request, bucket: &str, key: &str) 
         cache_control: source_object.cache_control,
         content_disposition: source_object.content_disposition,
         metadata: source_object.metadata,
-        encryption: source_object.encryption,
+        encryption: inherited_encryption,
         retention: source_object.retention,
         legal_hold: source_object.legal_hold,
         ..Default::default()
@@ -1894,11 +2009,15 @@ fn copy_object(store: &FileBucketStore, req: &Request, bucket: &str, key: &str) 
         input.content_disposition = req.header("content-disposition").to_string();
         input.metadata = user_metadata(&req.headers);
     }
+    let mut dst_sse_c_key: Option<SseCustomerKey> = None;
     if has_server_side_encryption_headers(req) {
-        input.encryption = match server_side_encryption_from_headers(req) {
-            Ok(encryption) => encryption,
+        match server_side_encryption_from_headers(req) {
+            Ok((encryption, key)) => {
+                input.encryption = encryption;
+                dst_sse_c_key = key;
+            }
             Err(err) => return server_side_encryption_error(err),
-        };
+        }
     }
     if has_object_lock_headers(req) {
         let Some((retention, legal_hold)) = object_lock_from_headers(req) else {
@@ -1912,8 +2031,21 @@ fn copy_object(store: &FileBucketStore, req: &Request, bucket: &str, key: &str) 
         }
     }
 
-    let stored = if if_none_match {
-        store.put_object_if_absent(input)
+    let key_ref = dst_sse_c_key.as_ref().map(|k| &k.key);
+    let stored = if let Some(condition) = if_none_match {
+        match store.put_object_if_with_sse_c(input, key_ref, |current| {
+            if current.is_some_and(|obj| etag_list_matches(&condition, &obj.etag)) {
+                Err(())
+            } else {
+                Ok(())
+            }
+        }) {
+            Ok(o) => Ok(o),
+            Err(ConditionalError::Condition(())) => Err(StoreError::PreconditionFailed),
+            Err(ConditionalError::Store(e)) => Err(e),
+        }
+    } else if let Some(key_bytes) = key_ref {
+        store.put_object_with_sse_c(input, key_bytes)
     } else {
         store.put_object(input)
     };
@@ -1956,25 +2088,18 @@ fn select_object_content(
     bucket: &str,
     key: &str,
 ) -> Response {
-    let Some(select) = parse_select_object_content_request(&req.body) else {
+    let Some(select_req) = parse_select_object_content_request(&req.body) else {
         return xml_error(400, "MalformedXML", "request body is malformed");
     };
-    if select.expression_type.trim() != "SQL" {
+    if select_req.expression_type.trim() != "SQL" {
         return xml_error(
             400,
             "InvalidExpressionType",
             "only SQL expressions are supported",
         );
     }
-    if !supported_select_expression(&select.expression) {
-        return xml_error(
-            501,
-            "NotImplemented",
-            "only SELECT * FROM S3Object is supported",
-        );
-    }
     let version_id = req.query.get("versionId").map(String::as_str).unwrap_or("");
-    let (_, body) = match store.get_object_version(bucket, key, version_id) {
+    let (object, raw_body) = match store.get_object_version(bucket, key, version_id) {
         Ok(Some((object, _))) if object.delete_marker => {
             return xml_error(404, "NoSuchKey", "object does not exist");
         }
@@ -1991,9 +2116,18 @@ fn select_object_content(
         }
         Err(_) => return xml_error(500, "InternalError", "internal error"),
     };
-    let output = match evaluate_select_object_content(&select, &body) {
+    let body = match decrypt_sse_c_body(&object, raw_body, sse_c::parse_customer_key(req)) {
+        Ok(plaintext) => plaintext,
+        Err(resp) => return resp,
+    };
+    let output = match select::evaluate(&select_req, &body) {
         Ok(output) => output,
-        Err(message) => return xml_error(501, "NotImplemented", &message),
+        Err(SelectError::Unsupported(message)) => {
+            return xml_error(501, "NotImplemented", &message)
+        }
+        Err(SelectError::Invalid(message)) => {
+            return xml_error(400, "ParseInvalidContext", &message);
+        }
     };
     let mut payload = encode_event_stream_message(
         &[
@@ -2015,28 +2149,6 @@ fn select_object_content(
     r.headers
         .insert("Content-Length".to_string(), r.body.len().to_string());
     r
-}
-
-#[derive(Debug, Default)]
-struct SelectObjectContent {
-    expression: String,
-    expression_type: String,
-    input_csv: Option<SelectCsvSerialization>,
-    input_json: Option<SelectJsonSerialization>,
-    output_csv: Option<SelectCsvSerialization>,
-    output_json: Option<SelectJsonSerialization>,
-}
-
-#[derive(Debug, Default, Clone)]
-struct SelectCsvSerialization {
-    file_header_info: String,
-    record_delimiter: String,
-    field_delimiter: String,
-}
-
-#[derive(Debug, Default, Clone)]
-struct SelectJsonSerialization {
-    kind: String,
 }
 
 fn parse_select_object_content_request(body: &[u8]) -> Option<SelectObjectContent> {
@@ -2062,6 +2174,9 @@ fn parse_select_csv(xml: &str) -> SelectCsvSerialization {
         file_header_info: tag_text_in(&csv_xml, "FileHeaderInfo").unwrap_or_default(),
         record_delimiter: tag_text_in(&csv_xml, "RecordDelimiter").unwrap_or_default(),
         field_delimiter: tag_text_in(&csv_xml, "FieldDelimiter").unwrap_or_default(),
+        quote_character: tag_text_in(&csv_xml, "QuoteCharacter").unwrap_or_default(),
+        comments: tag_text_in(&csv_xml, "Comments").unwrap_or_default(),
+        quote_fields: tag_text_in(&csv_xml, "QuoteFields").unwrap_or_default(),
     }
 }
 
@@ -2069,114 +2184,12 @@ fn parse_select_json(xml: &str) -> SelectJsonSerialization {
     let json_xml = tag_block(xml, "JSON").unwrap_or_default();
     SelectJsonSerialization {
         kind: tag_text_in(&json_xml, "Type").unwrap_or_default(),
+        record_delimiter: tag_text_in(&json_xml, "RecordDelimiter").unwrap_or_default(),
     }
 }
 
 fn xml_child_present(xml: &str, tag: &str) -> bool {
     xml.contains(&format!("<{tag}>")) || xml.contains(&format!("<{tag} "))
-}
-
-fn supported_select_expression(expression: &str) -> bool {
-    let normalized = expression.split_whitespace().collect::<Vec<_>>().join(" ");
-    normalized.eq_ignore_ascii_case("SELECT * FROM S3Object")
-        || normalized.eq_ignore_ascii_case("SELECT * FROM S3Object s")
-}
-
-fn evaluate_select_object_content(
-    request: &SelectObjectContent,
-    body: &[u8],
-) -> Result<Vec<u8>, String> {
-    if request.input_csv.is_some() {
-        evaluate_csv_select_object_content(request, body)
-    } else if request.input_json.is_some() {
-        evaluate_json_select_object_content(request, body)
-    } else {
-        Err("input serialization is not supported".to_string())
-    }
-}
-
-fn evaluate_csv_select_object_content(
-    request: &SelectObjectContent,
-    body: &[u8],
-) -> Result<Vec<u8>, String> {
-    let Some(output) = &request.output_csv else {
-        return Err("only CSV output is supported for CSV input".to_string());
-    };
-    let input = request.input_csv.clone().unwrap_or_default();
-    let input_delimiter = select_field_delimiter(&input);
-    let output_delimiter = select_field_delimiter(output);
-    if input_delimiter.len() != 1 || output_delimiter.len() != 1 {
-        return Err("only single-byte CSV field delimiters are supported".to_string());
-    }
-    let input_delimiter = input_delimiter.as_bytes()[0] as char;
-    let mut records: Vec<Vec<String>> = String::from_utf8_lossy(body)
-        .lines()
-        .filter(|line| !line.is_empty())
-        .map(|line| {
-            line.split(input_delimiter)
-                .map(|field| field.to_string())
-                .collect()
-        })
-        .collect();
-    if input.file_header_info.eq_ignore_ascii_case("USE") && !records.is_empty() {
-        records.remove(0);
-    }
-    let output_delimiter = output_delimiter.as_bytes()[0] as char;
-    let mut out = String::new();
-    for record in records {
-        out.push_str(&record.join(&output_delimiter.to_string()));
-        out.push('\n');
-    }
-    let record_delimiter = select_record_delimiter(output);
-    if record_delimiter != "\n" {
-        Ok(out.replace('\n', &record_delimiter).into_bytes())
-    } else {
-        Ok(out.into_bytes())
-    }
-}
-
-fn evaluate_json_select_object_content(
-    request: &SelectObjectContent,
-    body: &[u8],
-) -> Result<Vec<u8>, String> {
-    let Some(input) = &request.input_json else {
-        return Err("only JSON LINES input is supported".to_string());
-    };
-    if request.output_json.is_none() {
-        return Err("only JSON output is supported for JSON input".to_string());
-    }
-    if !input.kind.is_empty() && input.kind != "LINES" {
-        return Err("only JSON LINES input is supported".to_string());
-    }
-    let mut out = Vec::new();
-    for line in String::from_utf8_lossy(body)
-        .lines()
-        .filter(|line| !line.is_empty())
-    {
-        let value: serde_json::Value =
-            serde_json::from_str(line).map_err(|_| "JSON input is malformed".to_string())?;
-        let encoded =
-            serde_json::to_vec(&value).map_err(|_| "JSON input is malformed".to_string())?;
-        out.extend(encoded);
-        out.push(b'\n');
-    }
-    Ok(out)
-}
-
-fn select_field_delimiter(csv: &SelectCsvSerialization) -> String {
-    if csv.field_delimiter.is_empty() {
-        ",".to_string()
-    } else {
-        csv.field_delimiter.clone()
-    }
-}
-
-fn select_record_delimiter(csv: &SelectCsvSerialization) -> String {
-    if csv.record_delimiter.is_empty() {
-        "\n".to_string()
-    } else {
-        csv.record_delimiter.clone()
-    }
 }
 
 fn encode_event_stream_message(headers: &[(&str, &str)], payload: &[u8]) -> Vec<u8> {
@@ -2218,9 +2231,9 @@ fn crc32_ieee(data: &[u8]) -> u32 {
 }
 
 #[derive(Debug)]
-struct SignatureError {
-    code: &'static str,
-    status: u16,
+pub(crate) struct SignatureError {
+    pub(crate) code: &'static str,
+    pub(crate) status: u16,
 }
 
 /// What `aws-chunked` verification needs from an already verified seed signature.
@@ -2232,30 +2245,51 @@ struct ChunkSigning {
     has_trailer: bool,
 }
 
-fn verify_signature(
+fn authenticate_request<'a>(
     req: &Request,
-    auth: &AuthConfig,
-) -> Result<Option<ChunkSigning>, SignatureError> {
+    auth: &'a AuthConfig,
+) -> Result<(Option<ChunkSigning>, iam::Caller<'a>), SignatureError> {
     if !auth.auth_mode.eq_ignore_ascii_case("strict") {
-        return Ok(None);
+        return Ok((
+            None,
+            iam::Caller::Authenticated {
+                access_key_id: auth::configured_access_key(auth),
+            },
+        ));
     }
-    let has_presign = req
+    let authed = iam::Caller::Authenticated {
+        access_key_id: auth::configured_access_key(auth),
+    };
+    if auth::is_sigv4a_presign(req) {
+        auth::verify_sigv4a_presign(req, auth)?;
+        return Ok((None, authed));
+    }
+    if req
         .query
         .get("X-Amz-Algorithm")
-        .map(|v| !v.is_empty())
-        .unwrap_or(false);
-    let has_header_auth = !req.header("authorization").is_empty();
-    if !has_presign && !has_header_auth {
-        return Err(SignatureError {
-            code: "AccessDenied",
-            status: 403,
-        });
+        .is_some_and(|v| !v.is_empty())
+    {
+        verify_presigned_url(req, auth)?;
+        return Ok((None, authed));
     }
-    if has_presign {
-        verify_presigned_url(req, auth).map(|()| None)
-    } else {
-        verify_authorization_header(req, auth)
+    if auth::is_sigv2_presign(req) {
+        auth::verify_sigv2_presign(req, auth)?;
+        return Ok((None, authed));
     }
+    if auth::is_sigv4a_header(req) {
+        auth::verify_sigv4a_header(req, auth)?;
+        return Ok((None, authed));
+    }
+    if auth::is_sigv2_header(req) {
+        auth::verify_sigv2_header(req, auth)?;
+        return Ok((None, authed));
+    }
+    if !req.header("authorization").is_empty() {
+        let chunk = verify_authorization_header(req, auth)?;
+        return Ok((chunk, authed));
+    }
+    // No credentials supplied: evaluate bucket policy and canned ACLs as anonymous.
+    Ok((None, iam::Caller::Anonymous))
 }
 
 fn verify_presigned_url(req: &Request, auth: &AuthConfig) -> Result<(), SignatureError> {
@@ -2533,14 +2567,14 @@ fn verify_chunk_signatures(
     Ok(())
 }
 
-fn unix_now() -> i64 {
+pub(crate) fn unix_now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
 }
 
-fn verify_scope_date(amz_date: &str, date_stamp: &str) -> Result<(), SignatureError> {
+pub(crate) fn verify_scope_date(amz_date: &str, date_stamp: &str) -> Result<(), SignatureError> {
     if amz_date.starts_with(date_stamp) && date_stamp.len() == 8 {
         return Ok(());
     }
@@ -2555,7 +2589,7 @@ fn verify_scope_date(amz_date: &str, date_stamp: &str) -> Result<(), SignatureEr
 /// an added `x-amz-copy-source`). `x-amz-user-agent` is exempt because browser
 /// SDKs send it unsigned and it has no effect on the request;
 /// `x-amz-content-sha256` because its value is signed as the payload hash anyway.
-fn verify_signed_header_coverage(
+pub(crate) fn verify_signed_header_coverage(
     req: &Request,
     signed_headers: &str,
 ) -> Result<(), SignatureError> {
@@ -2593,7 +2627,7 @@ fn valid_credential(auth: &AuthConfig, access_key: &str, region: &str, service: 
     access_key == configured_access_key && region == configured_region && service == SIGV4_SERVICE
 }
 
-fn verify_payload_hash(req: &Request, payload_hash: &str) -> Result<(), SignatureError> {
+pub(crate) fn verify_payload_hash(req: &Request, payload_hash: &str) -> Result<(), SignatureError> {
     if matches!(
         payload_hash,
         "UNSIGNED-PAYLOAD"
@@ -2661,7 +2695,7 @@ fn signature_for_request(
 
 /// `req.path` is the raw request target, so each segment is normalized through
 /// a decode/encode round trip rather than encoded a second time.
-fn canonical_uri(raw_path: &str) -> String {
+pub(crate) fn canonical_uri(raw_path: &str) -> String {
     raw_path
         .split('/')
         .map(|segment| aws_percent_encode(&percent_decode(segment), "~"))
@@ -2678,7 +2712,7 @@ fn parse_credential_scope(credential: &str) -> Option<(&str, &str, &str, &str)> 
     }
 }
 
-fn parse_auth_params(value: &str) -> BTreeMap<String, String> {
+pub(crate) fn parse_auth_params(value: &str) -> BTreeMap<String, String> {
     value
         .split(',')
         .filter_map(|part| {
@@ -2688,7 +2722,10 @@ fn parse_auth_params(value: &str) -> BTreeMap<String, String> {
         .collect()
 }
 
-fn canonical_query_string(values: &BTreeMap<String, String>, ignored_key: &str) -> String {
+pub(crate) fn canonical_query_string(
+    values: &BTreeMap<String, String>,
+    ignored_key: &str,
+) -> String {
     values
         .iter()
         .filter(|(key, _)| key.as_str() != ignored_key)
@@ -2703,7 +2740,7 @@ fn canonical_query_string(values: &BTreeMap<String, String>, ignored_key: &str) 
         .join("&")
 }
 
-fn canonical_headers(req: &Request, signed_headers: &str) -> String {
+pub(crate) fn canonical_headers(req: &Request, signed_headers: &str) -> String {
     let mut out = String::new();
     for name in signed_headers.to_ascii_lowercase().split(';') {
         let name = name.trim();
@@ -2754,7 +2791,7 @@ pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     a.iter().zip(b).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0
 }
 
-fn parse_sigv4_time(value: &str) -> Option<i64> {
+pub(crate) fn parse_sigv4_time(value: &str) -> Option<i64> {
     if value.len() != 16 || !value.is_ascii() || !value.ends_with('Z') {
         return None;
     }
@@ -2808,7 +2845,39 @@ fn get_object(
             }
             r
         }
-        Ok(Some((object, body))) => object_response(req, object, body, head_only),
+        Ok(Some((object, body))) => {
+            if object.encryption.is_sse_c() {
+                if head_only {
+                    if let Err(resp) =
+                        verify_sse_c_head(&object, &body, sse_c::parse_customer_key(req))
+                    {
+                        return resp;
+                    }
+                    let size = object.size.max(0) as usize;
+                    return object_response(req, object, vec![0u8; size], true);
+                }
+                let plaintext =
+                    match decrypt_sse_c_body(&object, body, sse_c::parse_customer_key(req)) {
+                        Ok(pt) => pt,
+                        Err(resp) => return resp,
+                    };
+                object_response(req, object, plaintext, false)
+            } else {
+                match sse_c::parse_customer_key(req) {
+                    Ok(None) => object_response(req, object, body, head_only),
+                    Ok(Some(_)) => xml_error(
+                        400,
+                        "InvalidRequest",
+                        "The object was not stored using SSE-C",
+                    ),
+                    Err(_) => xml_error(
+                        400,
+                        "InvalidArgument",
+                        "server-side encryption headers are invalid",
+                    ),
+                }
+            }
+        }
         Ok(None) => xml_error(404, "NoSuchKey", "object does not exist"),
         Err(StoreError::BucketNotExist) => xml_error(404, "NoSuchBucket", "bucket does not exist"),
         Err(StoreError::InvalidVersionId) => {
@@ -2841,6 +2910,12 @@ fn object_response(req: &Request, object: Object, body: Vec<u8>, head_only: bool
     );
     write_object_lock_headers(&mut r, &object);
     write_server_side_encryption_headers(&mut r, &object);
+    if object.effective_storage_class() != "STANDARD" {
+        r.headers.insert(
+            "x-amz-storage-class".to_string(),
+            object.effective_storage_class().to_string(),
+        );
+    }
     r.headers.insert("ETag".to_string(), object.etag);
     r.headers.insert(
         "Last-Modified".to_string(),
@@ -3005,12 +3080,15 @@ fn list_objects(store: &FileBucketStore, req: &Request, bucket: &str) -> Respons
     result.contents = listing
         .contents
         .into_iter()
-        .map(|object| ObjectElement {
-            key: encode_list_value(&object.key, encoding_type),
-            last_modified: to_rfc3339_seconds(&object.last_modified),
-            etag: object.etag,
-            size: object.size,
-            storage_class: "STANDARD".to_string(),
+        .map(|object| {
+            let storage_class = object.effective_storage_class().to_string();
+            ObjectElement {
+                key: encode_list_value(&object.key, encoding_type),
+                last_modified: to_rfc3339_seconds(&object.last_modified),
+                etag: object.etag,
+                size: object.size,
+                storage_class,
+            }
         })
         .collect();
     Response::xml(200, result.to_xml())
@@ -3065,6 +3143,7 @@ fn list_object_versions(store: &FileBucketStore, req: &Request, bucket: &str) ->
                 last_modified: to_rfc3339_seconds(&object.last_modified),
             });
         } else {
+            let storage_class = object.effective_storage_class().to_string();
             result.versions.push(VersionElement {
                 key: object.key,
                 version_id,
@@ -3072,7 +3151,7 @@ fn list_object_versions(store: &FileBucketStore, req: &Request, bucket: &str) ->
                 last_modified: to_rfc3339_seconds(&object.last_modified),
                 etag: object.etag,
                 size: object.size,
-                storage_class: "STANDARD".to_string(),
+                storage_class,
             });
         }
     }
@@ -3089,18 +3168,14 @@ fn user_metadata(headers: &BTreeMap<String, String>) -> BTreeMap<String, String>
         .collect()
 }
 
-/// Reads `If-None-Match` on PutObject/CopyObject/CompleteMultipartUpload. S3
-/// accepts only `*` there; `Ok(true)` means the write must not replace a
-/// current object.
-fn if_none_match_write(req: &Request) -> Result<bool, Response> {
-    match req.header("if-none-match").trim() {
-        "" => Ok(false),
-        "*" => Ok(true),
-        _ => Err(xml_error(
-            501,
-            "NotImplemented",
-            "A header you provided implies functionality that is not implemented",
-        )),
+/// Reads `If-None-Match` on PutObject/CopyObject/CompleteMultipartUpload.
+/// Supports `*` as well as specific ETag values or comma-separated ETag lists.
+fn if_none_match_write(req: &Request) -> Option<String> {
+    let value = req.header("if-none-match").trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
     }
 }
 
@@ -3187,19 +3262,11 @@ fn has_server_side_encryption_headers(req: &Request) -> bool {
 
 fn server_side_encryption_from_headers(
     req: &Request,
-) -> Result<ServerSideEncryption, ServerSideEncryptionHeaderError> {
-    if !req
-        .header("x-amz-server-side-encryption-customer-algorithm")
-        .is_empty()
-        || !req
-            .header("x-amz-server-side-encryption-customer-key")
-            .is_empty()
-        || !req
-            .header("x-amz-server-side-encryption-customer-key-md5")
-            .is_empty()
-    {
-        return Err(ServerSideEncryptionHeaderError::Unsupported);
-    }
+) -> Result<(ServerSideEncryption, Option<SseCustomerKey>), ServerSideEncryptionHeaderError> {
+    let customer_key = match sse_c::parse_customer_key(req) {
+        Ok(key) => key,
+        Err(_) => return Err(ServerSideEncryptionHeaderError::Invalid),
+    };
 
     let algorithm = req.header("x-amz-server-side-encryption").trim();
     let kms_key_id = req
@@ -3208,11 +3275,24 @@ fn server_side_encryption_from_headers(
     let bucket_key_value = req
         .header("x-amz-server-side-encryption-bucket-key-enabled")
         .trim();
+
+    if let Some(key) = customer_key {
+        if !algorithm.is_empty() || !kms_key_id.is_empty() || !bucket_key_value.is_empty() {
+            return Err(ServerSideEncryptionHeaderError::Invalid);
+        }
+        let encryption = ServerSideEncryption {
+            customer_algorithm: key.algorithm.clone(),
+            customer_key_md5: key.key_md5.clone(),
+            ..Default::default()
+        };
+        return Ok((encryption, Some(key)));
+    }
+
     if algorithm.is_empty() {
         if !kms_key_id.is_empty() || !bucket_key_value.is_empty() {
             return Err(ServerSideEncryptionHeaderError::Invalid);
         }
-        return Ok(ServerSideEncryption::default());
+        return Ok((ServerSideEncryption::default(), None));
     }
 
     match algorithm {
@@ -3220,12 +3300,15 @@ fn server_side_encryption_from_headers(
             if !kms_key_id.is_empty() || !bucket_key_value.is_empty() {
                 return Err(ServerSideEncryptionHeaderError::Invalid);
             }
-            Ok(ServerSideEncryption {
-                algorithm: algorithm.to_string(),
-                ..Default::default()
-            })
+            Ok((
+                ServerSideEncryption {
+                    algorithm: algorithm.to_string(),
+                    ..Default::default()
+                },
+                None,
+            ))
         }
-        "aws:kms" => {
+        "aws:kms" | "aws:kms:dsse" => {
             let bucket_key_enabled = if bucket_key_value.is_empty() {
                 None
             } else {
@@ -3235,14 +3318,97 @@ fn server_side_encryption_from_headers(
                     _ => return Err(ServerSideEncryptionHeaderError::Invalid),
                 }
             };
-            Ok(ServerSideEncryption {
-                algorithm: algorithm.to_string(),
-                kms_key_id: kms_key_id.to_string(),
-                bucket_key_enabled,
-            })
+            Ok((
+                ServerSideEncryption {
+                    algorithm: algorithm.to_string(),
+                    kms_key_id: kms_key_id.to_string(),
+                    bucket_key_enabled,
+                    ..Default::default()
+                },
+                None,
+            ))
         }
         _ => Err(ServerSideEncryptionHeaderError::Unsupported),
     }
+}
+
+fn decrypt_sse_c_body(
+    object: &Object,
+    body: Vec<u8>,
+    parsed: Result<Option<SseCustomerKey>, sse_c::SseCustomerHeaderError>,
+) -> Result<Vec<u8>, Response> {
+    if !object.encryption.is_sse_c() {
+        return match parsed {
+            Ok(None) => Ok(body),
+            Ok(Some(_)) => Err(xml_error(
+                400,
+                "InvalidRequest",
+                "The object was not stored using SSE-C",
+            )),
+            Err(_) => Err(xml_error(
+                400,
+                "InvalidArgument",
+                "server-side encryption headers are invalid",
+            )),
+        };
+    }
+    let key = match parsed {
+        Ok(Some(k)) => k,
+        Ok(None) => {
+            return Err(xml_error(
+                400,
+                "InvalidRequest",
+                "The object was stored using a form of Server Side Encryption. The correct parameters must be provided to retrieve the object.",
+            ));
+        }
+        Err(_) => {
+            return Err(xml_error(
+                400,
+                "InvalidArgument",
+                "server-side encryption headers are invalid",
+            ));
+        }
+    };
+    if !constant_time_eq(
+        key.key_md5.as_bytes(),
+        object.encryption.customer_key_md5.as_bytes(),
+    ) {
+        return Err(xml_error(403, "AccessDenied", "Access Denied"));
+    }
+    sse_c::decrypt_frames(&key.key, &body)
+        .ok_or_else(|| xml_error(403, "AccessDenied", "Access Denied"))
+}
+
+fn verify_sse_c_head(
+    object: &Object,
+    body: &[u8],
+    parsed: Result<Option<SseCustomerKey>, sse_c::SseCustomerHeaderError>,
+) -> Result<(), Response> {
+    let key = match parsed {
+        Ok(Some(k)) => k,
+        Ok(None) => {
+            return Err(xml_error(
+                400,
+                "InvalidRequest",
+                "The object was stored using a form of Server Side Encryption. The correct parameters must be provided to retrieve the object.",
+            ));
+        }
+        Err(_) => {
+            return Err(xml_error(
+                400,
+                "InvalidArgument",
+                "server-side encryption headers are invalid",
+            ));
+        }
+    };
+    if !constant_time_eq(
+        key.key_md5.as_bytes(),
+        object.encryption.customer_key_md5.as_bytes(),
+    ) || !sse_c::verify_frames(&key.key, body)
+    {
+        return Err(xml_error(403, "AccessDenied", "Access Denied"));
+    }
+    Ok(())
 }
 
 fn server_side_encryption_error(err: ServerSideEncryptionHeaderError) -> Response {
@@ -3261,22 +3427,38 @@ fn server_side_encryption_error(err: ServerSideEncryptionHeaderError) -> Respons
 }
 
 fn write_server_side_encryption_headers(response: &mut Response, object: &Object) {
-    if !object.encryption.algorithm.is_empty() {
+    write_encryption_headers(response, &object.encryption);
+}
+
+fn write_encryption_headers(response: &mut Response, encryption: &ServerSideEncryption) {
+    if !encryption.algorithm.is_empty() {
         response.headers.insert(
             "x-amz-server-side-encryption".to_string(),
-            object.encryption.algorithm.clone(),
+            encryption.algorithm.clone(),
         );
     }
-    if !object.encryption.kms_key_id.is_empty() {
+    if !encryption.kms_key_id.is_empty() {
         response.headers.insert(
             "x-amz-server-side-encryption-aws-kms-key-id".to_string(),
-            object.encryption.kms_key_id.clone(),
+            encryption.kms_key_id.clone(),
         );
     }
-    if let Some(enabled) = object.encryption.bucket_key_enabled {
+    if let Some(enabled) = encryption.bucket_key_enabled {
         response.headers.insert(
             "x-amz-server-side-encryption-bucket-key-enabled".to_string(),
             enabled.to_string(),
+        );
+    }
+    if !encryption.customer_algorithm.is_empty() {
+        response.headers.insert(
+            "x-amz-server-side-encryption-customer-algorithm".to_string(),
+            encryption.customer_algorithm.clone(),
+        );
+    }
+    if !encryption.customer_key_md5.is_empty() {
+        response.headers.insert(
+            "x-amz-server-side-encryption-customer-key-MD5".to_string(),
+            encryption.customer_key_md5.clone(),
         );
     }
 }
@@ -3614,7 +3796,7 @@ fn replicate_object_write(
     let Some((config, true)) = store.get_bucket_replication(bucket)? else {
         return Ok(());
     };
-    if object.delete_marker {
+    if object.delete_marker || object.encryption.is_sse_c() {
         return Ok(());
     }
     let Some((_, body)) = store.get_object_version(bucket, key, &object.version_id)? else {
@@ -3888,7 +4070,6 @@ fn validate_analytics_configuration(id: &str, config: &AnalyticsConfiguration) -
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LifecycleParseError {
     Malformed,
-    Unsupported,
 }
 
 fn parse_lifecycle_configuration(
@@ -3897,13 +4078,6 @@ fn parse_lifecycle_configuration(
     let xml = std::str::from_utf8(body).map_err(|_| LifecycleParseError::Malformed)?;
     if !xml.contains("<LifecycleConfiguration") {
         return Err(LifecycleParseError::Malformed);
-    }
-    if xml.contains("<Transition")
-        || xml.contains("<NoncurrentVersionTransition")
-        || xml.contains("<NoncurrentVersionExpiration")
-        || xml.contains("<AbortIncompleteMultipartUpload")
-    {
-        return Err(LifecycleParseError::Unsupported);
     }
 
     let mut rules = Vec::new();
@@ -3936,24 +4110,174 @@ fn parse_lifecycle_rule(xml: &str) -> std::result::Result<LifecycleRule, Lifecyc
     let top_level_xml = remove_tag_block(xml, "Filter");
     let prefix = tag_text_in(&top_level_xml, "Prefix").unwrap_or_default();
 
-    let expiration_xml = tag_block(xml, "Expiration").ok_or(LifecycleParseError::Malformed)?;
-    let days = match tag_text_in(&expiration_xml, "Days") {
-        Some(value) => {
-            let parsed = value
-                .parse::<i64>()
-                .map_err(|_| LifecycleParseError::Malformed)?;
-            if parsed < 0 {
+    let expiration = if let Some(expiration_xml) = tag_block(xml, "Expiration") {
+        let days = match tag_text_in(&expiration_xml, "Days") {
+            Some(value) => {
+                let parsed = value
+                    .parse::<i64>()
+                    .map_err(|_| LifecycleParseError::Malformed)?;
+                if parsed < 0 {
+                    return Err(LifecycleParseError::Malformed);
+                }
+                Some(parsed)
+            }
+            None => None,
+        };
+        let date = tag_text_in(&expiration_xml, "Date").unwrap_or_default();
+        if !date.is_empty() && parse_lifecycle_date(&date).is_none() {
+            return Err(LifecycleParseError::Malformed);
+        }
+        let expired_object_delete_marker =
+            match tag_text_in(&expiration_xml, "ExpiredObjectDeleteMarker") {
+                Some(v) if v == "true" => Some(true),
+                Some(v) if v == "false" => Some(false),
+                Some(_) => return Err(LifecycleParseError::Malformed),
+                None => None,
+            };
+        let has_days_or_date = days.is_some() || !date.trim().is_empty();
+        if (!has_days_or_date && expired_object_delete_marker.is_none())
+            || (has_days_or_date && expired_object_delete_marker.is_some())
+        {
+            return Err(LifecycleParseError::Malformed);
+        }
+        LifecycleExpiration {
+            days,
+            date,
+            expired_object_delete_marker,
+        }
+    } else {
+        LifecycleExpiration::default()
+    };
+
+    let mut transitions = Vec::new();
+    for tr_xml in tag_blocks(xml, "Transition") {
+        let days = match tag_text_in(&tr_xml, "Days") {
+            Some(v) => {
+                let parsed = v
+                    .parse::<i64>()
+                    .map_err(|_| LifecycleParseError::Malformed)?;
+                if parsed < 0 {
+                    return Err(LifecycleParseError::Malformed);
+                }
+                Some(parsed)
+            }
+            None => None,
+        };
+        let date = tag_text_in(&tr_xml, "Date").unwrap_or_default();
+        if !date.is_empty() && parse_lifecycle_date(&date).is_none() {
+            return Err(LifecycleParseError::Malformed);
+        }
+        let storage_class =
+            tag_text_in(&tr_xml, "StorageClass").ok_or(LifecycleParseError::Malformed)?;
+        if !supported_lifecycle_storage_class(&storage_class)
+            || (days.is_none() && date.trim().is_empty())
+        {
+            return Err(LifecycleParseError::Malformed);
+        }
+        transitions.push(LifecycleTransition {
+            days,
+            date,
+            storage_class,
+        });
+    }
+
+    let noncurrent_version_expiration =
+        if let Some(ncv_xml) = tag_block(xml, "NoncurrentVersionExpiration") {
+            let noncurrent_days = match tag_text_in(&ncv_xml, "NoncurrentDays") {
+                Some(v) => {
+                    let parsed = v
+                        .parse::<i64>()
+                        .map_err(|_| LifecycleParseError::Malformed)?;
+                    if parsed < 0 {
+                        return Err(LifecycleParseError::Malformed);
+                    }
+                    Some(parsed)
+                }
+                None => None,
+            };
+            let newer_noncurrent_versions = match tag_text_in(&ncv_xml, "NewerNoncurrentVersions") {
+                Some(v) => {
+                    let parsed = v
+                        .parse::<i64>()
+                        .map_err(|_| LifecycleParseError::Malformed)?;
+                    if parsed <= 0 {
+                        return Err(LifecycleParseError::Malformed);
+                    }
+                    Some(parsed)
+                }
+                None => None,
+            };
+            if noncurrent_days.is_none() {
                 return Err(LifecycleParseError::Malformed);
             }
-            Some(parsed)
+            Some(LifecycleNoncurrentVersionExpiration {
+                noncurrent_days,
+                newer_noncurrent_versions,
+            })
+        } else {
+            None
+        };
+
+    let mut noncurrent_version_transitions = Vec::new();
+    for tr_xml in tag_blocks(xml, "NoncurrentVersionTransition") {
+        let noncurrent_days = match tag_text_in(&tr_xml, "NoncurrentDays") {
+            Some(v) => {
+                let parsed = v
+                    .parse::<i64>()
+                    .map_err(|_| LifecycleParseError::Malformed)?;
+                if parsed < 0 {
+                    return Err(LifecycleParseError::Malformed);
+                }
+                Some(parsed)
+            }
+            None => None,
+        };
+        let newer_noncurrent_versions = match tag_text_in(&tr_xml, "NewerNoncurrentVersions") {
+            Some(v) => {
+                let parsed = v
+                    .parse::<i64>()
+                    .map_err(|_| LifecycleParseError::Malformed)?;
+                if parsed <= 0 {
+                    return Err(LifecycleParseError::Malformed);
+                }
+                Some(parsed)
+            }
+            None => None,
+        };
+        let storage_class =
+            tag_text_in(&tr_xml, "StorageClass").ok_or(LifecycleParseError::Malformed)?;
+        if noncurrent_days.is_none() || !supported_lifecycle_storage_class(&storage_class) {
+            return Err(LifecycleParseError::Malformed);
         }
-        None => None,
-    };
-    let date = tag_text_in(&expiration_xml, "Date").unwrap_or_default();
-    if days.is_none() && date.trim().is_empty() {
-        return Err(LifecycleParseError::Malformed);
+        noncurrent_version_transitions.push(LifecycleNoncurrentVersionTransition {
+            noncurrent_days,
+            newer_noncurrent_versions,
+            storage_class,
+        });
     }
-    if !date.is_empty() && parse_lifecycle_date(&date).is_none() {
+
+    let abort_incomplete_multipart_upload =
+        if let Some(abort_xml) = tag_block(xml, "AbortIncompleteMultipartUpload") {
+            let days = tag_text_in(&abort_xml, "DaysAfterInitiation")
+                .and_then(|v| v.parse::<i64>().ok())
+                .filter(|&d| d > 0)
+                .ok_or(LifecycleParseError::Malformed)?;
+            Some(LifecycleAbortIncompleteMultipartUpload {
+                days_after_initiation: days,
+            })
+        } else {
+            None
+        };
+
+    let has_expiration = expiration.days.is_some()
+        || !expiration.date.is_empty()
+        || expiration.expired_object_delete_marker.is_some();
+    if !has_expiration
+        && transitions.is_empty()
+        && noncurrent_version_expiration.is_none()
+        && noncurrent_version_transitions.is_empty()
+        && abort_incomplete_multipart_upload.is_none()
+    {
         return Err(LifecycleParseError::Malformed);
     }
 
@@ -3964,8 +4288,24 @@ fn parse_lifecycle_rule(xml: &str) -> std::result::Result<LifecycleRule, Lifecyc
             prefix: filter_prefix,
         },
         status,
-        expiration: LifecycleExpiration { days, date },
+        expiration,
+        transitions,
+        noncurrent_version_expiration,
+        noncurrent_version_transitions,
+        abort_incomplete_multipart_upload,
     })
+}
+
+fn supported_lifecycle_storage_class(value: &str) -> bool {
+    matches!(
+        value,
+        "STANDARD_IA"
+            | "ONEZONE_IA"
+            | "INTELLIGENT_TIERING"
+            | "GLACIER"
+            | "GLACIER_IR"
+            | "DEEP_ARCHIVE"
+    )
 }
 
 fn tag_block(xml: &str, tag: &str) -> Option<String> {
@@ -4024,7 +4364,7 @@ fn remove_tag_block(xml: &str, tag: &str) -> String {
     out
 }
 
-fn parse_path_style(path: &str) -> Option<(String, String)> {
+pub(crate) fn parse_path_style(path: &str) -> Option<(String, String)> {
     let trimmed = path.strip_prefix('/').unwrap_or(path);
     if trimmed.is_empty() {
         return None;

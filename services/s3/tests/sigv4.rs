@@ -621,3 +621,287 @@ fn presigned_urls_enforce_signature_and_time_window() {
         "AccessDenied"
     );
 }
+
+fn hmac_sha1_test(key: &[u8], data: &[u8]) -> [u8; 20] {
+    fn sha1(data: &[u8]) -> [u8; 20] {
+        let mut h: [u32; 5] = [
+            0x6745_2301,
+            0xEFCD_AB89,
+            0x98BA_DCFE,
+            0x1032_5476,
+            0xC3D2_E1F0,
+        ];
+        let bit_len = (data.len() as u64).wrapping_mul(8);
+        let mut padded = data.to_vec();
+        padded.push(0x80);
+        while padded.len() % 64 != 56 {
+            padded.push(0);
+        }
+        padded.extend_from_slice(&bit_len.to_be_bytes());
+        let mut w = [0u32; 80];
+        for chunk in padded.chunks_exact(64) {
+            for (i, word) in w[..16].iter_mut().enumerate() {
+                *word = u32::from_be_bytes(chunk[i * 4..i * 4 + 4].try_into().unwrap());
+            }
+            for i in 16..80 {
+                w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
+            }
+            let [mut a, mut b, mut c, mut d, mut e] = h;
+            for (i, &wi) in w.iter().enumerate() {
+                let (f, k) = match i {
+                    0..=19 => ((b & c) | ((!b) & d), 0x5A82_7999u32),
+                    20..=39 => (b ^ c ^ d, 0x6ED9_EBA1u32),
+                    40..=59 => ((b & c) | (b & d) | (c & d), 0x8F1B_BCDCu32),
+                    _ => (b ^ c ^ d, 0xCA62_C1D6u32),
+                };
+                let temp = a
+                    .rotate_left(5)
+                    .wrapping_add(f)
+                    .wrapping_add(e)
+                    .wrapping_add(k)
+                    .wrapping_add(wi);
+                e = d;
+                d = c;
+                c = b.rotate_left(30);
+                b = a;
+                a = temp;
+            }
+            h[0] = h[0].wrapping_add(a);
+            h[1] = h[1].wrapping_add(b);
+            h[2] = h[2].wrapping_add(c);
+            h[3] = h[3].wrapping_add(d);
+            h[4] = h[4].wrapping_add(e);
+        }
+        let mut out = [0u8; 20];
+        for (i, word) in h.iter().enumerate() {
+            out[i * 4..i * 4 + 4].copy_from_slice(&word.to_be_bytes());
+        }
+        out
+    }
+    let mut k = [0u8; 64];
+    if key.len() > 64 {
+        k[..20].copy_from_slice(&sha1(key));
+    } else {
+        k[..key.len()].copy_from_slice(key);
+    }
+    let mut inner: Vec<u8> = k.iter().map(|b| b ^ 0x36).collect();
+    inner.extend_from_slice(data);
+    let inner_hash = sha1(&inner);
+    let mut outer: Vec<u8> = k.iter().map(|b| b ^ 0x5c).collect();
+    outer.extend_from_slice(&inner_hash);
+    sha1(&outer)
+}
+
+fn sign_sigv2(
+    method: &str,
+    target: &str,
+    body: &[u8],
+    unix: i64,
+    extra_amz: &[(&str, &str)],
+) -> Request {
+    let date = amz_date(unix);
+    let mut req = Request::new(method, target, body.to_vec());
+    req.headers.insert("x-amz-date".to_string(), date);
+    for (k, v) in extra_amz {
+        req.headers.insert((*k).to_string(), (*v).to_string());
+    }
+    let mut amz_lines = String::new();
+    for (k, v) in &req.headers {
+        if k.starts_with("x-amz-") {
+            amz_lines.push_str(&format!("{k}:{v}\n"));
+        }
+    }
+    let canonical_resource = target.to_string();
+    let sts = format!("{method}\n\n\n\n{amz_lines}{canonical_resource}");
+    let sig = devcloud_s3::base64::std_encode(&hmac_sha1_test(SECRET.as_bytes(), sts.as_bytes()));
+    req.headers
+        .insert("authorization".to_string(), format!("AWS test-key:{sig}"));
+    req
+}
+
+#[test]
+fn sigv2_header_and_presigned_urls_verify_and_reject_tampering() {
+    let store = store();
+    let auth = auth();
+
+    let put = sign_sigv2("PUT", "/data/v2.txt", b"hello v2", now(), &[]);
+    assert_eq!(route_with_auth(&store, &put, &auth).status, 200);
+
+    let get = sign_sigv2("GET", "/data/v2.txt", b"", now(), &[]);
+    let got = route_with_auth(&store, &get, &auth);
+    assert_eq!(got.status, 200);
+    assert_eq!(got.body, b"hello v2");
+
+    // Subresource signing (?acl).
+    let acl = sign_sigv2("GET", "/data/v2.txt?acl", b"", now(), &[]);
+    assert_eq!(route_with_auth(&store, &acl, &auth).status, 200);
+
+    // Skewed timestamp is rejected.
+    let stale = sign_sigv2("GET", "/data/v2.txt", b"", now() - 1000, &[]);
+    let stale_resp = route_with_auth(&store, &stale, &auth);
+    assert_eq!(stale_resp.status, 403);
+    assert_eq!(code(&stale_resp), "RequestTimeTooSkewed");
+
+    // Tampered path fails signature match.
+    let mut tampered = sign_sigv2("GET", "/data/v2.txt", b"", now(), &[]);
+    tampered.path = "/data/other.txt".to_string();
+    assert_eq!(
+        code(&route_with_auth(&store, &tampered, &auth)),
+        "SignatureDoesNotMatch"
+    );
+
+    // Unknown access key is rejected.
+    let mut bad_key = sign_sigv2("GET", "/data/v2.txt", b"", now(), &[]);
+    bad_key.headers.insert(
+        "authorization".to_string(),
+        bad_key.headers["authorization"].replace("test-key", "other-key"),
+    );
+    assert_eq!(
+        code(&route_with_auth(&store, &bad_key, &auth)),
+        "InvalidAccessKeyId"
+    );
+
+    // Query-string presigned SigV2 URL.
+    let expires = now() + 300;
+    let sts = format!("GET\n\n\n{expires}\n/data/v2.txt");
+    let sig = devcloud_s3::base64::std_encode(&hmac_sha1_test(SECRET.as_bytes(), sts.as_bytes()));
+    let presigned = Request::new(
+        "GET",
+        &format!(
+            "/data/v2.txt?AWSAccessKeyId=test-key&Expires={expires}&Signature={}",
+            aws_percent_encode(&sig, "")
+        ),
+        Vec::new(),
+    );
+    let presigned_resp = route_with_auth(&store, &presigned, &auth);
+    assert_eq!(presigned_resp.status, 200);
+    assert_eq!(presigned_resp.body, b"hello v2");
+
+    // Expired SigV2 presigned URL is rejected.
+    let expired_ts = now() - 10;
+    let expired_sts = format!("GET\n\n\n{expired_ts}\n/data/v2.txt");
+    let expired_sig =
+        devcloud_s3::base64::std_encode(&hmac_sha1_test(SECRET.as_bytes(), expired_sts.as_bytes()));
+    let expired_req = Request::new(
+        "GET",
+        &format!(
+            "/data/v2.txt?AWSAccessKeyId=test-key&Expires={expired_ts}&Signature={}",
+            aws_percent_encode(&expired_sig, "")
+        ),
+        Vec::new(),
+    );
+    assert_eq!(route_with_auth(&store, &expired_req, &auth).status, 403);
+}
+
+fn sign_sigv4a(method: &str, target: &str, body: &[u8], region_set: &str, unix: i64) -> Request {
+    let date = amz_date(unix);
+    let date_stamp = &date[..8];
+    let payload_hash = sha256_hex(body);
+    let mut req = Request::new(method, target, body.to_vec());
+    req.headers
+        .insert("host".to_string(), "s3.test:9000".to_string());
+    req.headers.insert("x-amz-date".to_string(), date.clone());
+    req.headers
+        .insert("x-amz-content-sha256".to_string(), payload_hash.clone());
+    req.headers
+        .insert("x-amz-region-set".to_string(), region_set.to_string());
+    let signed_headers: String = req
+        .headers
+        .keys()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(";");
+    let canonical_headers: String = req
+        .headers
+        .iter()
+        .map(|(k, v)| format!("{k}:{v}\n"))
+        .collect();
+    let canonical_request = [
+        method,
+        target.split('?').next().unwrap(),
+        "",
+        &canonical_headers,
+        &signed_headers,
+        &payload_hash,
+    ]
+    .join("\n");
+    let scope = format!("{date_stamp}/s3/aws4_request");
+    let string_to_sign = format!(
+        "AWS4-ECDSA-P256-SHA256\n{date}\n{scope}\n{}",
+        sha256_hex(canonical_request.as_bytes())
+    );
+    let d = devcloud_s3::auth::derive_sigv4a_private_key("test-key", SECRET).unwrap();
+    let digest: [u8; 32] = Sha256::digest(string_to_sign.as_bytes()).into();
+    let z = devcloud_s3::auth::p256::U256::from_be_bytes(&digest);
+    let k = devcloud_s3::auth::p256::U256([0x1111, 0x2222, 0x3333, 0x4445]);
+    let sig_hex = hex::encode(devcloud_s3::auth::p256::ecdsa_sign_der_with_k(&d, &z, &k));
+    req.headers.insert(
+        "authorization".to_string(),
+        format!(
+            "AWS4-ECDSA-P256-SHA256 Credential=test-key/{scope}, SignedHeaders={signed_headers}, Signature={sig_hex}"
+        ),
+    );
+    req
+}
+
+#[test]
+fn sigv4a_header_and_presigned_urls_verify_and_enforce_region_set() {
+    let store = store();
+    let auth = auth();
+
+    let put = sign_sigv4a("PUT", "/data/v4a.txt", b"hello v4a", "*", now());
+    assert_eq!(route_with_auth(&store, &put, &auth).status, 200);
+
+    let get = sign_sigv4a("GET", "/data/v4a.txt", b"", "us-west-2,us-east-1", now());
+    let got = route_with_auth(&store, &get, &auth);
+    assert_eq!(got.status, 200);
+    assert_eq!(got.body, b"hello v4a");
+
+    // Region set not matching configured region is rejected.
+    let wrong_region = sign_sigv4a("GET", "/data/v4a.txt", b"", "eu-west-1", now());
+    assert_eq!(
+        code(&route_with_auth(&store, &wrong_region, &auth)),
+        "AuthorizationHeaderMalformed"
+    );
+
+    // Tampered path fails ECDSA verification.
+    let mut tampered = sign_sigv4a("GET", "/data/v4a.txt", b"", "*", now());
+    tampered.path = "/data/other.txt".to_string();
+    assert_eq!(
+        code(&route_with_auth(&store, &tampered, &auth)),
+        "SignatureDoesNotMatch"
+    );
+
+    // Presigned SigV4a URL.
+    let date = amz_date(now());
+    let date_stamp = &date[..8];
+    let scope = format!("{date_stamp}/s3/aws4_request");
+    let credential = format!("test-key/{scope}");
+    let query = format!(
+        "X-Amz-Algorithm=AWS4-ECDSA-P256-SHA256&X-Amz-Credential={}&X-Amz-Date={date}&X-Amz-Expires=300&X-Amz-Region-Set={}&X-Amz-SignedHeaders=host",
+        aws_percent_encode(&credential, ""),
+        aws_percent_encode("*", "")
+    );
+    let canonical_request =
+        format!("GET\n/data/v4a.txt\n{query}\nhost:s3.test:9000\n\nhost\nUNSIGNED-PAYLOAD");
+    let string_to_sign = format!(
+        "AWS4-ECDSA-P256-SHA256\n{date}\n{scope}\n{}",
+        sha256_hex(canonical_request.as_bytes())
+    );
+    let d = devcloud_s3::auth::derive_sigv4a_private_key("test-key", SECRET).unwrap();
+    let digest: [u8; 32] = Sha256::digest(string_to_sign.as_bytes()).into();
+    let z = devcloud_s3::auth::p256::U256::from_be_bytes(&digest);
+    let k = devcloud_s3::auth::p256::U256([0xaaaa, 0xbbbb, 0xcccc, 0xddd1]);
+    let sig_hex = hex::encode(devcloud_s3::auth::p256::ecdsa_sign_der_with_k(&d, &z, &k));
+    let mut presigned = Request::new(
+        "GET",
+        &format!("/data/v4a.txt?{query}&X-Amz-Signature={sig_hex}"),
+        Vec::new(),
+    );
+    presigned
+        .headers
+        .insert("host".to_string(), "s3.test:9000".to_string());
+    let resp = route_with_auth(&store, &presigned, &auth);
+    assert_eq!(resp.status, 200);
+    assert_eq!(resp.body, b"hello v4a");
+}
