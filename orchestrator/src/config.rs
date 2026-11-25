@@ -338,6 +338,7 @@ pub struct RedisServiceConfig {
     pub mode: String,
     pub binary_path: String,
     pub external_url: String,
+    pub external_tls_ca_file: String,
     pub data_dir: String,
     pub max_memory_mb: i32,
     pub append_only: bool,
@@ -622,6 +623,7 @@ pub fn default_config() -> Config {
                 mode: "managed".to_string(),
                 binary_path: String::new(),
                 external_url: String::new(),
+                external_tls_ca_file: String::new(),
                 data_dir: "redis".to_string(),
                 max_memory_mb: 256,
                 append_only: false,
@@ -1157,6 +1159,9 @@ pub fn apply_config_value(cfg: &mut Config, path: &[String], value: &str) -> io:
         "services.redis.binaryPath" => cfg.services.redis.binary_path = value.to_string(),
         "services.redis.externalUrl" | "services.redis.externalURL" => {
             cfg.services.redis.external_url = value.to_string()
+        }
+        "services.redis.externalTlsCaFile" => {
+            cfg.services.redis.external_tls_ca_file = trim_quotes(value)
         }
         "services.redis.dataDir" => cfg.services.redis.data_dir = value.to_string(),
         "services.redis.maxMemoryMB" => {
@@ -1698,6 +1703,7 @@ pub fn default_config_yaml(cfg: &Config) -> String {
             "    mode: {redis_mode}\n",
             "    binaryPath: {redis_binary_path}\n",
             "    externalUrl: {redis_external_url}\n",
+            "    externalTlsCaFile: {redis_external_tls_ca_file}\n",
             "    dataDir: {redis_data_dir}\n",
             "    maxMemoryMB: {redis_max_memory_mb}\n",
             "    appendOnly: {redis_append_only}\n",
@@ -1870,6 +1876,7 @@ pub fn default_config_yaml(cfg: &Config) -> String {
         redis_mode = redis_mode(redis),
         redis_binary_path = redis.binary_path,
         redis_external_url = redis.external_url,
+        redis_external_tls_ca_file = redis.external_tls_ca_file,
         redis_data_dir = default_string(&redis.data_dir, "redis"),
         redis_max_memory_mb = redis.max_memory_mb,
         redis_append_only = fmt_bool(redis.append_only),
@@ -2357,6 +2364,16 @@ mod tests {
         parsed.services.pubsub.data_dir = cfg.services.pubsub.data_dir.clone();
         parsed.services.pubsub.message_data_dir = cfg.services.pubsub.message_data_dir.clone();
         assert_eq!(parsed, cfg);
+    }
+
+    #[test]
+    fn external_redis_tls_settings_round_trip() {
+        let mut cfg = default_config();
+        cfg.services.redis.mode = "external".into();
+        cfg.services.redis.external_url = "rediss://localhost:6380/3".into();
+        cfg.services.redis.external_tls_ca_file = "certs/redis-ca.pem".into();
+        let parsed = parse_yaml_in_memory(&default_config_yaml(&cfg)).unwrap();
+        assert_eq!(parsed.services.redis, cfg.services.redis);
     }
 
     #[test]

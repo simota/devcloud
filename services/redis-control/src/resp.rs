@@ -1,11 +1,4 @@
-//! Minimal hand-rolled RESP2 client over a tokio `TcpStream`.
-//!
-//! The legacy reference (`internal/services/redis/server.rs`) is a CLIENT of the
-//! upstream `redis-server` via the Redis client library. There is no Rust RESP
-//! client in the workspace, so this hand-rolls RESP2 the same way the redshift
-//! backend hand-rolls a pgwire client (`devcloud-redshift`
-//! `src/backend_postgres.rs`): a std-first wire client on a single tokio
-//! `TcpStream`, no third-party redis crate.
+//! Minimal hand-rolled RESP2 client over TCP or TLS.
 //!
 //! Only the subset the control surface needs is implemented: connect (+ optional
 //! `AUTH` and `SELECT`), command send as a RESP array of bulk strings, and reply
@@ -16,11 +9,16 @@
 //! or any command arguments or values — the audit discipline lives in `http.rs`
 //! (`audit_mutation`: command + key only).
 
+use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use rustls_pki_types::{pem::PemObject, CertificateDer, ServerName};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
+use tokio_rustls::rustls::{self, ClientConfig, RootCertStore};
+use tokio_rustls::TlsConnector;
 
 /// Matches the Redis client dial/read/write timeouts the legacy `newClientForDB` sets
 /// (2s each). Applied to connect and to every command round-trip.
@@ -56,34 +54,108 @@ impl Value {
     }
 }
 
-/// A single RESP2 connection. Owns the `TcpStream` after a completed handshake
+#[derive(Clone)]
+pub struct Upstream {
+    pub addr: String,
+    pub username: String,
+    pub password: String,
+    tls: Option<(ServerName<'static>, TlsConnector)>,
+}
+
+impl Upstream {
+    pub fn new(addr: String, username: String, password: String) -> Self {
+        Self {
+            addr,
+            username,
+            password,
+            tls: None,
+        }
+    }
+
+    /// Verify the URL host against the peer certificate and trust the supplied PEM roots.
+    pub fn enable_tls(&mut self, ca_file: &Path) -> Result<(), String> {
+        let host = self
+            .addr
+            .rsplit_once(':')
+            .map(|(host, _)| host.trim_matches(['[', ']']))
+            .ok_or("redis TLS requires a host and port")?;
+        let server_name =
+            ServerName::try_from(host.to_owned()).map_err(|_| "invalid redis TLS server name")?;
+        let certs =
+            CertificateDer::pem_file_iter(ca_file).map_err(|_| "cannot open Redis TLS CA file")?;
+        let mut roots = RootCertStore::empty();
+        for cert in certs {
+            roots
+                .add(cert.map_err(|_| "invalid PEM in Redis TLS CA file")?)
+                .map_err(|_| "invalid certificate in Redis TLS CA file")?;
+        }
+        if roots.is_empty() {
+            return Err("Redis TLS CA file has no certificates".into());
+        }
+        let config =
+            ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                .with_safe_default_protocol_versions()
+                .map_err(|_| "cannot configure Redis TLS protocol versions")?
+                .with_root_certificates(roots)
+                .with_no_client_auth();
+        self.tls = Some((server_name, TlsConnector::from(Arc::new(config))));
+        Ok(())
+    }
+}
+
+trait RespStream: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> RespStream for T {}
+
+/// A single RESP2 connection. Owns the stream after a completed handshake
 /// (AUTH + SELECT). One connection is opened per redis database, mirroring the
 /// legacy `dbClients` map keyed by db index.
 pub struct RespConn {
-    stream: TcpStream,
+    stream: Box<dyn RespStream>,
 }
 
 impl RespConn {
-    /// Connects to `addr` (host:port), then issues `AUTH` when a password is set
-    /// and `SELECT db`. Mirrors Redis client `Options{Addr, Password, DB}`.
-    pub async fn connect(addr: &str, password: &str, db: i64) -> Result<RespConn, String> {
-        let stream = timeout(IO_TIMEOUT, TcpStream::connect(addr))
+    /// Connects, negotiates TLS when configured, then authenticates and selects the DB.
+    pub async fn connect(upstream: &Upstream, db: i64) -> Result<RespConn, String> {
+        let tcp = timeout(IO_TIMEOUT, TcpStream::connect(&upstream.addr))
             .await
             .map_err(|_| "connect redis: timed out".to_string())?
             .map_err(|e| format!("connect redis: {e}"))?;
+        let stream: Box<dyn RespStream> = if let Some((name, connector)) = &upstream.tls {
+            let tls = timeout(IO_TIMEOUT, connector.connect(name.clone(), tcp))
+                .await
+                .map_err(|_| "redis TLS handshake: timed out")?
+                .map_err(|e| format!("redis TLS handshake: {e}"))?;
+            Box::new(tls)
+        } else {
+            Box::new(tcp)
+        };
         let mut conn = RespConn { stream };
-        if !password.is_empty() {
-            // AUTH carries the password as a bulk-string argument; it is never
-            // logged here or anywhere in the crate.
-            conn.command(&["AUTH", password]).await?;
+        if !upstream.username.is_empty() {
+            conn.expect_reply(&["AUTH", &upstream.username, &upstream.password], "OK")
+                .await?;
+        } else if !upstream.password.is_empty() {
+            conn.expect_reply(&["AUTH", &upstream.password], "OK")
+                .await?;
         }
         if db != 0 {
-            conn.command(&["SELECT", &db.to_string()]).await?;
+            conn.expect_reply(&["SELECT", &db.to_string()], "OK")
+                .await?;
         } else {
-            // PING confirms liveness even on db 0 (legacy Run pings after connect).
-            conn.command(&["PING"]).await?;
+            conn.ping().await?;
         }
         Ok(conn)
+    }
+
+    pub async fn ping(&mut self) -> Result<(), String> {
+        self.expect_reply(&["PING"], "PONG").await
+    }
+
+    async fn expect_reply(&mut self, args: &[&str], expected: &str) -> Result<(), String> {
+        match self.command(args).await {
+            Ok(Value::Simple(reply)) if reply == expected => Ok(()),
+            // An upstream can include credentials in a handshake error.
+            _ => Err(format!("redis {} failed", args[0])),
+        }
     }
 
     /// Sends a command as a RESP array of bulk strings and reads one reply.
@@ -211,6 +283,8 @@ impl RespConn {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::net::TcpListener;
+    use tokio_rustls::{rustls::ServerConfig, TlsAcceptor};
 
     #[test]
     fn value_as_text_renders_scalars() {
@@ -222,5 +296,70 @@ mod tests {
         );
         assert_eq!(Value::Bulk(None).as_text(), None);
         assert_eq!(Value::Array(None).as_text(), None);
+    }
+
+    #[tokio::test]
+    async fn acl_auth_sends_username_and_password_and_sanitizes_upstream_errors() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream = Upstream::new(
+            listener.local_addr().unwrap().to_string(),
+            "reader".into(),
+            "test-password".into(),
+        );
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            const EXPECTED: &[u8] = b"*3\r\n$4\r\nAUTH\r\n$6\r\nreader\r\n$13\r\ntest-password\r\n";
+            let mut received = [0; EXPECTED.len()];
+            stream.read_exact(&mut received).await.unwrap();
+            assert!(received == EXPECTED, "expected ACL authentication frame");
+            stream
+                .write_all(b"-WRONGPASS reader test-password\r\n")
+                .await
+                .unwrap();
+        });
+        assert_eq!(
+            crate::validate_upstream(&upstream, 1).await.unwrap_err(),
+            "redis AUTH failed"
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn tls_rejects_an_untrusted_certificate_and_a_wrong_hostname() {
+        let directory = tempfile::tempdir().unwrap();
+        let ca_file = directory.path().join("redis-ca.pem");
+        for trusted in [false, true] {
+            let names = if trusted { "localhost" } else { "127.0.0.1" };
+            let cert = rcgen::generate_simple_self_signed(vec![names.into()]).unwrap();
+            let unrelated = rcgen::generate_simple_self_signed(vec![names.into()]).unwrap();
+            let root = if trusted { &cert.cert } else { &unrelated.cert };
+            std::fs::write(&ca_file, root.pem()).unwrap();
+            let config = ServerConfig::builder_with_provider(Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![cert.cert.der().clone()],
+                rustls_pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der()).into(),
+            )
+            .unwrap();
+            let acceptor = TlsAcceptor::from(Arc::new(config));
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut upstream = Upstream::new(
+                listener.local_addr().unwrap().to_string(),
+                "reader".into(),
+                "test-password".into(),
+            );
+            upstream.enable_tls(&ca_file).unwrap();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                assert!(acceptor.accept(stream).await.is_err());
+            });
+            let error = crate::validate_upstream(&upstream, 0).await.unwrap_err();
+            assert!(error.starts_with("redis TLS handshake:"), "{error}");
+            server.await.unwrap();
+        }
     }
 }

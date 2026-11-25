@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use crate::command_allowlist::{command_allowed, CommandClass};
-use crate::resp::{RespConn, Value};
+use crate::resp::{RespConn, Upstream, Value};
 
 /// Default database count when redis does not report `databases` via CONFIG GET,
 /// mirroring `defaultDatabaseCount`.
@@ -75,11 +75,8 @@ pub struct CommandResult {
 pub const ERR_COMMAND_NOT_ALLOWED: &str = "redis command is not allowlisted";
 
 /// The control server's client over the upstream redis, mirroring `*Server`.
-/// `mode`/`address` are display-only (the dashboard status fields); the data
-/// plane connection target is `addr` + `password`.
 pub struct Server {
-    addr: String,
-    password: String,
+    upstream: Upstream,
     mode: String,
     state: Mutex<State>,
     /// Emits a `redis.command.mutation` event carrying command + optional key,
@@ -98,8 +95,7 @@ impl Server {
     /// status response (`managed`/`external` and the redis address). `emit` is
     /// invoked on every mutation with `(command, key)` — `key` empty when none.
     pub fn new(
-        addr: String,
-        password: String,
+        upstream: Upstream,
         mode: String,
         database_count: i64,
         emit: Box<dyn Fn(&str, &str) + Send + Sync>,
@@ -110,8 +106,7 @@ impl Server {
             DEFAULT_DATABASE_COUNT
         };
         Server {
-            addr,
-            password,
+            upstream,
             mode,
             state: Mutex::new(State {
                 clients: HashMap::new(),
@@ -133,7 +128,7 @@ impl Server {
     /// On first connect, refreshes `database_count` from `CONFIG GET databases`
     /// (mirrors legacy Run). Best-effort: a failure leaves the default in place.
     pub async fn refresh_database_count(&self) {
-        let mut conn = match RespConn::connect(&self.addr, &self.password, 0).await {
+        let mut conn = match RespConn::connect(&self.upstream, 0).await {
             Ok(conn) => conn,
             Err(_) => return,
         };
@@ -154,7 +149,7 @@ impl Server {
     /// Runs `op` with a mutable borrow of the connection for `db`, opening and
     /// caching it on first use (mirrors `ensureClientForDB` + `currentClient`).
     ///
-    /// A tokio `TcpStream` is held across the await, so the connection cannot be
+    /// The stream is held across the await, so the connection cannot be
     /// stored behind the std `Mutex` while awaiting. Instead the connection is
     /// taken out of the map for the duration of the call and returned after,
     /// which also serializes access per db (matching Redis client' single-conn use
@@ -167,7 +162,7 @@ impl Server {
         let existing = self.state.lock().unwrap().clients.remove(&db);
         let conn = match existing {
             Some(conn) => conn,
-            None => RespConn::connect(&self.addr, &self.password, db).await?,
+            None => RespConn::connect(&self.upstream, db).await?,
         };
         let (conn, result) = op(conn).await;
         // Only re-cache a healthy connection; on error drop it so the next call
@@ -187,7 +182,7 @@ impl Server {
         };
         let mut status = Status {
             mode: self.mode.clone(),
-            address: self.addr.clone(),
+            address: self.upstream.addr.clone(),
             current_db,
             database_count,
             ..Default::default()

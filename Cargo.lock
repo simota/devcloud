@@ -362,9 +362,11 @@ dependencies = [
  "devcloud-sqs",
  "devcloud-ssm",
  "devcloud-sts",
+ "rcgen",
  "serde",
  "serde_json",
  "tokio",
+ "tokio-rustls",
  "tonic",
 ]
 
@@ -395,9 +397,13 @@ dependencies = [
 name = "devcloud-redis-control"
 version = "0.1.0"
 dependencies = [
+ "rcgen",
+ "rustls-pki-types",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
+ "tokio-rustls",
 ]
 
 [[package]]

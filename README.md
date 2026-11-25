@@ -481,12 +481,12 @@ Pub/Sub dashboard actions are available under `/dashboard/pubsub`:
 | Feature | Status | Notes |
 | --- | --- | --- |
 | Redis wire endpoint | Yes | Uses a real `redis-server` child process in managed mode; devcloud does not re-implement RESP. |
-| External Redis mode | Yes | `services.redis.mode: external` accepts `redis://[:password@]host[:port][/db]`, validates `AUTH`/`SELECT`/`PING`, and uses that target for dashboard commands. Credentials are omitted from the displayed endpoint. TLS and non-default ACL users are not supported. |
+| External Redis mode | Yes | Set `services.redis.mode: external` and `services.redis.externalUrl` to `redis://host[:port][/db]` or `rediss://host[:port][/db]`. For TLS, set `services.redis.externalTlsCaFile` to a PEM trust bundle. Devcloud verifies the certificate chain and URL hostname or IP. Startup validates the connection, authentication, and selected database. The dashboard uses the same target and displays the URL without credentials. |
 | Managed persistence | Yes | Runtime data is kept under `.devcloud/data/redis` by default. |
 | String/hash/list/set/zset inspection | Partial | `/dashboard/redis` lists keys with SCAN and shows type-specific previews. |
 | Command runner | Partial | Dashboard commands are restricted to the Redis allowlist in `docs/design-redis-compat.md`. |
 | Destructive actions | Partial | Key delete, expire, and guarded `FLUSHDB` are supported; `FLUSHALL` and unsafe commands are rejected. |
-| Redis AUTH | Partial | Relaxed mode does not set `requirepass`; strict mode passes the configured password to managed Redis. |
+| Redis AUTH | Yes | In managed mode, strict auth configures `requirepass` and relaxed mode leaves it unset. For external Redis, put `:password@` (or `default:password@`) before the host for password-only AUTH, or `username:password@` for a non-default ACL user. Percent-encode special characters in URL credentials. Upstream credentials apply in both HTTP auth modes. |
 | HTTP API authentication | Partial | Strict mode protects the Redis control API with the configured Redis Basic credentials; the dashboard forwards those credentials for reads and mutations. |
 | Browser guards | Yes | Direct introspection/control HTTP endpoints reject public DNS Host names and cross-site mutations, using the Dashboard API host allowlist. SDK/CLI requests without Origin remain supported. |
 | Cluster, Sentinel, modules, RedisJSON, RediSearch | No | Out of local compatibility scope. |

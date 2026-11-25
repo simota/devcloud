@@ -2,9 +2,7 @@
 //! `internal/services/redis` (`http.rs` + `server.rs`).
 //!
 //! The legacy server is a CLIENT of the upstream `redis-server` via Redis client; here
-//! the RESP client is hand-rolled over tokio TCP (precedent: the redshift pgwire
-//! client in `devcloud-redshift`), keeping the crate std-first with deps limited
-//! to tokio/serde/serde_json.
+//! the RESP client is hand-rolled over tokio TCP with optional rustls transport.
 //!
 //! IMPORTANT asymmetry (carried from the legacy comment): this listener stays in the
 //! single binary even under the Rust redis engine — the redis *data plane* is
@@ -34,6 +32,7 @@ mod resp;
 mod server;
 
 pub use command_allowlist::CommandClass;
+pub use resp::Upstream;
 
 /// Configuration for the redis control surface, mirroring the inputs legacy
 /// `HTTPConfig` + `Config` carry. The orchestrator builds this from its own
@@ -42,21 +41,18 @@ pub use command_allowlist::CommandClass;
 /// | field            | orchestrator source                                  |
 /// |------------------|------------------------------------------------------|
 /// | `http_addr`      | loopback + `cfg.server.redis_http_port`              |
-/// | `redis_addr`     | managed loopback or external URL host/port          |
-/// | `redis_password` | managed strict password or external URL password    |
+/// | `upstream`       | managed loopback or external URL connection settings  |
 /// | `control_auth_mode` | `cfg.auth.redis.mode` ("relaxed" | "strict")     |
 /// | `control_password`  | `cfg.auth.redis.password` for HTTP Basic             |
 /// | `mode`           | redis mode display string ("managed" | "external")  |
 /// | `initial_db`     | external URL database, otherwise 0                  |
 /// | `database_count` | 0 = probe via `CONFIG GET databases` (default 16)   |
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Config {
     /// `host:port` the control HTTP listener binds (loopback).
     pub http_addr: String,
-    /// `host:port` of the upstream redis data plane.
-    pub redis_addr: String,
-    /// Upstream redis password (sent via `AUTH`; never logged).
-    pub redis_password: String,
+    /// Connection settings for the upstream Redis data plane.
+    pub upstream: Upstream,
     /// Control-surface auth mode: "relaxed" (open) or "strict" (HTTP Basic).
     pub control_auth_mode: String,
     /// Control-surface password checked in strict mode (HTTP Basic). External
@@ -86,16 +82,19 @@ impl Config {
 /// Validates the configured external upstream with AUTH, SELECT and PING.
 /// Keeps the RESP transport private while allowing the orchestrator's external
 /// lifecycle to fail clearly when the configured endpoint is unavailable.
-pub async fn validate_upstream(addr: &str, password: &str, database: i64) -> Result<(), String> {
-    let mut conn = resp::RespConn::connect(addr, password, database).await?;
-    conn.command(&["PING"]).await.map(|_| ())
+pub async fn validate_upstream(upstream: &Upstream, database: i64) -> Result<(), String> {
+    let mut conn = resp::RespConn::connect(upstream, database).await?;
+    if database != 0 {
+        conn.ping().await?;
+    }
+    Ok(())
 }
 
 /// Runs the redis control/introspection HTTP surface until `shutdown` resolves.
 ///
 /// Binds `cfg.http_addr`, then serves only `/_introspect/` (reads) and
 /// `/_control/` (mutations + Exec) over a hand-rolled HTTP/1.1 transport. Every
-/// operation is a thin transport over the RESP client against `cfg.redis_addr`,
+/// operation is a thin transport over the RESP client against `cfg.upstream`,
 /// never any other path.
 pub async fn run(
     cfg: Config,
@@ -108,8 +107,7 @@ pub async fn run(
     let auth = cfg.auth();
     let emit = build_emitter(cfg.event_sink.clone());
     let server = Arc::new(server::Server::new(
-        cfg.redis_addr.clone(),
-        cfg.redis_password.clone(),
+        cfg.upstream,
         normalize_mode(&cfg.mode),
         cfg.database_count,
         emit,
