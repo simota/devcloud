@@ -87,10 +87,27 @@ async fn handle_conn(
     mut stream: TcpStream,
     server: std::sync::Arc<Mutex<Server>>,
 ) -> std::io::Result<()> {
-    let request = match read_request(&mut stream).await {
+    let mut request = match read_request(&mut stream).await {
         Ok(Some(req)) => req,
         _ => return Ok(()),
     };
+    if crate::introspect::is_introspect_path(&request.path) {
+        let outcome = {
+            let guard = server.lock().unwrap();
+            crate::introspect::handle_introspect(&guard, &request.method, &request.path)
+        };
+        return write_introspect_response(&mut stream, outcome).await;
+    }
+    if request.method != "POST" && request.method != "GET" {
+        return write_json_response(
+            &mut stream,
+            JsonOutcome::error(405, "InvalidAction", "method is not supported"),
+        )
+        .await;
+    }
+    if let Err(outcome) = verify_and_decode(&server, &mut request) {
+        return write_outcome(&mut stream, outcome).await;
+    }
     // ReceiveMessage's long poll is handled separately from the generic
     // dispatch below: it must not hold the server lock for the whole wait
     // (see `long_poll_receive_message`).
@@ -110,11 +127,69 @@ async fn handle_conn(
         .await;
         return write_query_response(&mut stream, outcome).await;
     }
-    match process(&server, &request) {
-        Outcome::Json(outcome) => write_json_response(&mut stream, outcome).await,
-        Outcome::Introspect(outcome) => write_introspect_response(&mut stream, outcome).await,
-        Outcome::Query(outcome) => write_query_response(&mut stream, outcome).await,
+    write_outcome(&mut stream, process(&server, &request)).await
+}
+
+async fn write_outcome(stream: &mut TcpStream, outcome: Outcome) -> std::io::Result<()> {
+    match outcome {
+        Outcome::Json(outcome) => write_json_response(stream, outcome).await,
+        Outcome::Introspect(outcome) => write_introspect_response(stream, outcome).await,
+        Outcome::Query(outcome) => write_query_response(stream, outcome).await,
     }
+}
+
+fn verify_and_decode(server: &Mutex<Server>, req: &mut Request) -> Result<(), Outcome> {
+    let (auth_mode, access_key_id, secret_access_key, region) = {
+        let guard = server.lock().unwrap();
+        let cfg = guard.config();
+        (
+            cfg.auth_mode.clone(),
+            cfg.access_key_id.clone(),
+            cfg.secret_access_key.clone(),
+            cfg.region.clone(),
+        )
+    };
+    let is_json = req.header("x-amz-target").starts_with("AmazonSQS.")
+        || (req
+            .header("content-type")
+            .contains("application/x-amz-json-1.0")
+            && req.method == "POST");
+    let sig_error = |e: crate::sigv4::SignatureError| {
+        if is_json {
+            Outcome::Json(JsonOutcome::error(e.status, e.code, e.code))
+        } else {
+            Outcome::Query(QueryOutcome::error(e.status, e.code, e.code))
+        }
+    };
+    let header_fn = |name: &str| -> Option<String> { req.headers.get(name).cloned() };
+    let signed = crate::sigv4::SignedRequest {
+        method: &req.method,
+        path: &req.path,
+        query: &req.query,
+        host: req.header("host"),
+        authorization: req.header("authorization"),
+        amz_date: req.header("x-amz-date"),
+        content_sha256: req.header("x-amz-content-sha256"),
+        header: &header_fn,
+        body: &req.body,
+    };
+    let creds = crate::sigv4::Credentials {
+        auth_mode: &auth_mode,
+        access_key_id: &access_key_id,
+        secret_access_key: &secret_access_key,
+        region: &region,
+    };
+    crate::sigv4::verify_signature(&signed, &creds).map_err(sig_error)?;
+    if crate::sigv4::is_aws_chunked(
+        req.header("x-amz-content-sha256"),
+        req.header("content-encoding"),
+    ) {
+        let decoded =
+            crate::sigv4::decode_aws_chunked(&req.body, req.header("x-amz-decoded-content-length"))
+                .map_err(sig_error)?;
+        req.body = decoded;
+    }
+    Ok(())
 }
 
 /// True when `req` is exactly the JSON `ReceiveMessage` request that `process`

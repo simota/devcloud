@@ -13,7 +13,9 @@ use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::server::{Reply, Server};
-use crate::sigv4::{verify_signature, Credentials, SignedRequest};
+use crate::sigv4::{
+    decode_aws_chunked, is_aws_chunked, verify_signature, Credentials, SignedRequest,
+};
 
 const MAX_HEADER_BYTES: usize = 64 * 1024;
 /// Base64 inflates a 50 MiB package to ~67 MiB of JSON.
@@ -239,6 +241,19 @@ pub async fn process(server: &Arc<Server>, req: &Request) -> Reply {
         return reply;
     }
 
+    let decoded_body = if is_aws_chunked(
+        req.header("x-amz-content-sha256"),
+        req.header("content-encoding"),
+    ) {
+        match decode_aws_chunked(&req.body, req.header("x-amz-decoded-content-length")) {
+            Ok(b) => Some(b),
+            Err(e) => return Reply::error(e.status, e.name, e.name),
+        }
+    } else {
+        None
+    };
+    let body: &[u8] = decoded_body.as_deref().unwrap_or(&req.body);
+
     // Invocation log tails are handler output: signed like the API (the
     // dashboard signs its requests in strict mode).
     if let ("GET", ["_introspect", "invocations"]) = (req.method.as_str(), seg.as_slice()) {
@@ -250,7 +265,7 @@ pub async fn process(server: &Arc<Server>, req: &Request) -> Reply {
         ["2015-03-31", "functions"] | ["2015-03-31", "functions", ""] => match m {
             "GET" => server.list_functions(&query),
             "POST" => {
-                let body = req.body.clone();
+                let body = body.to_vec();
                 blocking(server, move |s| s.create_function(&body)).await
             }
             _ => method_not_allowed(),
@@ -262,12 +277,12 @@ pub async fn process(server: &Arc<Server>, req: &Request) -> Reply {
         },
         ["2015-03-31", "functions", id, "configuration"] => match m {
             "GET" => server.get_function_configuration(id, &query),
-            "PUT" => server.update_function_configuration(id, &req.body),
+            "PUT" => server.update_function_configuration(id, body),
             _ => method_not_allowed(),
         },
         ["2015-03-31", "functions", id, "code"] => match m {
             "PUT" => {
-                let (id, body) = (id.to_string(), req.body.clone());
+                let (id, body) = (id.to_string(), body.to_vec());
                 blocking(server, move |s| s.update_function_code(&id, &body)).await
             }
             _ => method_not_allowed(),
@@ -280,16 +295,16 @@ pub async fn process(server: &Arc<Server>, req: &Request) -> Reply {
                         &query,
                         req.header("x-amz-invocation-type"),
                         req.header("x-amz-log-type"),
-                        &req.body,
+                        body,
                     )
                     .await
             }
             _ => method_not_allowed(),
         },
         ["2021-10-31", "functions", id, "url"] => match m {
-            "POST" => server.create_function_url_config(id, &query, &req.body),
+            "POST" => server.create_function_url_config(id, &query, body),
             "GET" => server.get_function_url_config(id, &query),
-            "PUT" => server.update_function_url_config(id, &query, &req.body),
+            "PUT" => server.update_function_url_config(id, &query, body),
             "DELETE" => server.delete_function_url_config(id, &query),
             _ => method_not_allowed(),
         },
@@ -299,7 +314,7 @@ pub async fn process(server: &Arc<Server>, req: &Request) -> Reply {
         },
         ["2017-03-31", "tags", arn] => match m {
             "GET" => server.list_tags(arn),
-            "POST" => server.tag_resource(arn, &req.body),
+            "POST" => server.tag_resource(arn, body),
             "DELETE" => {
                 let keys = query_all(&req.query, "tagKeys");
                 server.untag_resource(arn, &keys)

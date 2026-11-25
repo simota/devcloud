@@ -159,6 +159,31 @@ impl ChunkedBody<'_> {
     fn payload_len(&self) -> usize {
         self.chunks.iter().map(|c| c.data.len()).sum()
     }
+
+    fn payload(&self) -> Vec<u8> {
+        self.chunks.iter().flat_map(|c| c.data).copied().collect()
+    }
+}
+
+pub fn is_aws_chunked(content_sha256: &str, content_encoding: &str) -> bool {
+    content_sha256.starts_with("STREAMING-")
+        || content_encoding
+            .split(',')
+            .any(|e| e.trim().eq_ignore_ascii_case("aws-chunked"))
+}
+
+pub fn decode_aws_chunked(
+    body: &[u8],
+    decoded_content_length: &str,
+) -> Result<Vec<u8>, SignatureError> {
+    let parsed =
+        parse_chunked_body(body).ok_or_else(|| err("AuthorizationHeaderMalformed", 400))?;
+    let decoded = parsed.payload();
+    let decoded_length = decoded_content_length.trim();
+    if !decoded_length.is_empty() && decoded_length.parse::<usize>().ok() != Some(decoded.len()) {
+        return Err(err("AuthorizationHeaderMalformed", 400));
+    }
+    Ok(decoded)
 }
 
 fn parse_chunked_body(body: &[u8]) -> Option<ChunkedBody<'_>> {

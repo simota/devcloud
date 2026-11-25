@@ -3673,3 +3673,274 @@ async fn strict_mode_signs_invocation_introspection() {
     .await;
     assert_eq!(rebound.status, 403);
 }
+
+fn sign_lambda_streaming(
+    method: &str,
+    path: &str,
+    host: &str,
+    payload_hash: &str,
+    chunks: &[&[u8]],
+    trailer: Option<&str>,
+    tamper_chunk_sig: bool,
+    override_body: Option<&[u8]>,
+) -> (Vec<(String, String)>, Vec<u8>) {
+    use hmac::{Hmac, Mac};
+    use sha2::{Digest, Sha256};
+
+    fn sha(b: &[u8]) -> String {
+        hex::encode(Sha256::digest(b))
+    }
+    fn hm(key: &[u8], data: &[u8]) -> Vec<u8> {
+        let mut mac = Hmac::<Sha256>::new_from_slice(key).unwrap();
+        mac.update(data);
+        mac.finalize().into_bytes().to_vec()
+    }
+
+    let date_stamp = "20260430";
+    let amz_date = "20260430T100000Z";
+    let region = "us-east-1";
+    let scope = format!("{date_stamp}/{region}/lambda/aws4_request");
+    let signed_headers = "host;x-amz-content-sha256;x-amz-date";
+    let canonical_headers =
+        format!("host:{host}\nx-amz-content-sha256:{payload_hash}\nx-amz-date:{amz_date}\n");
+    let canonical_path: String = path
+        .bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect();
+    let canonical_request = format!(
+        "{method}\n{canonical_path}\n\n{canonical_headers}\n{signed_headers}\n{payload_hash}"
+    );
+    let string_to_sign = format!(
+        "AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}",
+        sha(canonical_request.as_bytes())
+    );
+    let k_date = hm(b"AWS4dev", date_stamp.as_bytes());
+    let k_region = hm(&k_date, region.as_bytes());
+    let k_service = hm(&k_region, b"lambda");
+    let signing_key = hm(&k_service, b"aws4_request");
+    let seed = hex::encode(hm(&signing_key, string_to_sign.as_bytes()));
+
+    let decoded_len: usize = chunks.iter().map(|c| c.len()).sum();
+    let body = match override_body {
+        Some(raw) => raw.to_vec(),
+        None => {
+            let empty_hash = sha(b"");
+            let mut prev = seed.clone();
+            let mut out = Vec::new();
+            for (idx, chunk) in chunks.iter().copied().chain([&b""[..]]).enumerate() {
+                let to_sign = format!(
+                    "AWS4-HMAC-SHA256-PAYLOAD\n{amz_date}\n{scope}\n{prev}\n{empty_hash}\n{}",
+                    sha(chunk)
+                );
+                let mut sig = hex::encode(hm(&signing_key, to_sign.as_bytes()));
+                prev = sig.clone();
+                if tamper_chunk_sig && idx == 0 {
+                    let last = sig.pop().unwrap();
+                    sig.push(if last == '0' { '1' } else { '0' });
+                }
+                out.extend(format!("{:x};chunk-signature={sig}\r\n", chunk.len()).into_bytes());
+                out.extend_from_slice(chunk);
+                out.extend_from_slice(b"\r\n");
+            }
+            if let Some(trailer) = trailer {
+                out.truncate(out.len() - 2);
+                let to_sign = format!(
+                    "AWS4-HMAC-SHA256-TRAILER\n{amz_date}\n{scope}\n{prev}\n{}",
+                    sha(format!("{trailer}\n").as_bytes())
+                );
+                let sig = hex::encode(hm(&signing_key, to_sign.as_bytes()));
+                out.extend(
+                    format!("{trailer}\r\nx-amz-trailer-signature:{sig}\r\n\r\n").into_bytes(),
+                );
+            }
+            out
+        }
+    };
+    let auth = format!(
+        "AWS4-HMAC-SHA256 Credential=dev/{scope}, SignedHeaders={signed_headers}, Signature={seed}"
+    );
+    let headers = vec![
+        ("host".to_string(), host.to_string()),
+        ("content-encoding".to_string(), "aws-chunked".to_string()),
+        ("x-amz-date".to_string(), amz_date.to_string()),
+        ("x-amz-content-sha256".to_string(), payload_hash.to_string()),
+        (
+            "x-amz-decoded-content-length".to_string(),
+            decoded_len.to_string(),
+        ),
+        ("authorization".to_string(), auth),
+    ];
+    (headers, body)
+}
+
+#[tokio::test]
+async fn streaming_payloads_execute_lambda_operations_end_to_end() {
+    use devcloud_lambda::sigv4::{
+        STREAMING_SIGNED, STREAMING_SIGNED_TRAILER, STREAMING_UNSIGNED_TRAILER,
+    };
+
+    let dir = temp_dir("sigv4streaming");
+    let server = Arc::new(Server::new(Config {
+        auth_mode: "strict".into(),
+        access_key_id: "dev".into(),
+        secret_access_key: "dev".into(),
+        ..config_for(&dir)
+    }));
+    let host = "127.0.0.1:19010";
+
+    // 1. Strict mode multi-chunk STREAMING-AWS4-HMAC-SHA256-PAYLOAD CreateFunction.
+    let zip = build_stored(&[("app.py", PY_HANDLER.as_bytes())]);
+    let create_json = json!({
+        "FunctionName": "stream-fn",
+        "Runtime": "python3.12",
+        "Role": "arn:aws:iam::000000000000:role/lambda",
+        "Handler": "app.handler",
+        "Code": { "ZipFile": b64(&zip) },
+    })
+    .to_string();
+    let split = create_json.len() / 2;
+    let (headers, body) = sign_lambda_streaming(
+        "POST",
+        "/2015-03-31/functions",
+        host,
+        STREAMING_SIGNED,
+        &[
+            &create_json.as_bytes()[..split],
+            &create_json.as_bytes()[split..],
+        ],
+        None,
+        false,
+        None,
+    );
+    let refs: Vec<(&str, &str)> = headers
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    let created = call(&server, "POST", "/2015-03-31/functions", &refs, &body).await;
+    assert_eq!(
+        created.status,
+        201,
+        "{}",
+        String::from_utf8_lossy(&created.body)
+    );
+    let fn_arn = created.json()["FunctionArn"].as_str().unwrap().to_string();
+
+    // 2. Strict mode STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER TagResource + ListFunctions.
+    let tag_path = format!("/2017-03-31/tags/{}", fn_arn.replace(':', "%3A"));
+    let tag_json = br#"{"Tags":{"env":"streaming"}}"#;
+    let (headers, body) = sign_lambda_streaming(
+        "POST",
+        &tag_path,
+        host,
+        STREAMING_SIGNED_TRAILER,
+        &[tag_json],
+        Some("x-amz-checksum-crc32:AAAA"),
+        false,
+        None,
+    );
+    let refs: Vec<(&str, &str)> = headers
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    let tagged = call(&server, "POST", &tag_path, &refs, &body).await;
+    assert_eq!(
+        tagged.status,
+        204,
+        "{}",
+        String::from_utf8_lossy(&tagged.body)
+    );
+
+    let (headers, body) = sign_lambda_streaming(
+        "GET",
+        "/2015-03-31/functions",
+        host,
+        STREAMING_SIGNED,
+        &[],
+        None,
+        false,
+        None,
+    );
+    let refs: Vec<(&str, &str)> = headers
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    let listed = call(&server, "GET", "/2015-03-31/functions", &refs, &body).await;
+    assert_eq!(listed.status, 200);
+    assert_eq!(listed.json()["Functions"][0]["FunctionName"], "stream-fn");
+
+    // 3. Strict mode rejects tampered chunk signature with 403.
+    let (headers, body) = sign_lambda_streaming(
+        "POST",
+        &tag_path,
+        host,
+        STREAMING_SIGNED,
+        &[tag_json],
+        None,
+        true,
+        None,
+    );
+    let refs: Vec<(&str, &str)> = headers
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    let tampered = call(&server, "POST", &tag_path, &refs, &body).await;
+    assert_eq!(tampered.status, 403);
+
+    // 4. Strict mode rejects malformed framing with 400.
+    let (headers, body) = sign_lambda_streaming(
+        "POST",
+        &tag_path,
+        host,
+        STREAMING_SIGNED,
+        &[tag_json],
+        None,
+        false,
+        Some(b"malformed-chunked"),
+    );
+    let refs: Vec<(&str, &str)> = headers
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    let malformed = call(&server, "POST", &tag_path, &refs, &body).await;
+    assert_eq!(malformed.status, 400);
+
+    // 5. Relaxed & signed-relaxed modes decode aws-chunked bodies before dispatch.
+    for mode in ["relaxed", "signed-relaxed"] {
+        let mserver = Arc::new(Server::new(Config {
+            auth_mode: mode.into(),
+            ..config_for(&dir)
+        }));
+        let payload = format!(r#"{{"Tags":{{"mode":"{mode}"}}}}"#);
+        let chunked = format!(
+            "{:x}\r\n{payload}\r\n0\r\nx-amz-checksum-crc32:AAAA\r\n\r\n",
+            payload.len()
+        );
+        let sig = "a".repeat(64);
+        let auth = format!(
+            "AWS4-HMAC-SHA256 Credential=any/20260430/us-east-1/lambda/aws4_request, SignedHeaders=host;x-amz-date, Signature={sig}"
+        );
+        let mut hdrs = vec![
+            ("host", host),
+            ("content-encoding", "aws-chunked"),
+            ("x-amz-date", "20260430T100000Z"),
+            ("x-amz-content-sha256", STREAMING_UNSIGNED_TRAILER),
+        ];
+        if mode == "signed-relaxed" {
+            hdrs.push(("authorization", &auth));
+        }
+        let resp = call(&mserver, "POST", &tag_path, &hdrs, chunked.as_bytes()).await;
+        assert_eq!(
+            resp.status,
+            204,
+            "{mode}: {}",
+            String::from_utf8_lossy(&resp.body)
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
