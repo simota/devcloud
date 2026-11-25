@@ -16,11 +16,11 @@ use crate::model::{
 use crate::responses::{dataset_etag, default_string, unix_millis_string};
 use crate::server::{now_unix_nanos, Server};
 use crate::sql_eval::{
-    execute_parsed_query, query_result_rows_to_stored_rows, QueryExecutionResult,
+    dry_run_parsed_query_with_server, execute_parsed_query_with_server,
+    query_result_rows_to_stored_rows, QueryExecutionResult,
 };
 use crate::sql_parser::{
-    aggregate_dry_run_fields, bind_query_parameters, fields_for_query,
-    grouped_aggregate_dry_run_fields, parse_simple_select, SimpleSelectQuery,
+    bind_query_parameters, parse_simple_select, FromSource, SimpleSelectQuery,
 };
 use crate::validation::{path_escape, validate_resource_id};
 
@@ -60,10 +60,20 @@ impl Server {
         if !config.destination_table.table_id.is_empty() && !dry_run {
             self.write_query_destination_table(request_project_id, &config, &result)?;
         }
+        let effective_location =
+            default_string(requested_ref.location.clone(), self.default_location());
+        let parsed_source = parse_simple_select(&effective_query, request_project_id)
+            .ok()
+            .map(|q| q.from_source);
+        let bi_engine_statistics = self.compute_bi_engine_statistics(
+            request_project_id,
+            &effective_location,
+            parsed_source.as_ref(),
+        );
         let job_ref = JobReference {
             project_id: request_project_id.to_string(),
             job_id: job_id.clone(),
-            location: default_string(requested_ref.location.clone(), self.default_location()),
+            location: effective_location,
         };
         let response = QueryResponse {
             kind: "bigquery#queryResponse".to_string(),
@@ -98,6 +108,7 @@ impl Server {
                     total_rows: response.total_rows.clone(),
                     cache_hit: false,
                     dry_run,
+                    bi_engine_statistics,
                 },
             },
         };
@@ -280,20 +291,21 @@ impl Server {
         raw_query: &str,
         depth: i32,
     ) -> Result<QueryExecutionResult, String> {
-        let query = parse_simple_select(raw_query, request_project_id)?;
-        let (schema, _) = self.query_source(&query, true, depth)?;
-        if let Some(aggregate) = &query.aggregate {
-            let fields = if !query.group_by.is_empty() {
-                grouped_aggregate_dry_run_fields(&schema, &query.group_by, aggregate)?
-            } else {
-                aggregate_dry_run_fields(&schema, aggregate)?
-            };
-            return Ok(QueryExecutionResult {
-                fields,
-                rows: Vec::new(),
-            });
+        let trimmed = raw_query.strip_suffix(';').unwrap_or(raw_query).trim();
+        let upper = trimmed.to_ascii_uppercase();
+        if upper.starts_with("CALL ") {
+            return self.execute_call_procedure(trimmed, request_project_id, true, depth);
         }
-        let fields = fields_for_query(&schema, &query.selected_fields)?;
+        if Self::is_create_model_query(trimmed) {
+            return self.execute_create_model(trimmed, request_project_id, true, depth);
+        }
+        if Self::is_drop_model_query(trimmed) {
+            return self.execute_drop_model(trimmed, request_project_id, true);
+        }
+        let query = parse_simple_select(raw_query, request_project_id)?;
+        let (schema, _) = self.query_source(&query, request_project_id, true, depth)?;
+        let fields =
+            dry_run_parsed_query_with_server(self, request_project_id, &schema, &query, depth)?;
         Ok(QueryExecutionResult {
             fields,
             rows: Vec::new(),
@@ -316,67 +328,122 @@ impl Server {
         raw_query: &str,
         depth: i32,
     ) -> Result<QueryExecutionResult, String> {
+        let trimmed = raw_query.strip_suffix(';').unwrap_or(raw_query).trim();
+        let upper = trimmed.to_ascii_uppercase();
+        if upper.starts_with("CALL ") {
+            return self.execute_call_procedure(trimmed, request_project_id, false, depth);
+        }
+        if Self::is_create_model_query(trimmed) {
+            return self.execute_create_model(trimmed, request_project_id, false, depth);
+        }
+        if Self::is_drop_model_query(trimmed) {
+            return self.execute_drop_model(trimmed, request_project_id, false);
+        }
         let query = parse_simple_select(raw_query, request_project_id)?;
-        let (schema, rows) = self.query_source(&query, false, depth)?;
-        execute_parsed_query(&schema, &rows, &query)
+        let (schema, rows) = self.query_source(&query, request_project_id, false, depth)?;
+        execute_parsed_query_with_server(self, request_project_id, &schema, &rows, &query, depth)
     }
 
-    /// legacy `querySource`: the table's schema + rows, resolving VIEWs by
-    /// executing their query (bounded recursion depth of 8).
+    /// legacy `querySource`: the table's schema + rows, resolving VIEWs, SQL
+    /// TVFs, and BigQuery ML table functions (bounded recursion depth of 8).
     fn query_source(
         &self,
         query: &SimpleSelectQuery,
+        request_project_id: &str,
         dry_run: bool,
         depth: i32,
     ) -> Result<(TableSchema, Vec<StoredRow>), String> {
-        let table = self
-            .read_table(&query.project_id, &query.dataset_id, &query.table_id)
-            .map_err(|err| err.to_string())?;
-        let Some(table) = table else {
-            return Err(format!(
-                "not found: table {}:{}.{}",
-                query.project_id, query.dataset_id, query.table_id
-            ));
-        };
-
-        if table.table_type.eq_ignore_ascii_case("VIEW") {
-            let view = match &table.view {
-                Some(view) if !view.query.trim().is_empty() => view,
-                _ => {
-                    return Err(format!(
-                        "view {}:{}.{} has no query",
-                        query.project_id, query.dataset_id, query.table_id
-                    ));
+        match &query.from_source {
+            FromSource::None => Ok((TableSchema::default(), Vec::new())),
+            FromSource::TableValuedFunction { name_parts, args } => {
+                let result =
+                    self.execute_tvf(name_parts, args, request_project_id, dry_run, depth)?;
+                let schema = TableSchema {
+                    fields: result.fields.clone(),
+                };
+                if dry_run {
+                    return Ok((schema, Vec::new()));
                 }
-            };
-            if view.use_legacy_sql {
-                return Err("legacy SQL views are not supported".to_string());
+                Ok((schema, query_result_rows_to_stored_rows(&result)))
             }
-            if depth >= 8 {
-                return Err("view reference depth exceeded".to_string());
+            FromSource::MlTableFunction {
+                kind,
+                model_project_id,
+                model_dataset_id,
+                model_id,
+                input_sql,
+            } => {
+                let result = self.execute_ml_table_function(
+                    *kind,
+                    model_project_id,
+                    model_dataset_id,
+                    model_id,
+                    input_sql.as_deref(),
+                    request_project_id,
+                    dry_run,
+                    depth,
+                )?;
+                let schema = TableSchema {
+                    fields: result.fields.clone(),
+                };
+                if dry_run {
+                    return Ok((schema, Vec::new()));
+                }
+                Ok((schema, query_result_rows_to_stored_rows(&result)))
             }
-            let result =
-                self.execute_query_for_view(&query.project_id, &view.query, dry_run, depth + 1)?;
-            let schema = TableSchema {
-                fields: result.fields.clone(),
-            };
-            if dry_run {
-                return Ok((schema, Vec::new()));
-            }
-            return Ok((schema, query_result_rows_to_stored_rows(&result)));
-        }
+            FromSource::Table {
+                project_id,
+                dataset_id,
+                table_id,
+            } => {
+                let table = self
+                    .read_table(project_id, dataset_id, table_id)
+                    .map_err(|err| err.to_string())?;
+                let Some(table) = table else {
+                    return Err(format!(
+                        "not found: table {project_id}:{dataset_id}.{table_id}"
+                    ));
+                };
 
-        if dry_run {
-            return Ok((table.schema, Vec::new()));
+                if table.table_type.eq_ignore_ascii_case("VIEW") {
+                    let view = match &table.view {
+                        Some(view) if !view.query.trim().is_empty() => view,
+                        _ => {
+                            return Err(format!(
+                                "view {project_id}:{dataset_id}.{table_id} has no query"
+                            ));
+                        }
+                    };
+                    if view.use_legacy_sql {
+                        return Err("legacy SQL views are not supported".to_string());
+                    }
+                    if depth >= 8 {
+                        return Err("view reference depth exceeded".to_string());
+                    }
+                    let result =
+                        self.execute_query_for_view(project_id, &view.query, dry_run, depth + 1)?;
+                    let schema = TableSchema {
+                        fields: result.fields.clone(),
+                    };
+                    if dry_run {
+                        return Ok((schema, Vec::new()));
+                    }
+                    return Ok((schema, query_result_rows_to_stored_rows(&result)));
+                }
+
+                if dry_run {
+                    return Ok((table.schema, Vec::new()));
+                }
+                let rows = self
+                    .read_rows(project_id, dataset_id, table_id)
+                    .map_err(|err| err.to_string())?;
+                Ok((table.schema, rows))
+            }
         }
-        let rows = self
-            .read_rows(&query.project_id, &query.dataset_id, &query.table_id)
-            .map_err(|err| err.to_string())?;
-        Ok((table.schema, rows))
     }
 
     /// legacy `executeQueryForView`.
-    fn execute_query_for_view(
+    pub(crate) fn execute_query_for_view(
         &self,
         request_project_id: &str,
         raw_query: &str,

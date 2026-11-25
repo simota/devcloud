@@ -382,12 +382,14 @@ Completed resumable uploads retain a small metadata receipt and notification mar
 | Table schema and row APIs | Yes | `tables.insert`, `tables.get/list/patch/delete`, `tabledata.insertAll`, and `tabledata.list`. |
 | Partitioning and clustering metadata | Yes | Time/range partitioning and clustering fields round-trip in table metadata. |
 | View metadata and query execution | Partial | View table resources persist query metadata and can be queried through the local SELECT subset. |
-| Routine metadata | Partial | `routines.insert/list/get/patch/update/delete` persist local UDF/procedure metadata; routines are not executable. |
+| Routine metadata and SQL execution | Partial | `routines.insert/list/get/patch/update/delete` persist local UDF/TVF/procedure metadata. SQL scalar UDFs execute in `SELECT` (with or without `FROM`), `WHERE`, views, and nested UDF calls; SQL TVFs execute in `FROM`; SQL `PROCEDURE`s execute via `CALL` for single-`SELECT` bodies. JavaScript/remote UDFs and procedural scripting fail closed. |
 | Jobs API | Yes | Query, query destination tables, load, copy, extract, get, list, cancel, and result workflows are covered locally. |
 | GoogleSQL query execution | Partial | Deterministic local subset for common `SELECT` workflows; unsupported syntax fails closed. |
 | Google Cloud BigQuery client libraries | Partial | Local dataset/table/row/query compatibility workflows are covered through Rust E2E gates with endpoint override. |
 | IAM policy endpoints | Partial | Local policy shape is supported; no real Google IAM enforcement. |
-| BigQuery Storage API, BI Engine, ML | No | Not implemented. |
+| BigQuery ML | Partial | REST v2 `models.list/get/patch/delete` plus SQL `CREATE [OR REPLACE] MODEL`, `DROP MODEL`, `ML.PREDICT`, `ML.EVALUATE`, and `ML.WEIGHTS` for deterministic local `LINEAR_REG` and `LOGISTIC_REG` over numeric/boolean features; other model types and remote/Vertex AI models fail closed. |
+| BI Engine | Partial | Reservation API v1 `GET`/`PATCH /v1/projects/{project}/locations/{location}/biReservation` persists local reservation size and `preferredTables`, and query jobs populate `statistics.query.biEngineStatistics` when size > 0; real in-memory columnar caching and acceleration are not emulated. |
+| BigQuery Storage API | No | Not implemented (requires gRPC HTTP/2 streaming with Arrow/Avro/Protobuf binary row codecs on a dedicated Storage API endpoint). |
 
 ### DynamoDB-Compatible API
 

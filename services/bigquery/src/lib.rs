@@ -40,6 +40,7 @@ pub(crate) fn event_sink() -> Option<&'static UnboundedSender<String>> {
     EVENT_SINK.get()
 }
 
+pub mod bi_engine;
 pub mod dashboard;
 pub mod dataset_handlers;
 pub mod http;
@@ -47,13 +48,17 @@ pub mod iam_handlers;
 pub mod introspect;
 pub mod job_handlers;
 pub mod job_load_extract;
+pub mod ml;
 pub mod model;
+pub mod model_handlers;
 pub mod query_engine;
 pub mod responses;
 pub mod routes;
+pub mod routine_exec;
 pub mod routine_handlers;
 pub mod server;
 pub mod sql_eval;
+pub mod sql_expr;
 pub mod sql_parser;
 pub mod storage;
 pub mod table_handlers;

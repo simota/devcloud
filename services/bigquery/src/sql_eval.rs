@@ -17,9 +17,13 @@ use serde_json::Value;
 
 use crate::model::{RawJson, StoredRow, TableCell, TableDataRow, TableFieldSchema, TableSchema};
 use crate::responses::default_string;
+use crate::server::Server;
+use crate::sql_expr::{
+    eval_expr, find_schema_field, schema_field_type, validate_and_infer_expr_type, SqlValue,
+};
 use crate::sql_parser::{
     aggregate_field, fields_for_query, grouped_aggregate_dry_run_fields, AggregateFunction,
-    AggregateSelection, ComparisonOp, SimpleSelectQuery, WhereCondition,
+    AggregateSelection, ComparisonOp, FromSource, SelectItem, SimpleSelectQuery, WhereCondition,
 };
 use crate::wire_json;
 
@@ -30,7 +34,7 @@ pub struct QueryExecutionResult {
     pub rows: Vec<TableDataRow>,
 }
 
-/// legacy `executeParsedQuery`.
+/// legacy `executeParsedQuery` (non-expression fast path).
 pub fn execute_parsed_query(
     schema: &TableSchema,
     rows: &[StoredRow],
@@ -78,6 +82,297 @@ pub fn execute_parsed_query(
         fields: selected_fields,
         rows: response_rows,
     })
+}
+
+/// Validates and computes the output schema for queries that contain computed
+/// projections (including SQL UDF calls) or expression `WHERE` predicates.
+pub fn dry_run_parsed_query_with_server(
+    server: &Server,
+    default_project_id: &str,
+    schema: &TableSchema,
+    query: &SimpleSelectQuery,
+    depth: i32,
+) -> Result<Vec<TableFieldSchema>, String> {
+    if let Some(where_expr) = &query.where_expr {
+        validate_and_infer_expr_type(
+            server,
+            default_project_id,
+            where_expr,
+            &|name| schema_field_type(schema, name),
+            depth,
+        )?;
+    }
+    if let Some(aggregate) = &query.aggregate {
+        if !query.group_by.is_empty() {
+            return grouped_aggregate_dry_run_fields(schema, &query.group_by, aggregate);
+        }
+        return aggregate_dry_run_fields_from_schema(schema, aggregate);
+    }
+    if !query.has_computed_select() && !matches!(query.from_source, FromSource::None) {
+        return fields_for_query(schema, &query.selected_fields);
+    }
+    build_select_item_fields(
+        server,
+        default_project_id,
+        schema,
+        &query.select_items,
+        depth,
+    )
+}
+
+fn aggregate_dry_run_fields_from_schema(
+    schema: &TableSchema,
+    aggregate: &AggregateSelection,
+) -> Result<Vec<TableFieldSchema>, String> {
+    crate::sql_parser::aggregate_dry_run_fields(schema, aggregate)
+}
+
+fn build_select_item_fields(
+    server: &Server,
+    default_project_id: &str,
+    schema: &TableSchema,
+    items: &[SelectItem],
+    depth: i32,
+) -> Result<Vec<TableFieldSchema>, String> {
+    let mut fields = Vec::new();
+    let mut unnamed_idx = 0usize;
+    for item in items {
+        match item {
+            SelectItem::Star => {
+                fields.extend(schema.fields.iter().cloned());
+            }
+            SelectItem::Field { name, alias } => {
+                let Some(field) = schema.fields.iter().rev().find(|f| &f.name == name) else {
+                    return Err(format!("selected field {name:?} does not exist"));
+                };
+                let mut cloned = field.clone();
+                if let Some(alias) = alias {
+                    cloned.name = alias.clone();
+                }
+                fields.push(cloned);
+            }
+            SelectItem::Expr { expr, alias } => {
+                let field_type = validate_and_infer_expr_type(
+                    server,
+                    default_project_id,
+                    expr,
+                    &|name| schema_field_type(schema, name),
+                    depth,
+                )?;
+                let name = match alias {
+                    Some(alias) => alias.clone(),
+                    None => {
+                        let generated = format!("f{unnamed_idx}_");
+                        unnamed_idx += 1;
+                        generated
+                    }
+                };
+                fields.push(TableFieldSchema {
+                    name,
+                    field_type,
+                    mode: "NULLABLE".to_string(),
+                    ..Default::default()
+                });
+            }
+        }
+    }
+    Ok(fields)
+}
+
+/// Executes a parsed query with full support for SQL routine calls in SELECT
+/// and WHERE, as well as scalar SELECT queries without FROM.
+pub fn execute_parsed_query_with_server(
+    server: &Server,
+    default_project_id: &str,
+    schema: &TableSchema,
+    rows: &[StoredRow],
+    query: &SimpleSelectQuery,
+    depth: i32,
+) -> Result<QueryExecutionResult, String> {
+    if !query.has_computed_select()
+        && query.where_expr.is_none()
+        && !matches!(query.from_source, FromSource::None)
+    {
+        return execute_parsed_query(schema, rows, query);
+    }
+
+    if matches!(query.from_source, FromSource::None) {
+        let fields = build_select_item_fields(
+            server,
+            default_project_id,
+            schema,
+            &query.select_items,
+            depth,
+        )?;
+        let mut cells = Vec::with_capacity(fields.len());
+        let mut field_idx = 0usize;
+        for item in &query.select_items {
+            match item {
+                SelectItem::Expr { expr, .. } => {
+                    let val = eval_expr(server, default_project_id, expr, &|_| None, depth)?;
+                    cells.push(TableCell {
+                        v: val.to_cell_value(&fields[field_idx].field_type),
+                    });
+                    field_idx += 1;
+                }
+                SelectItem::Field { name, .. } => {
+                    return Err(format!("selected field {name:?} does not exist"));
+                }
+                SelectItem::Star => return Err("SELECT * requires FROM".to_string()),
+            }
+        }
+        let mut response_rows = vec![TableDataRow { f: cells }];
+        if query.offset > 0 {
+            response_rows.clear();
+        }
+        if query.limit >= 0 && (query.limit as usize) < response_rows.len() {
+            response_rows.truncate(query.limit as usize);
+        }
+        return Ok(QueryExecutionResult {
+            fields,
+            rows: response_rows,
+        });
+    }
+
+    let mut filtered: Vec<&StoredRow> = Vec::new();
+    for row in rows {
+        let matched = if let Some(where_expr) = &query.where_expr {
+            let val = eval_expr(
+                server,
+                default_project_id,
+                where_expr,
+                &|name| row_ident_value(row, schema, name),
+                depth,
+            )?;
+            match val {
+                SqlValue::Bool(b) => b,
+                SqlValue::Null => false,
+                _ => return Err("WHERE condition must evaluate to BOOLEAN".to_string()),
+            }
+        } else {
+            row_matches_query(row, query)
+        };
+        if matched {
+            filtered.push(row);
+        }
+    }
+
+    if let Some(aggregate) = &query.aggregate {
+        if !query.group_by.is_empty() {
+            return execute_grouped_aggregate_query(&filtered, schema, query, aggregate);
+        }
+        return execute_aggregate_query(&filtered, schema, aggregate);
+    }
+
+    let fields = build_select_item_fields(
+        server,
+        default_project_id,
+        schema,
+        &query.select_items,
+        depth,
+    )?;
+
+    // Project every matching row alongside its raw sort keys.
+    let mut projected: Vec<(TableDataRow, String)> = Vec::with_capacity(filtered.len());
+    let order_by_projected_idx = if !query.order_by.is_empty() {
+        fields.iter().position(|f| f.name == query.order_by)
+    } else {
+        None
+    };
+
+    for row in &filtered {
+        let mut cells = Vec::with_capacity(fields.len());
+        let mut projected_raws: Vec<String> = Vec::with_capacity(fields.len());
+        let mut field_idx = 0usize;
+        for item in &query.select_items {
+            match item {
+                SelectItem::Star => {
+                    for f in &schema.fields {
+                        let raw = raw_field(row, &f.name);
+                        let cell = if raw.is_empty() || is_json_null(raw) {
+                            TableCell { v: Value::Null }
+                        } else {
+                            TableCell {
+                                v: raw_value_for_field_response(raw, f),
+                            }
+                        };
+                        cells.push(cell);
+                        projected_raws.push(raw.to_string());
+                        field_idx += 1;
+                    }
+                }
+                SelectItem::Field { name, .. } => {
+                    let f = &fields[field_idx];
+                    let raw = raw_field(row, name);
+                    let cell = if raw.is_empty() || is_json_null(raw) {
+                        TableCell { v: Value::Null }
+                    } else {
+                        TableCell {
+                            v: raw_value_for_field_response(raw, f),
+                        }
+                    };
+                    cells.push(cell);
+                    projected_raws.push(raw.to_string());
+                    field_idx += 1;
+                }
+                SelectItem::Expr { expr, .. } => {
+                    let f = &fields[field_idx];
+                    let val = eval_expr(
+                        server,
+                        default_project_id,
+                        expr,
+                        &|name| row_ident_value(row, schema, name),
+                        depth,
+                    )?;
+                    projected_raws.push(val.to_raw_json());
+                    cells.push(TableCell {
+                        v: val.to_cell_value(&f.field_type),
+                    });
+                    field_idx += 1;
+                }
+            }
+        }
+        let sort_key = if query.order_by.is_empty() {
+            String::new()
+        } else if let Some(idx) = order_by_projected_idx {
+            projected_raws[idx].clone()
+        } else {
+            raw_field(row, &query.order_by).to_string()
+        };
+        projected.push((TableDataRow { f: cells }, sort_key));
+    }
+
+    if !query.order_by.is_empty() {
+        projected.sort_by(|(_, a), (_, b)| {
+            let cmp = compare_raw_values(a, b);
+            if query.order_desc {
+                cmp.reverse()
+            } else {
+                cmp
+            }
+        });
+    }
+    if query.offset > 0 {
+        if query.offset >= projected.len() as i64 {
+            projected.clear();
+        } else {
+            projected.drain(..query.offset as usize);
+        }
+    }
+    if query.limit >= 0 && query.limit < projected.len() as i64 {
+        projected.truncate(query.limit as usize);
+    }
+    let response_rows = projected.into_iter().map(|(row, _)| row).collect();
+    Ok(QueryExecutionResult {
+        fields,
+        rows: response_rows,
+    })
+}
+
+fn row_ident_value(row: &StoredRow, schema: &TableSchema, name: &str) -> Option<SqlValue> {
+    let field = find_schema_field(schema, name)?;
+    let raw = row.json.get(&field.name).map(|r| r.get()).unwrap_or("");
+    Some(SqlValue::from_raw_json(raw, Some(field)))
 }
 
 /// Missing key ≙ legacy nil `json.RawMessage` (empty bytes): every decode fails,

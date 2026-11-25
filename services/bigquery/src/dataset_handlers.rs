@@ -229,7 +229,9 @@ impl Server {
             Ok(_) => {}
         }
         if query.get("deleteContents") != "true"
-            && (has_children(&dir.join("tables")) || has_children(&dir.join("routines")))
+            && (has_children(&dir.join("tables"))
+                || has_children(&dir.join("routines"))
+                || has_children(&dir.join("models")))
         {
             return ApiResponse::error(409, "duplicate", "dataset is not empty");
         }

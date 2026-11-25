@@ -67,6 +67,29 @@ pub fn handle(server: &Server, req: &Request) -> ApiResponse {
     if req.path.starts_with("/bigquery/v2/projects/") {
         return handle_project_resource(server, req);
     }
+    if req.path.starts_with("/v1/projects/") {
+        return handle_v1_project_resource(server, req);
+    }
+    ApiResponse::error(404, "notFound", "not found")
+}
+
+/// BigQuery Reservation API v1 routes (`/v1/projects/{p}/locations/{l}/biReservation`).
+fn handle_v1_project_resource(server: &Server, req: &Request) -> ApiResponse {
+    let Some(parts) = resource_parts(&req.path, "/v1/projects/") else {
+        return ApiResponse::error(400, "invalid", "invalid resource path");
+    };
+    if parts.len() == 4
+        && parts[1] == "locations"
+        && parts[3] == "biReservation"
+        && !parts[0].is_empty()
+        && !parts[2].is_empty()
+    {
+        return match req.method.as_str() {
+            "GET" => server.get_bi_reservation(&parts[0], &parts[2]),
+            "PATCH" => server.update_bi_reservation(&parts[0], &parts[2], &req.query, &req.body),
+            _ => ApiResponse::method_not_allowed("GET, PATCH"),
+        };
+    }
     ApiResponse::error(404, "notFound", "not found")
 }
 
@@ -428,6 +451,10 @@ fn handle_datasets(server: &Server, req: &Request, parts: &[String]) -> ApiRespo
                     "POST" => server.create_routine(project_id, dataset_id, &req.body),
                     _ => ApiResponse::method_not_allowed("GET, POST"),
                 },
+                "models" => match req.method.as_str() {
+                    "GET" => server.list_models(project_id, dataset_id, &req.query),
+                    _ => ApiResponse::method_not_allowed("GET"),
+                },
                 _ => ApiResponse::error(404, "notFound", "not found"),
             }
         }
@@ -477,6 +504,18 @@ fn handle_datasets(server: &Server, req: &Request, parts: &[String]) -> ApiRespo
                             .patch_routine(project_id, dataset_id, routine_id, true, &req.body),
                         "DELETE" => server.delete_routine(project_id, dataset_id, routine_id),
                         _ => ApiResponse::method_not_allowed("GET, PATCH, PUT, DELETE"),
+                    }
+                }
+                "models" => {
+                    let model_id = parts[4].as_str();
+                    if let Err(message) = validate_resource_id(model_id, "model") {
+                        return ApiResponse::error(400, "invalid", &message);
+                    }
+                    match req.method.as_str() {
+                        "GET" => server.get_model(project_id, dataset_id, model_id),
+                        "PATCH" => server.patch_model(project_id, dataset_id, model_id, &req.body),
+                        "DELETE" => server.delete_model(project_id, dataset_id, model_id),
+                        _ => ApiResponse::method_not_allowed("GET, PATCH, DELETE"),
                     }
                 }
                 _ => ApiResponse::error(404, "notFound", "not found"),
