@@ -7,8 +7,10 @@ use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use crate::runtime::ProvisionedStatus;
 use crate::server::{
-    effective_qualifier, invalid_param, parse_json, parse_pagination, validation, Reply, Server,
+    effective_qualifier, invalid_param, parse_json, parse_pagination, provisioned_target_of,
+    validation, FunctionRecord, Reply, Server,
 };
 use crate::time_fmt::now_lambda;
 
@@ -24,14 +26,33 @@ pub(crate) struct ProvisionedConcurrencyConfig {
 }
 
 impl ProvisionedConcurrencyConfig {
-    pub(crate) fn to_json(&self, function_arn: Option<&str>) -> Value {
+    /// `available` is the number of pre-started environments (`None`: not
+    /// pre-started, as for container image functions, reported as fully
+    /// allocated); `failure` is why starting one failed.
+    pub(crate) fn to_json(
+        &self,
+        function_arn: Option<&str>,
+        available: Option<i64>,
+        failure: Option<&str>,
+    ) -> Value {
+        let available = available.unwrap_or(self.requested).min(self.requested);
+        let status = if failure.is_some() {
+            "FAILED"
+        } else if available >= self.requested {
+            "READY"
+        } else {
+            "IN_PROGRESS"
+        };
         let mut v = json!({
             "RequestedProvisionedConcurrentExecutions": self.requested,
-            "AvailableProvisionedConcurrentExecutions": self.requested,
-            "AllocatedProvisionedConcurrentExecutions": self.requested,
-            "Status": "READY",
+            "AvailableProvisionedConcurrentExecutions": available,
+            "AllocatedProvisionedConcurrentExecutions": available,
+            "Status": status,
             "LastModified": self.last_modified,
         });
+        if let Some(reason) = failure {
+            v["StatusReason"] = json!(reason);
+        }
         if let Some(arn) = function_arn {
             v["FunctionArn"] = json!(arn);
         }
@@ -92,6 +113,38 @@ impl ConcurrencyTracker {
 }
 
 impl Server {
+    /// The config's JSON with its pre-started environments counted. Several
+    /// configs running the same version (a version and an alias to it) share
+    /// that version's environments, filled in qualifier order.
+    fn provisioned_json(
+        &self,
+        rec: &FunctionRecord,
+        qualifier: &str,
+        cfg: &ProvisionedConcurrencyConfig,
+        function_arn: Option<&str>,
+    ) -> Value {
+        let Some((_, key, image)) = provisioned_target_of(rec, qualifier) else {
+            return cfg.to_json(function_arn, Some(0), None);
+        };
+        if image {
+            return cfg.to_json(function_arn, None, None);
+        }
+        let status = self.provisioned_status(&key).unwrap_or(ProvisionedStatus {
+            available: 0,
+            failure: None,
+        });
+        // Environments of the key used up by configs listed before this one.
+        let before: i64 = rec
+            .provisioned_concurrency
+            .iter()
+            .take_while(|(q, _)| q.as_str() != qualifier)
+            .filter(|(q, _)| provisioned_target_of(rec, q).is_some_and(|t| t.1 == key))
+            .map(|(_, c)| c.requested)
+            .sum();
+        let available = (status.available as i64 - before).max(0);
+        cfg.to_json(function_arn, Some(available), status.failure.as_deref())
+    }
+
     fn provisioned_not_found(&self, name: &str, qualifier: &str) -> Reply {
         Reply::error(
             404,
@@ -289,7 +342,16 @@ impl Server {
             Ok(())
         });
         match result {
-            Ok(()) => Reply::json(202, &cfg.to_json(None)),
+            // Environments start in the background (the caller reconciles).
+            Ok(()) => {
+                let st = self.state.lock().unwrap();
+                match st.functions.get(&name) {
+                    Some(rec) => {
+                        Reply::json(202, &self.provisioned_json(rec, &qualifier, &cfg, None))
+                    }
+                    None => self.not_found(&name),
+                }
+            }
             Err(r) => r,
         }
     }
@@ -328,7 +390,7 @@ impl Server {
             return self.not_found(&name);
         };
         match rec.provisioned_concurrency.get(&qualifier) {
-            Some(cfg) => Reply::json(200, &cfg.to_json(None)),
+            Some(cfg) => Reply::json(200, &self.provisioned_json(rec, &qualifier, cfg, None)),
             None => self.provisioned_not_found(&name, &qualifier),
         }
     }
@@ -355,7 +417,7 @@ impl Server {
             .iter()
             .map(|(q, cfg)| {
                 let arn = self.qualified_function_arn(&name, Some(q));
-                cfg.to_json(Some(&arn))
+                self.provisioned_json(rec, q, cfg, Some(&arn))
             })
             .collect();
         let page: Vec<Value> = all.iter().skip(start).take(max_items).cloned().collect();

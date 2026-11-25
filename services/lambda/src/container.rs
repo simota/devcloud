@@ -189,7 +189,7 @@ pub async fn invoke(at: &Endpoint, payload: &[u8]) -> std::io::Result<Response> 
     read_response(&mut s).await
 }
 
-async fn read_response(s: &mut TcpStream) -> std::io::Result<Response> {
+pub(crate) async fn read_response(s: &mut TcpStream) -> std::io::Result<Response> {
     let bad = |msg: &str| std::io::Error::new(std::io::ErrorKind::InvalidData, msg.to_string());
     let mut buf = Vec::new();
     let head_end = loop {

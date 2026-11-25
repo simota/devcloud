@@ -303,7 +303,9 @@ name = "devcloud-lambda"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "devcloud-dynamodb",
  "devcloud-s3",
+ "devcloud-sqs",
  "hex",
  "hmac",
  "libc",

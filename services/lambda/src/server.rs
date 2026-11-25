@@ -101,6 +101,8 @@ pub struct Config {
     /// [`runtime::DEFAULT_IDLE_TIMEOUT`], zero disables reuse (every
     /// invocation is a cold start).
     pub idle_timeout: Option<std::time::Duration>,
+    /// Local services that event source mappings are polled from.
+    pub event_sources: crate::event_poller::EventSources,
 }
 
 /// One HTTP reply: status, extra headers, body. `X-Amzn-ErrorType` is carried
@@ -556,6 +558,8 @@ pub struct Server {
     blocking_gate: Arc<tokio::sync::RwLock<bool>>,
     /// Warm execution environments.
     pool: Arc<runtime::Pool>,
+    /// Event source mapping polling.
+    pub(crate) poll: crate::event_poller::PollState,
 }
 
 #[derive(Default)]
@@ -596,6 +600,7 @@ impl Server {
                 config.idle_timeout.unwrap_or(runtime::DEFAULT_IDLE_TIMEOUT),
                 instance_id(&config.storage_path),
             ),
+            poll: Default::default(),
             config,
         };
         if !server.config.storage_path.is_empty() {
@@ -2616,37 +2621,10 @@ impl Server {
             );
         }
 
-        let layer_dirs: Vec<PathBuf> = leases
-            .layers
-            .iter()
-            .map(|l| l.dir().to_path_buf())
-            .collect();
         let request_id = self.new_id();
         let executed_version = record.version.clone();
-        let inv = Invocation {
-            runtime: record.runtime.clone(),
-            handler: record.handler.clone(),
-            code_dir: leases.code.dir().to_path_buf(),
-            function_name: record.function_name.clone(),
-            function_arn: self
-                .qualified_function_arn(&record.function_name, record.arn_qualifier.as_deref()),
-            function_version: executed_version.clone(),
-            memory_size: record.memory_size,
-            timeout_seconds: record.timeout,
-            region: self.region().to_string(),
-            request_id: request_id.clone(),
-            environment: record.environment.clone(),
-            payload: payload.to_vec(),
-            opt_dir: self
-                .config
-                .opt_dir
-                .clone()
-                .unwrap_or_else(|| PathBuf::from("/opt")),
-            layer_dirs,
-            credentials: self.config.function_credentials.clone(),
-            env_key: record.revision_id.clone(),
-            image,
-        };
+        let inv = self.invocation_for(&record, &leases, image, &request_id, payload);
+        let provisioned = self.has_provisioned(&record.function_name);
 
         if invocation_type == "Event" {
             let server = Arc::clone(self);
@@ -2657,11 +2635,20 @@ impl Server {
             while bg.tasks.try_join_next().is_some() {}
             bg.tasks.spawn(async move {
                 let _ = server.execute(inv, "Event", leases, permit).await;
+                if provisioned {
+                    server.reconcile_provisioned();
+                }
             });
             return Reply::empty(202).header("X-Amzn-RequestId", &request_id);
         }
 
-        match self.execute(inv, "RequestResponse", leases, permit).await {
+        let executed = self.execute(inv, "RequestResponse", leases, permit).await;
+        // An environment that crashed or timed out no longer counts toward
+        // provisioned concurrency: start its replacement.
+        if provisioned {
+            self.reconcile_provisioned();
+        }
+        match executed {
             Ok((outcome, log)) => {
                 let (body, error) = match outcome {
                     Outcome::Success(b) => (b, false),
@@ -2690,6 +2677,128 @@ impl Server {
             ),
             Err(RuntimeError::Spawn(msg)) => Reply::error(502, "ServiceException", &msg),
         }
+    }
+
+    /// The [`Invocation`] that runs `record` from the leased trees.
+    fn invocation_for(
+        &self,
+        record: &ResolvedFunction,
+        leases: &LeaseBundle,
+        image: Option<ImageSpec>,
+        request_id: &str,
+        payload: &[u8],
+    ) -> Invocation {
+        Invocation {
+            runtime: record.runtime.clone(),
+            handler: record.handler.clone(),
+            code_dir: leases.code.dir().to_path_buf(),
+            function_name: record.function_name.clone(),
+            function_arn: self
+                .qualified_function_arn(&record.function_name, record.arn_qualifier.as_deref()),
+            function_version: record.version.clone(),
+            memory_size: record.memory_size,
+            timeout_seconds: record.timeout,
+            region: self.region().to_string(),
+            request_id: request_id.to_string(),
+            environment: record.environment.clone(),
+            payload: payload.to_vec(),
+            opt_dir: self
+                .config
+                .opt_dir
+                .clone()
+                .unwrap_or_else(|| PathBuf::from("/opt")),
+            layer_dirs: leases
+                .layers
+                .iter()
+                .map(|l| l.dir().to_path_buf())
+                .collect(),
+            credentials: self.config.function_credentials.clone(),
+            env_key: record.revision_id.clone(),
+            image,
+        }
+    }
+
+    /// Brings the pre-started environments of every provisioned concurrency
+    /// configuration in line with its target: computes the targets from
+    /// state, stops surplus environments, and starts missing ones in the
+    /// background. Cheap when nothing is missing; called after configuration
+    /// changes and after invocations of functions with provisioned
+    /// concurrency.
+    pub fn reconcile_provisioned(self: &Arc<Self>) {
+        // Targets by configuration key, with the function and version that
+        // configuration runs.
+        let mut desired: Vec<runtime::ProvisionedTarget> = Vec::new();
+        let mut runs: HashMap<String, (String, String)> = HashMap::new();
+        {
+            let st = self.state.lock().unwrap();
+            for rec in st.functions.values() {
+                for (qualifier, cfg) in &rec.provisioned_concurrency {
+                    let Some((version, key, image)) = provisioned_target_of(rec, qualifier) else {
+                        continue;
+                    };
+                    if image {
+                        continue;
+                    }
+                    runs.insert(key.clone(), (rec.function_name.clone(), version));
+                    let pos = match desired.iter().position(|d| d.key == key) {
+                        Some(pos) => pos,
+                        None => {
+                            desired.push(runtime::ProvisionedTarget {
+                                function: rec.function_name.clone(),
+                                key,
+                                target: 0,
+                                generation: String::new(),
+                            });
+                            desired.len() - 1
+                        }
+                    };
+                    let d = &mut desired[pos];
+                    d.target += cfg.requested.max(0) as usize;
+                    d.generation
+                        .push_str(&format!("{qualifier}={};", cfg.last_modified));
+                }
+            }
+        }
+        for (key, count) in self.pool.set_provisioned(&desired) {
+            let (function, version) = &runs[&key];
+            for _ in 0..count {
+                let leased = match self.lookup_leased_for_invoke(function, Some(version)) {
+                    Ok(r) if r.0.revision_id == key => Some(r),
+                    // Changed meanwhile: a later reconcile follows it.
+                    _ => None,
+                };
+                let mut bg = self.background.lock().unwrap();
+                let Some((record, leases)) = leased.filter(|_| !bg.closed) else {
+                    self.pool.provision_abandoned(&key);
+                    continue;
+                };
+                let inv = self.invocation_for(&record, &leases, None, "provisioned", b"");
+                let server = Arc::clone(self);
+                while bg.tasks.try_join_next().is_some() {}
+                bg.tasks.spawn(async move {
+                    runtime::provision(
+                        &inv,
+                        &server.config.interpreters,
+                        &server.pool,
+                        Box::new(leases),
+                    )
+                    .await;
+                });
+            }
+        }
+    }
+
+    /// Whether any provisioned concurrency configuration exists for `function`.
+    fn has_provisioned(&self, function: &str) -> bool {
+        let st = self.state.lock().unwrap();
+        st.functions
+            .get(function)
+            .is_some_and(|r| !r.provisioned_concurrency.is_empty())
+    }
+
+    /// Provisioned concurrency progress of configuration `key`.
+    pub(crate) fn provisioned_status(&self, key: &str) -> Option<runtime::ProvisionedStatus> {
+        self.pool.provisioned_status(key)
     }
 
     /// Runs one invocation. `leases` pins the code and layer trees it started
@@ -2763,6 +2872,7 @@ impl Server {
     /// Stops accepting async invocations, then aborts and awaits the running
     /// ones so each tears down its handler process group.
     pub async fn shutdown(&self) {
+        self.stop_event_source_polling().await;
         // Package jobs are not cancellable midway: let running ones finish
         // so nothing touches storage after `serve` returns.
         *self.blocking_gate.write().await = true;
@@ -3079,6 +3189,27 @@ impl Server {
         }
         v
     }
+}
+
+/// The version a provisioned concurrency `qualifier` (a published version or
+/// an alias) runs: `(version, configuration key, is_image)`.
+pub(crate) fn provisioned_target_of(
+    rec: &FunctionRecord,
+    qualifier: &str,
+) -> Option<(String, String, bool)> {
+    let version = match qualifier.parse::<u64>() {
+        Ok(_) => qualifier.to_string(),
+        Err(_) => rec.aliases.get(qualifier)?.function_version.clone(),
+    };
+    if version == "$LATEST" {
+        return Some((version, rec.revision_id.clone(), rec.is_image()));
+    }
+    let ver = rec.versions.get(&version.parse::<u64>().ok()?)?;
+    Some((
+        version,
+        ver.revision_id.clone(),
+        ver.package_type == "Image",
+    ))
 }
 
 /// Resolves the qualifier from `id` and `query_qualifier`, rejecting mismatches
