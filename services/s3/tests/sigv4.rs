@@ -1062,3 +1062,167 @@ fn sigv4a_header_and_presigned_urls_verify_and_enforce_region_set() {
     assert_eq!(resp.status, 200);
     assert_eq!(resp.body, b"hello v4a");
 }
+
+/// A presigned SigV4 (`AWS4-HMAC-SHA256`) or SigV4a URL for `method path` that
+/// signs `host` plus every header in `headers`, with `payload_hash` as the
+/// canonical payload hash (sent as `x-amz-content-sha256`).
+fn presign_streaming(
+    sigv4a: bool,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    payload_hash: &str,
+) -> Request {
+    let date = amz_date(now());
+    let date_stamp = &date[..8];
+    let (algorithm, scope) = if sigv4a {
+        (
+            "AWS4-ECDSA-P256-SHA256",
+            format!("{date_stamp}/s3/aws4_request"),
+        )
+    } else {
+        (
+            "AWS4-HMAC-SHA256",
+            format!("{date_stamp}/us-east-1/s3/aws4_request"),
+        )
+    };
+    let mut all_headers: Vec<(String, String)> = vec![("host".into(), "s3.test:9000".into())];
+    all_headers.extend(headers.iter().map(|(k, v)| (k.to_string(), v.to_string())));
+    all_headers.sort();
+    let signed_headers = all_headers
+        .iter()
+        .filter(|(k, _)| k == "host" || k.starts_with("x-amz-"))
+        .map(|(k, _)| k.as_str())
+        .collect::<Vec<_>>()
+        .join(";");
+    let canonical_headers: String = all_headers
+        .iter()
+        .filter(|(k, _)| k == "host" || k.starts_with("x-amz-"))
+        .map(|(k, v)| format!("{k}:{v}\n"))
+        .collect();
+    let region_set = if sigv4a {
+        format!("&X-Amz-Region-Set={}", aws_percent_encode("*", ""))
+    } else {
+        String::new()
+    };
+    let query = format!(
+        "X-Amz-Algorithm={algorithm}&X-Amz-Credential={}&X-Amz-Date={date}&X-Amz-Expires=300{region_set}&X-Amz-SignedHeaders={}",
+        aws_percent_encode(&format!("test-key/{scope}"), ""),
+        aws_percent_encode(&signed_headers, "")
+    );
+    let canonical_request =
+        format!("{method}\n{path}\n{query}\n{canonical_headers}\n{signed_headers}\n{payload_hash}");
+    let string_to_sign = format!(
+        "{algorithm}\n{date}\n{scope}\n{}",
+        sha256_hex(canonical_request.as_bytes())
+    );
+    let signature = if sigv4a {
+        sigv4a_key().sign(string_to_sign.as_bytes())
+    } else {
+        hex::encode(hmac_sha256(
+            &signing_key(date_stamp),
+            string_to_sign.as_bytes(),
+        ))
+    };
+    let mut request = Request::new(
+        method,
+        &format!("{path}?{query}&X-Amz-Signature={signature}"),
+        Vec::new(),
+    );
+    for (k, v) in all_headers {
+        request.headers.insert(k, v);
+    }
+    request
+        .headers
+        .insert("x-amz-content-sha256".to_string(), payload_hash.to_string());
+    request
+}
+
+const PRESIGNED_STREAM_HEADERS: [(&str, &str); 3] = [
+    ("content-encoding", "aws-chunked"),
+    ("x-amz-decoded-content-length", "11"),
+    ("x-amz-trailer", "x-amz-checksum-crc32"),
+];
+
+#[test]
+fn presigned_urls_accept_unsigned_trailer_streaming_payloads() {
+    let store = store();
+    let auth = auth();
+    for (sigv4a, key) in [(false, "pre-v4.txt"), (true, "pre-v4a.txt")] {
+        let mut put = presign_streaming(
+            sigv4a,
+            "PUT",
+            &format!("/data/{key}"),
+            &PRESIGNED_STREAM_HEADERS,
+            UNSIGNED_TRAILER,
+        );
+        put.body =
+            b"6\r\nhello \r\n5\r\nworld\r\n0\r\nx-amz-checksum-crc32:DUoRhQ==\r\n\r\n".to_vec();
+        let response = route_with_auth(&store, &put, &auth);
+        assert_eq!(
+            response.status,
+            200,
+            "{sigv4a}: {}",
+            String::from_utf8_lossy(&response.body)
+        );
+        let got = stored(&store, key);
+        assert_eq!(got.body, b"hello world");
+        assert!(!got.headers.contains_key("Content-Encoding"));
+
+        // The trailer checksum is still validated against the decoded payload.
+        let mut bad = presign_streaming(
+            sigv4a,
+            "PUT",
+            "/data/bad-checksum.txt",
+            &PRESIGNED_STREAM_HEADERS,
+            UNSIGNED_TRAILER,
+        );
+        bad.body = b"b\r\nhello worle\r\n0\r\nx-amz-checksum-crc32:DUoRhQ==\r\n\r\n".to_vec();
+        let response = route_with_auth(&store, &bad, &auth);
+        assert_eq!(response.status, 400);
+        assert_eq!(code(&response), "BadDigest");
+
+        // The URL signature covers the streaming payload hash and its headers.
+        let mut tampered = presign_streaming(
+            sigv4a,
+            "PUT",
+            "/data/tampered.txt",
+            &PRESIGNED_STREAM_HEADERS,
+            UNSIGNED_TRAILER,
+        );
+        tampered
+            .headers
+            .insert("x-amz-decoded-content-length".to_string(), "12".to_string());
+        tampered.body = b"c\r\nhello world!\r\n0\r\n\r\n".to_vec();
+        assert_eq!(
+            code(&route_with_auth(&store, &tampered, &auth)),
+            "SignatureDoesNotMatch"
+        );
+        assert_eq!(stored(&store, "bad-checksum.txt").status, 404);
+        assert_eq!(stored(&store, "tampered.txt").status, 404);
+    }
+}
+
+#[test]
+fn presigned_urls_still_refuse_signed_chunk_streaming_payloads() {
+    let store = store();
+    let auth = auth();
+    for (sigv4a, payload_hash) in [
+        (false, STREAMING),
+        (false, STREAMING_TRAILER),
+        (true, devcloud_sigv4a::STREAMING_PAYLOAD),
+    ] {
+        let mut put = presign_streaming(
+            sigv4a,
+            "PUT",
+            "/data/signed-chunks.txt",
+            &STREAM_HEADERS,
+            payload_hash,
+        );
+        put.body = b"0;chunk-signature=00\r\n\r\n".to_vec();
+        let response = route_with_auth(&store, &put, &auth);
+        assert_eq!(response.status, 501, "{payload_hash}");
+        assert_eq!(code(&response), "NotImplemented");
+    }
+    assert_eq!(stored(&store, "signed-chunks.txt").status, 404);
+}

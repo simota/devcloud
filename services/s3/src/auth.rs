@@ -590,6 +590,9 @@ pub(crate) fn verify_sigv4a_presign(
     verify_signed_header_coverage(req, signed_headers)?;
     let payload_hash = match req.header("x-amz-content-sha256") {
         "" => "UNSIGNED-PAYLOAD",
+        // Decoded (and its trailer checksums validated) once the URL verifies.
+        unsigned @ "STREAMING-UNSIGNED-PAYLOAD-TRAILER" => unsigned,
+        // A chunk-signature chain is seeded by an `Authorization` header signature.
         streaming if streaming.starts_with("STREAMING-") => {
             return Err(SignatureError {
                 code: "NotImplemented",

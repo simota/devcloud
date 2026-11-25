@@ -17,6 +17,16 @@
 //!   or from the bucket policy; a principal from another account needs both. A
 //!   session policy must also allow the action (it limits both grants). Public
 //!   canned ACL grants apply to every caller.
+//! - A permissions boundary on the user or role must also allow the action. It
+//!   limits identity-policy grants and owner-account bucket-policy grants,
+//!   except a bucket-policy `Allow` naming the user ARN or the session ARN
+//!   itself (not the role, account, or a wildcard), as in AWS.
+//! - SCPs attached to the principal's account must allow the action (the union
+//!   of the attached SCPs; an explicit `Deny` in any wins). They limit every
+//!   grant, including bucket policies and ACLs. Accounts without an SCP are not
+//!   restricted, and the owner/management account `000000000000` never is.
+//! - The KMS JSON and IAM/STS Query APIs served at `POST /` authorize their
+//!   actions themselves (`kms_api.rs`, `query_api.rs`) with [`identity_allows`].
 
 use serde_json::Value;
 
@@ -90,6 +100,9 @@ pub(crate) fn authorize_request(
         Caller::Owner { .. } => Ok(()),
         _ => Err(()),
     };
+    if crate::query_api::classify(req).is_some() {
+        return Ok(());
+    }
     if is_control_path(&req.path) {
         // Any principal may call AssumeRole; the trust policy decides.
         if req.method == "POST" && req.path == crate::identities::ASSUME_ROLE_PATH {
@@ -136,17 +149,30 @@ pub(crate) fn authorize_request(
             }
         }
         Caller::Iam(p) => {
+            if !scps_permit(p, req, &ctx, caller) {
+                return Err(());
+            }
             let identity = evaluate_documents(&p.identity_policies, req, &ctx, caller);
             let session = p
                 .session_policy
                 .as_ref()
                 .map(|doc| evaluate_document(doc, req, &ctx, caller, PolicyKind::Identity));
-            if identity == PolicyDecision::Deny || session == Some(PolicyDecision::Deny) {
+            let boundary = p
+                .permissions_boundary
+                .as_ref()
+                .map(|doc| evaluate_document(doc, req, &ctx, caller, PolicyKind::Identity));
+            if identity == PolicyDecision::Deny
+                || session == Some(PolicyDecision::Deny)
+                || boundary == Some(PolicyDecision::Deny)
+            {
                 return Err(());
             }
             let session_ok = session.is_none_or(|d| d == PolicyDecision::Allow);
-            let identity_allow = identity == PolicyDecision::Allow && session_ok;
-            let bucket_allow = policy_decision == PolicyDecision::Allow && session_ok;
+            let boundary_ok = boundary.is_none_or(|d| d == PolicyDecision::Allow);
+            let identity_allow = identity == PolicyDecision::Allow && session_ok && boundary_ok;
+            let bucket_allow = policy_decision == PolicyDecision::Allow
+                && session_ok
+                && (boundary_ok || bucket_policy_names_directly(store, req, &ctx, caller, p));
             let granted = if p.account == OWNER_ACCOUNT {
                 identity_allow || bucket_allow
             } else {
@@ -161,8 +187,44 @@ pub(crate) fn authorize_request(
     }
 }
 
-/// Whether `p`'s identity policies (and session policy, if any) allow `action`
-/// on `resource_arn` without an explicit `Deny`.
+/// SCPs attached to `p`'s account allow the action (no SCP: unrestricted).
+fn scps_permit(p: &Principal, req: &Request, ctx: &ActionContext, caller: &Caller) -> bool {
+    p.scps.is_empty() || evaluate_documents(&p.scps, req, ctx, caller) == PolicyDecision::Allow
+}
+
+/// Whether `p`'s account SCPs allow `action` on `resource_arn`.
+pub(crate) fn scps_allow(
+    p: &Principal,
+    req: &Request,
+    action: &'static str,
+    resource_arn: &str,
+    caller: &Caller,
+) -> bool {
+    scps_permit(p, req, &ActionContext::global(action, resource_arn), caller)
+}
+
+/// A bucket-policy `Allow` naming `p`'s own ARN (user or session ARN) exactly,
+/// which a permissions boundary does not limit.
+fn bucket_policy_names_directly(
+    store: &FileBucketStore,
+    req: &Request,
+    ctx: &ActionContext,
+    caller: &Caller,
+    p: &Principal,
+) -> bool {
+    let Ok(Some((raw, true))) = store.get_bucket_policy(&ctx.bucket) else {
+        return false;
+    };
+    let Ok(doc) = serde_json::from_slice::<Value>(&raw) else {
+        return false;
+    };
+    let direct = PrincipalMatch::Exact(&p.arn);
+    evaluate_document_with(&doc, req, ctx, caller, PolicyKind::Bucket, direct)
+        == PolicyDecision::Allow
+}
+
+/// Whether `p`'s identity policies allow `action` on `resource_arn` without an
+/// explicit `Deny`, within its session policy, permissions boundary, and SCPs.
 pub(crate) fn identity_allows(
     p: &Principal,
     req: &Request,
@@ -172,11 +234,15 @@ pub(crate) fn identity_allows(
 ) -> bool {
     let ctx = ActionContext::global(action, resource_arn);
     let identity = evaluate_documents(&p.identity_policies, req, &ctx, caller);
-    let session = p
-        .session_policy
-        .as_ref()
-        .map(|doc| evaluate_document(doc, req, &ctx, caller, PolicyKind::Identity));
-    identity == PolicyDecision::Allow && session.is_none_or(|d| d == PolicyDecision::Allow)
+    let limit_ok = |doc: &Option<Value>| {
+        doc.as_ref().is_none_or(|doc| {
+            evaluate_document(doc, req, &ctx, caller, PolicyKind::Identity) == PolicyDecision::Allow
+        })
+    };
+    identity == PolicyDecision::Allow
+        && limit_ok(&p.session_policy)
+        && limit_ok(&p.permissions_boundary)
+        && scps_permit(p, req, &ctx, caller)
 }
 
 /// Whether the role trust policy `doc` allows `caller` to `sts:AssumeRole`.
@@ -376,12 +442,32 @@ fn evaluate_bucket_policy(
     evaluate_document(&doc, req, ctx, caller, PolicyKind::Bucket)
 }
 
+/// How a resource or trust policy `Principal` is matched against the caller.
+#[derive(Clone, Copy)]
+enum PrincipalMatch<'a> {
+    /// Any form that names the caller (ARN, role, account, wildcards).
+    Caller,
+    /// Only this exact ARN, without wildcards.
+    Exact(&'a str),
+}
+
 fn evaluate_document(
     doc: &Value,
     req: &Request,
     ctx: &ActionContext,
     caller: &Caller,
     kind: PolicyKind,
+) -> PolicyDecision {
+    evaluate_document_with(doc, req, ctx, caller, kind, PrincipalMatch::Caller)
+}
+
+fn evaluate_document_with(
+    doc: &Value,
+    req: &Request,
+    ctx: &ActionContext,
+    caller: &Caller,
+    kind: PolicyKind,
+    principal: PrincipalMatch<'_>,
 ) -> PolicyDecision {
     let statements = match doc.get("Statement") {
         Some(Value::Array(arr)) => arr.iter().collect::<Vec<_>>(),
@@ -394,7 +480,7 @@ fn evaluate_document(
         let Some(effect) = stmt.get("Effect").and_then(Value::as_str) else {
             continue;
         };
-        if !statement_matches(stmt, req, ctx, caller, kind) {
+        if !statement_matches(stmt, req, ctx, caller, kind, principal) {
             continue;
         }
         if effect.eq_ignore_ascii_case("Deny") {
@@ -417,14 +503,16 @@ fn statement_matches(
     ctx: &ActionContext,
     caller: &Caller,
     kind: PolicyKind,
+    principal: PrincipalMatch<'_>,
 ) -> bool {
     let principal_ok = if kind == PolicyKind::Identity {
         // Identity and session policies apply to the principal they are attached to.
         true
     } else if let Some(p) = stmt.get("Principal") {
-        principal_matches(p, caller)
+        principal_matches(p, caller, principal)
     } else if let Some(np) = stmt.get("NotPrincipal") {
-        !principal_matches(np, caller)
+        // "Everyone except" never names a principal directly.
+        matches!(principal, PrincipalMatch::Caller) && !principal_matches(np, caller, principal)
     } else {
         false
     };
@@ -463,17 +551,18 @@ fn statement_matches(
     true
 }
 
-fn principal_matches(principal: &Value, caller: &Caller) -> bool {
+fn principal_matches(principal: &Value, caller: &Caller, how: PrincipalMatch<'_>) -> bool {
+    let matches = |pattern: &str| match how {
+        PrincipalMatch::Caller => principal_pattern_matches(pattern, caller),
+        PrincipalMatch::Exact(arn) => pattern == arn,
+    };
     match principal {
-        Value::String(s) => principal_pattern_matches(s, caller),
+        Value::String(s) => matches(s),
         Value::Object(map) => {
             if let Some(aws) = map.get("AWS") {
                 match aws {
-                    Value::String(s) => principal_pattern_matches(s, caller),
-                    Value::Array(arr) => arr
-                        .iter()
-                        .filter_map(Value::as_str)
-                        .any(|s| principal_pattern_matches(s, caller)),
+                    Value::String(s) => matches(s),
+                    Value::Array(arr) => arr.iter().filter_map(Value::as_str).any(matches),
                     _ => false,
                 }
             } else {

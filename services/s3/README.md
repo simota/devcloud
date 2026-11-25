@@ -64,6 +64,12 @@ Strict mode also evaluates bucket policies (`Allow`/`Deny`, `Principal`,
 ACLs (`public-read`, `public-read-write`), allowing anonymous public access when
 granted and enforcing explicit `Deny` statements even on authenticated requests.
 
+Presigned SigV4 and SigV4a URLs also accept `STREAMING-UNSIGNED-PAYLOAD-TRAILER`
+uploads: sign `x-amz-decoded-content-length` and `x-amz-trailer` into the URL and
+use `STREAMING-UNSIGNED-PAYLOAD-TRAILER` as the canonical payload hash (it is
+sent as `x-amz-content-sha256`). Signed-chunk streaming payloads on presigned
+URLs return `NotImplemented`.
+
 In every auth mode, `aws-chunked` trailer checksums (`x-amz-checksum-crc32`,
 `-crc32c`, `-crc64nvme`, `-sha1`, `-sha256`) are checked against the decoded
 payload: a mismatch is `BadDigest`, and a malformed value or a checksum named in
@@ -103,6 +109,62 @@ mode treats every request as the owner and skips trust policies.
 `GET /_iam/config` never returns secrets. The registry is stored as `.iam.json`
 and `.iam-sessions.json` in the storage root.
 
+### Permissions boundaries and SCPs
+
+The config can also declare customer managed policies and SCPs:
+
+```json
+{
+  "Users": [{"UserName": "carol", "AccessKeyId": "AKIACAROL", "SecretAccessKey": "carol-secret",
+             "Policies": [{"Statement": [{"Effect": "Allow", "Action": "s3:*", "Resource": "*"}]}],
+             "PermissionsBoundary": "arn:aws:iam::000000000000:policy/read-only"}],
+  "ManagedPolicies": [{"PolicyName": "read-only",
+                       "PolicyDocument": {"Statement": [{"Effect": "Allow", "Action": "s3:GetObject", "Resource": "*"}]}}],
+  "ServiceControlPolicies": [{"PolicyName": "no-deletes", "TargetAccounts": ["111111111111"],
+                              "PolicyDocument": {"Statement": [
+                                {"Effect": "Allow", "Action": "*", "Resource": "*"},
+                                {"Effect": "Deny", "Action": "s3:DeleteObject", "Resource": "*"}]}}]
+}
+```
+
+A `PermissionsBoundary` (users and roles; it applies to the role's sessions)
+must name a `ManagedPolicies` entry in the same account. In strict mode it must
+also allow the action: it limits identity-policy grants and owner-account
+bucket-policy grants, except a bucket-policy `Allow` that names the user ARN or
+the session ARN itself. SCPs apply to every user and session in their
+`TargetAccounts`: the union of those SCPs must allow the action and any SCP
+`Deny` wins, including over bucket policies, ACLs, and `sts:AssumeRole`. As with
+an AWS account that has only custom SCPs attached, an account with SCPs that do
+not allow an action is denied it. Accounts without SCPs are not restricted; the
+owner account `000000000000` is the organization's management account and cannot
+be targeted.
+
+### IAM and STS Query APIs
+
+The S3 port also answers the AWS Query protocol at `POST /` (form-encoded
+`Action=...`), so SDK IAM and STS clients can point their endpoint at it:
+
+```sh
+aws --endpoint-url http://127.0.0.1:9000 sts get-caller-identity
+aws --endpoint-url http://127.0.0.1:9000 sts assume-role \
+  --role-arn arn:aws:iam::000000000000:role/reader --role-session-name job
+aws --endpoint-url http://127.0.0.1:9000 iam list-users
+aws --endpoint-url http://127.0.0.1:9000 iam put-user-permissions-boundary \
+  --user-name carol --permissions-boundary arn:aws:iam::000000000000:policy/read-only
+```
+
+Supported actions: STS `GetCallerIdentity` and `AssumeRole`; IAM `GetUser`,
+`ListUsers`, `GetRole`, `ListRoles`, `GetPolicy`, `PutUserPermissionsBoundary`,
+`DeleteUserPermissionsBoundary`, `PutRolePermissionsBoundary`, and
+`DeleteRolePermissionsBoundary`. In strict mode requests must be signed for the
+`sts` or `iam` service (IAM also accepts `us-east-1`); the owner key may call
+everything and is reported as `arn:aws:iam::000000000000:root`; registry
+principals need the IAM action within their session policy, boundary, and SCPs,
+and see only their own account. `GetCallerIdentity` needs no permission, and
+`AssumeRole` follows the role's trust policy (refusing unknown roles with
+`AccessDenied`, as STS does). Lists are returned in one page. Other IAM actions
+are `InvalidAction`; manage users, roles, and policies with `PUT /_iam/config`.
+
 ## Local KMS keys for SSE-KMS
 
 ```sh
@@ -121,6 +183,36 @@ returned as given, and reads are never refused.
 Objects are not encrypted with the KMS key at rest, because the store is shared
 with other devcloud services that read it directly. The keyring is `.kms.json`
 in the storage root.
+
+### KMS API
+
+The same keyring answers a local subset of the AWS KMS JSON API at `POST /`
+(`X-Amz-Target: TrentService.<Operation>`):
+
+```sh
+aws --endpoint-url http://127.0.0.1:9000 kms create-key --description app
+aws --endpoint-url http://127.0.0.1:9000 kms encrypt --key-id alias/app \
+  --plaintext fileb://secret.txt --encryption-context tenant=a
+aws --endpoint-url http://127.0.0.1:9000 kms generate-data-key --key-id alias/app --key-spec AES_256
+```
+
+Operations: `CreateKey`, `DescribeKey`, `ListKeys`, `EnableKey`, `DisableKey`,
+`ScheduleKeyDeletion`, `CancelKeyDeletion`, `CreateAlias`, `DeleteAlias`,
+`ListAliases`, `Encrypt`, `Decrypt`, `ReEncrypt`, `GenerateDataKey`, and
+`GenerateDataKeyWithoutPlaintext`, for symmetric (`SYMMETRIC_DEFAULT`) keys.
+Keys accept key IDs, key ARNs, alias names, and alias ARNs. `Decrypt` needs the
+same encryption context that `Encrypt` used (`InvalidCiphertextException`
+otherwise), and refuses a `KeyId` that did not encrypt the blob
+(`IncorrectKeyException`). Disabled and pending-deletion keys refuse
+cryptography. Each key's 256-bit key material is created on first use and kept
+in `.kms-material.json` in the storage root (never returned); it is derived from
+the clock and a counter, so use it for local tests only, and ciphertext blobs
+are only valid for this emulator. In strict mode requests must be signed for the
+`kms` service; registry principals in the owner account need `kms:<Operation>`
+on the key ARN (`*` for `CreateKey`, `ListKeys`, `ListAliases`), other accounts
+are refused (there are no key policies), and the AWS managed `alias/aws/s3` key
+cannot be used directly. Asymmetric and HMAC keys, grants, key policies,
+rotation, imported key material, and multi-Region keys are not emulated.
 
 ## CORS
 
