@@ -50,7 +50,7 @@ impl Request {
 /// legacy `handle` (minus the `Server` response header, which the HTTP layer
 /// adds).
 pub fn handle(server: &Server, req: &Request) -> ApiResponse {
-    if !authorize(server, req) {
+    if !authorize(server, &req.authorization) {
         return ApiResponse::error(401, "authError", "invalid authentication credentials")
             .with_www_authenticate();
     }
@@ -94,13 +94,13 @@ fn handle_v1_project_resource(server: &Server, req: &Request) -> ApiResponse {
 }
 
 /// legacy `authorize`.
-fn authorize(server: &Server, req: &Request) -> bool {
+pub(crate) fn authorize(server: &Server, authorization: &str) -> bool {
     let mode = server.config().auth_mode.trim().to_lowercase();
     match mode.as_str() {
         "" | "off" | "relaxed" => true,
-        "oauth-relaxed" => !bearer_token_from_request(req).is_empty(),
+        "oauth-relaxed" => !bearer_token(authorization).is_empty(),
         "bearer-dev" | "strict" => {
-            let token = bearer_token_from_request(req);
+            let token = bearer_token(authorization);
             let expected = server.config().bearer_token.trim();
             if token.is_empty() || expected.is_empty() {
                 return false;
@@ -124,11 +124,10 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 }
 
 /// legacy `bearerTokenFromRequest`.
-fn bearer_token_from_request(req: &Request) -> String {
-    let auth = req.authorization.trim();
-    match auth.split_once(' ') {
-        Some((scheme, token)) if scheme.eq_ignore_ascii_case("Bearer") => token.trim().to_string(),
-        _ => String::new(),
+fn bearer_token(authorization: &str) -> &str {
+    match authorization.trim().split_once(' ') {
+        Some((scheme, token)) if scheme.eq_ignore_ascii_case("Bearer") => token.trim(),
+        _ => "",
     }
 }
 

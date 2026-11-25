@@ -101,6 +101,12 @@ impl Server {
             ));
         }
 
+        let table_lock = self.table_lock(
+            &destination_ref.project_id,
+            &destination_ref.dataset_id,
+            &destination_ref.table_id,
+        );
+        let _guard = table_lock.lock().unwrap();
         let destination = self
             .read_table(
                 &destination_ref.project_id,
@@ -215,6 +221,12 @@ impl Server {
         if config.source_uris.is_empty() {
             return Err("configuration.load.sourceUris is required".to_string());
         }
+        let table_lock = self.table_lock(
+            &destination_ref.project_id,
+            &destination_ref.dataset_id,
+            &destination_ref.table_id,
+        );
+        let _guard = table_lock.lock().unwrap();
         let table = self
             .read_table(
                 &destination_ref.project_id,
@@ -308,6 +320,12 @@ impl Server {
                 config.source_format
             ));
         }
+        let table_lock = self.table_lock(
+            &destination_ref.project_id,
+            &destination_ref.dataset_id,
+            &destination_ref.table_id,
+        );
+        let _guard = table_lock.lock().unwrap();
         let table = self
             .read_table(
                 &destination_ref.project_id,

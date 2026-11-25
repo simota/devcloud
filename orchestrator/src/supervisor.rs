@@ -98,7 +98,7 @@ pub async fn run(cfg: Config) -> Result<(), String> {
     }
     if cfg.services.bigquery.enabled {
         let c = cfg.clone();
-        let sd = shutdown_future(rx.clone());
+        let sd = rx.clone();
         set.spawn(async move { services::bigquery::run(&c, sd).await });
     }
     if cfg.services.sqs.enabled {

@@ -727,6 +727,7 @@ fn spawn_devcloud_up(workspace: &Path) -> Child {
 \u{20}\u{20}gcsPort: 24443\n\
 \u{20}\u{20}dynamodbPort: 28000\n\
 \u{20}\u{20}bigqueryPort: 29050\n\
+\u{20}\u{20}bigqueryStoragePort: 0\n\
 \u{20}\u{20}redshiftPort: 25439\n\
 \u{20}\u{20}redshiftAPIPort: 29099\n\
 \u{20}\u{20}redisPort: 26379\n\

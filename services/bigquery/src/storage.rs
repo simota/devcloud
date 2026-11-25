@@ -402,6 +402,41 @@ impl Server {
         Ok(())
     }
 
+    /// Commits a validated Storage API batch and its metadata under the caller's table lock.
+    pub(crate) fn commit_storage_rows(
+        &self,
+        table: &TableResource,
+        existing_rows: &[StoredRow],
+        rows: &[StoredRow],
+    ) -> StorageResult<()> {
+        let reference = &table.table_reference;
+        let path = self.rows_path(
+            &reference.project_id,
+            &reference.dataset_id,
+            &reference.table_id,
+        );
+        let mut batch = Vec::new();
+        for row in rows {
+            batch.extend(wire_json::to_vec(&compact_row(row)?));
+        }
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
+        let original_size = file.metadata()?.len();
+        let result = file
+            .write_all(&batch)
+            .map_err(StorageError::from)
+            .and_then(|()| self.refresh_table_row_stats_incremental(table, existing_rows, rows));
+        if result.is_err() {
+            file.set_len(original_size)?;
+        }
+        result
+    }
+
     pub fn read_rows(
         &self,
         project_id: &str,

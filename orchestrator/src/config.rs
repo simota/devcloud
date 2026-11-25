@@ -50,6 +50,7 @@ pub struct ServerConfig {
     pub gcs_port: i32,
     pub dynamodb_port: i32,
     pub bigquery_port: i32,
+    pub bigquery_storage_port: i32,
     pub redshift_port: i32,
     pub redshift_api_port: i32,
     pub redis_port: i32,
@@ -446,6 +447,7 @@ pub fn default_config() -> Config {
             gcs_port: 14443,
             dynamodb_port: 18000,
             bigquery_port: 19050,
+            bigquery_storage_port: 19051,
             redshift_port: 15439,
             redshift_api_port: 19099,
             redis_port: 16379,
@@ -838,6 +840,9 @@ pub fn apply_config_value(cfg: &mut Config, path: &[String], value: &str) -> io:
         }
         "server.bigqueryPort" | "server.bigQueryPort" => {
             cfg.server.bigquery_port = parse_int("server.bigQueryPort", value)?
+        }
+        "server.bigqueryStoragePort" => {
+            cfg.server.bigquery_storage_port = parse_int("server.bigqueryStoragePort", value)?
         }
         "server.redshiftPort" => {
             cfg.server.redshift_port = parse_int("server.redshiftPort", value)?
@@ -1550,6 +1555,7 @@ pub fn default_config_yaml(cfg: &Config) -> String {
             "  gcsPort: {gcs_port}\n",
             "  dynamodbPort: {dynamodb_port}\n",
             "  bigqueryPort: {bigquery_port}\n",
+            "  bigqueryStoragePort: {bigquery_storage_port}\n",
             "  redshiftPort: {redshift_port}\n",
             "  redshiftAPIPort: {redshift_api_port}\n",
             "  redisPort: {redis_port}\n",
@@ -1757,6 +1763,7 @@ pub fn default_config_yaml(cfg: &Config) -> String {
         gcs_port = s.gcs_port,
         dynamodb_port = s.dynamodb_port,
         bigquery_port = s.bigquery_port,
+        bigquery_storage_port = s.bigquery_storage_port,
         redshift_port = s.redshift_port,
         redshift_api_port = s.redshift_api_port,
         redis_port = s.redis_port,
@@ -2245,6 +2252,7 @@ mod tests {
         "server.dynamodbPort",
         "server.bigqueryPort",
         "server.bigQueryPort",
+        "server.bigqueryStoragePort",
         "server.redshiftPort",
         "server.redshiftAPIPort",
         "server.redshiftApiPort",
@@ -2414,6 +2422,16 @@ mod tests {
         assert!(yaml.ends_with(
             "  cloudRun:\n    enabled: true\n    project: devcloud\n    region: us-central1\n    docker: false\n"
         ));
+    }
+
+    #[test]
+    fn bigquery_storage_port_round_trips_and_defaults_on_old_configs() {
+        let mut cfg = parse_yaml_in_memory("server:\n  bigqueryPort: 29050\n").unwrap();
+        assert_eq!(cfg.server.bigquery_storage_port, 19051);
+        cfg.server.bigquery_storage_port = 29051;
+        let parsed = parse_yaml_in_memory(&default_config_yaml(&cfg)).unwrap();
+        assert_eq!(parsed.server.bigquery_port, 29050);
+        assert_eq!(parsed.server.bigquery_storage_port, 29051);
     }
 
     #[test]

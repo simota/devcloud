@@ -1,0 +1,138 @@
+syntax = "proto3";
+
+// Wire-compatible subset of google/cloud/bigquery/storage/v1.
+package google.cloud.bigquery.storage.v1;
+
+import "google/protobuf/descriptor.proto";
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/wrappers.proto";
+
+service BigQueryRead {
+  rpc CreateReadSession(CreateReadSessionRequest) returns (ReadSession);
+  rpc ReadRows(ReadRowsRequest) returns (stream ReadRowsResponse);
+}
+
+service BigQueryWrite {
+  rpc AppendRows(stream AppendRowsRequest) returns (stream AppendRowsResponse);
+}
+
+enum DataFormat {
+  DATA_FORMAT_UNSPECIFIED = 0;
+  AVRO = 1;
+  ARROW = 2;
+}
+
+message AvroSchema {
+  string schema = 1;
+}
+
+message AvroRows {
+  bytes serialized_binary_rows = 1;
+  int64 row_count = 2;
+}
+
+message ReadStream {
+  string name = 1;
+}
+
+message ReadSession {
+  message TableModifiers {
+    google.protobuf.Timestamp snapshot_time = 1;
+  }
+  message TableReadOptions {
+    repeated string selected_fields = 1;
+    string row_restriction = 2;
+    // Opaque fields let the server reject unsupported serialization options.
+    oneof output_format_serialization_options {
+      bytes arrow_serialization_options = 3;
+      bytes avro_serialization_options = 4;
+    }
+    optional double sample_percentage = 5;
+    optional int32 response_compression_codec = 6;
+  }
+  string name = 1;
+  google.protobuf.Timestamp expire_time = 2;
+  DataFormat data_format = 3;
+  oneof schema {
+    AvroSchema avro_schema = 4;
+  }
+  string table = 6;
+  TableModifiers table_modifiers = 7;
+  TableReadOptions read_options = 8;
+  repeated ReadStream streams = 10;
+  string trace_id = 13;
+  int64 estimated_row_count = 14;
+}
+
+message CreateReadSessionRequest {
+  string parent = 1;
+  ReadSession read_session = 2;
+  int32 max_stream_count = 3;
+  int32 preferred_min_stream_count = 4;
+}
+
+message ReadRowsRequest {
+  string read_stream = 1;
+  int64 offset = 2;
+  optional bytes arrow_serialization_options = 5;
+}
+
+message ReadRowsResponse {
+  oneof rows {
+    AvroRows avro_rows = 3;
+  }
+  int64 row_count = 6;
+  oneof schema {
+    AvroSchema avro_schema = 7;
+  }
+}
+
+message ProtoSchema {
+  google.protobuf.DescriptorProto proto_descriptor = 1;
+}
+
+message ProtoRows {
+  repeated bytes serialized_rows = 1;
+}
+
+message AppendRowsRequest {
+  message ProtoData {
+    ProtoSchema writer_schema = 1;
+    ProtoRows rows = 2;
+  }
+  string write_stream = 1;
+  google.protobuf.Int64Value offset = 2;
+  oneof rows {
+    ProtoData proto_rows = 4;
+    bytes arrow_rows = 5;
+  }
+  map<string, int32> missing_value_interpretations = 7;
+  int32 default_missing_value_interpretation = 8;
+}
+
+message AppendRowsResponse {
+  message AppendResult {
+    google.protobuf.Int64Value offset = 1;
+  }
+  // Wire subset of google.rpc.Status.
+  message Error {
+    int32 code = 1;
+    string message = 2;
+  }
+  oneof response {
+    AppendResult append_result = 1;
+    Error error = 2;
+  }
+  repeated RowError row_errors = 4;
+  string write_stream = 5;
+}
+
+message RowError {
+  enum RowErrorCode {
+    ROW_ERROR_CODE_UNSPECIFIED = 0;
+    FIELDS_ERROR = 1;
+  }
+  int64 index = 1;
+  RowErrorCode code = 2;
+  string message = 3;
+}
