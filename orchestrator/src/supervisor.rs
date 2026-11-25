@@ -47,12 +47,15 @@ pub async fn shutdown_future(mut rx: watch::Receiver<bool>) {
 pub async fn run(cfg: Config) -> Result<(), String> {
     // Resolve external Redis before launching tasks, so invalid URL settings
     // cannot partially start the daemon or silently select the managed port.
-    let redis_target = cfg
+    let mut redis_target = cfg
         .services
         .redis
         .enabled
         .then(|| services::redis::connection_target(&cfg))
         .transpose()?;
+    if let Some(target) = &mut redis_target {
+        target.configure_tls(&cfg)?;
+    }
     let (tx, rx) = watch::channel(false);
     let mut set: JoinSet<Result<(), String>> = JoinSet::new();
 
@@ -142,9 +145,14 @@ pub async fn run(cfg: Config) -> Result<(), String> {
         set.spawn(async move { services::redshift::run(&c, sd).await });
     }
     if let Some(redis_target) = redis_target {
-        let c = cfg.clone();
         let sd = shutdown_future(rx.clone());
-        set.spawn(async move { services::redis::run(&c, sd).await });
+        if redis_target.mode == "external" {
+            let target = redis_target.clone();
+            set.spawn(async move { services::redis::run_external(&target, sd).await });
+        } else {
+            let c = cfg.clone();
+            set.spawn(async move { services::redis::run(&c, sd).await });
+        }
 
         // Redis control/introspection HTTP surface (dashboard redis page). Stays
         // in-process even when the upstream redis-server is absent (reads/mutations
@@ -152,8 +160,7 @@ pub async fn run(cfg: Config) -> Result<(), String> {
         // enabled. Feeds redis mutation events into the same relay channel.
         let rc_cfg = devcloud_redis_control::Config {
             http_addr: format!("127.0.0.1:{}", cfg.server.redis_http_port),
-            redis_addr: redis_target.addr,
-            redis_password: redis_target.password,
+            upstream: redis_target.upstream,
             control_auth_mode: cfg.auth.redis.mode.clone(),
             control_password: cfg.auth.redis.password.clone(),
             mode: redis_target.mode,

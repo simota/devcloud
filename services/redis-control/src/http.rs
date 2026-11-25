@@ -772,8 +772,7 @@ mod tests {
     #[tokio::test]
     async fn direct_control_rejects_simple_cross_site_posts_before_running_commands() {
         let server = Server::new(
-            "127.0.0.1:0".into(),
-            String::new(),
+            crate::Upstream::new("127.0.0.1:0".into(), String::new(), String::new()),
             "managed".into(),
             16,
             Box::new(|_, _| {}),

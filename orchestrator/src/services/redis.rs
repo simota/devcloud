@@ -7,9 +7,11 @@
 //! is a separate listener (see `services::redis_control`).
 
 use std::future::Future;
+use std::path::Path;
 use std::process::Stdio;
 
 use devcloud_redis::Config;
+use devcloud_redis_control::Upstream;
 use tokio::process::Command;
 
 use crate::config::Config as AppConfig;
@@ -30,20 +32,33 @@ fn redis_mode(cfg: &AppConfig) -> String {
 
 /// One resolved upstream, shared by lifecycle, control-plane wiring and display.
 /// The upstream password is independent of the control HTTP Basic password.
+#[derive(Clone)]
 pub struct ConnectionTarget {
     pub mode: String,
-    pub addr: String,
-    pub password: String,
+    pub upstream: Upstream,
     pub database: i64,
+    tls: bool,
 }
 
 impl ConnectionTarget {
     pub fn display_endpoint(&self) -> String {
         if self.mode == "external" {
-            format!("redis://{}/{}", self.addr, self.database)
+            let scheme = if self.tls { "rediss" } else { "redis" };
+            format!("{scheme}://{}/{}", self.upstream.addr, self.database)
         } else {
-            format!("redis://{}", self.addr)
+            format!("redis://{}", self.upstream.addr)
         }
+    }
+
+    pub fn configure_tls(&mut self, cfg: &AppConfig) -> Result<(), String> {
+        if self.tls {
+            let path = &cfg.services.redis.external_tls_ca_file;
+            if path.is_empty() {
+                return Err("redis: rediss requires services.redis.externalTlsCaFile".into());
+            }
+            self.upstream.enable_tls(Path::new(path))?;
+        }
+        Ok(())
     }
 }
 
@@ -60,26 +75,31 @@ pub fn connection_target(cfg: &AppConfig) -> Result<ConnectionTarget, String> {
         "external" => parse_external_url(config_text(&cfg.services.redis.external_url)),
         "managed" => Ok(ConnectionTarget {
             mode: "managed".into(),
-            addr: format!("127.0.0.1:{}", cfg.server.redis_port),
-            password: if cfg.auth.redis.mode.trim().eq_ignore_ascii_case("strict") {
-                cfg.auth.redis.password.clone()
-            } else {
-                String::new()
-            },
+            upstream: Upstream::new(
+                format!("127.0.0.1:{}", cfg.server.redis_port),
+                String::new(),
+                if cfg.auth.redis.mode.trim().eq_ignore_ascii_case("strict") {
+                    cfg.auth.redis.password.clone()
+                } else {
+                    String::new()
+                },
+            ),
             database: 0,
+            tls: false,
         }),
         _ => Err("redis: services.redis.mode must be managed or external".into()),
     }
 }
 
-/// Redis's supported local URL form: redis://[:password@]host[:port][/db].
-/// Non-default ACL users and TLS are outside this emulator's Redis contract;
-/// reject them explicitly rather than connecting with different credentials.
 fn parse_external_url(raw: &str) -> Result<ConnectionTarget, String> {
     let invalid = |reason: &str| format!("redis: invalid services.redis.externalUrl: {reason}");
-    let rest = raw
-        .strip_prefix("redis://")
-        .ok_or_else(|| invalid("expected a redis:// URL"))?;
+    let (tls, rest) = if let Some(rest) = raw.strip_prefix("rediss://") {
+        (true, rest)
+    } else if let Some(rest) = raw.strip_prefix("redis://") {
+        (false, rest)
+    } else {
+        return Err(invalid("expected a redis:// or rediss:// URL"));
+    };
     if rest.contains(['?', '#']) {
         return Err(invalid("query parameters and fragments are unsupported"));
     }
@@ -93,21 +113,23 @@ fn parse_external_url(raw: &str) -> Result<ConnectionTarget, String> {
         path.parse::<i64>()
             .map_err(|_| invalid("database is out of range"))?
     };
-    let (authority, password) = match authority.rsplit_once('@') {
+    let (authority, username, password) = match authority.rsplit_once('@') {
         Some((userinfo, authority)) => {
             let (username, password) = userinfo
                 .split_once(':')
-                .ok_or_else(|| invalid("credentials must use :password@host"))?;
+                .ok_or_else(|| invalid("credentials must use [username]:password@host"))?;
             let username = decode_url_component(username)
                 .ok_or_else(|| invalid("credentials contain an invalid percent escape"))?;
-            if !username.is_empty() && username != "default" {
-                return Err(invalid("only the default Redis ACL user is supported"));
-            }
             let password = decode_url_component(password)
                 .ok_or_else(|| invalid("credentials contain an invalid percent escape"))?;
-            (authority, password)
+            let username = if username == "default" {
+                String::new()
+            } else {
+                username
+            };
+            (authority, username, password)
         }
-        None => (authority, String::new()),
+        None => (authority, String::new(), String::new()),
     };
     let (host, port) = if let Some(rest) = authority.strip_prefix('[') {
         let (host, suffix) = rest
@@ -141,9 +163,9 @@ fn parse_external_url(raw: &str) -> Result<ConnectionTarget, String> {
         .ok_or_else(|| invalid("port must be an integer between 1 and 65535"))?;
     Ok(ConnectionTarget {
         mode: "external".into(),
-        addr: format!("{host}:{port}"),
-        password,
+        upstream: Upstream::new(format!("{host}:{port}"), username, password),
         database,
+        tls,
     })
 }
 
@@ -165,29 +187,18 @@ fn decode_url_component(value: &str) -> Option<String> {
     String::from_utf8(output).ok()
 }
 
-pub async fn run(cfg: &AppConfig, shutdown: impl Future<Output = ()>) -> Result<(), String> {
-    // External mode: the orchestrator does not own a redis process; the control
-    // surface talks to the user-supplied URL. Nothing to manage here.
-    let target = connection_target(cfg)?;
-    if target.mode == "external" {
-        let result = devcloud_redis_control::validate_upstream(
-            &target.addr,
-            &target.password,
-            target.database,
-        )
-        .await;
-        result.map_err(|error| {
-            let error = if target.password.is_empty() {
-                error
-            } else {
-                error.replace(&target.password, "redacted")
-            };
-            format!("redis: validate external Redis connection: {error}")
-        })?;
-        shutdown.await;
-        return Ok(());
-    }
+pub async fn run_external(
+    target: &ConnectionTarget,
+    shutdown: impl Future<Output = ()>,
+) -> Result<(), String> {
+    devcloud_redis_control::validate_upstream(&target.upstream, target.database)
+        .await
+        .map_err(|error| format!("redis: validate external Redis connection: {error}"))?;
+    shutdown.await;
+    Ok(())
+}
 
+pub async fn run(cfg: &AppConfig, shutdown: impl Future<Output = ()>) -> Result<(), String> {
     let rc = Config {
         addr: format!("127.0.0.1:{}", cfg.server.redis_port),
         data_dir: scoped_data_dir(&cfg.storage.path, &cfg.services.redis.data_dir, "redis").into(),
@@ -252,8 +263,9 @@ mod tests {
         cfg.auth.redis.mode = "strict".into();
         cfg.auth.redis.password = "control-only-secret".into();
         let target = connection_target(&cfg).unwrap();
-        assert_eq!(target.addr, "[::1]:6380");
-        assert_eq!(target.password, "p@ss:word");
+        assert_eq!(target.upstream.addr, "[::1]:6380");
+        assert!(target.upstream.username.is_empty());
+        assert_eq!(target.upstream.password, "p@ss:word");
         assert_eq!(target.database, 3);
         assert_eq!(target.display_endpoint(), "redis://[::1]:6380/3");
 
@@ -261,9 +273,22 @@ mod tests {
         cfg.services.redis.external_url = "redis://localhost".into();
         let target = connection_target(&cfg).unwrap();
         assert_eq!(target.mode, "external");
-        assert_eq!(target.addr, "localhost:6379");
-        assert!(target.password.is_empty());
+        assert_eq!(target.upstream.addr, "localhost:6379");
+        assert!(target.upstream.password.is_empty());
         assert_eq!(target.database, 0);
+    }
+
+    #[test]
+    fn rediss_requires_a_ca_file_without_exposing_url_credentials() {
+        let mut cfg = AppConfig::default();
+        cfg.services.redis.mode = "external".into();
+        cfg.services.redis.external_url = "rediss://reader:test-password@localhost".into();
+        let mut target = connection_target(&cfg).unwrap();
+        assert_eq!(target.display_endpoint(), "rediss://localhost:6379/0");
+        assert_eq!(
+            target.configure_tls(&cfg).unwrap_err(),
+            "redis: rediss requires services.redis.externalTlsCaFile"
+        );
     }
 
     #[test]
@@ -271,7 +296,6 @@ mod tests {
         for raw in [
             "",
             "https://:secret@example.test:6379",
-            "rediss://:secret@example.test:6379",
             "redis://:secret@",
             "redis://:secret@host:0",
             "redis://:secret@host:65536",
@@ -279,7 +303,8 @@ mod tests {
             "redis://:secret@host/9223372036854775808",
             "redis://:secret@host/0?db=1",
             "redis://:secret@host/0#fragment",
-            "redis://other:secret@host/0",
+            "redis://other@host/0",
+            "redis://other%zz:secret@host/0",
             "redis://:secret%あ@host/0",
             "redis://:secret%zz@host/0",
             "redis://:secret@[not-an-ip]/0",
@@ -297,13 +322,16 @@ mod tests {
         let mut cfg = AppConfig::default();
         cfg.auth.redis.password = "control-secret".into();
         let target = connection_target(&cfg).unwrap();
-        assert_eq!(target.addr, "127.0.0.1:16379");
+        assert_eq!(target.upstream.addr, "127.0.0.1:16379");
         assert!(
-            target.password.is_empty(),
+            target.upstream.password.is_empty(),
             "relaxed Redis has no requirepass"
         );
         cfg.auth.redis.mode = "strict".into();
-        assert_eq!(connection_target(&cfg).unwrap().password, "control-secret");
+        assert_eq!(
+            connection_target(&cfg).unwrap().upstream.password,
+            "control-secret"
+        );
         cfg.services.redis.mode = "typo".into();
         assert!(connection_target(&cfg).is_err());
     }

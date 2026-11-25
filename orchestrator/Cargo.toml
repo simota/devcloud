@@ -39,6 +39,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 [dev-dependencies]
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 # dashboard_conformance.rs replays the dashboard golden oracle: it drives
 # `devcloud up` and reuses the dashboard crate's hand-rolled HTTP client to seed
 # + probe. devcloud-dashboard / tokio / serde_json are already normal deps; these
