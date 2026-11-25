@@ -2,9 +2,7 @@
 //! (`X-Amz-Target: AmazonDAXV3.<Operation>`).
 //!
 //! Emulates cluster, subnet group, parameter group, and tag lifecycle
-//! deterministically in the DynamoDB service state. The proprietary binary
-//! DAX data-plane caching protocol (Tube/CBOR on TCP port 8111/9111) is not
-//! emulated.
+//! deterministically in the DynamoDB service state.
 
 use std::collections::{BTreeMap, BTreeSet};
 

@@ -7,6 +7,7 @@
 
 pub mod attribute;
 pub mod dax;
+pub mod dax_data;
 pub mod errors;
 pub mod expression;
 pub mod global_tables;
