@@ -738,3 +738,134 @@ fn postgres_backend_transaction_drop_from_worker_thread_does_not_panic() {
         .expect("dropping Transaction on a worker thread must not panic");
     });
 }
+
+// ---- UNLOAD on the PostgreSQL backend ----
+
+fn temp_s3_dir(tag: &str) -> std::path::PathBuf {
+    static COUNTER: AtomicUsize = AtomicUsize::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+    let dir = std::env::temp_dir().join(format!(
+        "devcloud-redshift-pg-unload-{tag}-{}-{n}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).expect("create temp s3 dir");
+    dir
+}
+
+#[test]
+fn postgres_backend_unload_to_local_s3_formats_and_options() {
+    use devcloud_redshift::{RedshiftToPostgres, Server as RedshiftServer};
+    use devcloud_s3::store::FileBucketStore;
+
+    let fake_pg = start_fake_server(false);
+    let backend = Backend::open(Config {
+        dsn: fake_pg.dsn.clone(),
+        ..Config::default()
+    })
+    .expect("open backend");
+
+    let s3_dir = temp_s3_dir("formats");
+    let store = Arc::new(FileBucketStore::new(s3_dir.clone()));
+    store.create_bucket("unload-bucket").expect("create bucket");
+
+    let server = RedshiftServer::new(devcloud_redshift::Config {
+        object_store: Some(Arc::clone(&store)),
+        sql_backend: Some(Arc::new(backend)),
+        translator: Some(Arc::new(RedshiftToPostgres)),
+        ..devcloud_redshift::Config::default()
+    });
+
+    // 1. Default text format (`|` delimiter), HEADER, NULL AS, on a client session.
+    let mut session = server.backend().session().expect("open session");
+    let res = server
+        .execute_sql_in(
+            &mut session,
+            "UNLOAD ('select mixed types') TO 's3://unload-bucket/text/part_' IAM_ROLE 'arn:aws:iam::000000000000:role/r' HEADER NULL AS '\\N'",
+        )
+        .expect("UNLOAD text");
+    assert_eq!(res.tag, "UNLOAD");
+    let (_, data) = store
+        .get_object("unload-bucket", "text/part_000")
+        .expect("get text")
+        .expect("text object exists");
+    assert_eq!(
+        String::from_utf8(data).unwrap(),
+        "ok|amount|created_at|payload|missing\ntrue|12.34|2026-05-04 15:28:19|hello|\\N\n"
+    );
+
+    // 2. Non-empty destination without ALLOWOVERWRITE / CLEANPATH fails.
+    let err = server
+        .execute_sql_in(
+            &mut session,
+            "UNLOAD ('select mixed types') TO 's3://unload-bucket/text/part_' IAM_ROLE default",
+        )
+        .expect_err("UNLOAD without ALLOWOVERWRITE should fail");
+    assert!(
+        err.to_string().contains("ALLOWOVERWRITE"),
+        "unexpected error: {err}"
+    );
+
+    // 3. ALLOWOVERWRITE succeeds and replaces the object; CSV with custom delimiter.
+    server
+        .execute_sql_in(
+            &mut session,
+            "UNLOAD ('select mixed types') TO 's3://unload-bucket/text/part_' IAM_ROLE default FORMAT AS CSV DELIMITER ';' ALLOWOVERWRITE",
+        )
+        .expect("UNLOAD CSV allowoverwrite");
+    let (_, data) = store
+        .get_object("unload-bucket", "text/part_000")
+        .expect("get csv")
+        .expect("csv object exists");
+    assert_eq!(
+        String::from_utf8(data).unwrap(),
+        "true;12.34;2026-05-04 15:28:19;hello;\n"
+    );
+
+    // 4. CLEANPATH removes prior objects under prefix before writing GZIP output.
+    store
+        .put_object(devcloud_s3::objops::PutObjectInput {
+            bucket: "unload-bucket".to_string(),
+            key: "clean/stale.txt".to_string(),
+            body: b"old".to_vec(),
+            ..Default::default()
+        })
+        .expect("seed stale object");
+    server
+        .execute_sql_in(
+            &mut session,
+            "UNLOAD ('select mixed types') TO 's3://unload-bucket/clean/' CSV GZIP CLEANPATH",
+        )
+        .expect("UNLOAD GZIP CLEANPATH");
+    assert!(
+        store
+            .get_object("unload-bucket", "clean/stale.txt")
+            .unwrap()
+            .is_none(),
+        "CLEANPATH should delete stale objects under prefix"
+    );
+    let (_, gz_data) = store
+        .get_object("unload-bucket", "clean/000.gz")
+        .expect("get gz")
+        .expect("gz object exists");
+    let mut plain = String::new();
+    flate2::read::MultiGzDecoder::new(&gz_data[..])
+        .read_to_string(&mut plain)
+        .expect("gunzip");
+    assert_eq!(plain, "true,12.34,2026-05-04 15:28:19,hello,\n");
+
+    // 5. FORMAT AS JSON writes typed JSON Lines to 000.json.
+    server
+        .execute_sql(
+            "UNLOAD ('SELECT NVL(NULL, 42) AS answer') TO 's3://unload-bucket/json/row_' FORMAT AS JSON",
+        )
+        .expect("UNLOAD JSON");
+    let (_, json_data) = store
+        .get_object("unload-bucket", "json/row_000.json")
+        .expect("get json")
+        .expect("json object exists");
+    assert_eq!(String::from_utf8(json_data).unwrap(), "{\"answer\":42}\n");
+
+    drop(session);
+    let _ = server.backend().close();
+    let _ = std::fs::remove_dir_all(&s3_dir);
+}

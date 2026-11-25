@@ -1,26 +1,29 @@
-//! Redshift `COPY ... FROM 's3://...'` for SQL backends that do not implement
-//! it themselves (PostgreSQL).
+//! Redshift `COPY ... FROM 's3://...'` and `UNLOAD ('...') TO 's3://...'` for
+//! SQL backends that do not implement them themselves (PostgreSQL).
 //!
-//! devcloud reads the objects from the local S3 store, parses them the way
+//! devcloud reads COPY objects from the local S3 store, parses them the way
 //! Redshift does, and loads the rows with `INSERT` statements on the client's
 //! own backend session — so a COPY into a temp table, or inside an open
 //! transaction, behaves as it does on Redshift.
 //!
-//! Supported: `FROM 's3://bucket/prefix'` (every object whose key starts with
-//! the prefix, in key order), the default text format with `DELIMITER`,
-//! `CSV` / `FORMAT AS CSV`, `JSON 'auto'` / `JSON 'auto ignorecase'`, `GZIP`,
-//! `IGNOREHEADER`, `NULL AS`, `EMPTYASNULL`, `BLANKSASNULL`. Authorization
-//! (`IAM_ROLE`, `CREDENTIALS`, ...) and `REGION` are accepted and ignored.
-//! Any other option is refused rather than silently ignored.
+//! For UNLOAD, devcloud translates the inner query through the server's
+//! `RedshiftTranslator`, runs it on the client's backend session (or the
+//! backend connection), formats the result rows as delimited text, CSV, or
+//! JSON Lines (optionally GZIP-compressed, with `HEADER`, `DELIMITER`,
+//! `NULL AS`, and `ALLOWOVERWRITE` / `CLEANPATH`), and writes the output to the
+//! local S3 store.
 
-use std::io::Read;
+use std::io::{Read, Write};
 
-use crate::backend::{ExecResult, SqlSession};
+use devcloud_s3::objops::PutObjectInput;
+
+use crate::backend::{ExecResult, Field, SqlSession};
 use crate::copy_unload::{parse_csv_delimiter, tokenize_sql_options};
 use crate::engine::QueryResult;
 use crate::errors::SqlError;
-use crate::server::Server;
-use crate::sql_parse::parse_leading_sql_string_literal;
+use crate::server::{default_str, Server};
+use crate::sql_parse::{matching_paren, parse_leading_sql_string_literal};
+use crate::translator::Session as TranslatorSession;
 
 /// Rows per generated INSERT.
 const INSERT_BATCH_ROWS: usize = 500;
@@ -30,6 +33,14 @@ pub(crate) fn is_copy(statement: &str) -> bool {
     // Bytes, not a str slice: the statement may start with any UTF-8 text.
     let b = statement.trim_start().as_bytes();
     b.len() > 4 && b[..4].eq_ignore_ascii_case(b"copy") && b[4].is_ascii_whitespace()
+}
+
+/// Whether `statement` is an UNLOAD (`UNLOAD ('...') TO 's3://...'`).
+pub(crate) fn is_unload(statement: &str) -> bool {
+    let b = statement.trim_start().as_bytes();
+    b.len() > 6
+        && b[..6].eq_ignore_ascii_case(b"unload")
+        && (b[6].is_ascii_whitespace() || b[6] == b'(')
 }
 
 /// Byte offset of the `FROM` keyword: whitespace before it, whitespace or a
@@ -567,6 +578,424 @@ fn gunzip(data: &[u8]) -> std::io::Result<Vec<u8>> {
     Ok(out)
 }
 
+fn gzip(data: &[u8]) -> std::io::Result<Vec<u8>> {
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(data)?;
+    encoder.finish()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnloadFormat {
+    Text,
+    Csv,
+    Json,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UnloadOptions {
+    format: UnloadFormat,
+    delimiter: Option<char>,
+    gzip: bool,
+    header: bool,
+    null_as: Option<String>,
+    allow_overwrite: bool,
+    clean_path: bool,
+}
+
+impl Default for UnloadOptions {
+    fn default() -> Self {
+        UnloadOptions {
+            format: UnloadFormat::Text,
+            delimiter: None,
+            gzip: false,
+            header: false,
+            null_as: None,
+            allow_overwrite: false,
+            clean_path: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UnloadStatement {
+    select_sql: String,
+    target_prefix: String,
+    options: UnloadOptions,
+}
+
+impl Server {
+    pub(crate) fn unload_through_backend(
+        &self,
+        backend_session: &mut Option<Box<dyn SqlSession>>,
+        statement: &str,
+    ) -> Result<QueryResult, SqlError> {
+        let unload = parse_unload(statement)?;
+        if unload.options.format == UnloadFormat::Json {
+            if unload.options.header {
+                return Err(SqlError::new("UNLOAD HEADER is not supported with JSON"));
+            }
+            if unload.options.delimiter.is_some() {
+                return Err(SqlError::new("UNLOAD DELIMITER is not supported with JSON"));
+            }
+            if unload.options.null_as.is_some() {
+                return Err(SqlError::new("UNLOAD NULL AS is not supported with JSON"));
+            }
+        }
+        let Some(store) = &self.shared.config.object_store else {
+            return Err(SqlError::new(
+                "UNLOAD to s3 URI requires local S3 service to be enabled",
+            ));
+        };
+        let (bucket, prefix) = parse_unload_s3_uri(&unload.target_prefix)?;
+
+        let existing = store
+            .list_objects(&bucket, &prefix)
+            .map_err(|err| SqlError::new(format!("UNLOAD list S3 objects: {err:?}")))?
+            .ok_or_else(|| {
+                SqlError::new(format!("UNLOAD target bucket {bucket} does not exist"))
+            })?;
+
+        if !existing.is_empty() && !unload.options.allow_overwrite && !unload.options.clean_path {
+            return Err(SqlError::new(format!(
+                "Specified unload destination on S3 is not empty: s3://{bucket}/{prefix}. Consider using a different bucket / prefix, manually removing the target files in S3, or using the ALLOWOVERWRITE option."
+            )));
+        }
+
+        let session = TranslatorSession {
+            database: default_str(&self.shared.config.database, "dev"),
+            user: default_str(&self.shared.config.user, "dev"),
+            schema: "public".to_string(),
+        };
+        let translated = self.translator.translate(&session, &unload.select_sql)?;
+        let backend_sql = if translated.backend_sql.trim().is_empty() {
+            unload.select_sql.as_str()
+        } else {
+            translated.backend_sql.as_str()
+        };
+
+        let (fields, rows) = match backend_session.as_mut() {
+            Some(s) => s.exec_nullable(backend_sql)?,
+            None => self.backend().exec_nullable(backend_sql)?,
+        };
+
+        let formatted = format_unload_output(&fields, &rows, &unload.options);
+        let body = if unload.options.gzip {
+            gzip(formatted.as_bytes())
+                .map_err(|err| SqlError::new(format!("UNLOAD gzip: {err}")))?
+        } else {
+            formatted.into_bytes()
+        };
+
+        if unload.options.clean_path {
+            for obj in existing {
+                store
+                    .delete_object(&bucket, &obj.key)
+                    .map_err(|err| SqlError::new(format!("UNLOAD clean S3 object: {err:?}")))?;
+            }
+        }
+
+        let suffix = match (unload.options.format, unload.options.gzip) {
+            (UnloadFormat::Json, true) => "000.json.gz",
+            (UnloadFormat::Json, false) => "000.json",
+            (_, true) => "000.gz",
+            (_, false) => "000",
+        };
+        let content_type = match (unload.options.format, unload.options.gzip) {
+            (_, true) => "application/gzip",
+            (UnloadFormat::Json, false) => "application/json",
+            (UnloadFormat::Csv, false) => "text/csv",
+            (UnloadFormat::Text, false) => "text/plain",
+        };
+        let key = format!("{prefix}{suffix}");
+        store
+            .put_object(PutObjectInput {
+                bucket,
+                key,
+                body,
+                content_type: content_type.to_string(),
+                ..Default::default()
+            })
+            .map_err(|err| SqlError::new(format!("UNLOAD write S3 object: {err:?}")))?;
+
+        Ok(QueryResult::tag_only("UNLOAD"))
+    }
+}
+
+fn parse_unload(statement: &str) -> Result<UnloadStatement, SqlError> {
+    let body = statement.trim().trim_end_matches(';').trim();
+    let rest = body["unload".len()..].trim_start();
+    if !rest.starts_with('(') {
+        return Err(SqlError::new("UNLOAD requires a parenthesized SELECT"));
+    }
+    let close = matching_paren(rest, 0)
+        .ok_or_else(|| SqlError::new("UNLOAD has an unterminated SELECT"))?;
+    let inner = rest[1..close].trim();
+    let (select_sql, inner_rest) = parse_leading_sql_string_literal(inner).map_err(|err| {
+        SqlError::new(format!(
+            "UNLOAD requires SELECT SQL as a string literal: {err}"
+        ))
+    })?;
+    if !inner_rest.trim().is_empty() {
+        return Err(SqlError::new(
+            "UNLOAD requires SELECT SQL as a single string literal",
+        ));
+    }
+    let select_sql = select_sql.trim().trim_end_matches(';').trim().to_string();
+    if select_sql.is_empty() {
+        return Err(SqlError::new("UNLOAD SELECT query cannot be empty"));
+    }
+    let after_select = rest[close + 1..].trim_start();
+    let after_bytes = after_select.as_bytes();
+    if after_bytes.len() < 2
+        || !after_bytes[..2].eq_ignore_ascii_case(b"to")
+        || !after_bytes
+            .get(2)
+            .is_some_and(|c| c.is_ascii_whitespace() || *c == b'\'')
+    {
+        return Err(SqlError::new("UNLOAD requires TO"));
+    }
+    let after_to = after_select["to".len()..].trim_start();
+    let (target_prefix, options_text) = parse_leading_sql_string_literal(after_to)
+        .map_err(|err| SqlError::new(format!("UNLOAD requires an s3:// target prefix: {err}")))?;
+    Ok(UnloadStatement {
+        select_sql,
+        target_prefix,
+        options: parse_unload_options(&options_text)?,
+    })
+}
+
+fn parse_unload_s3_uri(uri: &str) -> Result<(String, String), SqlError> {
+    let Some(rest) = uri
+        .get(..5)
+        .filter(|scheme| scheme.eq_ignore_ascii_case("s3://"))
+        .map(|_| &uri[5..])
+    else {
+        return Err(SqlError::new("UNLOAD supports only s3:// targets"));
+    };
+    match rest.split_once('/') {
+        Some((bucket, prefix)) if !bucket.is_empty() && !prefix.is_empty() => {
+            Ok((bucket.to_string(), prefix.to_string()))
+        }
+        _ => Err(SqlError::new(
+            "UNLOAD s3:// URI requires bucket and key prefix",
+        )),
+    }
+}
+
+fn parse_unload_options(text: &str) -> Result<UnloadOptions, SqlError> {
+    let tokens = tokenize_sql_options(text)?;
+    let mut options = UnloadOptions::default();
+    let mut i = 0;
+    let value = |i: &mut usize, name: &str| -> Result<String, SqlError> {
+        if tokens
+            .get(*i + 1)
+            .is_some_and(|t| t.eq_ignore_ascii_case("as"))
+        {
+            *i += 1;
+        }
+        *i += 1;
+        tokens
+            .get(*i)
+            .cloned()
+            .ok_or_else(|| SqlError::new(format!("UNLOAD {name} requires a value")))
+    };
+    while i < tokens.len() {
+        let token = tokens[i].to_ascii_lowercase();
+        match token.as_str() {
+            "format" => {
+                if tokens
+                    .get(i + 1)
+                    .is_some_and(|t| t.eq_ignore_ascii_case("as"))
+                {
+                    i += 1;
+                }
+                i += 1;
+                let Some(fmt) = tokens.get(i) else {
+                    return Err(SqlError::new("UNLOAD FORMAT requires a value"));
+                };
+                match fmt.to_ascii_lowercase().as_str() {
+                    "csv" => options.format = UnloadFormat::Csv,
+                    "json" => options.format = UnloadFormat::Json,
+                    other => {
+                        return Err(SqlError::new(format!(
+                            "UNLOAD FORMAT {} is not supported by devcloud",
+                            other.to_ascii_uppercase()
+                        )))
+                    }
+                }
+            }
+            "csv" => options.format = UnloadFormat::Csv,
+            "json" => options.format = UnloadFormat::Json,
+            "delimiter" => {
+                options.delimiter = Some(parse_csv_delimiter(&value(&mut i, "DELIMITER")?)?)
+            }
+            "gzip" => options.gzip = true,
+            "header" => options.header = true,
+            "null" => options.null_as = Some(value(&mut i, "NULL AS")?),
+            "allowoverwrite" => options.allow_overwrite = true,
+            "cleanpath" => options.clean_path = true,
+            "parallel" => {
+                let v = value(&mut i, "PARALLEL")?;
+                if !matches!(
+                    v.to_ascii_lowercase().as_str(),
+                    "on" | "off" | "true" | "false"
+                ) {
+                    return Err(SqlError::new("UNLOAD PARALLEL requires ON or OFF"));
+                }
+            }
+            "iam_role"
+            | "credentials"
+            | "access_key_id"
+            | "secret_access_key"
+            | "session_token"
+            | "master_symmetric_key" => {
+                i += 1;
+            }
+            "region" => {
+                value(&mut i, "REGION")?;
+            }
+            "" => {}
+            other => {
+                return Err(SqlError::new(format!(
+                    "UNLOAD option {} is not supported by devcloud",
+                    other.to_ascii_uppercase()
+                )))
+            }
+        }
+        i += 1;
+    }
+    Ok(options)
+}
+
+fn format_unload_output(
+    fields: &[Field],
+    rows: &[Vec<Option<String>>],
+    options: &UnloadOptions,
+) -> String {
+    match options.format {
+        UnloadFormat::Csv => format_unload_csv(fields, rows, options),
+        UnloadFormat::Text => format_unload_text(fields, rows, options),
+        UnloadFormat::Json => format_unload_json(fields, rows),
+    }
+}
+
+fn format_unload_csv(
+    fields: &[Field],
+    rows: &[Vec<Option<String>>],
+    options: &UnloadOptions,
+) -> String {
+    let delimiter = options.delimiter.unwrap_or(',');
+    let null_str = options.null_as.as_deref().unwrap_or("");
+    let mut out = String::new();
+    if options.header && !fields.is_empty() {
+        let header: Vec<&str> = fields.iter().map(|f| f.name.as_str()).collect();
+        write_unload_csv_line(&mut out, &header, delimiter);
+    }
+    for row in rows {
+        let cols: Vec<&str> = row
+            .iter()
+            .map(|v| v.as_deref().unwrap_or(null_str))
+            .collect();
+        write_unload_csv_line(&mut out, &cols, delimiter);
+    }
+    out
+}
+
+fn write_unload_csv_line(out: &mut String, cols: &[&str], delimiter: char) {
+    for (i, field) in cols.iter().enumerate() {
+        if i > 0 {
+            out.push(delimiter);
+        }
+        if field
+            .chars()
+            .any(|c| c == delimiter || c == '"' || c == '\r' || c == '\n')
+        {
+            out.push('"');
+            for ch in field.chars() {
+                if ch == '"' {
+                    out.push('"');
+                }
+                out.push(ch);
+            }
+            out.push('"');
+        } else {
+            out.push_str(field);
+        }
+    }
+    out.push('\n');
+}
+
+fn format_unload_text(
+    fields: &[Field],
+    rows: &[Vec<Option<String>>],
+    options: &UnloadOptions,
+) -> String {
+    let delimiter = options.delimiter.unwrap_or('|');
+    let null_str = options.null_as.as_deref().unwrap_or("");
+    let mut out = String::new();
+    if options.header && !fields.is_empty() {
+        for (i, f) in fields.iter().enumerate() {
+            if i > 0 {
+                out.push(delimiter);
+            }
+            out.push_str(&f.name);
+        }
+        out.push('\n');
+    }
+    for row in rows {
+        for (i, v) in row.iter().enumerate() {
+            if i > 0 {
+                out.push(delimiter);
+            }
+            out.push_str(v.as_deref().unwrap_or(null_str));
+        }
+        out.push('\n');
+    }
+    out
+}
+
+fn format_unload_json(fields: &[Field], rows: &[Vec<Option<String>>]) -> String {
+    let mut out = String::new();
+    for row in rows {
+        let mut obj = serde_json::Map::with_capacity(fields.len());
+        for (i, field) in fields.iter().enumerate() {
+            let val = match row.get(i).and_then(|v| v.as_deref()) {
+                None => serde_json::Value::Null,
+                Some(text) => json_value_for_oid(text, field.type_oid),
+            };
+            obj.insert(field.name.clone(), val);
+        }
+        if let Ok(line) = serde_json::to_string(&serde_json::Value::Object(obj)) {
+            out.push_str(&line);
+            out.push('\n');
+        }
+    }
+    out
+}
+
+fn json_value_for_oid(text: &str, type_oid: i32) -> serde_json::Value {
+    match type_oid {
+        16 => match text.to_ascii_lowercase().as_str() {
+            "t" | "true" | "1" => serde_json::Value::Bool(true),
+            "f" | "false" | "0" => serde_json::Value::Bool(false),
+            _ => serde_json::Value::String(text.to_string()),
+        },
+        20 | 21 | 23 => text
+            .parse::<i64>()
+            .map(|n| serde_json::Value::Number(n.into()))
+            .unwrap_or_else(|_| serde_json::Value::String(text.to_string())),
+        700 | 701 | 1700 => text
+            .parse::<f64>()
+            .ok()
+            .and_then(serde_json::Number::from_f64)
+            .map(serde_json::Value::Number)
+            .unwrap_or_else(|| serde_json::Value::String(text.to_string())),
+        114 | 3802 => serde_json::from_str(text)
+            .unwrap_or_else(|_| serde_json::Value::String(text.to_string())),
+        _ => serde_json::Value::String(text.to_string()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -758,5 +1187,117 @@ mod tests {
         assert_eq!(c.table, "\"from table\"");
         let c = parse_copy("COPY fromage FROM 's3://b/k'").unwrap();
         assert_eq!(c.table, "fromage");
+    }
+
+    #[test]
+    fn is_unload_detects_the_keyword() {
+        assert!(is_unload("  unload ('select 1') to 's3://b/k'"));
+        assert!(is_unload("UNLOAD('select 1') TO 's3://b/k'"));
+        assert!(is_unload("UNLOAD\n  ('select 1') TO 's3://b/k'"));
+        assert!(!is_unload("UNLOADER"));
+        assert!(!is_unload("select 'unload '"));
+        assert!(!is_unload("-- 猫\nSELECT 1;"));
+        assert!(!is_unload("猫猫"));
+    }
+
+    #[test]
+    fn parses_unload_statements_and_options() {
+        let u = parse_unload(
+            "UNLOAD ('SELECT id, name FROM t WHERE name = ''alice''') TO 's3://b/out/part_' IAM_ROLE 'arn:aws:iam::1:role/r' FORMAT AS CSV HEADER GZIP ALLOWOVERWRITE NULL AS 'NULL' PARALLEL OFF;",
+        )
+        .unwrap();
+        assert_eq!(u.select_sql, "SELECT id, name FROM t WHERE name = 'alice'");
+        assert_eq!(u.target_prefix, "s3://b/out/part_");
+        assert_eq!(u.options.format, UnloadFormat::Csv);
+        assert!(u.options.header);
+        assert!(u.options.gzip);
+        assert!(u.options.allow_overwrite);
+        assert_eq!(u.options.null_as.as_deref(), Some("NULL"));
+
+        let u = parse_unload(
+            r"UNLOAD('select 1') TO's3://b/out/' CREDENTIALS 'aws_access_key_id=a;aws_secret_access_key=b' DELIMITER '\t' CLEANPATH REGION AS 'us-east-1'",
+        )
+        .unwrap();
+        assert_eq!(u.options.format, UnloadFormat::Text);
+        assert_eq!(u.options.delimiter, Some('\t'));
+        assert!(u.options.clean_path);
+
+        let u = parse_unload("UNLOAD ('select 1') TO 's3://b/out/' FORMAT AS JSON").unwrap();
+        assert_eq!(u.options.format, UnloadFormat::Json);
+
+        for bad in [
+            "MANIFEST",
+            "BZIP2",
+            "FORMAT AS PARQUET",
+            "PARTITION BY (dt)",
+            "MAXFILESIZE 100 MB",
+            "ENCRYPTED",
+        ] {
+            assert!(parse_unload_options(bad).is_err(), "{bad}");
+        }
+        assert!(parse_unload("UNLOAD 'select 1' TO 's3://b/k'").is_err());
+        assert!(parse_unload("UNLOAD ('') TO 's3://b/k'").is_err());
+        assert!(parse_unload("UNLOAD ('select 1') 's3://b/k'").is_err());
+    }
+
+    #[test]
+    fn formats_unload_text_csv_and_json() {
+        let fields = vec![
+            Field {
+                name: "id".into(),
+                type_oid: 23,
+                type_size: 4,
+            },
+            Field {
+                name: "name".into(),
+                type_oid: 1043,
+                type_size: -1,
+            },
+            Field {
+                name: "ok".into(),
+                type_oid: 16,
+                type_size: 1,
+            },
+        ];
+        let rows = vec![
+            vec![Some("1".into()), Some("a, \"b\"".into()), Some("t".into())],
+            vec![Some("2".into()), None, Some("f".into())],
+        ];
+
+        let text = format_unload_output(
+            &fields,
+            &rows,
+            &UnloadOptions {
+                format: UnloadFormat::Text,
+                header: true,
+                null_as: Some("\\N".into()),
+                ..UnloadOptions::default()
+            },
+        );
+        assert_eq!(text, "id|name|ok\n1|a, \"b\"|t\n2|\\N|f\n");
+
+        let csv = format_unload_output(
+            &fields,
+            &rows,
+            &UnloadOptions {
+                format: UnloadFormat::Csv,
+                header: true,
+                ..UnloadOptions::default()
+            },
+        );
+        assert_eq!(csv, "id,name,ok\n1,\"a, \"\"b\"\"\",t\n2,,f\n");
+
+        let json = format_unload_output(
+            &fields,
+            &rows,
+            &UnloadOptions {
+                format: UnloadFormat::Json,
+                ..UnloadOptions::default()
+            },
+        );
+        assert_eq!(
+            json,
+            "{\"id\":1,\"name\":\"a, \\\"b\\\"\",\"ok\":true}\n{\"id\":2,\"name\":null,\"ok\":false}\n"
+        );
     }
 }
