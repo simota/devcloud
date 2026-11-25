@@ -108,3 +108,18 @@ pub struct ListMessagesResult {
     #[serde(rename = "nextCursor", default)]
     pub next_cursor: String,
 }
+
+/// A non-deleted message paired with its stable, strictly increasing 1-based
+/// mailbox UID (used by IMAP and POP3).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MailboxMessage {
+    pub uid: u32,
+    pub message: Message,
+}
+
+/// Chronological (oldest-first) mailbox snapshot for IMAP/POP3 sessions.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MailboxSnapshot {
+    pub messages: Vec<MailboxMessage>,
+    pub uid_next: u32,
+}

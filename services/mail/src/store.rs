@@ -13,7 +13,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use crate::blob::BlobStore;
-use crate::model::{ListMessagesInput, ListMessagesResult, Message, MessageEntry};
+use crate::model::{
+    ListMessagesInput, ListMessagesResult, MailboxMessage, MailboxSnapshot, Message, MessageEntry,
+};
 use crate::time_fmt::{now_rfc3339, unix_from_rfc3339};
 
 /// Storage backend for received messages. Mirrors legacy `mail.Store`.
@@ -25,6 +27,22 @@ pub trait Store: Send + Sync {
     fn list(&self, input: ListMessagesInput) -> Result<ListMessagesResult, String>;
     fn list_all(&self) -> Result<Vec<MessageEntry>, String> {
         Err("list_all unsupported".to_string())
+    }
+    /// Chronological (oldest-first) snapshot of active messages with stable
+    /// 1-based UIDs and `uid_next` for IMAP/POP3 access.
+    fn list_mailbox(&self) -> Result<MailboxSnapshot, String> {
+        let mut messages = self.list(ListMessagesInput::default())?.messages;
+        messages.reverse();
+        let uid_next = (messages.len() as u32).saturating_add(1).max(1);
+        let messages = messages
+            .into_iter()
+            .enumerate()
+            .map(|(i, message)| MailboxMessage {
+                uid: (i + 1) as u32,
+                message,
+            })
+            .collect();
+        Ok(MailboxSnapshot { messages, uid_next })
     }
     fn get(&self, id: &str) -> Result<Option<Message>, String>;
     fn get_raw(&self, id: &str) -> Result<Option<Vec<u8>>, String>;
@@ -286,6 +304,22 @@ impl Store for FileStore {
         messages
             .sort_by_key(|m| std::cmp::Reverse(m.received_at.as_deref().map(unix_from_rfc3339)));
         Ok(messages)
+    }
+
+    fn list_mailbox(&self) -> Result<MailboxSnapshot, String> {
+        let mut guard = self.index.lock().unwrap();
+        let records = self.ensure_loaded(&mut guard)?;
+        let uid_next = (records.len() as u32).saturating_add(1).max(1);
+        let messages = records
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.deleted_at.is_none())
+            .map(|(idx, m)| MailboxMessage {
+                uid: (idx + 1) as u32,
+                message: m.clone(),
+            })
+            .collect();
+        Ok(MailboxSnapshot { messages, uid_next })
     }
 
     fn get_raw(&self, id: &str) -> Result<Option<Vec<u8>>, String> {

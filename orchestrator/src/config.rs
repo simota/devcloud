@@ -38,6 +38,11 @@ pub struct Config {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ServerConfig {
     pub smtp_port: i32,
+    pub smtps_port: i32,
+    pub imap_port: i32,
+    pub imaps_port: i32,
+    pub pop3_port: i32,
+    pub pop3s_port: i32,
     pub mail_http_port: i32,
     pub dashboard_port: i32,
     pub event_relay_port: i32,
@@ -201,6 +206,19 @@ pub struct ServicesConfig {
 pub struct MailServiceConfig {
     pub enabled: bool,
     pub max_message_bytes: i64,
+    pub tls: MailTlsConfig,
+}
+
+/// TLS settings for Mail listeners (SMTP STARTTLS/SMTPS, IMAP STARTTLS/IMAPS,
+/// POP3 STLS/POP3S). When `enabled` or `require` is true with no PEM files,
+/// devcloud generates a local self-signed certificate in memory.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct MailTlsConfig {
+    pub enabled: bool,
+    pub cert_file: String,
+    pub key_file: String,
+    /// Refuse auth and mail commands until TLS is negotiated.
+    pub require: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -416,6 +434,11 @@ pub fn default_config() -> Config {
         project: "dev".to_string(),
         server: ServerConfig {
             smtp_port: 11025,
+            smtps_port: 0,
+            imap_port: 11143,
+            imaps_port: 0,
+            pop3_port: 11110,
+            pop3s_port: 0,
             mail_http_port: 11080,
             dashboard_port: 18025,
             event_relay_port: 18027,
@@ -521,6 +544,7 @@ pub fn default_config() -> Config {
             mail: MailServiceConfig {
                 enabled: true,
                 max_message_bytes: 10 * 1024 * 1024,
+                tls: MailTlsConfig::default(),
             },
             s3: S3ServiceConfig {
                 enabled: true,
@@ -793,6 +817,11 @@ pub fn apply_config_value(cfg: &mut Config, path: &[String], value: &str) -> io:
     match key.as_str() {
         "project" => cfg.project = value.to_string(),
         "server.smtpPort" => cfg.server.smtp_port = parse_int("server.smtpPort", value)?,
+        "server.smtpsPort" => cfg.server.smtps_port = parse_int("server.smtpsPort", value)?,
+        "server.imapPort" => cfg.server.imap_port = parse_int("server.imapPort", value)?,
+        "server.imapsPort" => cfg.server.imaps_port = parse_int("server.imapsPort", value)?,
+        "server.pop3Port" => cfg.server.pop3_port = parse_int("server.pop3Port", value)?,
+        "server.pop3sPort" => cfg.server.pop3s_port = parse_int("server.pop3sPort", value)?,
         "server.mailHttpPort" | "server.mailHTTPPort" => {
             cfg.server.mail_http_port = parse_int("server.mailHttpPort", value)?
         }
@@ -902,6 +931,18 @@ pub fn apply_config_value(cfg: &mut Config, path: &[String], value: &str) -> io:
                 return Err(err_positive("services.mail.maxMessageBytes"));
             }
             cfg.services.mail.max_message_bytes = n;
+        }
+        "services.mail.tls.enabled" => {
+            cfg.services.mail.tls.enabled = parse_bool("services.mail.tls.enabled", value)?
+        }
+        "services.mail.tls.certFile" => {
+            cfg.services.mail.tls.cert_file = trim_quotes(value);
+        }
+        "services.mail.tls.keyFile" => {
+            cfg.services.mail.tls.key_file = trim_quotes(value);
+        }
+        "services.mail.tls.require" => {
+            cfg.services.mail.tls.require = parse_bool("services.mail.tls.require", value)?
         }
         "services.s3.enabled" => {
             cfg.services.s3.enabled = parse_bool("services.s3.enabled", value)?
@@ -1420,6 +1461,42 @@ fn fmt_bool(b: bool) -> &'static str {
     }
 }
 
+/// Optional implicit-TLS mail server port keys, rendered only when non-zero.
+fn mail_optional_port_lines(s: &ServerConfig) -> String {
+    let mut out = String::new();
+    if s.smtps_port > 0 {
+        out.push_str(&format!("  smtpsPort: {}\n", s.smtps_port));
+    }
+    if s.imaps_port > 0 {
+        out.push_str(&format!("  imapsPort: {}\n", s.imaps_port));
+    }
+    if s.pop3s_port > 0 {
+        out.push_str(&format!("  pop3sPort: {}\n", s.pop3s_port));
+    }
+    out
+}
+
+/// Optional `services.mail.tls` block, rendered only when configured.
+fn mail_tls_optional_lines(tls: &MailTlsConfig) -> String {
+    if !tls.enabled && !tls.require && tls.cert_file.is_empty() && tls.key_file.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("    tls:\n");
+    if tls.enabled {
+        out.push_str("      enabled: true\n");
+    }
+    if !tls.cert_file.is_empty() {
+        out.push_str(&format!("      certFile: {}\n", tls.cert_file));
+    }
+    if !tls.key_file.is_empty() {
+        out.push_str(&format!("      keyFile: {}\n", tls.key_file));
+    }
+    if tls.require {
+        out.push_str("      require: true\n");
+    }
+    out
+}
+
 /// The optional `services.lambda` keys, rendered only when set so the default
 /// output stays unchanged.
 fn lambda_optional_lines(l: &LambdaServiceConfig) -> String {
@@ -1463,6 +1540,9 @@ pub fn default_config_yaml(cfg: &Config) -> String {
             "\n",
             "server:\n",
             "  smtpPort: {smtp_port}\n",
+            "  imapPort: {imap_port}\n",
+            "  pop3Port: {pop3_port}\n",
+            "{mail_optional_ports}",
             "  mailHttpPort: {mail_http_port}\n",
             "  dashboardPort: {dashboard_port}\n",
             "  eventRelayPort: {event_relay_port}\n",
@@ -1553,6 +1633,7 @@ pub fn default_config_yaml(cfg: &Config) -> String {
             "  mail:\n",
             "    enabled: {mail_enabled}\n",
             "    maxMessageBytes: {mail_max_message_bytes}\n",
+            "{mail_tls_optional}",
             "  s3:\n",
             "    enabled: {s3_enabled}\n",
             "    region: {s3_region}\n",
@@ -1666,6 +1747,9 @@ pub fn default_config_yaml(cfg: &Config) -> String {
         ),
         project = cfg.project,
         smtp_port = s.smtp_port,
+        imap_port = s.imap_port,
+        pop3_port = s.pop3_port,
+        mail_optional_ports = mail_optional_port_lines(s),
         mail_http_port = s.mail_http_port,
         dashboard_port = s.dashboard_port,
         event_relay_port = s.event_relay_port,
@@ -1735,6 +1819,7 @@ pub fn default_config_yaml(cfg: &Config) -> String {
         storage_path = cfg.storage.path,
         mail_enabled = fmt_bool(sv.mail.enabled),
         mail_max_message_bytes = sv.mail.max_message_bytes,
+        mail_tls_optional = mail_tls_optional_lines(&sv.mail.tls),
         s3_enabled = fmt_bool(sv.s3.enabled),
         s3_region = sv.s3.region,
         s3_path_style = fmt_bool(sv.s3.path_style),
@@ -2146,6 +2231,11 @@ mod tests {
     // Include aliases: each spelling must preserve the destination type's bounds.
     const I32_CONFIG_KEYS: &[&str] = &[
         "server.smtpPort",
+        "server.smtpsPort",
+        "server.imapPort",
+        "server.imapsPort",
+        "server.pop3Port",
+        "server.pop3sPort",
         "server.mailHttpPort",
         "server.mailHTTPPort",
         "server.dashboardPort",
@@ -2267,6 +2357,34 @@ mod tests {
         parsed.services.pubsub.data_dir = cfg.services.pubsub.data_dir.clone();
         parsed.services.pubsub.message_data_dir = cfg.services.pubsub.message_data_dir.clone();
         assert_eq!(parsed, cfg);
+    }
+
+    #[test]
+    fn mail_tls_and_optional_ports_round_trip() {
+        let mut cfg = default_config();
+        let default_yaml = default_config_yaml(&cfg);
+        assert!(default_yaml.contains("  imapPort: 11143\n"));
+        assert!(default_yaml.contains("  pop3Port: 11110\n"));
+        assert!(!default_yaml.contains("smtpsPort"));
+        assert!(!default_yaml.contains("imapsPort"));
+        assert!(!default_yaml.contains("pop3sPort"));
+
+        cfg.server.smtps_port = 11465;
+        cfg.server.imaps_port = 11993;
+        cfg.server.pop3s_port = 11995;
+        cfg.services.mail.tls.enabled = true;
+        cfg.services.mail.tls.cert_file = "/tmp/mail.pem".into();
+        cfg.services.mail.tls.key_file = "/tmp/mail.key".into();
+        cfg.services.mail.tls.require = true;
+
+        let yaml = default_config_yaml(&cfg);
+        let parsed = parse_yaml_in_memory(&yaml).expect("parse mail yaml");
+        assert_eq!(parsed.server.smtps_port, 11465);
+        assert_eq!(parsed.server.imap_port, 11143);
+        assert_eq!(parsed.server.imaps_port, 11993);
+        assert_eq!(parsed.server.pop3_port, 11110);
+        assert_eq!(parsed.server.pop3s_port, 11995);
+        assert_eq!(parsed.services.mail.tls, cfg.services.mail.tls);
     }
 
     #[test]

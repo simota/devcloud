@@ -318,10 +318,13 @@ name = "devcloud-mail"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "rcgen",
+ "rustls-pki-types",
  "serde",
  "serde_json",
  "sha2",
  "tokio",
+ "tokio-rustls",
 ]
 
 [[package]]
