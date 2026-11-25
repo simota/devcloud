@@ -525,6 +525,174 @@ async fn applicationautoscaling_scheduled_actions_forwards_describe_action() {
     assert_eq!(v["scheduledActions"].as_array().unwrap().len(), 0);
 }
 
+#[tokio::test]
+async fn applicationautoscaling_register_scalable_target_forwards_provider_protocol() {
+    let (base, record) = mock_upstream(200, r#"{}"#).await;
+    let cfg = Config {
+        app_auto_scaling_base: base,
+        ..Config::default()
+    };
+
+    let body = br#"{"input":{"ResourceId":"table/orders","ScalableDimension":"dynamodb:table:ReadCapacityUnits","MinCapacity":1,"MaxCapacity":10}}"#;
+    let resp = route(
+        &cfg,
+        &req("POST", "/api/applicationautoscaling/scalable-targets", body),
+    )
+    .await;
+    assert_eq!(resp.status, 200);
+    let rec = record.lock().unwrap().clone();
+    assert_eq!(rec.method, "POST");
+    assert_eq!(rec.target, "/");
+    assert_eq!(
+        rec.headers.get("x-amz-target").map(String::as_str),
+        Some("AnyScaleFrontendService.RegisterScalableTarget")
+    );
+    assert_eq!(
+        rec.headers.get("content-type").map(String::as_str),
+        Some("application/x-amz-json-1.1")
+    );
+    let sent: serde_json::Value = serde_json::from_slice(&rec.body).unwrap();
+    assert_eq!(sent["ServiceNamespace"], "dynamodb");
+    assert_eq!(sent["ResourceId"], "table/orders");
+    assert_eq!(sent["MinCapacity"], 1);
+    assert_eq!(sent["MaxCapacity"], 10);
+}
+
+#[tokio::test]
+async fn applicationautoscaling_deregister_scalable_target_forwards_provider_protocol() {
+    let (base, record) = mock_upstream(200, r#"{}"#).await;
+    let cfg = Config {
+        app_auto_scaling_base: base,
+        ..Config::default()
+    };
+
+    let body = br#"{"input":{"ResourceId":"table/orders","ScalableDimension":"dynamodb:table:ReadCapacityUnits"},"confirmation":"table/orders"}"#;
+    let resp = route(
+        &cfg,
+        &req(
+            "POST",
+            "/api/applicationautoscaling/scalable-targets/deregister",
+            body,
+        ),
+    )
+    .await;
+    assert_eq!(resp.status, 200);
+    let rec = record.lock().unwrap().clone();
+    assert_eq!(
+        rec.headers.get("x-amz-target").map(String::as_str),
+        Some("AnyScaleFrontendService.DeregisterScalableTarget")
+    );
+    let sent: serde_json::Value = serde_json::from_slice(&rec.body).unwrap();
+    assert_eq!(sent["ServiceNamespace"], "dynamodb");
+    assert_eq!(sent["ResourceId"], "table/orders");
+}
+
+#[tokio::test]
+async fn applicationautoscaling_put_and_delete_scaling_policy_forward_provider_protocol() {
+    let (base, record) = mock_upstream(
+        200,
+        r#"{"PolicyARN":"arn:aws:autoscaling:us-east-1:000000000000:scalingPolicy:1:resource/dynamodb/table/orders:policyName/p1","Alarms":[]}"#,
+    )
+    .await;
+    let cfg = Config {
+        app_auto_scaling_base: base,
+        ..Config::default()
+    };
+
+    let put_body = br#"{"input":{"PolicyName":"p1","ResourceId":"table/orders","ScalableDimension":"dynamodb:table:ReadCapacityUnits","PolicyType":"TargetTrackingScaling","TargetTrackingScalingPolicyConfiguration":{"TargetValue":70.0}}}"#;
+    let resp = route(
+        &cfg,
+        &req(
+            "POST",
+            "/api/applicationautoscaling/scaling-policies",
+            put_body,
+        ),
+    )
+    .await;
+    assert_eq!(resp.status, 200);
+    let rec = record.lock().unwrap().clone();
+    assert_eq!(
+        rec.headers.get("x-amz-target").map(String::as_str),
+        Some("AnyScaleFrontendService.PutScalingPolicy")
+    );
+    let sent: serde_json::Value = serde_json::from_slice(&rec.body).unwrap();
+    assert_eq!(sent["ServiceNamespace"], "dynamodb");
+    assert_eq!(sent["PolicyName"], "p1");
+
+    let (base2, record2) = mock_upstream(200, r#"{}"#).await;
+    let cfg2 = Config {
+        app_auto_scaling_base: base2,
+        ..Config::default()
+    };
+    let del_body = br#"{"input":{"PolicyName":"p1","ResourceId":"table/orders","ScalableDimension":"dynamodb:table:ReadCapacityUnits"},"confirmation":"p1"}"#;
+    let resp2 = route(
+        &cfg2,
+        &req(
+            "POST",
+            "/api/applicationautoscaling/scaling-policies/delete",
+            del_body,
+        ),
+    )
+    .await;
+    assert_eq!(resp2.status, 200);
+    let rec2 = record2.lock().unwrap().clone();
+    assert_eq!(
+        rec2.headers.get("x-amz-target").map(String::as_str),
+        Some("AnyScaleFrontendService.DeleteScalingPolicy")
+    );
+}
+
+#[tokio::test]
+async fn applicationautoscaling_put_and_delete_scheduled_action_forward_provider_protocol() {
+    let (base, record) = mock_upstream(200, r#"{}"#).await;
+    let cfg = Config {
+        app_auto_scaling_base: base,
+        ..Config::default()
+    };
+
+    let put_body = br#"{"input":{"ScheduledActionName":"act1","ResourceId":"table/orders","ScalableDimension":"dynamodb:table:ReadCapacityUnits","Schedule":"rate(1 day)","ScalableTargetAction":{"MinCapacity":2,"MaxCapacity":8}}}"#;
+    let resp = route(
+        &cfg,
+        &req(
+            "POST",
+            "/api/applicationautoscaling/scheduled-actions",
+            put_body,
+        ),
+    )
+    .await;
+    assert_eq!(resp.status, 200);
+    let rec = record.lock().unwrap().clone();
+    assert_eq!(
+        rec.headers.get("x-amz-target").map(String::as_str),
+        Some("AnyScaleFrontendService.PutScheduledAction")
+    );
+    let sent: serde_json::Value = serde_json::from_slice(&rec.body).unwrap();
+    assert_eq!(sent["ServiceNamespace"], "dynamodb");
+    assert_eq!(sent["ScheduledActionName"], "act1");
+
+    let (base2, record2) = mock_upstream(200, r#"{}"#).await;
+    let cfg2 = Config {
+        app_auto_scaling_base: base2,
+        ..Config::default()
+    };
+    let del_body = br#"{"input":{"ScheduledActionName":"act1","ResourceId":"table/orders","ScalableDimension":"dynamodb:table:ReadCapacityUnits"},"confirmation":"act1"}"#;
+    let resp2 = route(
+        &cfg2,
+        &req(
+            "POST",
+            "/api/applicationautoscaling/scheduled-actions/delete",
+            del_body,
+        ),
+    )
+    .await;
+    assert_eq!(resp2.status, 200);
+    let rec2 = record2.lock().unwrap().clone();
+    assert_eq!(
+        rec2.headers.get("x-amz-target").map(String::as_str),
+        Some("AnyScaleFrontendService.DeleteScheduledAction")
+    );
+}
+
 // ── Lambda: provider-protocol reads + test invoke ───────────────────────────
 
 #[tokio::test]
@@ -623,6 +791,139 @@ async fn cloudrun_revisions_forwards_admin_api() {
     assert_eq!(
         record.lock().unwrap().target,
         "/v2/projects/p/locations/us-central1/services/web/revisions"
+    );
+}
+
+#[tokio::test]
+async fn cloudrun_create_update_delete_and_iam_forward_admin_api() {
+    // Create service
+    let (base, record) = mock_upstream(
+        200,
+        r#"{"name":"projects/p/locations/us-central1/operations/1","done":true,"response":{"name":"projects/p/locations/us-central1/services/web"}}"#,
+    )
+    .await;
+    let cfg = Config {
+        cloudrun_base: base,
+        cloudrun_project: "p".into(),
+        cloudrun_region: "us-central1".into(),
+        ..Config::default()
+    };
+    let create_body = br#"{"serviceId":"web","service":{"template":{"containers":[{"image":"us-docker.pkg.dev/cloudrun/container/hello"}]}}}"#;
+    let resp = route(
+        &cfg,
+        &req("POST", "/api/cloudrun/services/create", create_body),
+    )
+    .await;
+    assert_eq!(resp.status, 200);
+    let rec = record.lock().unwrap().clone();
+    assert_eq!(rec.method, "POST");
+    assert_eq!(
+        rec.target,
+        "/v2/projects/p/locations/us-central1/services?serviceId=web"
+    );
+    let sent: serde_json::Value = serde_json::from_slice(&rec.body).unwrap();
+    assert_eq!(
+        sent["template"]["containers"][0]["image"],
+        "us-docker.pkg.dev/cloudrun/container/hello"
+    );
+
+    // Update service
+    let (base2, record2) = mock_upstream(200, r#"{"done":true}"#).await;
+    let cfg2 = Config {
+        cloudrun_base: base2,
+        ..Config::default()
+    };
+    let update_body = br#"{"updateMask":"labels","service":{"labels":{"env":"dev"}}}"#;
+    let resp2 = route(
+        &cfg2,
+        &req(
+            "POST",
+            "/api/cloudrun/services/p/us-central1/web/update",
+            update_body,
+        ),
+    )
+    .await;
+    assert_eq!(resp2.status, 200);
+    let rec2 = record2.lock().unwrap().clone();
+    assert_eq!(rec2.method, "PATCH");
+    assert_eq!(
+        rec2.target,
+        "/v2/projects/p/locations/us-central1/services/web?updateMask=labels"
+    );
+
+    // Set IAM policy
+    let (base3, record3) = mock_upstream(
+        200,
+        r#"{"bindings":[{"role":"roles/run.invoker","members":["allUsers"]}]}"#,
+    )
+    .await;
+    let cfg3 = Config {
+        cloudrun_base: base3,
+        ..Config::default()
+    };
+    let iam_body =
+        br#"{"policy":{"bindings":[{"role":"roles/run.invoker","members":["allUsers"]}]}}"#;
+    let resp3 = route(
+        &cfg3,
+        &req(
+            "POST",
+            "/api/cloudrun/services/p/us-central1/web/iam",
+            iam_body,
+        ),
+    )
+    .await;
+    assert_eq!(resp3.status, 200);
+    let rec3 = record3.lock().unwrap().clone();
+    assert_eq!(rec3.method, "POST");
+    assert_eq!(
+        rec3.target,
+        "/v2/projects/p/locations/us-central1/services/web:setIamPolicy"
+    );
+
+    // Delete revision
+    let (base4, record4) = mock_upstream(200, r#"{"done":true}"#).await;
+    let cfg4 = Config {
+        cloudrun_base: base4,
+        ..Config::default()
+    };
+    let resp4 = route(
+        &cfg4,
+        &req(
+            "DELETE",
+            "/api/cloudrun/services/p/us-central1/web/revisions/web-00001-abc",
+            b"",
+        ),
+    )
+    .await;
+    assert_eq!(resp4.status, 200);
+    let rec4 = record4.lock().unwrap().clone();
+    assert_eq!(rec4.method, "DELETE");
+    assert_eq!(
+        rec4.target,
+        "/v2/projects/p/locations/us-central1/services/web/revisions/web-00001-abc"
+    );
+
+    // Delete service
+    let (base5, record5) = mock_upstream(200, r#"{"done":true}"#).await;
+    let cfg5 = Config {
+        cloudrun_base: base5,
+        ..Config::default()
+    };
+    let resp5 = route(
+        &cfg5,
+        &req(
+            "DELETE",
+            "/api/cloudrun/services/p/us-central1/web",
+            br#"{"confirmation":"web"}"#,
+        ),
+    )
+    .await;
+    assert_eq!(resp5.status, 200);
+    let rec5 = record5.lock().unwrap().clone();
+    assert_eq!(rec5.method, "DELETE");
+    assert_eq!(
+        rec5.target,
+        "/v2/projects/p/locations/us-central1/services/web"
     );
 }
 

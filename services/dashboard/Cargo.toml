@@ -41,7 +41,9 @@ sha2 = "0.10"
 hex = "0.4"
 
 [dev-dependencies]
-# strict_auth_forwarding.rs drives real strict-mode Lambda / Cloud Run servers
-# to prove the dashboard's signed / bearer forwarding is accepted.
+# strict_auth_forwarding.rs drives real strict-mode Application Auto Scaling /
+# Lambda / Cloud Run servers to prove the dashboard's signed / bearer forwarding
+# is accepted.
+devcloud-applicationautoscaling = { path = "../applicationautoscaling" }
 devcloud-lambda = { path = "../lambda" }
 devcloud-cloudrun = { path = "../cloudrun" }

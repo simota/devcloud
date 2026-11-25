@@ -249,6 +249,7 @@ name = "devcloud-dashboard"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "devcloud-applicationautoscaling",
  "devcloud-cloudrun",
  "devcloud-lambda",
  "futures-util",

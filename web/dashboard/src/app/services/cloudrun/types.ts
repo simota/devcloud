@@ -30,6 +30,7 @@ export type CloudRunService = {
   latestReadyRevision: string
   latestCreatedRevision: string
   ingress: string
+  invokerIamDisabled?: boolean
   template: { containers: CloudRunContainer[] }
   terminalCondition?: { type: string; state: string }
 }
@@ -49,6 +50,47 @@ export type CloudRunInstance = {
   mode: string
   startedAt: string
   requestCount: number
+}
+
+export type CloudRunIamBinding = {
+  role: string
+  members: string[]
+}
+
+export type CloudRunIamPolicy = {
+  version?: number
+  etag?: string
+  bindings?: CloudRunIamBinding[]
+}
+
+export type CloudRunOperation = {
+  name: string
+  done: boolean
+  response?: CloudRunService
+}
+
+export type CloudRunCreateServiceInput = {
+  project?: string
+  location?: string
+  serviceId: string
+  service: {
+    ingress?: string
+    labels?: Record<string, string>
+    template: {
+      containers: CloudRunContainer[]
+    }
+  }
+}
+
+export type CloudRunUpdateServiceInput = {
+  updateMask?: string
+  service: {
+    ingress?: string
+    labels?: Record<string, string>
+    template?: {
+      containers: CloudRunContainer[]
+    }
+  }
 }
 
 export type CloudRunServicesResponse = { services: CloudRunService[] }

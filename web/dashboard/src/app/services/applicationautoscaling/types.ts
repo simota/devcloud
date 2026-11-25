@@ -49,7 +49,10 @@ export type ApplicationAutoScalingScheduledAction = {
   Timezone?: string
   StartTime?: string
   EndTime?: string
-  ScalableTargetAction?: unknown
+  ScalableTargetAction?: {
+    MinCapacity?: number
+    MaxCapacity?: number
+  }
   CreationTime: string
 }
 
@@ -63,4 +66,62 @@ export type ApplicationAutoScalingScalingPoliciesResponse = {
 
 export type ApplicationAutoScalingScheduledActionsResponse = {
   scheduledActions: ApplicationAutoScalingScheduledAction[]
+}
+
+export type RegisterScalableTargetInput = {
+  ServiceNamespace?: string
+  ResourceId: string
+  ScalableDimension: string
+  MinCapacity: number
+  MaxCapacity: number
+  RoleARN?: string
+  SuspendedState?: ApplicationAutoScalingSuspendedState
+}
+
+export type DeregisterScalableTargetInput = {
+  ServiceNamespace?: string
+  ResourceId: string
+  ScalableDimension: string
+}
+
+export type PutScalingPolicyInput = {
+  ServiceNamespace?: string
+  PolicyName: string
+  ResourceId: string
+  ScalableDimension: string
+  PolicyType: 'TargetTrackingScaling' | 'StepScaling'
+  TargetTrackingScalingPolicyConfiguration?: Record<string, unknown>
+  StepScalingPolicyConfiguration?: Record<string, unknown>
+}
+
+export type PutScalingPolicyResponse = {
+  PolicyARN: string
+  Alarms: unknown[]
+}
+
+export type DeleteScalingPolicyInput = {
+  ServiceNamespace?: string
+  PolicyName: string
+  ResourceId: string
+  ScalableDimension: string
+}
+
+export type PutScheduledActionInput = {
+  ServiceNamespace?: string
+  ScheduledActionName: string
+  ResourceId: string
+  ScalableDimension: string
+  Schedule: string
+  Timezone?: string
+  ScalableTargetAction?: {
+    MinCapacity?: number
+    MaxCapacity?: number
+  }
+}
+
+export type DeleteScheduledActionInput = {
+  ServiceNamespace?: string
+  ScheduledActionName: string
+  ResourceId: string
+  ScalableDimension: string
 }
