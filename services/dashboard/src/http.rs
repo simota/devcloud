@@ -357,11 +357,20 @@ pub async fn route(config: &Config, req: &Request) -> Response {
     if path == "/api/applicationautoscaling/scalable-targets" {
         return applicationautoscaling::handle_scalable_targets(config, req).await;
     }
+    if path == "/api/applicationautoscaling/scalable-targets/deregister" {
+        return applicationautoscaling::handle_deregister_scalable_target(config, req).await;
+    }
     if path == "/api/applicationautoscaling/scaling-policies" {
         return applicationautoscaling::handle_scaling_policies(config, req).await;
     }
+    if path == "/api/applicationautoscaling/scaling-policies/delete" {
+        return applicationautoscaling::handle_delete_scaling_policy(config, req).await;
+    }
     if path == "/api/applicationautoscaling/scheduled-actions" {
         return applicationautoscaling::handle_scheduled_actions(config, req).await;
+    }
+    if path == "/api/applicationautoscaling/scheduled-actions/delete" {
+        return applicationautoscaling::handle_delete_scheduled_action(config, req).await;
     }
 
     // Lambda.
@@ -384,6 +393,9 @@ pub async fn route(config: &Config, req: &Request) -> Response {
     }
     if path == "/api/cloudrun/services" {
         return cloudrun::handle_services(config, req).await;
+    }
+    if path == "/api/cloudrun/services/create" {
+        return cloudrun::handle_create_service(config, req).await;
     }
     if path == "/api/cloudrun/instances" {
         return cloudrun::handle_instances(config, req).await;

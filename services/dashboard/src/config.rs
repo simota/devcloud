@@ -80,6 +80,9 @@ pub struct Config {
     pub app_auto_scaling_endpoint: String,
     pub app_auto_scaling_storage_path: String,
     pub app_auto_scaling_region: String,
+    pub app_auto_scaling_auth_mode: String,
+    pub app_auto_scaling_access_key_id: String,
+    pub app_auto_scaling_secret_access_key: String,
 
     pub ssm_base: String,
     pub ssm_endpoint: String,
@@ -198,6 +201,12 @@ impl Config {
                 "DEVCLOUD_DASHBOARD_APPAUTOSCALING_REGION",
                 "us-east-1",
             ),
+            app_auto_scaling_auth_mode: env_or(
+                "DEVCLOUD_DASHBOARD_APPAUTOSCALING_AUTH_MODE",
+                "relaxed",
+            ),
+            app_auto_scaling_access_key_id: env("DEVCLOUD_DASHBOARD_APPAUTOSCALING_ACCESS_KEY"),
+            app_auto_scaling_secret_access_key: env("DEVCLOUD_DASHBOARD_APPAUTOSCALING_SECRET_KEY"),
 
             ssm_base: env("DEVCLOUD_DASHBOARD_SSM_BASE"),
             ssm_endpoint: env_or("DEVCLOUD_DASHBOARD_SSM_ENDPOINT", "http://127.0.0.1:18031"),

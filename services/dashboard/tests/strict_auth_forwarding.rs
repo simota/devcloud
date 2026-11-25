@@ -264,3 +264,160 @@ async fn cloudrun_revisions_view_follows_every_page() {
     assert_eq!(v["revisions"].as_array().unwrap().len(), 101);
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[tokio::test]
+async fn applicationautoscaling_forwarding_is_signed_for_strict_mode() {
+    let dir = temp_dir("aas");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let server = Arc::new(devcloud_applicationautoscaling::Server::new(
+        devcloud_applicationautoscaling::Config {
+            addr: addr.clone(),
+            region: "us-east-1".into(),
+            account_id: "000000000000".into(),
+            auth_mode: "strict".into(),
+            access_key_id: "dev".into(),
+            secret_access_key: "devsecret".into(),
+            storage_path: dir.to_string_lossy().into_owned(),
+        },
+    ));
+    tokio::spawn(devcloud_applicationautoscaling::http::serve(
+        listener,
+        server,
+        std::future::pending(),
+    ));
+
+    let cfg = Config {
+        app_auto_scaling_base: format!("http://{addr}"),
+        app_auto_scaling_region: "us-east-1".into(),
+        app_auto_scaling_auth_mode: "strict".into(),
+        app_auto_scaling_access_key_id: "dev".into(),
+        app_auto_scaling_secret_access_key: "devsecret".into(),
+        ..Config::default()
+    };
+
+    let reg = route(
+        &cfg,
+        &req(
+            "POST",
+            "/api/applicationautoscaling/scalable-targets",
+            &[],
+            br#"{"input":{"ResourceId":"table/strict-t","ScalableDimension":"dynamodb:table:ReadCapacityUnits","MinCapacity":1,"MaxCapacity":5}}"#,
+        ),
+    )
+    .await;
+    assert_eq!(reg.status, 200, "{}", String::from_utf8_lossy(&reg.body));
+
+    let list = route(
+        &cfg,
+        &req(
+            "GET",
+            "/api/applicationautoscaling/scalable-targets",
+            &[],
+            b"",
+        ),
+    )
+    .await;
+    assert_eq!(list.status, 200, "{}", String::from_utf8_lossy(&list.body));
+    let v: serde_json::Value = serde_json::from_slice(&list.body).unwrap();
+    assert_eq!(v["scalableTargets"].as_array().unwrap().len(), 1);
+
+    let unsigned = Config {
+        app_auto_scaling_auth_mode: "relaxed".into(),
+        ..cfg
+    };
+    let denied = route(
+        &unsigned,
+        &req(
+            "GET",
+            "/api/applicationautoscaling/scalable-targets",
+            &[],
+            b"",
+        ),
+    )
+    .await;
+    assert_eq!(denied.status, 403);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn cloudrun_mutations_forward_bearer_in_strict_mode() {
+    let dir = temp_dir("cloudrun-mutate");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let server = Arc::new(devcloud_cloudrun::Server::new(devcloud_cloudrun::Config {
+        addr: addr.clone(),
+        project: "p".into(),
+        region: "us-central1".into(),
+        auth_mode: "strict".into(),
+        bearer_token: "secret".into(),
+        storage_path: dir.to_string_lossy().into_owned(),
+        docker_bin: None,
+    }));
+    tokio::spawn(devcloud_cloudrun::http::serve(
+        listener,
+        server,
+        std::future::pending(),
+    ));
+
+    let cfg = Config {
+        cloudrun_base: format!("http://{addr}"),
+        cloudrun_project: "p".into(),
+        cloudrun_region: "us-central1".into(),
+        cloudrun_auth_mode: "strict".into(),
+        cloudrun_bearer_token: "secret".into(),
+        ..Config::default()
+    };
+
+    let created = route(
+        &cfg,
+        &req(
+            "POST",
+            "/api/cloudrun/services/create",
+            &[],
+            br#"{"serviceId":"api-svc","service":{"template":{"containers":[{"image":"us-docker.pkg.dev/cloudrun/container/hello"}]}}}"#,
+        ),
+    )
+    .await;
+    assert_eq!(
+        created.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&created.body)
+    );
+
+    let updated = route(
+        &cfg,
+        &req(
+            "POST",
+            "/api/cloudrun/services/p/us-central1/api-svc/update",
+            &[],
+            br#"{"service":{"template":{"containers":[{"image":"us-docker.pkg.dev/cloudrun/container/hello","env":[{"name":"V","value":"2"}]}]}}}"#,
+        ),
+    )
+    .await;
+    assert_eq!(
+        updated.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&updated.body)
+    );
+
+    let deleted = route(
+        &cfg,
+        &req(
+            "DELETE",
+            "/api/cloudrun/services/p/us-central1/api-svc",
+            &[],
+            br#"{"confirmation":"api-svc"}"#,
+        ),
+    )
+    .await;
+    assert_eq!(
+        deleted.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&deleted.body)
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}

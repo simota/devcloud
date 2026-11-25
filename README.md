@@ -298,7 +298,7 @@ Legend:
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | Local endpoint | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
 | Dashboard view | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
-| Dashboard mutation actions | Partial | Partial | Partial | Partial | Partial | Partial | Yes | Yes | Partial | No | Partial | No |
+| Dashboard mutation actions | Partial | Partial | Partial | Partial | Partial | Partial | Yes | Yes | Partial | Partial | Partial | Partial |
 | Persistent local storage | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
 | Configurable port | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
 | Enable/disable via config | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
@@ -541,8 +541,9 @@ Pub/Sub dashboard actions are available under `/dashboard/pubsub`:
 | Pub/Sub dashboard API | Yes | Status, topics, subscriptions, publish, pull, ack, and message metadata. |
 | Redshift dashboard API | Yes | Status, clusters, catalog, table detail, query runner, and statement history. |
 | Redis dashboard API | Yes | Status, SCAN-based keys, key inspector, allowlisted command runner, delete, expire, and guarded `FLUSHDB`. |
+| Application Auto Scaling dashboard API | Yes | Status, scalable targets, scaling policies, scheduled actions, and guarded register/deregister/put/delete mutations over the AWS JSON 1.1 provider protocol. |
 | Lambda dashboard API | Yes | Status, functions, recent invocations with log tails, and test invoke through the Invoke API. |
-| Cloud Run dashboard API | Yes | Status, services, revisions, running instances, and instance logs. |
+| Cloud Run dashboard API | Yes | Status, services, revisions, running instances, instance logs, and guarded create/update/delete service, delete revision, and IAM invoker policy mutations through the Admin API v2. |
 | Browser guards | Yes | `/api/*` mutations from another site (a non-loopback `Origin` that is not the dashboard's own, or `Sec-Fetch-Site: cross-site`) are refused with 403; scripts and CLIs send no `Origin` and are unaffected. Every request whose `Host` is a public DNS name is refused (a DNS-rebinding page keeps its own domain as `Host`); IP addresses, single-label names (`localhost`, docker-compose service names) and `.localhost`, `.internal`, `.local`, `.test`, `.example`, `.invalid`, `.home.arpa` names are accepted. Set `DEVCLOUD_ALLOWED_HOSTS` (comma-separated; `.suffix` for a domain, `*` for any) to reach devcloud through another name. Lambda and Cloud Run apply the same Host rule. WebSocket handshakes (`/api/events`, and the event relay itself) are refused from other sites' origins too, since WebSockets get no CORS protection. |
 | Common React dashboard shell | Yes | All service pages are served under `/dashboard/<svc>` from the shared React shell; compatibility `/mail`, `/s3`, `/gcs`, `/dynamodb`, `/bigquery`, `/redis` paths return 301 redirects. |
 

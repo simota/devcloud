@@ -98,6 +98,9 @@ fn build_config(cfg: &AppConfig) -> Config {
         app_auto_scaling_endpoint: http_ep(cfg.server.app_auto_scaling_port),
         app_auto_scaling_storage_path: join(s, "applicationautoscaling"),
         app_auto_scaling_region: cfg.services.app_auto_scaling.region.clone(),
+        app_auto_scaling_auth_mode: cfg.auth.app_auto_scaling.mode.clone(),
+        app_auto_scaling_access_key_id: cfg.auth.app_auto_scaling.access_key_id.clone(),
+        app_auto_scaling_secret_access_key: cfg.auth.app_auto_scaling.secret_access_key.clone(),
 
         ssm_base: enabled_ep(cfg.services.ssm.enabled, cfg.server.ssm_port),
         ssm_endpoint: http_ep(cfg.server.ssm_port),
