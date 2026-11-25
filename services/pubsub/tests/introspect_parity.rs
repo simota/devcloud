@@ -309,3 +309,87 @@ fn quotas_snapshot_reports_effective_limits_and_usage() {
     );
     assert_eq!(entries[4]["limit"], 500);
 }
+
+#[test]
+fn billing_snapshot_reports_retained_usage_across_protocols_and_restart() {
+    let dir = tempdir();
+    let mut s = server(&dir);
+    let request = get("/_introspect/billing");
+    let empty = serde_json::json!({
+        "project": "devcloud",
+        "usage": { "retainedMessages": 0, "retainedMessageBytes": 0 }
+    });
+    assert_eq!(body_json(&mut s, &request), (200, empty.clone()));
+
+    let topic = "projects/devcloud/topics/orders";
+    s.create_topic("devcloud", "orders", &Topic::default())
+        .expect("create orders");
+    for name in ["first", "second"] {
+        s.create_subscription(
+            "devcloud",
+            name,
+            &Subscription {
+                topic: topic.to_string(),
+                ..Default::default()
+            },
+        )
+        .expect("create subscription");
+    }
+    let mut publish = get("/v1/projects/devcloud/topics/orders:publish");
+    publish.method = "POST".to_string();
+    publish.body = br#"{"messages":[{"data":"aGVsbG8="}]}"#.to_vec();
+    assert_eq!(route(&mut s, &publish).status, 200);
+    s.grpc_publish(
+        topic,
+        &[(
+            "eHk".to_string(),
+            BTreeMap::from([("key".to_string(), "値".to_string())]),
+            "order".to_string(),
+        )],
+    )
+    .expect("publish via gRPC");
+
+    let retained = serde_json::json!({
+        "project": "devcloud",
+        "usage": { "retainedMessages": 2, "retainedMessageBytes": 18 }
+    });
+    assert_eq!(body_json(&mut s, &request), (200, retained.clone()));
+    drop(s);
+    let mut s = server(&dir);
+    assert_eq!(body_json(&mut s, &request), (200, retained.clone()));
+
+    for (name, expected) in [("first", retained), ("second", empty)] {
+        let response = s.pull("devcloud", name, 2).expect("pull messages");
+        let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        let ack_ids: Vec<String> = body["receivedMessages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|message| message["ackId"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(ack_ids.len(), 2);
+        s.acknowledge("devcloud", name, &ack_ids)
+            .expect("acknowledge messages");
+        assert_eq!(body_json(&mut s, &request), (200, expected));
+    }
+}
+
+#[test]
+fn billing_snapshot_uses_existing_auth_and_read_only_routing() {
+    let mut s = Server::new(Config {
+        auth_mode: "strict".to_string(),
+        bearer_token: "test-token".to_string(),
+        ..Default::default()
+    });
+    let mut request = get("/_introspect/billing");
+    assert_eq!(route(&mut s, &request).status, 401);
+    request
+        .headers
+        .insert("authorization".to_string(), "Bearer test-token".to_string());
+    assert_eq!(route(&mut s, &request).status, 200);
+
+    request.method = "POST".to_string();
+    let response = route(&mut s, &request);
+    assert_eq!(response.status, 405);
+    assert_eq!(response.allow.as_deref(), Some("GET"));
+}
