@@ -30,6 +30,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::iam_acl::expand_predefined_acl;
+use crate::iam_enforce::{authorize_request, Principal};
 use crate::lifecycle::{apply_bucket_lifecycle, effective_storage_class, validate_lifecycle};
 use crate::notifications::emit_object_notification;
 use crate::retention::{
@@ -37,7 +38,8 @@ use crate::retention::{
     object_mutation_blocked_reason, recompute_retention_after_event_hold_release,
     validate_object_retention_update,
 };
-use crate::signed_urls::{verify_signed_url, SignedUrlCheck};
+use crate::rsa_keys::{parse_service_account_json, RsaPublicKey};
+use crate::signed_urls::{signed_url_signer, verify_signed_url, SignedUrlCheck};
 use crate::state::{
     delete_object_sidecars, read_bucket_meta, read_object_meta, write_bucket_acl,
     write_bucket_meta, write_default_object_acl, write_object_acl, write_object_meta,
@@ -65,8 +67,15 @@ pub struct Server {
     sessions: BTreeMap<String, ResumableSession>,
     next_upload_id: u64,
     hmac_keys: BTreeMap<String, String>,
+    hmac_service_accounts: BTreeMap<String, String>,
+    rsa_keys: BTreeMap<String, RsaPublicKey>,
+    access_tokens: BTreeMap<String, String>,
     pubsub_rest_addr: Option<String>,
 }
+
+/// Environment variable listing service-account JSON key files (comma
+/// separated) whose RSA public keys verify `GOOG4-RSA-SHA256` / V2 signed URLs.
+pub const SERVICE_ACCOUNT_KEYS_ENV: &str = "DEVCLOUD_GCS_SERVICE_ACCOUNT_KEYS";
 
 impl Server {
     pub fn new(config: Config, store: FileBucketStore) -> Self {
@@ -87,10 +96,29 @@ impl Server {
             sessions: BTreeMap::new(),
             next_upload_id: 1,
             hmac_keys,
+            hmac_service_accounts: BTreeMap::new(),
+            rsa_keys: BTreeMap::new(),
+            access_tokens: BTreeMap::new(),
             pubsub_rest_addr,
         };
         server.load_sessions();
+        server.load_service_account_keys_from_env();
         server
+    }
+
+    fn load_service_account_keys_from_env(&mut self) {
+        let Ok(paths) = std::env::var(SERVICE_ACCOUNT_KEYS_ENV) else {
+            return;
+        };
+        for path in paths.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+            let result = fs::read_to_string(path)
+                .map_err(|e| e.to_string())
+                .and_then(|json| self.add_service_account_key_json(&json));
+            if let Err(e) = result {
+                // Only the path and parser error are reported, never key material.
+                eprintln!("gcs: ignoring service account key file {path}: {e}");
+            }
+        }
     }
 
     pub fn store(&self) -> &FileBucketStore {
@@ -127,6 +155,12 @@ impl Server {
         }
     }
 
+    /// `strict` mode: bearer tokens must be registered, RSA signed URLs need a
+    /// registered key, and every request is authorized against bucket IAM.
+    pub fn is_strict_auth(&self) -> bool {
+        self.config.auth_mode.trim().eq_ignore_ascii_case("strict")
+    }
+
     pub fn is_relaxed_auth(&self) -> bool {
         matches!(
             self.config.auth_mode.trim().to_ascii_lowercase().as_str(),
@@ -142,6 +176,67 @@ impl Server {
 
     pub fn hmac_secret(&self, access_id: &str) -> Option<&str> {
         self.hmac_keys.get(access_id).map(String::as_str)
+    }
+
+    /// Registers an HMAC key owned by a service account. In `strict` mode,
+    /// requests signed with it are authorized as `serviceAccount:{email}`;
+    /// keys registered with `add_hmac_key` act as the project owner.
+    pub fn add_hmac_key_for_service_account(
+        &mut self,
+        access_id: impl Into<String>,
+        secret: impl Into<String>,
+        service_account_email: impl Into<String>,
+    ) {
+        let access_id = access_id.into();
+        self.hmac_keys.insert(access_id.clone(), secret.into());
+        self.hmac_service_accounts
+            .insert(access_id, service_account_email.into());
+    }
+
+    pub(crate) fn hmac_service_account(&self, access_id: &str) -> Option<&str> {
+        self.hmac_service_accounts
+            .get(access_id)
+            .map(String::as_str)
+    }
+
+    /// Registers the RSA public key (PEM public or private key) that verifies
+    /// `GOOG4-RSA-SHA256` and V2 signed URLs for `service_account_email`.
+    pub fn add_rsa_public_key_pem(
+        &mut self,
+        service_account_email: impl Into<String>,
+        pem: &str,
+    ) -> Result<(), String> {
+        let key = RsaPublicKey::from_pem(pem)?;
+        self.rsa_keys.insert(service_account_email.into(), key);
+        Ok(())
+    }
+
+    /// Registers the public half of a Google service-account JSON key file
+    /// under its `client_email`.
+    pub fn add_service_account_key_json(&mut self, json: &str) -> Result<(), String> {
+        let (email, key) = parse_service_account_json(json)?;
+        self.rsa_keys.insert(email, key);
+        Ok(())
+    }
+
+    pub(crate) fn rsa_public_key(&self, service_account_email: &str) -> Option<&RsaPublicKey> {
+        self.rsa_keys.get(service_account_email)
+    }
+
+    /// Registers a bearer token that, in `strict` mode, authenticates as the
+    /// IAM `member` (e.g. `user:alice@example.com`). The configured
+    /// `bearer_token` always authenticates as the project owner.
+    pub fn add_access_token(&mut self, token: impl Into<String>, member: impl Into<String>) {
+        self.access_tokens.insert(token.into(), member.into());
+    }
+
+    pub(crate) fn access_token_member(&self, token: &str) -> Option<&str> {
+        self.access_tokens.get(token).map(String::as_str)
+    }
+
+    pub(crate) fn is_owner_token(&self, token: &str) -> bool {
+        let configured = self.config.bearer_token.trim();
+        !configured.is_empty() && token == configured
     }
 
     /// Configures a local loopback Pub/Sub REST address (e.g. `127.0.0.1:18086`)
@@ -174,6 +269,7 @@ impl Server {
             "" | "off" | "relaxed" => true,
             "oauth-relaxed" => !token.trim().is_empty(),
             "bearer-dev" => !token.is_empty() && token == self.config.bearer_token.trim(),
+            "strict" => self.is_owner_token(token) || self.access_token_member(token).is_some(),
             _ => false,
         }
     }
@@ -299,7 +395,7 @@ impl Request {
             .collect()
     }
 
-    fn bearer_token(&self) -> String {
+    pub(crate) fn bearer_token(&self) -> String {
         match self.header("authorization").trim().split_once(' ') {
             Some((scheme, token)) if scheme.eq_ignore_ascii_case("bearer") => {
                 token.trim().to_string()
@@ -573,8 +669,8 @@ pub fn route(server: &mut Server, req: &Request) -> Response {
         || req.path.starts_with("/upload/storage/v1/")
         || req.path.starts_with("/download/storage/v1/");
 
-    match verify_signed_url(server, req) {
-        SignedUrlCheck::Valid => {}
+    let principal = match verify_signed_url(server, req) {
+        SignedUrlCheck::Valid => Principal::from_signer(server, signed_url_signer(req)),
         SignedUrlCheck::Invalid {
             status,
             code,
@@ -587,7 +683,11 @@ pub fn route(server: &mut Server, req: &Request) -> Response {
             };
         }
         SignedUrlCheck::NotSigned => {
-            if !server.authorized(&req.bearer_token()) {
+            let token = req.bearer_token();
+            if server.is_strict_auth() && token.is_empty() {
+                // Anonymous callers are allowed only where IAM grants `allUsers`.
+                Principal::Anonymous
+            } else if !server.authorized(&token) {
                 let mut r = if is_json_or_introspect {
                     json_error(401, "authError", "invalid authentication credentials")
                 } else {
@@ -602,7 +702,15 @@ pub fn route(server: &mut Server, req: &Request) -> Response {
                     "Bearer realm=\"devcloud-gcs\"".to_string(),
                 );
                 return r;
+            } else {
+                Principal::from_token(server, &token)
             }
+        }
+    };
+
+    if server.is_strict_auth() {
+        if let Err(resp) = authorize_request(server, req, &principal, is_json_or_introspect) {
+            return resp;
         }
     }
 
@@ -3070,7 +3178,7 @@ fn parse_range(header: &str, size: usize) -> Result<(usize, usize, bool), ()> {
     Ok((start, end, true))
 }
 
-fn bucket_suffix(path: &str, prefix: &str) -> Option<(String, String)> {
+pub(crate) fn bucket_suffix(path: &str, prefix: &str) -> Option<(String, String)> {
     let trimmed = path.strip_prefix(prefix)?;
     if trimmed.is_empty() {
         return None;

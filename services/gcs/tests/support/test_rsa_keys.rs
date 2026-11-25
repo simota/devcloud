@@ -1,0 +1,24 @@
+//! Throwaway 2048-bit RSA keys generated only for these tests (`openssl
+//! genpkey -algorithm RSA`). They protect nothing and must never be used
+//! outside the devcloud test suite.
+#![allow(dead_code)]
+
+pub const TEST_SA_EMAIL: &str = "signer@devcloud.iam.gserviceaccount.com";
+
+pub const TEST_SA_PRIVATE_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQCtXWlZttXle/gY\nw79RER3pcRQY8QjdwCDzaK4/XcbgY4mXsEKADwnIKf1Poa0Zxts1VQ+t4A+jHVxj\nYxNCvPsHKnB93BzynEf6+ok5/dtt9Vi+xJ90IefRE8zOdhqjVo6g0Hw16rbaGDpb\nPv7IPUV2pfauWbRvSTXNh2jNgGR8yd3Mg5ICu9JEs5VFFh2ZOwc0D5Vmxag8cBN6\naFJQuXd+dnKDpoYCW7+1U66GF9dfxR7eX0HGYhsXZoGc5cJEm2zSUl19AQxfCvSR\nCeM55R9xeu1HOQD04jfDOZKfY/31CiL3CVgYdqm2fkupn7Mli2DKFmNB1sMczES3\noYbaj30lAgMBAAECggEAASfSaBzYtSRhOs0HN+5HcZhlhrsIkO3TFRGZY7u8yR8b\nZNhHFofDIW3s4ycpOmGXHCEP2dwDTquHQ57+mwnGbz2gV/5rxPmMs0a7O8M46gqM\nx7dozAMz191sFo42pD299U1zySo3g3b44JsoDe6hSWasIRe2T62Vvw521jPTt6SK\nplx7zZ2eDgNaJb3zwPhjdTIm0GUw07RAfy6Rgtdl0X6ZwqetIv2HCFD6YdkOXSXe\nUYy2lfjPKZD5Lj7RWExoAcHgSvYUuBk+FQIgOq2eYIBwlAsI5PdmtHTSdUdkDGCw\nvGpdrzdFjJMiF9H3TQwZbe7EWUCvUMFxpafDKf8LSwKBgQDxpE6iHtOAZyGhTnPw\niBAxojkILMuvN0GJwokKz9d8fRy31FomyYsDaPV7fWhRL9mpHCRlzk3dZQWLVK9n\newIGDeiQsDt1Ycp7qFOsXo3zBeEFCdjvHGE4fBvTe78Kg05CMvefN2ioADpfPgt5\nTFBRIKPJRiD/9uLAxYX5p0I2QwKBgQC3qoWEr2f5yTYL74rusx9y3u9zzdmcSviz\nRJSLV1Pe8E4m85vN4pJoMi9+PwccMMKnCKIeFSY7U/KLfs/w151TIwdqDOtIjPNm\nf0x9r8Ue3vZbNeLK1keQHLXfgeOpDkLLgkaaKXSzXu/To4LE7Tbf+pigawmGhzzK\nHTv8sExsdwKBgQDJ2b/ZyzhP5VaBYYCV54LngyRzAMBwsA6uHfPONUpC8lv/74IT\nLn5SLeYJ7vsp/neqvRhmdowyqYWVGvuezHEnT4z6+EvixPqYi0bCEQYwgLO0OsKd\nEq7fuUShR5iRFphT0jFpLabd17rq/nAlNitNaZ+HrW45gyltcFJ29lHn8wKBgHSB\n6kK6FkYAmpVFticnX2q5+sHGMiWP9WWaunQNyHlijODupcYb1O3d7/ywtKzwTXox\n4s0cc20tGm3c2sGXtQf474oZeeNC7l/1nqsYJf4oR7SiYSR0e17yp3iJ58Xk8wAv\nuuOuKoZiUdY6IgkTxTydtdYFMDyzax93Hgd0OnaPAoGBANVvVnQ+g7dL/AA6HDTp\nVLMsu6El+qoQKinX2e6YYzIpVs/FvkB3NQ6lPauOX3V5SXgMq9+wNKYpmv+69fV0\nnfsesUfjhDo4rJ/09oIN4D3HAZHoH1qGvWjElLUFTnkk5MqY4aNgQfrjoOBzy7cR\nKtTrylEK4B53RJAcwI0oNaWy\n-----END PRIVATE KEY-----\n";
+
+pub const TEST_SA_PUBLIC_KEY_PEM: &str = "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEArV1pWbbV5Xv4GMO/UREd\n6XEUGPEI3cAg82iuP13G4GOJl7BCgA8JyCn9T6GtGcbbNVUPreAPox1cY2MTQrz7\nBypwfdwc8pxH+vqJOf3bbfVYvsSfdCHn0RPMznYao1aOoNB8Neq22hg6Wz7+yD1F\ndqX2rlm0b0k1zYdozYBkfMndzIOSArvSRLOVRRYdmTsHNA+VZsWoPHATemhSULl3\nfnZyg6aGAlu/tVOuhhfXX8Ue3l9BxmIbF2aBnOXCRJts0lJdfQEMXwr0kQnjOeUf\ncXrtRzkA9OI3wzmSn2P99Qoi9wlYGHaptn5LqZ+zJYtgyhZjQdbDHMxEt6GG2o99\nJQIDAQAB\n-----END PUBLIC KEY-----\n";
+
+/// A second, unrelated key used to produce signatures that must not verify.
+pub const OTHER_PRIVATE_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQCb5zkgLf4xvTjB\nLgQeytMD5cYCRDHnNQ1D4EYHSqpJXBigREDlNxzLSthOxBSDeSbqQytnCGgyGt7q\nGj/ZHpirr1peXhuPHmLUtzKG9IfgQ4OvYDawMKLQydpnn4XLx1IHgYg/Hj1WBY+H\npQ11tf5cfEr6e7Si9oChqGhAm0hq+YjDu/dof45rB9ThDBapGKgo4T8AshTdwsal\nZPTHv9L2GK4EanCmXuvJRobEjCwSO2KUP8XgIO5Q/BCFWk1PPnEWHgebLKpHUiPK\n0GEIt5SzU1xnBm058rNate2q+ndrIRs1sgow5/Til2YoV9oYiVBMAD6TLkopriZo\nU6i1CpqLAgMBAAECggEAP2GP8FyyaF9AmQzPoQMdKYr65oX58cC4LV2aqrE4rI1T\n96f36BfxTVaWvOLrYg3Ze8il9wPMdH5HHM5iIa9WKwolh5Ljyln0nP0DfikgqlRY\nT26inRuQvagqchFA8DkOyL1o+hwdnICzOtans7CzAb+ILfAn3k6vuckA5S8cEFzS\nDBU1d+Xd2jvs8NrXwfw3XPo2sRjXi8KAwnOgq9oCp+Se6jlC1Jhk8ywif1yKhe3S\n3+31YBlcp6FUwcro1T5fuOqBwY6Ig5mEAUi5rYH8bhw4bt1CAY31qg2J/rdMCsB5\nQ1tCzCp06EK9uptwSuZKnmGg7OiwLyfOm3BRkKKEGQKBgQDbff8gaLh/vOToz81S\nof6kvwnkBdA7YLMoMYoUqfGhBBzntPBfQGkWxpAv7mckhuezHPeFzcDxaV6jCJgx\n2ZvUbTLsQ8n1zPW1l9j3D2oeqaMdPXZWn6JZfmGTXEnzaseF5FmTCM84Fzih13ni\nFRkd9YkkFiez4uFnCHfqUPOl6QKBgQC11ZnZvcUSIO8suVrayqQuzYllfRH4uqUu\nq2MzynmuFMq4mJXF6p7d0iB4rB4LmWjOc0+PLnoidEk9jNObj7NehlEHzpV9PjyN\nw7HdQxzByMmVYc2wS382sG6LbrJpKi89OG+J1gFZnW5mVVLf4PokvEhTvAu4xt6a\nJjunebtQUwKBgCMed9HBr7OQj7fId/u+u7W0c2qum3DEuiW2N3ey8VxoAg/43XUA\nI1BnmO5yYMJxa2U3P0uDblmyGFhRqbhgLxTAHCO9fPT9RFs33pk5OCuLzPOCwAqA\nJEPZetdPLu3pqd78eHCUOkOpQ4Bxr6jC42/tt3G0scmQhawsqLMvHKzxAoGAeYH9\nR0XKtSyQ5yANmHslb6klkU4cfkurKh6ZMfixiySVuvkrzI/WDYDm9fx+L14abSsd\nFR8HupJehuTeWuuR/y5eY4sm1gSKzmjhKGw6gTw9iLdMjexFXDRWCpK0YhYwbwaR\nclgxmsLbDUMjGDvsrDOtWVclthoekn/OCUINa8UCgYEApgHI0yy2eTyVt/4Qrry1\n5E1YOCyZe2TqRzpWe+uldF48/0B/nB2XWFK64x3Q0zowlXZS+dBjcy/Q8AWuki8I\nQV+zOy0VIijxSc/gKd5Nm+6h9qrZxllFNZbQWWrvQT31wD+OgAHXpjP/Wh9wPN3O\n3Oj6fzKOQIKqJVLtklozodE=\n-----END PRIVATE KEY-----\n";
+
+/// A service-account JSON key file for `TEST_SA_EMAIL`.
+pub fn test_service_account_json() -> String {
+    serde_json::json!({
+        "type": "service_account",
+        "project_id": "devcloud",
+        "client_email": TEST_SA_EMAIL,
+        "private_key": TEST_SA_PRIVATE_KEY_PEM,
+    })
+    .to_string()
+}

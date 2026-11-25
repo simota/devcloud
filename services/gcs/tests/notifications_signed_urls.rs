@@ -11,9 +11,19 @@ use devcloud_gcs::http::{
     route, Config, Request, Response, Server, DEFAULT_HMAC_ACCESS_ID, DEFAULT_HMAC_SECRET,
 };
 use devcloud_gcs::notifications::build_pubsub_publish_request;
-use devcloud_gcs::signed_urls::{sign_v4_hmac_target, SignV4HmacInput};
+use devcloud_gcs::signed_urls::{
+    sign_v2_target, sign_v4_hmac_target, sign_v4_rsa_target, SignV2Input, SignV4HmacInput,
+    SignV4RsaInput,
+};
 use devcloud_s3::base64;
 use devcloud_s3::store::FileBucketStore;
+
+#[path = "support/test_rsa_keys.rs"]
+mod test_rsa_keys;
+use test_rsa_keys::{
+    test_service_account_json, OTHER_PRIVATE_KEY_PEM, TEST_SA_EMAIL, TEST_SA_PRIVATE_KEY_PEM,
+    TEST_SA_PUBLIC_KEY_PEM,
+};
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -502,4 +512,276 @@ fn signed_urls_v4_hmac_v4_rsa_and_v2_validation() {
     );
     assert_eq!(v2_expired.status, 400);
     assert!(String::from_utf8_lossy(&v2_expired.body).contains("ExpiredToken"));
+}
+
+fn rsa_v4_target(method: &str, path: &str, key_pem: &str, account: &str) -> String {
+    sign_v4_rsa_target(&SignV4RsaInput {
+        method,
+        path,
+        host: "127.0.0.1:14443",
+        service_account: account,
+        private_key_pem: key_pem,
+        region: "auto",
+        goog_date: "20260601T120000Z",
+        expires: 300,
+        extra_query: vec![],
+        extra_headers: BTreeMap::new(),
+    })
+    .unwrap()
+}
+
+fn v2_target(method: &str, path: &str, key_pem: &str, content_type: &str) -> String {
+    sign_v2_target(&SignV2Input {
+        method,
+        path,
+        service_account: TEST_SA_EMAIL,
+        private_key_pem: key_pem,
+        // 2026-06-01T12:00:00Z + 600s
+        expires: 1_780_315_800,
+        content_md5: "",
+        content_type,
+        extra_headers: BTreeMap::new(),
+    })
+    .unwrap()
+}
+
+fn seed_rsa_bucket(f: &mut Fixture) {
+    let auth = [("Authorization", "Bearer secret-bearer")];
+    assert_eq!(
+        call(
+            &mut f.server,
+            "POST",
+            "/storage/v1/b",
+            br#"{"name":"rsa-bucket"}"#,
+            &auth
+        )
+        .status,
+        200
+    );
+    assert_eq!(
+        call(
+            &mut f.server,
+            "PUT",
+            "/rsa-bucket/doc.txt",
+            b"rsa payload",
+            &auth
+        )
+        .status,
+        200
+    );
+}
+
+#[test]
+fn rsa_signed_urls_v4_and_v2_are_cryptographically_verified() {
+    let mut f = Fixture::new(
+        Config {
+            auth_mode: "bearer-dev".to_string(),
+            bearer_token: "secret-bearer".to_string(),
+            ..Default::default()
+        },
+        "2026-06-01T12:00:00Z",
+    );
+    f.server
+        .add_rsa_public_key_pem(TEST_SA_EMAIL, TEST_SA_PUBLIC_KEY_PEM)
+        .unwrap();
+    seed_rsa_bucket(&mut f);
+    let host = [("Host", "127.0.0.1:14443")];
+
+    // V4 GOOG4-RSA-SHA256: a correct signature authorizes the request.
+    let target = rsa_v4_target(
+        "GET",
+        "/rsa-bucket/doc.txt",
+        TEST_SA_PRIVATE_KEY_PEM,
+        TEST_SA_EMAIL,
+    );
+    let ok = call(&mut f.server, "GET", &target, b"", &host);
+    assert_eq!(ok.status, 200, "{}", String::from_utf8_lossy(&ok.body));
+    assert_eq!(ok.body, b"rsa payload");
+
+    // Signature from an unrelated key, a flipped signature byte, a different
+    // method, and a different path are all rejected.
+    let wrong_key = rsa_v4_target(
+        "GET",
+        "/rsa-bucket/doc.txt",
+        OTHER_PRIVATE_KEY_PEM,
+        TEST_SA_EMAIL,
+    );
+    let mut flipped = target.clone();
+    let last = flipped.pop().unwrap();
+    flipped.push(if last == '0' { '1' } else { '0' });
+    for bad in [&wrong_key, &flipped] {
+        let r = call(&mut f.server, "GET", bad, b"", &host);
+        assert_eq!(r.status, 403);
+        assert!(String::from_utf8_lossy(&r.body).contains("SignatureDoesNotMatch"));
+    }
+    assert_eq!(call(&mut f.server, "HEAD", &target, b"", &host).status, 403);
+    let other_path = target.replacen("/rsa-bucket/doc.txt", "/rsa-bucket/other.txt", 1);
+    assert_eq!(
+        call(&mut f.server, "GET", &other_path, b"", &host).status,
+        403
+    );
+
+    // V4 RSA signed PUT works without a bearer token.
+    let put = rsa_v4_target(
+        "PUT",
+        "/rsa-bucket/up.txt",
+        TEST_SA_PRIVATE_KEY_PEM,
+        TEST_SA_EMAIL,
+    );
+    assert_eq!(
+        call(&mut f.server, "PUT", &put, b"uploaded", &host).status,
+        200
+    );
+
+    // V2: verified over VERB/Content-MD5/Content-Type/Expires/resource.
+    let v2 = v2_target("GET", "/rsa-bucket/doc.txt", TEST_SA_PRIVATE_KEY_PEM, "");
+    let r = call(&mut f.server, "GET", &v2, b"", &[]);
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.body, b"rsa payload");
+    let v2_wrong = v2_target("GET", "/rsa-bucket/doc.txt", OTHER_PRIVATE_KEY_PEM, "");
+    let r = call(&mut f.server, "GET", &v2_wrong, b"", &[]);
+    assert_eq!(r.status, 403);
+    assert!(String::from_utf8_lossy(&r.body).contains("SignatureDoesNotMatch"));
+    let v2_put = v2_target(
+        "PUT",
+        "/rsa-bucket/v2.txt",
+        TEST_SA_PRIVATE_KEY_PEM,
+        "text/plain",
+    );
+    assert_eq!(
+        call(
+            &mut f.server,
+            "PUT",
+            &v2_put,
+            b"v2",
+            &[("Content-Type", "text/plain")]
+        )
+        .status,
+        200
+    );
+    // Content-Type is part of the V2 string-to-sign.
+    assert_eq!(
+        call(
+            &mut f.server,
+            "PUT",
+            &v2_put,
+            b"v2",
+            &[("Content-Type", "text/html")]
+        )
+        .status,
+        403
+    );
+    // V2 against a virtual-host bucket signs `/{bucket}/{object}`.
+    let vhost = v2.replacen("/rsa-bucket/doc.txt", "/doc.txt", 1);
+    let r = call(
+        &mut f.server,
+        "GET",
+        &vhost,
+        b"",
+        &[("Host", "rsa-bucket.localhost:14443")],
+    );
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    // Expiry still applies to valid signatures.
+    f.server.set_fixed_now("2026-06-01T12:20:00Z");
+    let r = call(&mut f.server, "GET", &v2, b"", &[]);
+    assert_eq!(r.status, 400);
+    assert!(String::from_utf8_lossy(&r.body).contains("ExpiredToken"));
+}
+
+#[test]
+fn rsa_keys_register_from_service_account_json_and_strict_mode_requires_a_key() {
+    // Service-account JSON registration (private key -> public key).
+    let mut f = Fixture::new(
+        Config {
+            auth_mode: "strict".to_string(),
+            bearer_token: "secret-bearer".to_string(),
+            ..Default::default()
+        },
+        "2026-06-01T12:00:00Z",
+    );
+    seed_rsa_bucket(&mut f);
+    let host = [("Host", "127.0.0.1:14443")];
+    let target = rsa_v4_target(
+        "GET",
+        "/rsa-bucket/doc.txt",
+        TEST_SA_PRIVATE_KEY_PEM,
+        TEST_SA_EMAIL,
+    );
+
+    // strict: no key registered for the signer -> rejected.
+    let r = call(&mut f.server, "GET", &target, b"", &host);
+    assert_eq!(r.status, 403);
+    assert!(String::from_utf8_lossy(&r.body).contains("no RSA public key is registered"));
+
+    f.server
+        .add_service_account_key_json(&test_service_account_json())
+        .unwrap();
+    // Key registered but the service account has no IAM binding yet.
+    let r = call(&mut f.server, "GET", &target, b"", &host);
+    assert_eq!(r.status, 403);
+    assert!(String::from_utf8_lossy(&r.body).contains("storage.objects.get"));
+
+    let policy = format!(
+        r#"{{"bindings":[{{"role":"roles/storage.objectViewer","members":["serviceAccount:{TEST_SA_EMAIL}"]}}]}}"#
+    );
+    assert_eq!(
+        call(
+            &mut f.server,
+            "PUT",
+            "/storage/v1/b/rsa-bucket/iam",
+            policy.as_bytes(),
+            &[("Authorization", "Bearer secret-bearer")],
+        )
+        .status,
+        200
+    );
+    let r = call(&mut f.server, "GET", &target, b"", &host);
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.body, b"rsa payload");
+    // Viewer cannot write through a signed PUT.
+    let put = rsa_v4_target(
+        "PUT",
+        "/rsa-bucket/new.txt",
+        TEST_SA_PRIVATE_KEY_PEM,
+        TEST_SA_EMAIL,
+    );
+    assert_eq!(call(&mut f.server, "PUT", &put, b"x", &host).status, 403);
+
+    // Malformed key material is rejected at registration time.
+    assert!(f
+        .server
+        .add_rsa_public_key_pem(
+            "x@y",
+            "-----BEGIN PUBLIC KEY-----\nAAAA\n-----END PUBLIC KEY-----\n"
+        )
+        .is_err());
+    assert!(f.server.add_service_account_key_json("{}").is_err());
+
+    // Non-strict modes keep structural-only checks for unregistered signers.
+    let mut relaxed = Fixture::new(Config::default(), "2026-06-01T12:00:00Z");
+    assert_eq!(
+        call(
+            &mut relaxed.server,
+            "POST",
+            "/storage/v1/b",
+            br#"{"name":"rsa-bucket"}"#,
+            &[]
+        )
+        .status,
+        200
+    );
+    assert_eq!(
+        call(&mut relaxed.server, "PUT", "/rsa-bucket/doc.txt", b"r", &[]).status,
+        200
+    );
+    let unregistered = rsa_v4_target(
+        "GET",
+        "/rsa-bucket/doc.txt",
+        OTHER_PRIVATE_KEY_PEM,
+        "nobody@x.iam.gserviceaccount.com",
+    );
+    assert_eq!(
+        call(&mut relaxed.server, "GET", &unregistered, b"", &host).status,
+        200
+    );
 }

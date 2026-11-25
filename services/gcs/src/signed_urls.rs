@@ -1,6 +1,12 @@
 //! GCS V4 (`GOOG4-HMAC-SHA256`, `GOOG4-RSA-SHA256`) and V2
-//! (`GoogleAccessId`/`Expires`/`Signature`) signed URL validation and a V4 HMAC
-//! signing helper for deterministic local testing.
+//! (`GoogleAccessId`/`Expires`/`Signature`) signed URL validation, plus V4 HMAC,
+//! V4 RSA, and V2 RSA signing helpers for deterministic local testing.
+//!
+//! RSA-signed URLs (V4 RSA and V2) are cryptographically verified against the
+//! public key registered for the signing service account
+//! (`Server::add_rsa_public_key_pem` / `add_service_account_key_json`). When no
+//! key is registered, non-strict auth modes keep the structural/expiry-only
+//! checks; `strict` mode rejects the URL.
 
 use std::collections::BTreeMap;
 
@@ -190,10 +196,79 @@ fn verify_v4(server: &Server, req: &Request) -> SignedUrlCheck {
         }
     }
 
-    // For GOOG4-RSA-SHA256 (no real Google IAM private/public key service locally)
-    // and unregistered HMAC IDs in relaxed mode, all structural, header-coverage,
-    // and expiration checks above have passed.
+    if algo == V4_ALGO_RSA {
+        let Some(key) = server.rsa_public_key(access_id) else {
+            return unregistered_rsa_key(server);
+        };
+        let Ok(sig_bytes) = hex::decode(signature) else {
+            return invalid(
+                400,
+                "InvalidArgument",
+                "X-Goog-Signature must be a non-empty hex string",
+            );
+        };
+        let canonical_req = build_v4_canonical_request(
+            &req.method,
+            &req.path,
+            &req.query_pairs(),
+            &req.headers,
+            signed_headers,
+        );
+        let string_to_sign =
+            v4_string_to_sign(V4_ALGO_RSA, date_stamp, region, goog_date, &canonical_req);
+        if !key.verify_sha256(string_to_sign.as_bytes(), &sig_bytes) {
+            return invalid(
+                403,
+                "SignatureDoesNotMatch",
+                "request signature does not match calculated signature",
+            );
+        }
+    }
+
+    // Unregistered HMAC IDs (relaxed mode) and unregistered RSA keys (non-strict
+    // modes) have passed all structural, header-coverage, and expiration checks.
     SignedUrlCheck::Valid
+}
+
+fn unregistered_rsa_key(server: &Server) -> SignedUrlCheck {
+    if server.is_strict_auth() {
+        return invalid(
+            403,
+            "AccessDenied",
+            "no RSA public key is registered for the signing service account",
+        );
+    }
+    SignedUrlCheck::Valid
+}
+
+/// Identity proven (or, in relaxed modes, asserted) by a signed URL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SignedUrlSigner {
+    /// V4 `GOOG4-HMAC-SHA256` access ID.
+    Hmac(String),
+    /// V4 `GOOG4-RSA-SHA256` / V2 service-account email.
+    ServiceAccount(String),
+}
+
+/// Returns the signer of a request that `verify_signed_url` accepted.
+pub fn signed_url_signer(req: &Request) -> Option<SignedUrlSigner> {
+    if !has_signed_url_params(req) {
+        return None;
+    }
+    if req.query.contains_key("X-Goog-Algorithm")
+        || req.query.contains_key("X-Goog-Credential")
+        || req.query.contains_key("X-Goog-Signature")
+    {
+        let (access_id, ..) = parse_v4_credential(req.query_value("X-Goog-Credential"))?;
+        if req.query_value("X-Goog-Algorithm") == V4_ALGO_HMAC {
+            Some(SignedUrlSigner::Hmac(access_id.to_string()))
+        } else {
+            Some(SignedUrlSigner::ServiceAccount(access_id.to_string()))
+        }
+    } else {
+        let id = req.query_value("GoogleAccessId").trim();
+        (!id.is_empty()).then(|| SignedUrlSigner::ServiceAccount(id.to_string()))
+    }
 }
 
 fn verify_v2(server: &Server, req: &Request) -> SignedUrlCheck {
@@ -210,15 +285,78 @@ fn verify_v2(server: &Server, req: &Request) -> SignedUrlCheck {
         return invalid(400, "ExpiredToken", "signed URL has expired");
     }
     let sig = req.query_value("Signature").trim();
-    if sig.is_empty() || base64_looks_invalid(sig) {
+    let Some(sig_bytes) = decode_v2_signature(sig) else {
         return invalid(400, "InvalidArgument", "Signature must be valid base64");
+    };
+    let Some(key) = server.rsa_public_key(access_id) else {
+        return unregistered_rsa_key(server);
+    };
+    let string_to_sign = build_v2_string_to_sign(
+        &req.method,
+        req.header("content-md5"),
+        req.header("content-type"),
+        expires,
+        &req.headers,
+        &v2_canonical_resource(req),
+    );
+    if !key.verify_sha256(string_to_sign.as_bytes(), &sig_bytes) {
+        return invalid(
+            403,
+            "SignatureDoesNotMatch",
+            "request signature does not match calculated signature",
+        );
     }
     SignedUrlCheck::Valid
 }
 
-fn base64_looks_invalid(s: &str) -> bool {
-    let normalized = s.replace('-', "+").replace('_', "/");
-    base64::std_decode(&normalized).is_none()
+/// Decodes a V2 `Signature` value. A literal `+` that reached us unescaped is
+/// decoded to a space by query parsing, so spaces are mapped back to `+`.
+fn decode_v2_signature(s: &str) -> Option<Vec<u8>> {
+    if s.is_empty() {
+        return None;
+    }
+    let normalized = s.replace([' ', '-'], "+").replace('_', "/");
+    base64::std_decode(&normalized)
+}
+
+/// The V2 canonicalized resource: `/{bucket}/{object}`. Virtual-host requests
+/// carry only the object in the path, so the host bucket is prefixed.
+fn v2_canonical_resource(req: &Request) -> String {
+    match crate::xml_api::virtual_host_bucket(req.header("host")) {
+        Some(bucket) => format!("/{bucket}{}", req.path),
+        None => req.path.clone(),
+    }
+}
+
+/// Builds the V2 string-to-sign:
+/// `VERB\nContent-MD5\nContent-Type\nExpires\n{x-goog-* headers}{resource}`.
+pub fn build_v2_string_to_sign(
+    method: &str,
+    content_md5: &str,
+    content_type: &str,
+    expires: i64,
+    headers: &BTreeMap<String, String>,
+    canonical_resource: &str,
+) -> String {
+    let mut extension_headers = String::new();
+    for (name, value) in headers {
+        let lower = name.to_ascii_lowercase();
+        if lower.starts_with("x-goog-") {
+            extension_headers.push_str(&lower);
+            extension_headers.push(':');
+            extension_headers.push_str(&normalize_header_value(value));
+            extension_headers.push('\n');
+        }
+    }
+    format!(
+        "{}\n{}\n{}\n{}\n{}{}",
+        method.to_ascii_uppercase(),
+        content_md5.trim(),
+        content_type.trim(),
+        expires,
+        extension_headers,
+        canonical_resource
+    )
 }
 
 fn invalid(status: u16, code: &'static str, message: &str) -> SignedUrlCheck {
@@ -347,10 +485,12 @@ pub fn compute_v4_hmac_signature(
     goog_date: &str,
     canonical_request: &str,
 ) -> String {
-    let scope = format!("{date_stamp}/{region}/storage/goog4_request");
-    let string_to_sign = format!(
-        "{V4_ALGO_HMAC}\n{goog_date}\n{scope}\n{}",
-        sha256_hex(canonical_request.as_bytes())
+    let string_to_sign = v4_string_to_sign(
+        V4_ALGO_HMAC,
+        date_stamp,
+        region,
+        goog_date,
+        canonical_request,
     );
     let key0 = format!("GOOG4{secret}");
     let k_date = hmac_sha256(key0.as_bytes(), date_stamp.as_bytes());
@@ -358,6 +498,20 @@ pub fn compute_v4_hmac_signature(
     let k_service = hmac_sha256(&k_region, b"storage");
     let k_signing = hmac_sha256(&k_service, b"goog4_request");
     hex::encode(hmac_sha256(&k_signing, string_to_sign.as_bytes()))
+}
+
+pub fn v4_string_to_sign(
+    algo: &str,
+    date_stamp: &str,
+    region: &str,
+    goog_date: &str,
+    canonical_request: &str,
+) -> String {
+    let scope = format!("{date_stamp}/{region}/storage/goog4_request");
+    format!(
+        "{algo}\n{goog_date}\n{scope}\n{}",
+        sha256_hex(canonical_request.as_bytes())
+    )
 }
 
 /// Parameters for generating a deterministic GCS V4 HMAC-SHA256 signed URL
@@ -377,6 +531,132 @@ pub struct SignV4HmacInput<'a> {
 }
 
 pub fn sign_v4_hmac_target(input: &SignV4HmacInput<'_>) -> String {
+    let prepared = prepare_v4_target(&V4TargetParts {
+        algo: V4_ALGO_HMAC,
+        method: input.method,
+        path: input.path,
+        host: input.host,
+        access_id: input.access_id,
+        region: input.region,
+        goog_date: input.goog_date,
+        expires: input.expires,
+        extra_query: &input.extra_query,
+        extra_headers: &input.extra_headers,
+    });
+    let signature = compute_v4_hmac_signature(
+        input.secret,
+        &input.goog_date[0..8],
+        input.region,
+        input.goog_date,
+        &prepared.canonical_request,
+    );
+    prepared.finish(&signature)
+}
+
+/// Parameters for generating a GCS V4 `GOOG4-RSA-SHA256` signed URL target
+/// signed with a PEM RSA private key (PKCS#8 or PKCS#1).
+#[derive(Debug, Clone)]
+pub struct SignV4RsaInput<'a> {
+    pub method: &'a str,
+    pub path: &'a str,
+    pub host: &'a str,
+    pub service_account: &'a str,
+    pub private_key_pem: &'a str,
+    pub region: &'a str,
+    pub goog_date: &'a str,
+    pub expires: i64,
+    pub extra_query: Vec<(String, String)>,
+    pub extra_headers: BTreeMap<String, String>,
+}
+
+pub fn sign_v4_rsa_target(input: &SignV4RsaInput<'_>) -> Result<String, String> {
+    let prepared = prepare_v4_target(&V4TargetParts {
+        algo: V4_ALGO_RSA,
+        method: input.method,
+        path: input.path,
+        host: input.host,
+        access_id: input.service_account,
+        region: input.region,
+        goog_date: input.goog_date,
+        expires: input.expires,
+        extra_query: &input.extra_query,
+        extra_headers: &input.extra_headers,
+    });
+    let string_to_sign = v4_string_to_sign(
+        V4_ALGO_RSA,
+        &input.goog_date[0..8],
+        input.region,
+        input.goog_date,
+        &prepared.canonical_request,
+    );
+    let signature =
+        crate::rsa_keys::sign_sha256_pem(input.private_key_pem, string_to_sign.as_bytes())?;
+    Ok(prepared.finish(&hex::encode(signature)))
+}
+
+/// Parameters for generating a V2 (`GoogleAccessId`/`Expires`/`Signature`)
+/// signed URL target. `path` is the path-style `/{bucket}/{object}` resource.
+#[derive(Debug, Clone)]
+pub struct SignV2Input<'a> {
+    pub method: &'a str,
+    pub path: &'a str,
+    pub service_account: &'a str,
+    pub private_key_pem: &'a str,
+    pub expires: i64,
+    pub content_md5: &'a str,
+    pub content_type: &'a str,
+    pub extra_headers: BTreeMap<String, String>,
+}
+
+pub fn sign_v2_target(input: &SignV2Input<'_>) -> Result<String, String> {
+    let string_to_sign = build_v2_string_to_sign(
+        input.method,
+        input.content_md5,
+        input.content_type,
+        input.expires,
+        &input.extra_headers,
+        input.path,
+    );
+    let signature =
+        crate::rsa_keys::sign_sha256_pem(input.private_key_pem, string_to_sign.as_bytes())?;
+    Ok(format!(
+        "{}?GoogleAccessId={}&Expires={}&Signature={}",
+        input.path,
+        percent_encode_strict(input.service_account),
+        input.expires,
+        percent_encode_strict(&base64::std_encode(&signature))
+    ))
+}
+
+struct V4TargetParts<'a> {
+    algo: &'a str,
+    method: &'a str,
+    path: &'a str,
+    host: &'a str,
+    access_id: &'a str,
+    region: &'a str,
+    goog_date: &'a str,
+    expires: i64,
+    extra_query: &'a [(String, String)],
+    extra_headers: &'a BTreeMap<String, String>,
+}
+
+struct PreparedV4Target {
+    path: String,
+    query_pairs: Vec<(String, String)>,
+    canonical_request: String,
+}
+
+impl PreparedV4Target {
+    fn finish(self, signature_hex: &str) -> String {
+        let mut full_query = canonical_query_string(&self.query_pairs);
+        full_query.push_str("&X-Goog-Signature=");
+        full_query.push_str(signature_hex);
+        format!("{}?{}", self.path, full_query)
+    }
+}
+
+fn prepare_v4_target(input: &V4TargetParts<'_>) -> PreparedV4Target {
     let date_stamp = &input.goog_date[0..8];
     let credential = format!(
         "{}/{}/{}/storage/goog4_request",
@@ -384,35 +664,29 @@ pub fn sign_v4_hmac_target(input: &SignV4HmacInput<'_>) -> String {
     );
     let mut headers: BTreeMap<String, String> = BTreeMap::new();
     headers.insert("host".to_string(), input.host.to_string());
-    for (k, v) in &input.extra_headers {
+    for (k, v) in input.extra_headers {
         headers.insert(k.to_ascii_lowercase(), v.clone());
     }
     let signed_headers = headers.keys().cloned().collect::<Vec<_>>().join(";");
-    let mut query_pairs = input.extra_query.clone();
-    query_pairs.push(("X-Goog-Algorithm".to_string(), V4_ALGO_HMAC.to_string()));
+    let mut query_pairs = input.extra_query.to_vec();
+    query_pairs.push(("X-Goog-Algorithm".to_string(), input.algo.to_string()));
     query_pairs.push(("X-Goog-Credential".to_string(), credential));
     query_pairs.push(("X-Goog-Date".to_string(), input.goog_date.to_string()));
     query_pairs.push(("X-Goog-Expires".to_string(), input.expires.to_string()));
     query_pairs.push(("X-Goog-SignedHeaders".to_string(), signed_headers.clone()));
 
-    let canonical_req = build_v4_canonical_request(
+    let canonical_request = build_v4_canonical_request(
         input.method,
         input.path,
         &query_pairs,
         &headers,
         &signed_headers,
     );
-    let signature = compute_v4_hmac_signature(
-        input.secret,
-        date_stamp,
-        input.region,
-        input.goog_date,
-        &canonical_req,
-    );
-    let mut full_query = canonical_query_string(&query_pairs);
-    full_query.push_str("&X-Goog-Signature=");
-    full_query.push_str(&signature);
-    format!("{}?{}", input.path, full_query)
+    PreparedV4Target {
+        path: input.path.to_string(),
+        query_pairs,
+        canonical_request,
+    }
 }
 
 fn percent_encode_strict(value: &str) -> String {

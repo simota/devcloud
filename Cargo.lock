@@ -293,6 +293,7 @@ version = "0.1.0"
 dependencies = [
  "devcloud-s3",
  "hex",
+ "ring",
  "serde",
  "serde_json",
  "tokio",
