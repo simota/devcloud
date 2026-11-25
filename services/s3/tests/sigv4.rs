@@ -453,11 +453,11 @@ fn signed_trailer_is_verified() {
             &[b"hello world"],
             &signed.signature,
             &signed.amz_date,
-            Some("x-amz-checksum-crc32:DQpIDQ=="),
+            Some("x-amz-checksum-crc32:DUoRhQ=="),
         );
         let text = String::from_utf8(framed).unwrap();
         signed.request.body = text
-            .replace("x-amz-checksum-crc32:DQpIDQ==", trailer_on_wire)
+            .replace("x-amz-checksum-crc32:DUoRhQ==", trailer_on_wire)
             .into_bytes();
         route_with_auth(&store, &signed.request, &auth)
     };
@@ -465,7 +465,7 @@ fn signed_trailer_is_verified() {
         code(&upload("x-amz-checksum-crc32:AAAAAA==")),
         "SignatureDoesNotMatch"
     );
-    assert_eq!(upload("x-amz-checksum-crc32:DQpIDQ==").status, 200);
+    assert_eq!(upload("x-amz-checksum-crc32:DUoRhQ==").status, 200);
     assert_eq!(stored(&store, "trailer.txt").body, b"hello world");
 }
 
@@ -481,7 +481,7 @@ fn unsigned_trailer_upload_is_decoded_in_strict_mode() {
         now(),
     );
     signed.request.body =
-        b"b\r\nhello world\r\n0\r\nx-amz-checksum-crc32:DQpIDQ==\r\n\r\n".to_vec();
+        b"b\r\nhello world\r\n0\r\nx-amz-checksum-crc32:DUoRhQ==\r\n\r\n".to_vec();
     assert_eq!(
         route_with_auth(&store, &signed.request, &auth()).status,
         200
@@ -955,7 +955,7 @@ fn sigv4a_streaming_payload_is_verified_and_decoded() {
 fn sigv4a_streaming_trailer_is_verified() {
     let store = store();
     let auth = auth();
-    let trailer = [("x-amz-checksum-crc32", "DQpIDQ==")];
+    let trailer = [("x-amz-checksum-crc32", "DUoRhQ==")];
     let (put, _, _) = sigv4a_streaming_put(
         "/data/v4a-trailer.txt",
         &[b"hello world"],
@@ -972,7 +972,7 @@ fn sigv4a_streaming_trailer_is_verified() {
         true,
     );
     let text = String::from_utf8(put.body.clone()).unwrap();
-    put.body = text.replace("DQpIDQ==", "AAAAAA==").into_bytes();
+    put.body = text.replace("DUoRhQ==", "AAAAAA==").into_bytes();
     assert_eq!(
         code(&route_with_auth(&store, &put, &auth)),
         "SignatureDoesNotMatch"

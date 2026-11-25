@@ -34,7 +34,7 @@ pub fn crc32c_base64(data: &[u8]) -> String {
 }
 
 /// CRC32C (Castagnoli) checksum: reflected poly 0x82F63B78, init/xorout all-ones.
-fn crc32c(data: &[u8]) -> u32 {
+pub(crate) fn crc32c(data: &[u8]) -> u32 {
     let mut crc: u32 = 0xFFFF_FFFF;
     for &byte in data {
         crc ^= byte as u32;

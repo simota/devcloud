@@ -115,6 +115,64 @@ fn signed_req(method: &str, target: &str, body: &[u8]) -> Request {
     req
 }
 
+/// Signs `req` like an SDK: every header (including `extra`) and the query.
+fn signed_with_headers(method: &str, target: &str, body: &[u8], extra: &[(&str, &str)]) -> Request {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let amz_date = devcloud_s3::time_fmt::rfc3339_seconds_from_unix(now).replace(['-', ':'], "");
+    let date_stamp = amz_date[..8].to_string();
+    let body_hash = sha256_hex(body);
+    let mut req = Request::new(method, target, body.to_vec());
+    req.headers
+        .insert("host".to_string(), "example.com".to_string());
+    req.headers
+        .insert("x-amz-date".to_string(), amz_date.clone());
+    req.headers
+        .insert("x-amz-content-sha256".to_string(), body_hash.clone());
+    for (k, v) in extra {
+        req.headers.insert((*k).to_string(), (*v).to_string());
+    }
+    let signed_headers = req.headers.keys().cloned().collect::<Vec<_>>().join(";");
+    let canonical_headers: String = req
+        .headers
+        .iter()
+        .map(|(k, v)| format!("{k}:{v}\n"))
+        .collect();
+    let canonical_query = req
+        .query
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join("&");
+    let canonical_request = [
+        method,
+        target.split('?').next().unwrap(),
+        &canonical_query,
+        &canonical_headers,
+        &signed_headers,
+        &body_hash,
+    ]
+    .join("\n");
+    let scope = format!("{date_stamp}/us-east-1/s3/aws4_request");
+    let string_to_sign = format!(
+        "AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}",
+        sha256_hex(canonical_request.as_bytes())
+    );
+    let signature = hex::encode(hmac_sha256(
+        &test_signing_key("dev", &date_stamp, "us-east-1"),
+        string_to_sign.as_bytes(),
+    ));
+    req.headers.insert(
+        "authorization".to_string(),
+        format!(
+            "AWS4-HMAC-SHA256 Credential=dev/{scope}, SignedHeaders={signed_headers}, Signature={signature}"
+        ),
+    );
+    req
+}
+
 fn test_signing_key(secret: &str, date_stamp: &str, region: &str) -> Vec<u8> {
     let date_key = hmac_sha256(format!("AWS4{secret}").as_bytes(), date_stamp.as_bytes());
     let region_key = hmac_sha256(&date_key, region.as_bytes());
@@ -1228,7 +1286,7 @@ fn select_object_content_supports_csv_json_and_rejects_unsupported_sql() {
         &Request::new(
             "POST",
             "/demo-bucket/reports/users.csv?select&select-type=2",
-            br#"<SelectObjectContentRequest><Expression>SELECT name FROM S3Object GROUP BY name</Expression><ExpressionType>SQL</ExpressionType><InputSerialization><CSV><FileHeaderInfo>USE</FileHeaderInfo></CSV></InputSerialization><OutputSerialization><CSV /></OutputSerialization></SelectObjectContentRequest>"#.to_vec(),
+            br#"<SelectObjectContentRequest><Expression>SELECT name FROM S3Object GROUP BY name HAVING COUNT(*) &gt; 1</Expression><ExpressionType>SQL</ExpressionType><InputSerialization><CSV><FileHeaderInfo>USE</FileHeaderInfo></CSV></InputSerialization><OutputSerialization><CSV /></OutputSerialization></SelectObjectContentRequest>"#.to_vec(),
         ),
     );
     assert_eq!(unsupported.status, 501);
@@ -2494,4 +2552,435 @@ fn conditional_writes_support_etag_values_for_put_copy_and_complete_multipart() 
         route(&store, &req("GET", "/cond/doc")).body,
         b"v3-multipart"
     );
+}
+
+fn select_csv(store: &FileBucketStore, target: &str, sql: &str, json_out: bool) -> (u16, String) {
+    let output = if json_out { "<JSON />" } else { "<CSV />" };
+    let body = format!(
+        "<SelectObjectContentRequest><Expression>{sql}</Expression><ExpressionType>SQL</ExpressionType><InputSerialization><CSV><FileHeaderInfo>USE</FileHeaderInfo></CSV></InputSerialization><OutputSerialization>{output}</OutputSerialization></SelectObjectContentRequest>"
+    );
+    let response = route(
+        store,
+        &Request::new(
+            "POST",
+            &format!("{target}?select&select-type=2"),
+            body.into_bytes(),
+        ),
+    );
+    let records = if response.status == 200 {
+        String::from_utf8(event_stream_records(&response.body)).unwrap()
+    } else {
+        String::from_utf8(response.body).unwrap()
+    };
+    (response.status, records)
+}
+
+#[test]
+fn select_object_content_supports_group_by_order_by_and_self_join() {
+    let root = tempdir();
+    let store = FileBucketStore::new(&root);
+    assert_eq!(route(&store, &req("PUT", "/sel")).status, 200);
+    let csv = b"id,name,city,age,manager\n1,alice,Tokyo,31,\n2,bob,Osaka,28,1\n3,carol,Tokyo,35,1\n4,dave,Osaka,40,2\n5,erin,Kyoto,22,\n".to_vec();
+    assert_eq!(
+        route(&store, &Request::new("PUT", "/sel/people.csv", csv)).status,
+        200
+    );
+
+    // GROUP BY with aggregates, groups in first-appearance order.
+    assert_eq!(
+        select_csv(
+            &store,
+            "/sel/people.csv",
+            "SELECT city, COUNT(*), MAX(CAST(age AS INT)) FROM S3Object GROUP BY city",
+            false
+        ),
+        (200, "Tokyo,2,35\nOsaka,2,40\nKyoto,1,22\n".to_string())
+    );
+    // ORDER BY an aggregate alias descending, then the group key, plus LIMIT.
+    assert_eq!(
+        select_csv(
+            &store,
+            "/sel/people.csv",
+            "SELECT s.city, COUNT(*) AS n FROM S3Object s WHERE CAST(s.age AS INT) &gt; 20 GROUP BY s.city ORDER BY n DESC, city LIMIT 2",
+            true
+        ),
+        (
+            200,
+            "{\"city\":\"Osaka\",\"n\":2}\n{\"city\":\"Tokyo\",\"n\":2}\n".to_string()
+        )
+    );
+    // ORDER BY an aggregate that is not projected.
+    assert_eq!(
+        select_csv(
+            &store,
+            "/sel/people.csv",
+            "SELECT city FROM S3Object GROUP BY city ORDER BY SUM(CAST(age AS INT)) ASC",
+            false
+        ),
+        (200, "Kyoto\nTokyo\nOsaka\n".to_string())
+    );
+    // ORDER BY a numeric cast, a column position, and plain rows with LIMIT.
+    assert_eq!(
+        select_csv(
+            &store,
+            "/sel/people.csv",
+            "SELECT name, age FROM S3Object ORDER BY CAST(age AS INT) DESC LIMIT 3",
+            false
+        ),
+        (200, "dave,40\ncarol,35\nalice,31\n".to_string())
+    );
+    assert_eq!(
+        select_csv(
+            &store,
+            "/sel/people.csv",
+            "SELECT city, name FROM S3Object ORDER BY 1, 2 DESC",
+            false
+        ),
+        (
+            200,
+            "Kyoto,erin\nOsaka,dave\nOsaka,bob\nTokyo,carol\nTokyo,alice\n".to_string()
+        )
+    );
+    // Missing values (NULL) sort last ascending and first descending.
+    let jsonl = b"{\"n\":\"a\",\"r\":2}\n{\"n\":\"b\"}\n{\"n\":\"c\",\"r\":1}\n".to_vec();
+    assert_eq!(
+        route(&store, &Request::new("PUT", "/sel/ranks.jsonl", jsonl)).status,
+        200
+    );
+    for (order, expected) in [("ASC", "c\na\nb\n"), ("DESC", "b\na\nc\n")] {
+        let body = format!(
+            "<SelectObjectContentRequest><Expression>SELECT s.n FROM S3Object s ORDER BY s.r {order}</Expression><ExpressionType>SQL</ExpressionType><InputSerialization><JSON><Type>LINES</Type></JSON></InputSerialization><OutputSerialization><CSV /></OutputSerialization></SelectObjectContentRequest>"
+        );
+        let response = route(
+            &store,
+            &Request::new(
+                "POST",
+                "/sel/ranks.jsonl?select&select-type=2",
+                body.into_bytes(),
+            ),
+        );
+        assert_eq!(
+            String::from_utf8(event_stream_records(&response.body)).unwrap(),
+            expected
+        );
+    }
+
+    // Self-join: employees with their manager's name.
+    assert_eq!(
+        select_csv(
+            &store,
+            "/sel/people.csv",
+            "SELECT e.name, m.name AS manager_name FROM S3Object e JOIN S3Object m ON e.manager = m.id ORDER BY e.name",
+            true
+        ),
+        (
+            200,
+            "{\"manager_name\":\"alice\",\"name\":\"bob\"}\n{\"manager_name\":\"alice\",\"name\":\"carol\"}\n{\"manager_name\":\"bob\",\"name\":\"dave\"}\n"
+                .to_string()
+        )
+    );
+    // Comma join with WHERE, grouped by the manager.
+    assert_eq!(
+        select_csv(
+            &store,
+            "/sel/people.csv",
+            "SELECT m.name, COUNT(*) AS reports FROM S3Object e, S3Object m WHERE e.manager = m.id GROUP BY m.name ORDER BY reports DESC",
+            false
+        ),
+        (200, "alice,2\nbob,1\n".to_string())
+    );
+    // Qualified wildcard keeps one side of the join.
+    assert_eq!(
+        select_csv(
+            &store,
+            "/sel/people.csv",
+            "SELECT m.* FROM S3Object e INNER JOIN S3Object m ON e.manager = m.id WHERE e.name = 'dave'",
+            false
+        ),
+        (200, "2,bob,Osaka,28,1\n".to_string())
+    );
+
+    // Errors: unaliased join, aggregates without GROUP BY next to columns, outer joins.
+    for (sql, status) in [
+        ("SELECT * FROM S3Object JOIN S3Object m ON m.id = 1", 400),
+        ("SELECT city, COUNT(*) FROM S3Object", 400),
+        (
+            "SELECT * FROM S3Object e LEFT JOIN S3Object m ON e.manager = m.id",
+            501,
+        ),
+        ("SELECT * FROM S3Object GROUP BY city", 400),
+    ] {
+        assert_eq!(
+            select_csv(&store, "/sel/people.csv", sql, false).0,
+            status,
+            "{sql}"
+        );
+    }
+}
+
+#[test]
+fn sse_kms_writes_need_a_usable_local_kms_key_in_strict_mode() {
+    let root = tempdir();
+    let store = FileBucketStore::new(&root);
+    let auth = strict_auth();
+    let send = |method: &str, target: &str, body: &[u8], headers: &[(&str, &str)]| {
+        route_with_auth(
+            &store,
+            &signed_with_headers(method, target, body, headers),
+            &auth,
+        )
+    };
+    assert_eq!(send("PUT", "/kms", b"", &[]).status, 200);
+    let put = |key: &str, kms_key: Option<&str>| {
+        let mut headers = vec![("x-amz-server-side-encryption", "aws:kms")];
+        if let Some(id) = kms_key {
+            headers.push(("x-amz-server-side-encryption-aws-kms-key-id", id));
+        }
+        send("PUT", &format!("/kms/{key}"), b"secret", &headers)
+    };
+    let json = |response: &devcloud_s3::http::Response| -> serde_json::Value {
+        serde_json::from_slice(&response.body).unwrap()
+    };
+
+    // No key ID: the AWS managed alias/aws/s3 key is created and its ARN returned.
+    let default_put = put("default.txt", None);
+    assert_eq!(default_put.status, 200);
+    let default_arn = default_put
+        .headers
+        .get("x-amz-server-side-encryption-aws-kms-key-id")
+        .unwrap()
+        .clone();
+    assert!(default_arn.starts_with("arn:aws:kms:us-east-1:000000000000:key/"));
+
+    // Unknown keys are refused.
+    let missing = put(
+        "missing.txt",
+        Some("arn:aws:kms:us-east-1:000000000000:key/nope"),
+    );
+    assert_eq!(missing.status, 400);
+    assert!(String::from_utf8_lossy(&missing.body).contains("KMS.NotFoundException"));
+
+    // A customer key resolves by ID, ARN, and alias; the ARN is stored.
+    let created = send("POST", "/_kms/keys", br#"{"Description":"app"}"#, &[]);
+    assert_eq!(created.status, 200);
+    let metadata = json(&created)["KeyMetadata"].clone();
+    let key_id = metadata["KeyId"].as_str().unwrap().to_string();
+    let key_arn = metadata["Arn"].as_str().unwrap().to_string();
+    assert_eq!(metadata["KeyState"], "Enabled");
+    assert_eq!(
+        send(
+            "POST",
+            "/_kms/aliases",
+            format!(r#"{{"AliasName":"alias/app","TargetKeyId":"{key_id}"}}"#).as_bytes(),
+            &[]
+        )
+        .status,
+        200
+    );
+    for reference in [key_id.as_str(), key_arn.as_str(), "alias/app"] {
+        let response = put("app.txt", Some(reference));
+        assert_eq!(response.status, 200, "{reference}");
+        assert_eq!(
+            response
+                .headers
+                .get("x-amz-server-side-encryption-aws-kms-key-id"),
+            Some(&key_arn)
+        );
+    }
+    let head = send("HEAD", "/kms/app.txt", b"", &[]);
+    assert_eq!(
+        head.headers
+            .get("x-amz-server-side-encryption-aws-kms-key-id"),
+        Some(&key_arn)
+    );
+
+    // Disabling the key blocks new writes and GET (HEAD still works); enabling restores both.
+    assert_eq!(
+        send("POST", &format!("/_kms/keys/{key_id}/disable"), b"", &[]).status,
+        200
+    );
+    let disabled = put("other.txt", Some(&key_id));
+    assert_eq!(disabled.status, 400);
+    assert!(String::from_utf8_lossy(&disabled.body).contains("KMS.DisabledException"));
+    let get_disabled = send("GET", "/kms/app.txt", b"", &[]);
+    assert_eq!(get_disabled.status, 400);
+    assert!(String::from_utf8_lossy(&get_disabled.body).contains("KMS.DisabledException"));
+    assert_eq!(send("HEAD", "/kms/app.txt", b"", &[]).status, 200);
+    assert_eq!(
+        send(
+            "PUT",
+            "/kms/copy.txt",
+            b"",
+            &[("x-amz-copy-source", "/kms/app.txt")]
+        )
+        .status,
+        400
+    );
+    assert_eq!(
+        send("POST", &format!("/_kms/keys/{key_id}/enable"), b"", &[]).status,
+        200
+    );
+    let got = send("GET", "/kms/app.txt", b"", &[]);
+    assert_eq!(got.status, 200);
+    assert_eq!(got.body, b"secret");
+
+    // Scheduled deletion: invalid state for writes and reads; cancel leaves it disabled.
+    let scheduled = send(
+        "POST",
+        &format!("/_kms/keys/{key_id}/schedule-deletion"),
+        br#"{"PendingWindowInDays":7}"#,
+        &[],
+    );
+    assert_eq!(
+        json(&scheduled)["KeyMetadata"]["KeyState"],
+        "PendingDeletion"
+    );
+    let pending = send("GET", "/kms/app.txt", b"", &[]);
+    assert!(String::from_utf8_lossy(&pending.body).contains("KMS.KMSInvalidStateException"));
+    let cancelled = send(
+        "POST",
+        &format!("/_kms/keys/{key_id}/cancel-deletion"),
+        b"",
+        &[],
+    );
+    assert_eq!(json(&cancelled)["KeyMetadata"]["KeyState"], "Disabled");
+
+    // The managed key cannot be disabled; listing shows both keys and aliases.
+    let default_id = default_arn.rsplit('/').next().unwrap();
+    assert_eq!(
+        send(
+            "POST",
+            &format!("/_kms/keys/{default_id}/disable"),
+            b"",
+            &[]
+        )
+        .status,
+        400
+    );
+    let listed = json(&send("GET", "/_kms/keys", b"", &[]));
+    assert_eq!(listed["Keys"].as_array().unwrap().len(), 2);
+    assert_eq!(listed["Aliases"].as_array().unwrap().len(), 2);
+    // The keyring file is not a bucket.
+    let buckets = send("GET", "/", b"", &[]);
+    assert!(!String::from_utf8_lossy(&buckets.body).contains(".kms"));
+}
+
+#[test]
+fn sse_kms_relaxed_mode_stores_any_key_id_as_before() {
+    let root = tempdir();
+    let store = FileBucketStore::new(&root);
+    assert_eq!(route(&store, &req("PUT", "/kms")).status, 200);
+    let put = |key: &str, kms_key: Option<&str>| {
+        let mut r = Request::new("PUT", &format!("/kms/{key}"), b"secret".to_vec());
+        r.headers.insert(
+            "x-amz-server-side-encryption".to_string(),
+            "aws:kms".to_string(),
+        );
+        if let Some(id) = kms_key {
+            r.headers.insert(
+                "x-amz-server-side-encryption-aws-kms-key-id".to_string(),
+                id.to_string(),
+            );
+        }
+        route(&store, &r)
+    };
+    let key_header = "x-amz-server-side-encryption-aws-kms-key-id";
+    // Unknown key IDs, ARNs, and aliases are stored and echoed verbatim.
+    for (object, id) in [
+        ("id.txt", "unknown-key-id"),
+        ("arn.txt", "arn:aws:kms:us-east-1:000000000000:key/nope"),
+        ("alias.txt", "alias/not-created"),
+    ] {
+        let response = put(object, Some(id));
+        assert_eq!(response.status, 200, "{id}");
+        assert_eq!(
+            response.headers.get(key_header).map(String::as_str),
+            Some(id)
+        );
+        let head = route(&store, &req("HEAD", &format!("/kms/{object}")));
+        assert_eq!(head.headers.get(key_header).map(String::as_str), Some(id));
+        let got = route(&store, &req("GET", &format!("/kms/{object}")));
+        assert_eq!(got.status, 200);
+        assert_eq!(got.body, b"secret");
+    }
+    // No key ID: no key header and no keyring is created.
+    let default_put = put("default.txt", None);
+    assert_eq!(default_put.status, 200);
+    assert!(!default_put.headers.contains_key(key_header));
+    assert!(!root.join(".kms.json").exists());
+
+    // A keyring key disabled later does not block relaxed-mode writes or reads.
+    let created = route(&store, &Request::new("POST", "/_kms/keys", Vec::new()));
+    let metadata: serde_json::Value = serde_json::from_slice(&created.body).unwrap();
+    let key_id = metadata["KeyMetadata"]["KeyId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(put("keyed.txt", Some(&key_id)).status, 200);
+    assert_eq!(
+        route(
+            &store,
+            &req("POST", &format!("/_kms/keys/{key_id}/disable"))
+        )
+        .status,
+        200
+    );
+    assert_eq!(put("keyed2.txt", Some(&key_id)).status, 200);
+    assert_eq!(route(&store, &req("GET", "/kms/keyed.txt")).status, 200);
+}
+
+#[test]
+fn aws_chunked_trailer_checksums_are_validated_in_relaxed_mode() {
+    let root = tempdir();
+    let store = FileBucketStore::new(&root);
+    assert_eq!(route(&store, &req("PUT", "/sums")).status, 200);
+    let upload = |trailer: &str, declared: &str| {
+        let mut r = Request::new(
+            "PUT",
+            "/sums/k",
+            format!("b\r\nhello world\r\n0\r\n{trailer}\r\n\r\n").into_bytes(),
+        );
+        r.headers.insert(
+            "x-amz-content-sha256".to_string(),
+            "STREAMING-UNSIGNED-PAYLOAD-TRAILER".to_string(),
+        );
+        r.headers
+            .insert("content-encoding".to_string(), "aws-chunked".to_string());
+        r.headers
+            .insert("x-amz-trailer".to_string(), declared.to_string());
+        let response = route(&store, &r);
+        let body = String::from_utf8_lossy(&response.body).to_string();
+        (response.status, body)
+    };
+    let sha256 = devcloud_s3::base64::std_encode(&Sha256::digest(b"hello world"));
+    for (trailer, declared) in [
+        (
+            "x-amz-checksum-crc32:DUoRhQ==".to_string(),
+            "x-amz-checksum-crc32",
+        ),
+        (
+            "x-amz-checksum-crc32c:yZRlqg==".to_string(),
+            "x-amz-checksum-crc32c",
+        ),
+        (
+            format!("x-amz-checksum-sha256:{sha256}"),
+            "x-amz-checksum-sha256",
+        ),
+        (
+            "x-amz-checksum-sha1:Kq5sNclPz7QV2+lfQIuc6R7oRu0=".to_string(),
+            "x-amz-checksum-sha1",
+        ),
+    ] {
+        assert_eq!(upload(&trailer, declared).0, 200, "{trailer}");
+    }
+    let (status, body) = upload("x-amz-checksum-crc32:AAAAAA==", "x-amz-checksum-crc32");
+    assert_eq!(status, 400);
+    assert!(body.contains("<Code>BadDigest</Code>"));
+    let (status, body) = upload("x-amz-checksum-crc32:DUoRhQ==", "x-amz-checksum-sha256");
+    assert_eq!(status, 400);
+    assert!(body.contains("<Code>InvalidRequest</Code>"));
+    let (status, _) = upload("x-amz-checksum-crc32:%%%", "");
+    assert_eq!(status, 400);
+    // A failed checksum leaves the previous object in place.
+    assert_eq!(route(&store, &req("GET", "/sums/k")).body, b"hello world");
 }

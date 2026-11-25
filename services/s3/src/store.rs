@@ -109,6 +109,11 @@ impl FileBucketStore {
         }
     }
 
+    /// The storage root, which also holds the local IAM registry and KMS keyring.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
     /// Pins the clock for deterministic metadata in tests.
     pub fn set_fixed_now(&mut self, ts: &str) {
         self.fixed_now = Some(ts.to_string());
