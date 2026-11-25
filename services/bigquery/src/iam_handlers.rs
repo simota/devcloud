@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use crate::model::{SetIamPolicyRequest, TestIamPermissionsRequest, TestIamPermissionsResponse};
 use crate::responses::{normalize_iam_policy, ApiResponse};
 use crate::server::{now_unix_nanos, Server};
-use crate::validation::decode_body;
+use crate::validation::{decode_body, validate_resource_id};
 
 impl Server {
     /// legacy `handleDatasetIAMPolicy`.
@@ -62,6 +62,27 @@ impl Server {
                 body,
             ),
         }
+    }
+
+    /// Resource Manager v1 `projects/{p}:getIamPolicy` / `:setIamPolicy`,
+    /// served on the BigQuery port; strict mode consults this policy for
+    /// project-level grants inherited by every dataset and table.
+    pub fn handle_project_iam_policy(
+        &self,
+        method: &str,
+        project_id: &str,
+        action: &str,
+        body: &[u8],
+    ) -> ApiResponse {
+        if let Err(message) = validate_resource_id(project_id, "project") {
+            return ApiResponse::error(400, "invalid", &message);
+        }
+        self.handle_iam_policy(
+            method,
+            action,
+            self.project_iam_policy_path(project_id),
+            body,
+        )
     }
 
     /// legacy `handleIAMPolicy`.

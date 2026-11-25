@@ -170,6 +170,13 @@ impl Server {
             )
             .map_err(|err| err.to_string())?;
         }
+        // Copied rows keep their source insert times.
+        self.mark_rows_history_reset(
+            &destination_ref.project_id,
+            &destination_ref.dataset_id,
+            &destination_ref.table_id,
+        )
+        .map_err(|err| err.to_string())?;
         self.refresh_table_row_stats(&destination)
             .map_err(|err| err.to_string())?;
 
@@ -432,7 +439,13 @@ impl Server {
         );
         match std::fs::remove_file(&path) {
             Err(err) if err.kind() != std::io::ErrorKind::NotFound => Err(err.to_string()),
-            _ => Ok(()),
+            _ => self
+                .mark_rows_history_reset(
+                    &destination_ref.project_id,
+                    &destination_ref.dataset_id,
+                    &destination_ref.table_id,
+                )
+                .map_err(|err| err.to_string()),
         }
     }
 

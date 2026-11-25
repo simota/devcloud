@@ -6,7 +6,7 @@
 //! [`ApiResponse`]; the HTTP routing layer (part 4) maps paths/methods onto
 //! them, mirroring how the pubsub/dynamodb crates split store vs handlers.
 
-use crate::model::{DatasetListItem, DatasetResource, DatasetsListResponse};
+use crate::model::{DatasetAccessEntry, DatasetListItem, DatasetResource, DatasetsListResponse};
 use crate::responses::{
     dataset_etag, default_string, has_children, unix_millis_string, ApiResponse,
 };
@@ -18,6 +18,18 @@ use crate::validation::{
 impl Server {
     /// `POST /bigquery/v2/projects/{project}/datasets` (legacy `createDataset`).
     pub fn create_dataset(&self, project_id: &str, body: &[u8]) -> ApiResponse {
+        self.create_dataset_as(project_id, body, None)
+    }
+
+    /// `create_dataset` for a strict-mode principal: like BigQuery, a dataset
+    /// created without `access` gets the default project-role entries plus an
+    /// `OWNER` entry for the creating `member`.
+    pub(crate) fn create_dataset_as(
+        &self,
+        project_id: &str,
+        body: &[u8],
+        creator: Option<&str>,
+    ) -> ApiResponse {
         let mut request: DatasetResource = match decode_body(body, self.max_request_bytes()) {
             Ok(request) => request,
             Err(()) => return ApiResponse::error(400, "invalid", "invalid json request"),
@@ -35,6 +47,12 @@ impl Server {
         if let Err(message) = validate_resource_id(&request.dataset_reference.dataset_id, "dataset")
         {
             return ApiResponse::error(400, "invalid", &message);
+        }
+        if let Err(message) = validate_access(request.access.as_deref()) {
+            return ApiResponse::error(400, "invalid", &message);
+        }
+        if let (Some(member), None) = (creator, &request.access) {
+            request.access = Some(default_access(member));
         }
 
         let dataset_id = request.dataset_reference.dataset_id.clone();
@@ -64,6 +82,7 @@ impl Server {
             etag: dataset_etag(now),
             creation_time: unix_millis_string(now),
             last_modified_time: unix_millis_string(now),
+            access: request.access,
         };
         if self.write_dataset(&resource).is_err() {
             return ApiResponse::error(500, "backendError", "internal error");
@@ -172,6 +191,9 @@ impl Server {
                 "datasetReference.datasetId must match request dataset",
             );
         }
+        if let Err(message) = validate_access(request.access.as_deref()) {
+            return ApiResponse::error(400, "invalid", &message);
+        }
 
         let now = now_unix_nanos();
         let mut existing = existing.unwrap_or_else(|| DatasetResource {
@@ -191,6 +213,7 @@ impl Server {
             existing.description = request.description;
             existing.labels = request.labels;
             existing.location = default_string(request.location, self.default_location());
+            existing.access = request.access;
         } else {
             if !request.friendly_name.is_empty() {
                 existing.friendly_name = request.friendly_name;
@@ -203,6 +226,9 @@ impl Server {
             }
             if !request.location.is_empty() {
                 existing.location = request.location;
+            }
+            if request.access.is_some() {
+                existing.access = request.access;
             }
         }
         existing.etag = dataset_etag(now);
@@ -244,4 +270,78 @@ impl Server {
         );
         ApiResponse::no_content()
     }
+}
+
+/// Rejects `access` entries BigQuery would refuse: each entry names exactly
+/// one grantee; member entries need a legacy (`READER`/`WRITER`/`OWNER`) or
+/// `roles/...` role; authorized view/routine/dataset entries take no role.
+fn validate_access(access: Option<&[DatasetAccessEntry]>) -> Result<(), String> {
+    for entry in access.unwrap_or_default() {
+        let members = [
+            &entry.user_by_email,
+            &entry.group_by_email,
+            &entry.domain,
+            &entry.special_group,
+            &entry.iam_member,
+        ]
+        .iter()
+        .filter(|value| !value.is_empty())
+        .count();
+        let resources = [&entry.view, &entry.routine, &entry.dataset]
+            .iter()
+            .filter(|value| value.is_some())
+            .count();
+        if members + resources != 1 {
+            return Err("each access entry must specify exactly one grantee".to_string());
+        }
+        if resources == 1 {
+            if !entry.role.is_empty() {
+                return Err(
+                    "authorized view, routine and dataset access entries take no role".to_string(),
+                );
+            }
+            continue;
+        }
+        if !matches!(entry.role.as_str(), "READER" | "WRITER" | "OWNER")
+            && !entry.role.starts_with("roles/")
+        {
+            return Err(format!("invalid access entry role {:?}", entry.role));
+        }
+        if !entry.special_group.is_empty()
+            && !matches!(
+                entry.special_group.as_str(),
+                "projectOwners" | "projectWriters" | "projectReaders" | "allAuthenticatedUsers"
+            )
+        {
+            return Err(format!(
+                "invalid access entry specialGroup {:?}",
+                entry.special_group
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn default_access(member: &str) -> Vec<DatasetAccessEntry> {
+    let special = |role: &str, group: &str| DatasetAccessEntry {
+        role: role.to_string(),
+        special_group: group.to_string(),
+        ..Default::default()
+    };
+    let mut creator = DatasetAccessEntry {
+        role: "OWNER".to_string(),
+        ..Default::default()
+    };
+    match member.split_once(':') {
+        Some(("user" | "serviceAccount", email)) => creator.user_by_email = email.to_string(),
+        Some(("group", email)) => creator.group_by_email = email.to_string(),
+        Some(("domain", domain)) => creator.domain = domain.to_string(),
+        _ => creator.iam_member = member.to_string(),
+    }
+    vec![
+        special("WRITER", "projectWriters"),
+        special("OWNER", "projectOwners"),
+        special("READER", "projectReaders"),
+        creator,
+    ]
 }

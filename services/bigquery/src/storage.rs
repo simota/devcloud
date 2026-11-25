@@ -74,6 +74,48 @@ impl Server {
         }
     }
 
+    /// Local project IAM policy (Resource Manager `projects.getIamPolicy`).
+    pub fn project_iam_policy_path(&self, project_id: &str) -> PathBuf {
+        self.storage_root()
+            .join("projects")
+            .join(project_id)
+            .join("iam-policy.json")
+    }
+
+    /// Marks the point before which a table's rows have no reliable insert
+    /// history (truncation, copy, query destination writes); Storage API
+    /// snapshot reads older than it are refused.
+    pub(crate) fn mark_rows_history_reset(
+        &self,
+        project_id: &str,
+        dataset_id: &str,
+        table_id: &str,
+    ) -> StorageResult<()> {
+        let dir = self.table_dir(project_id, dataset_id, table_id);
+        fs::create_dir_all(&dir)?;
+        fs::write(
+            dir.join("rows-history-reset"),
+            crate::server::now_unix_nanos().to_string(),
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn rows_history_reset(
+        &self,
+        project_id: &str,
+        dataset_id: &str,
+        table_id: &str,
+    ) -> Option<i64> {
+        fs::read_to_string(
+            self.table_dir(project_id, dataset_id, table_id)
+                .join("rows-history-reset"),
+        )
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+    }
+
     pub fn dataset_dir(&self, project_id: &str, dataset_id: &str) -> PathBuf {
         self.storage_root()
             .join("projects")
