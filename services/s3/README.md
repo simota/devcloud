@@ -59,9 +59,63 @@ Strict mode also evaluates bucket policies (`Allow`/`Deny`, `Principal`,
 `Action`, `Resource`, common `Condition` operators) and canned bucket/object
 ACLs (`public-read`, `public-read-write`), allowing anonymous public access when
 granted and enforcing explicit `Deny` statements even on authenticated requests.
-Trailer checksums such as `x-amz-checksum-crc32` are accepted but not validated.
-SigV4a streaming chunked payloads and multi-account IAM/STS session policies are
-not implemented.
+SigV4a streaming chunked payloads are not implemented.
+
+In every auth mode, `aws-chunked` trailer checksums (`x-amz-checksum-crc32`,
+`-crc32c`, `-crc64nvme`, `-sha1`, `-sha256`) are checked against the decoded
+payload: a mismatch is `BadDigest`, and a malformed value or a checksum named in
+`x-amz-trailer` but missing from the body is `InvalidRequest`.
+
+## Local IAM users, roles, and sessions
+
+The access key above is the owner of every bucket (account `000000000000`).
+Other identities come from a local registry, replaced as a whole:
+
+```sh
+curl -X PUT http://127.0.0.1:9000/_iam/config -d '{
+  "Users": [{"UserName": "bob", "Account": "111111111111",
+             "AccessKeyId": "AKIABOB", "SecretAccessKey": "bob-secret",
+             "Policies": [{"Statement": [{"Effect": "Allow",
+               "Action": ["s3:GetObject", "sts:AssumeRole"], "Resource": "*"}]}]}],
+  "Roles": [{"RoleName": "reader", "MaxSessionDuration": 3600,
+             "AssumeRolePolicyDocument": {"Statement": [{"Effect": "Allow",
+               "Principal": {"AWS": "arn:aws:iam::111111111111:root"},
+               "Action": "sts:AssumeRole"}]},
+             "Policies": [{"Statement": [{"Effect": "Allow",
+               "Action": "s3:GetObject", "Resource": "arn:aws:s3:::demo/*"}]}]}]
+}'
+```
+
+`POST /_iam/assume-role` with `{"RoleArn", "RoleSessionName", "Policy",
+"DurationSeconds"}` returns STS-shaped `Credentials`. In strict mode the
+`/_iam/` and `/_kms/` endpoints need the owner key (any registry principal may
+call `assume-role`), the role's trust policy must allow the caller, and a caller
+from another account also needs `sts:AssumeRole` in its own policies. Requests
+signed with a registry key are verified with that key's secret; session keys
+also need their `x-amz-security-token` and stop working at expiry. Evaluation
+follows AWS: an explicit `Deny` in the bucket, identity, or session policy wins;
+an owner-account principal needs an `Allow` from its identity policies or the
+bucket policy; another account needs both; a session policy limits both. Relaxed
+mode treats every request as the owner and skips trust policies.
+`GET /_iam/config` never returns secrets. The registry is stored as `.iam.json`
+and `.iam-sessions.json` in the storage root.
+
+## Local KMS keys for SSE-KMS
+
+```sh
+curl -X POST http://127.0.0.1:9000/_kms/keys -d '{"Description": "app"}'
+curl -X POST http://127.0.0.1:9000/_kms/aliases -d '{"AliasName": "alias/app", "TargetKeyId": "<KeyId>"}'
+curl -X POST http://127.0.0.1:9000/_kms/keys/<KeyId>/disable   # or enable, schedule-deletion, cancel-deletion
+curl http://127.0.0.1:9000/_kms/keys
+```
+
+SSE-KMS writes resolve the key ID, key ARN, or alias (none means an AWS managed
+`alias/aws/s3` key created on first use) and store the key ARN. Missing,
+disabled, and pending-deletion keys refuse writes, and GET, Select, and copy
+reads of objects under a disabled or pending-deletion key; HEAD still works.
+Objects are not encrypted with the KMS key at rest, because the store is shared
+with other devcloud services that read it directly. The keyring is `.kms.json`
+in the storage root.
 
 ## CORS
 

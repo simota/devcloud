@@ -420,7 +420,7 @@ pub fn route_with_cors(
     auth: &AuthConfig,
     default_cors: Option<&CorsRule>,
 ) -> Response {
-    if crate::introspect::is_introspect_path(&req.path) {
+    if crate::introspect::is_introspect_path(&req.path) || is_local_control_path(&req.path) {
         return route_verified(store, req, auth);
     }
     if req.method == "OPTIONS" {
@@ -523,13 +523,24 @@ fn cors_preflight(
     response
 }
 
+/// The local IAM (`/_iam/`) and KMS (`/_kms/`) control endpoints.
+fn is_local_control_path(path: &str) -> bool {
+    path.starts_with(crate::identities::IAM_PREFIX) || path.starts_with(crate::kms::KMS_PREFIX)
+}
+
 fn route_verified(store: &FileBucketStore, req: &Request, auth: &AuthConfig) -> Response {
-    let (chunk_signing, caller) = match authenticate_request(req, auth) {
+    let (chunk_signing, caller) = match authenticate_request(store, req, auth) {
         Ok(res) => res,
         Err(err) => return xml_error(err.status, err.code, err.code),
     };
-    if iam::authorize_request(store, req, auth, caller).is_err() {
+    if iam::authorize_request(store, req, auth, &caller).is_err() {
         return xml_error(403, "AccessDenied", "Access Denied");
+    }
+    if req.path.starts_with(crate::identities::IAM_PREFIX) {
+        return crate::identities::handle(store.root(), req, auth, &caller);
+    }
+    if req.path.starts_with(crate::kms::KMS_PREFIX) {
+        return crate::kms::handle(store.root(), req, auth);
     }
     // Decoded in every auth mode: otherwise the chunk framing would be stored as
     // part of the object.
@@ -1545,7 +1556,7 @@ fn create_multipart_upload(
     bucket: &str,
     key: &str,
 ) -> Response {
-    let (encryption, _) = match server_side_encryption_from_headers(req) {
+    let (encryption, _) = match server_side_encryption_from_headers(store, req) {
         Ok(encryption) => encryption,
         Err(err) => return server_side_encryption_error(err),
     };
@@ -1852,7 +1863,7 @@ fn list_multipart_uploads(store: &FileBucketStore, bucket: &str) -> Response {
 
 fn put_object(store: &FileBucketStore, req: &Request, bucket: &str, key: &str) -> Response {
     let if_none_match = if_none_match_write(req);
-    let (encryption, sse_c_key) = match server_side_encryption_from_headers(req) {
+    let (encryption, sse_c_key) = match server_side_encryption_from_headers(store, req) {
         Ok(encryption) => encryption,
         Err(err) => return server_side_encryption_error(err),
     };
@@ -1965,6 +1976,9 @@ fn copy_object(store: &FileBucketStore, req: &Request, bucket: &str, key: &str) 
             }
             Err(_) => return xml_error(500, "InternalError", "internal error"),
         };
+    if let Err(resp) = kms_read_check(store, &source_object) {
+        return resp;
+    }
     let body = match decrypt_sse_c_body(
         &source_object,
         raw_body,
@@ -2011,7 +2025,7 @@ fn copy_object(store: &FileBucketStore, req: &Request, bucket: &str, key: &str) 
     }
     let mut dst_sse_c_key: Option<SseCustomerKey> = None;
     if has_server_side_encryption_headers(req) {
-        match server_side_encryption_from_headers(req) {
+        match server_side_encryption_from_headers(store, req) {
             Ok((encryption, key)) => {
                 input.encryption = encryption;
                 dst_sse_c_key = key;
@@ -2116,6 +2130,9 @@ fn select_object_content(
         }
         Err(_) => return xml_error(500, "InternalError", "internal error"),
     };
+    if let Err(resp) = kms_read_check(store, &object) {
+        return resp;
+    }
     let body = match decrypt_sse_c_body(&object, raw_body, sse_c::parse_customer_key(req)) {
         Ok(plaintext) => plaintext,
         Err(resp) => return resp,
@@ -2215,7 +2232,7 @@ fn encode_event_stream_message(headers: &[(&str, &str)], payload: &[u8]) -> Vec<
     message
 }
 
-fn crc32_ieee(data: &[u8]) -> u32 {
+pub(crate) fn crc32_ieee(data: &[u8]) -> u32 {
     let mut crc = 0xFFFF_FFFFu32;
     for byte in data {
         crc ^= *byte as u32;
@@ -2245,24 +2262,48 @@ struct ChunkSigning {
     has_trailer: bool,
 }
 
-fn authenticate_request<'a>(
+fn authenticate_request(
+    store: &FileBucketStore,
     req: &Request,
-    auth: &'a AuthConfig,
-) -> Result<(Option<ChunkSigning>, iam::Caller<'a>), SignatureError> {
-    if !auth.auth_mode.eq_ignore_ascii_case("strict") {
-        return Ok((
-            None,
-            iam::Caller::Authenticated {
-                access_key_id: auth::configured_access_key(auth),
-            },
-        ));
-    }
-    let authed = iam::Caller::Authenticated {
-        access_key_id: auth::configured_access_key(auth),
+    auth: &AuthConfig,
+) -> Result<(Option<ChunkSigning>, iam::Caller), SignatureError> {
+    let owner = || iam::Caller::Owner {
+        access_key_id: auth::configured_access_key(auth).to_string(),
     };
+    if !auth.auth_mode.eq_ignore_ascii_case("strict") {
+        return Ok((None, owner()));
+    }
+    // A key from the local IAM registry is verified with its own secret and
+    // authorizes as that user or assumed-role session.
+    let registry = claimed_access_key(req)
+        .filter(|key| key != auth::configured_access_key(auth))
+        .and_then(|key| crate::identities::resolve_access_key(store.root(), &key));
+    let Some(registry) = registry else {
+        return Ok(match verify_any_signature(req, auth)? {
+            Some(chunk) => (chunk, owner()),
+            None => (None, iam::Caller::Anonymous),
+        });
+    };
+    let chunk = verify_any_signature(req, &registry.auth_config(auth))?;
+    // Session tokens are checked only once the signature is known to be good.
+    registry
+        .check_session(req)
+        .map_err(|code| SignatureError { code, status: 400 })?;
+    Ok((
+        chunk.flatten(),
+        iam::Caller::Iam(Box::new(registry.principal)),
+    ))
+}
+
+/// Verifies whichever signature form `req` carries. `Ok(None)` means the
+/// request carries no credentials (anonymous).
+fn verify_any_signature(
+    req: &Request,
+    auth: &AuthConfig,
+) -> Result<Option<Option<ChunkSigning>>, SignatureError> {
     if auth::is_sigv4a_presign(req) {
         auth::verify_sigv4a_presign(req, auth)?;
-        return Ok((None, authed));
+        return Ok(Some(None));
     }
     if req
         .query
@@ -2270,26 +2311,40 @@ fn authenticate_request<'a>(
         .is_some_and(|v| !v.is_empty())
     {
         verify_presigned_url(req, auth)?;
-        return Ok((None, authed));
+        return Ok(Some(None));
     }
     if auth::is_sigv2_presign(req) {
         auth::verify_sigv2_presign(req, auth)?;
-        return Ok((None, authed));
+        return Ok(Some(None));
     }
     if auth::is_sigv4a_header(req) {
         auth::verify_sigv4a_header(req, auth)?;
-        return Ok((None, authed));
+        return Ok(Some(None));
     }
     if auth::is_sigv2_header(req) {
         auth::verify_sigv2_header(req, auth)?;
-        return Ok((None, authed));
+        return Ok(Some(None));
     }
     if !req.header("authorization").is_empty() {
-        let chunk = verify_authorization_header(req, auth)?;
-        return Ok((chunk, authed));
+        return Ok(Some(verify_authorization_header(req, auth)?));
     }
-    // No credentials supplied: evaluate bucket policy and canned ACLs as anonymous.
-    Ok((None, iam::Caller::Anonymous))
+    Ok(None)
+}
+
+/// The access key a request claims, from any supported signature form.
+fn claimed_access_key(req: &Request) -> Option<String> {
+    let authorization = req.header("authorization");
+    if let Some(rest) = authorization.strip_prefix("AWS ") {
+        return rest.split(':').next().map(|k| k.trim().to_string());
+    }
+    if let Some(idx) = authorization.find("Credential=") {
+        let rest = &authorization[idx + "Credential=".len()..];
+        return rest.split('/').next().map(|k| k.trim().to_string());
+    }
+    if let Some(credential) = req.query.get("X-Amz-Credential") {
+        return credential.split('/').next().map(str::to_string);
+    }
+    req.query.get("AWSAccessKeyId").cloned()
 }
 
 fn verify_presigned_url(req: &Request, auth: &AuthConfig) -> Result<(), SignatureError> {
@@ -2497,6 +2552,11 @@ fn decode_streaming_request(
     if !decoded_length.is_empty() && decoded_length.parse::<usize>().ok() != Some(body.len()) {
         return Err(incomplete());
     }
+    crate::checksums::validate_trailers(&parsed.trailers, req.header("x-amz-trailer"), &body)
+        .map_err(|err| SignatureError {
+            code: err.code(),
+            status: 400,
+        })?;
     let mut headers = req.headers.clone();
     let encodings: Vec<&str> = req
         .header("content-encoding")
@@ -2846,6 +2906,11 @@ fn get_object(
             r
         }
         Ok(Some((object, body))) => {
+            if !head_only {
+                if let Err(resp) = kms_read_check(store, &object) {
+                    return resp;
+                }
+            }
             if object.encryption.is_sse_c() {
                 if head_only {
                     if let Err(resp) =
@@ -3245,6 +3310,16 @@ fn bypass_governance_from_header(req: &Request) -> Option<bool> {
 enum ServerSideEncryptionHeaderError {
     Invalid,
     Unsupported,
+    Kms(crate::kms::KmsError),
+}
+
+/// Refuses reading an SSE-KMS object whose key is disabled or pending deletion.
+fn kms_read_check(store: &FileBucketStore, object: &Object) -> Result<(), Response> {
+    if !object.encryption.algorithm.starts_with("aws:kms") {
+        return Ok(());
+    }
+    crate::kms::check_readable(store.root(), &object.encryption.kms_key_id)
+        .map_err(|err| xml_error(err.status(), err.code(), err.message()))
 }
 
 fn has_server_side_encryption_headers(req: &Request) -> bool {
@@ -3261,6 +3336,7 @@ fn has_server_side_encryption_headers(req: &Request) -> bool {
 }
 
 fn server_side_encryption_from_headers(
+    store: &FileBucketStore,
     req: &Request,
 ) -> Result<(ServerSideEncryption, Option<SseCustomerKey>), ServerSideEncryptionHeaderError> {
     let customer_key = match sse_c::parse_customer_key(req) {
@@ -3318,10 +3394,12 @@ fn server_side_encryption_from_headers(
                     _ => return Err(ServerSideEncryptionHeaderError::Invalid),
                 }
             };
+            let kms_key_id = crate::kms::resolve_for_write(store.root(), kms_key_id)
+                .map_err(ServerSideEncryptionHeaderError::Kms)?;
             Ok((
                 ServerSideEncryption {
                     algorithm: algorithm.to_string(),
-                    kms_key_id: kms_key_id.to_string(),
+                    kms_key_id,
                     bucket_key_enabled,
                     ..Default::default()
                 },
@@ -3423,6 +3501,9 @@ fn server_side_encryption_error(err: ServerSideEncryptionHeaderError) -> Respons
             "InvalidArgument",
             "server-side encryption headers are invalid",
         ),
+        ServerSideEncryptionHeaderError::Kms(err) => {
+            xml_error(err.status(), err.code(), err.message())
+        }
     }
 }
 
@@ -4633,7 +4714,7 @@ mod tests {
 
     #[tokio::test]
     async fn aws_chunked_payload_inside_http_chunked_reaches_the_object() {
-        let framed = "b\r\nhello world\r\n0\r\nx-amz-checksum-crc32:AAAA\r\n\r\n";
+        let framed = "b\r\nhello world\r\n0\r\nx-amz-checksum-crc32:DUoRhQ==\r\n\r\n";
         let body = format!("{:x}\r\n{framed}\r\n0\r\n\r\n", framed.len());
         let headers = "Transfer-Encoding: chunked\r\nContent-Encoding: aws-chunked\r\n\
                        x-amz-content-sha256: STREAMING-UNSIGNED-PAYLOAD-TRAILER\r\n";

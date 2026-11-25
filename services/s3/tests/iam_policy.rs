@@ -32,6 +32,17 @@ fn strict_auth() -> AuthConfig {
 }
 
 fn sign(method: &str, target: &str, body: &[u8], extra_headers: &[(&str, &str)]) -> Request {
+    sign_as(ACCESS_KEY, SECRET_KEY, method, target, body, extra_headers)
+}
+
+fn sign_as(
+    access_key: &str,
+    secret_key: &str,
+    method: &str,
+    target: &str,
+    body: &[u8],
+    extra_headers: &[(&str, &str)],
+) -> Request {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -85,7 +96,7 @@ fn sign(method: &str, target: &str, body: &[u8], extra_headers: &[(&str, &str)])
         m.finalize().into_bytes().to_vec()
     };
     let k_date = hmac(
-        format!("AWS4{SECRET_KEY}").as_bytes(),
+        format!("AWS4{secret_key}").as_bytes(),
         date_stamp.as_bytes(),
     );
     let k_region = hmac(&k_date, b"us-east-1");
@@ -95,7 +106,7 @@ fn sign(method: &str, target: &str, body: &[u8], extra_headers: &[(&str, &str)])
     req.headers.insert(
         "authorization".to_string(),
         format!(
-            "AWS4-HMAC-SHA256 Credential={ACCESS_KEY}/{scope}, SignedHeaders={signed_headers}, Signature={signature}"
+            "AWS4-HMAC-SHA256 Credential={access_key}/{scope}, SignedHeaders={signed_headers}, Signature={signature}"
         ),
     );
     req
@@ -450,5 +461,329 @@ fn strict_mode_enforces_canned_bucket_and_object_acls() {
         )
         .status,
         403
+    );
+}
+
+const ALICE_KEY: &str = "AKIAALICE";
+const ALICE_SECRET: &str = "alice-secret";
+const BOB_KEY: &str = "AKIABOB";
+const BOB_SECRET: &str = "bob-secret";
+
+/// Owner-account user `alice` may read `shared/*`; `bob` in account
+/// 111111111111 has broad identity permissions; role `reader` in the owner
+/// account trusts account 111111111111.
+fn iam_config() -> String {
+    serde_json::json!({
+        "Users": [
+            {
+                "UserName": "alice",
+                "AccessKeyId": ALICE_KEY,
+                "SecretAccessKey": ALICE_SECRET,
+                "Policies": [{
+                    "Statement": [
+                        {"Effect": "Allow", "Action": ["s3:GetObject"], "Resource": "arn:aws:s3:::data/shared/*"},
+                        {"Effect": "Allow", "Action": "s3:ListAllMyBuckets", "Resource": "*"},
+                        {"Effect": "Deny", "Action": "s3:GetObject", "Resource": "arn:aws:s3:::data/shared/secret*"}
+                    ]
+                }]
+            },
+            {
+                "UserName": "bob",
+                "Account": "111111111111",
+                "AccessKeyId": BOB_KEY,
+                "SecretAccessKey": BOB_SECRET,
+                "Policies": [
+                    "{\"Statement\":[{\"Effect\":\"Allow\",\"Action\":[\"s3:*\",\"sts:AssumeRole\"],\"Resource\":\"*\"}]}"
+                ]
+            }
+        ],
+        "Roles": [{
+            "RoleName": "reader",
+            "AssumeRolePolicyDocument": {
+                "Statement": [{"Effect": "Allow", "Principal": {"AWS": "arn:aws:iam::111111111111:root"}, "Action": "sts:AssumeRole"}]
+            },
+            "Policies": [{
+                "Statement": [{"Effect": "Allow", "Action": ["s3:GetObject", "s3:PutObject"], "Resource": "arn:aws:s3:::data/*"}]
+            }],
+            "MaxSessionDuration": 7200
+        }]
+    })
+    .to_string()
+}
+
+fn setup_iam_store() -> (FileBucketStore, AuthConfig) {
+    let store = FileBucketStore::new(tempdir());
+    let auth = strict_auth();
+    assert_eq!(
+        route_with_auth(&store, &sign("PUT", "/data", b"", &[]), &auth).status,
+        200
+    );
+    for key in ["shared/a.txt", "shared/secret.txt", "private/b.txt"] {
+        assert_eq!(
+            route_with_auth(
+                &store,
+                &sign("PUT", &format!("/data/{key}"), b"v", &[]),
+                &auth
+            )
+            .status,
+            200
+        );
+    }
+    let config = iam_config();
+    let put = route_with_auth(
+        &store,
+        &sign("PUT", "/_iam/config", config.as_bytes(), &[]),
+        &auth,
+    );
+    assert_eq!(put.status, 200, "{}", String::from_utf8_lossy(&put.body));
+    (store, auth)
+}
+
+#[test]
+fn iam_users_are_authorized_by_identity_and_bucket_policies() {
+    let (store, auth) = setup_iam_store();
+    let as_alice = |method: &str, target: &str| {
+        route_with_auth(
+            &store,
+            &sign_as(ALICE_KEY, ALICE_SECRET, method, target, b"", &[]),
+            &auth,
+        )
+        .status
+    };
+    let as_bob = |method: &str, target: &str, body: &[u8]| {
+        route_with_auth(
+            &store,
+            &sign_as(BOB_KEY, BOB_SECRET, method, target, body, &[]),
+            &auth,
+        )
+        .status
+    };
+
+    // Same-account user: identity policy grants, explicit Deny wins, everything else is denied.
+    assert_eq!(as_alice("GET", "/data/shared/a.txt"), 200);
+    assert_eq!(as_alice("GET", "/data/shared/secret.txt"), 403);
+    assert_eq!(as_alice("GET", "/data/private/b.txt"), 403);
+    assert_eq!(as_alice("DELETE", "/data/shared/a.txt"), 403);
+    assert_eq!(as_alice("GET", "/"), 200);
+    // Registry keys cannot use the owner-only control endpoints.
+    assert_eq!(as_alice("GET", "/_iam/config"), 403);
+    assert_eq!(as_alice("GET", "/_kms/keys"), 403);
+    // A wrong secret for a registry key fails signature verification.
+    assert_eq!(
+        route_with_auth(
+            &store,
+            &sign_as(ALICE_KEY, "wrong", "GET", "/data/shared/a.txt", b"", &[]),
+            &auth
+        )
+        .status,
+        403
+    );
+
+    // Cross-account user: its own Allow is not enough without a bucket policy grant.
+    assert_eq!(as_bob("GET", "/data/shared/a.txt", b""), 403);
+    let policy = serde_json::json!({
+        "Statement": [
+            {"Effect": "Allow", "Principal": {"AWS": "arn:aws:iam::111111111111:user/bob"}, "Action": "s3:GetObject", "Resource": "arn:aws:s3:::data/*"},
+            {"Effect": "Allow", "Principal": {"AWS": "arn:aws:iam::000000000000:user/alice"}, "Action": "s3:GetObject", "Resource": "arn:aws:s3:::data/private/*",
+             "Condition": {"StringEquals": {"aws:PrincipalAccount": "000000000000"}}}
+        ]
+    })
+    .to_string();
+    assert_eq!(
+        route_with_auth(
+            &store,
+            &sign("PUT", "/data?policy", policy.as_bytes(), &[]),
+            &auth
+        )
+        .status,
+        204
+    );
+    assert_eq!(as_bob("GET", "/data/shared/a.txt", b""), 200);
+    assert_eq!(as_bob("PUT", "/data/shared/new.txt", b"x"), 403);
+    // Same-account: the bucket policy alone grants alice private/*.
+    assert_eq!(as_alice("GET", "/data/private/b.txt"), 200);
+
+    // GET /_iam/config never returns secrets.
+    let config = route_with_auth(&store, &sign("GET", "/_iam/config", b"", &[]), &auth);
+    assert_eq!(config.status, 200);
+    let text = String::from_utf8(config.body).unwrap();
+    assert!(text.contains("alice") && !text.contains(ALICE_SECRET) && !text.contains(BOB_SECRET));
+}
+
+#[test]
+fn assume_role_sessions_apply_trust_role_and_session_policies() {
+    let (store, auth) = setup_iam_store();
+    let assume = |key: &str, secret: &str, body: serde_json::Value| {
+        let body = body.to_string();
+        route_with_auth(
+            &store,
+            &sign_as(
+                key,
+                secret,
+                "POST",
+                "/_iam/assume-role",
+                body.as_bytes(),
+                &[],
+            ),
+            &auth,
+        )
+    };
+
+    // alice's account is not trusted by the role.
+    let denied = assume(
+        ALICE_KEY,
+        ALICE_SECRET,
+        serde_json::json!({"RoleArn": "arn:aws:iam::000000000000:role/reader", "RoleSessionName": "a1"}),
+    );
+    assert_eq!(denied.status, 403);
+    // Over MaxSessionDuration.
+    let too_long = assume(
+        BOB_KEY,
+        BOB_SECRET,
+        serde_json::json!({"RoleArn": "arn:aws:iam::000000000000:role/reader", "RoleSessionName": "b1", "DurationSeconds": 7201}),
+    );
+    assert_eq!(too_long.status, 400);
+
+    let issue = |policy: Option<serde_json::Value>| {
+        let mut body = serde_json::json!({
+            "RoleArn": "arn:aws:iam::000000000000:role/reader",
+            "RoleSessionName": "batch-job",
+        });
+        if let Some(policy) = policy {
+            body["Policy"] = serde_json::Value::String(policy.to_string());
+        }
+        let response = assume(BOB_KEY, BOB_SECRET, body);
+        assert_eq!(
+            response.status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&response.body)
+        );
+        let value: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(
+            value["AssumedRoleUser"]["Arn"],
+            "arn:aws:sts::000000000000:assumed-role/reader/batch-job"
+        );
+        let creds = &value["Credentials"];
+        (
+            creds["AccessKeyId"].as_str().unwrap().to_string(),
+            creds["SecretAccessKey"].as_str().unwrap().to_string(),
+            creds["SessionToken"].as_str().unwrap().to_string(),
+        )
+    };
+    let with_token = |creds: &(String, String, String), method: &str, target: &str, token: &str| {
+        route_with_auth(
+            &store,
+            &sign_as(
+                &creds.0,
+                &creds.1,
+                method,
+                target,
+                b"v",
+                &[("x-amz-security-token", token)],
+            ),
+            &auth,
+        )
+    };
+
+    // Role session without a session policy: role permissions apply.
+    let creds = issue(None);
+    assert!(creds.0.starts_with("ASIA"));
+    assert_eq!(
+        with_token(&creds, "GET", "/data/private/b.txt", &creds.2).status,
+        200
+    );
+    assert_eq!(
+        with_token(&creds, "PUT", "/data/private/c.txt", &creds.2).status,
+        200
+    );
+    assert_eq!(
+        with_token(&creds, "DELETE", "/data/private/c.txt", &creds.2).status,
+        403
+    );
+    // The session token is required and must match.
+    let missing_token = route_with_auth(
+        &store,
+        &sign_as(&creds.0, &creds.1, "GET", "/data/private/b.txt", b"", &[]),
+        &auth,
+    );
+    assert_eq!(missing_token.status, 400);
+    assert!(String::from_utf8_lossy(&missing_token.body).contains("InvalidToken"));
+
+    // A session policy narrows the role's permissions to GetObject on shared/*.
+    let narrowed = issue(Some(serde_json::json!({
+        "Statement": [{"Effect": "Allow", "Action": "s3:GetObject", "Resource": "arn:aws:s3:::data/shared/*"}]
+    })));
+    assert_eq!(
+        with_token(&narrowed, "GET", "/data/shared/a.txt", &narrowed.2).status,
+        200
+    );
+    assert_eq!(
+        with_token(&narrowed, "GET", "/data/private/b.txt", &narrowed.2).status,
+        403
+    );
+    assert_eq!(
+        with_token(&narrowed, "PUT", "/data/shared/d.txt", &narrowed.2).status,
+        403
+    );
+
+    // Expired sessions are refused.
+    let sessions_path = store.root().join(".iam-sessions.json");
+    let mut sessions: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&sessions_path).unwrap()).unwrap();
+    for session in sessions["Sessions"].as_array_mut().unwrap() {
+        session["Expiration"] = serde_json::json!(1);
+    }
+    std::fs::write(&sessions_path, sessions.to_string()).unwrap();
+    let expired = with_token(&creds, "GET", "/data/private/b.txt", &creds.2);
+    assert_eq!(expired.status, 400);
+    assert!(String::from_utf8_lossy(&expired.body).contains("ExpiredToken"));
+}
+
+#[test]
+fn relaxed_mode_ignores_iam_registry_and_trust_policies() {
+    let store = FileBucketStore::new(tempdir());
+    assert_eq!(
+        route(&store, &Request::new("PUT", "/data", Vec::new())).status,
+        200
+    );
+    let config = iam_config();
+    assert_eq!(
+        route(
+            &store,
+            &Request::new("PUT", "/_iam/config", config.into_bytes())
+        )
+        .status,
+        200
+    );
+    // Untrusted callers can assume the role in relaxed mode.
+    let body = serde_json::json!({"RoleArn": "arn:aws:iam::000000000000:role/reader", "RoleSessionName": "local"})
+        .to_string();
+    assert_eq!(
+        route(
+            &store,
+            &Request::new("POST", "/_iam/assume-role", body.into_bytes())
+        )
+        .status,
+        200
+    );
+    // An unsigned write still works and the registry files are not buckets.
+    assert_eq!(
+        route(&store, &Request::new("PUT", "/data/k", b"v".to_vec())).status,
+        200
+    );
+    let list = route(&store, &Request::new("GET", "/", Vec::new()));
+    assert_eq!(list.status, 200);
+    assert!(!String::from_utf8_lossy(&list.body).contains(".iam"));
+    // Invalid configs are refused.
+    let invalid =
+        r#"{"Users":[{"UserName":"x","Account":"12","AccessKeyId":"k","SecretAccessKey":"s"}]}"#;
+    assert_eq!(
+        route(
+            &store,
+            &Request::new("PUT", "/_iam/config", invalid.as_bytes().to_vec())
+        )
+        .status,
+        400
     );
 }

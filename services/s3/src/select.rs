@@ -1,8 +1,16 @@
 //! Deterministic local SQL evaluator for S3 `SelectObjectContent`.
 //!
-//! Supports `SELECT <projections> FROM S3Object [AS] [<alias>] [WHERE <expr>] [LIMIT <n>]`
+//! Supports
+//! `SELECT <projections> FROM S3Object [AS] [<alias>] [[INNER|CROSS] JOIN S3Object <alias> [ON <expr>] | , S3Object <alias>]
+//! [WHERE <expr>] [GROUP BY <expr>, ...] [ORDER BY <expr>|<n>|<aggregate> [ASC|DESC], ...] [LIMIT <n>]`
 //! over CSV (`FileHeaderInfo` = `USE`/`IGNORE`/`NONE`) and JSON (`LINES`/`DOCUMENT`)
 //! objects, emitting CSV or JSON Lines records.
+//!
+//! A `JOIN` is a self-join of the object's records (the only table S3 Select
+//! has); qualify columns with the table aliases. `GROUP BY` groups in order of
+//! first appearance; non-aggregate projections take the group's first record.
+//! `ORDER BY` is a stable sort; NULLs sort last ascending and first descending;
+//! CSV fields are strings, so `CAST` them for numeric order.
 
 use serde_json::{Map, Number, Value};
 
@@ -58,50 +66,98 @@ pub fn evaluate(request: &SelectObjectContent, body: &[u8]) -> Result<Vec<u8>, S
         ));
     }
 
+    let records = match &query.join {
+        Some(join) => join_records(records, join, query.alias.as_deref())?,
+        None => records,
+    };
+    let alias = query.alias.as_deref();
+    let grouped = query.is_aggregate() || !query.group_by.is_empty();
+    // Without sorting or grouping, LIMIT can stop the scan early.
+    let early_limit = if grouped || !query.order_by.is_empty() {
+        None
+    } else {
+        query.limit
+    };
+
     let mut filtered = Vec::new();
     for rec in records {
         if let Some(where_expr) = &query.where_clause {
-            if !eval_expr(where_expr, &rec, query.alias.as_deref()).is_truthy() {
+            if !eval_expr(where_expr, &rec, alias).is_truthy() {
                 continue;
             }
         }
         filtered.push(rec);
-        if !query.is_aggregate() {
-            if let Some(limit) = query.limit {
-                if filtered.len() >= limit {
-                    break;
-                }
-            }
+        if early_limit.is_some_and(|limit| filtered.len() >= limit) {
+            break;
         }
     }
 
-    let projected_rows: Vec<OutputRow> = if query.is_aggregate() {
-        let mut row = Vec::with_capacity(query.projections.len());
-        for (idx, item) in query.projections.iter().enumerate() {
-            let val = eval_aggregate(item, &filtered, query.alias.as_deref())?;
-            let col_name = item
-                .alias
-                .clone()
-                .unwrap_or_else(|| format!("_{}", idx + 1));
-            row.push((col_name, val));
-        }
-        if query.limit == Some(0) {
-            Vec::new()
+    // Each output row with its ORDER BY key values.
+    let mut rows: Vec<(OutputRow, Vec<SqlVal>)> = Vec::new();
+    if grouped {
+        let groups = if query.group_by.is_empty() {
+            vec![filtered]
         } else {
-            vec![OutputRow::Named(row)]
+            group_records(filtered, &query.group_by, alias)
+        };
+        for group in &groups {
+            let mut row = Vec::with_capacity(query.projections.len());
+            for (idx, item) in query.projections.iter().enumerate() {
+                let val = match &item.kind {
+                    ProjectionKind::Aggregate { .. } => eval_aggregate(item, group, alias)?,
+                    ProjectionKind::Expr(expr) => group
+                        .first()
+                        .map(|rec| eval_expr(expr, rec, alias))
+                        .unwrap_or(SqlVal::Null),
+                    ProjectionKind::Wildcard(_) => {
+                        return Err(SelectError::Invalid(
+                            "'*' cannot be projected in an aggregate or GROUP BY query".to_string(),
+                        ));
+                    }
+                };
+                let col_name = item
+                    .alias
+                    .clone()
+                    .or_else(|| match &item.kind {
+                        ProjectionKind::Expr(expr) => default_column_name(expr, is_csv_input),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| format!("_{}", idx + 1));
+                row.push((col_name, val));
+            }
+            let row = OutputRow::Named(row);
+            let mut keys = Vec::with_capacity(query.order_by.len());
+            for item in &query.order_by {
+                keys.push(order_key(item, &row, group.first(), Some(group), alias)?);
+            }
+            rows.push((row, keys));
         }
     } else {
-        let mut out_rows = Vec::with_capacity(filtered.len());
         for rec in &filtered {
-            out_rows.push(project_record(
-                &query.projections,
-                rec,
-                query.alias.as_deref(),
-                is_csv_input,
-            ));
+            let row = project_record(&query.projections, rec, alias, is_csv_input);
+            let mut keys = Vec::with_capacity(query.order_by.len());
+            for item in &query.order_by {
+                keys.push(order_key(item, &row, Some(rec), None, alias)?);
+            }
+            rows.push((row, keys));
         }
-        out_rows
-    };
+    }
+    if !query.order_by.is_empty() {
+        rows.sort_by(|(_, a), (_, b)| {
+            for ((x, y), item) in a.iter().zip(b).zip(&query.order_by) {
+                let ord = order_cmp(x, y);
+                let ord = if item.descending { ord.reverse() } else { ord };
+                if ord.is_ne() {
+                    return ord;
+                }
+            }
+            std::cmp::Ordering::Equal
+        });
+    }
+    if let Some(limit) = query.limit {
+        rows.truncate(limit);
+    }
+    let projected_rows: Vec<OutputRow> = rows.into_iter().map(|(row, _)| row).collect();
 
     if let Some(out_csv) = &request.output_csv {
         format_csv_output(out_csv, &projected_rows)
@@ -160,6 +216,8 @@ enum Record {
         fields: Vec<String>,
     },
     Json(Value),
+    /// A self-join row: each side's record under its table alias.
+    Joined(Vec<(String, Record)>),
 }
 
 #[derive(Debug, Clone)]
@@ -549,8 +607,35 @@ fn format_json_output(
 struct SelectQuery {
     projections: Vec<ProjectionItem>,
     alias: Option<String>,
+    join: Option<JoinSpec>,
     where_clause: Option<Expr>,
+    group_by: Vec<Expr>,
+    order_by: Vec<OrderItem>,
     limit: Option<usize>,
+}
+
+/// `S3Object <left> JOIN S3Object <right> [ON <expr>]` over the same records.
+#[derive(Debug)]
+struct JoinSpec {
+    right_alias: String,
+    on: Option<Expr>,
+}
+
+#[derive(Debug)]
+struct OrderItem {
+    key: OrderKey,
+    descending: bool,
+}
+
+#[derive(Debug)]
+enum OrderKey {
+    /// 1-based output column position.
+    Position(usize),
+    Expr(Expr),
+    Aggregate {
+        func: AggFunc,
+        arg: Option<Expr>,
+    },
 }
 
 impl SelectQuery {
@@ -569,7 +654,8 @@ struct ProjectionItem {
 
 #[derive(Debug)]
 enum ProjectionKind {
-    Wildcard,
+    /// `*`, or `<alias>.*` (which keeps only that table's columns in a join).
+    Wildcard(Option<String>),
     Expr(Expr),
     Aggregate {
         func: AggFunc,
@@ -915,19 +1001,6 @@ impl Parser {
             return Err(SelectError::Invalid("empty SELECT projection".to_string()));
         }
 
-        let has_agg = projections
-            .iter()
-            .any(|p| matches!(p.kind, ProjectionKind::Aggregate { .. }));
-        if has_agg
-            && !projections
-                .iter()
-                .all(|p| matches!(p.kind, ProjectionKind::Aggregate { .. }))
-        {
-            return Err(SelectError::Unsupported(
-                "mixing aggregate and non-aggregate projections is not supported".to_string(),
-            ));
-        }
-
         if !self.consume_kw("FROM") {
             return Err(SelectError::Invalid("expected FROM clause".to_string()));
         }
@@ -940,28 +1013,59 @@ impl Parser {
             }
         }
 
-        let alias = if self.consume_kw("AS") {
-            match self.next() {
-                Some(Token::Ident(a)) | Some(Token::QuotedIdent(a)) => Some(a),
-                _ => return Err(SelectError::Invalid("expected alias after AS".to_string())),
-            }
-        } else if let Some(Token::Ident(a)) = self.peek() {
-            if !is_clause_keyword(a) {
-                let a = a.clone();
-                self.pos += 1;
-                Some(a)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
+        let alias = self.parse_table_alias()?;
+        let join = self.parse_join(alias.as_deref())?;
 
         let where_clause = if self.consume_kw("WHERE") {
             Some(self.parse_or_expr()?)
         } else {
             None
         };
+
+        let mut group_by = Vec::new();
+        if self.is_kw("GROUP") {
+            self.next();
+            if !self.consume_kw("BY") {
+                return Err(SelectError::Invalid("expected BY after GROUP".to_string()));
+            }
+            loop {
+                group_by.push(self.parse_or_expr()?);
+                if matches!(self.peek(), Some(Token::Comma)) {
+                    self.next();
+                } else {
+                    break;
+                }
+            }
+        }
+        let has_agg = projections
+            .iter()
+            .any(|p| matches!(p.kind, ProjectionKind::Aggregate { .. }));
+        if has_agg
+            && group_by.is_empty()
+            && !projections
+                .iter()
+                .all(|p| matches!(p.kind, ProjectionKind::Aggregate { .. }))
+        {
+            return Err(SelectError::Invalid(
+                "non-aggregate projections next to aggregates need GROUP BY".to_string(),
+            ));
+        }
+
+        let mut order_by = Vec::new();
+        if self.is_kw("ORDER") {
+            self.next();
+            if !self.consume_kw("BY") {
+                return Err(SelectError::Invalid("expected BY after ORDER".to_string()));
+            }
+            loop {
+                order_by.push(self.parse_order_item()?);
+                if matches!(self.peek(), Some(Token::Comma)) {
+                    self.next();
+                } else {
+                    break;
+                }
+            }
+        }
 
         let limit = if self.consume_kw("LIMIT") {
             match self.next() {
@@ -983,12 +1087,11 @@ impl Parser {
         if let Some(tok) = self.peek() {
             return match tok {
                 Token::Ident(kw)
-                    if kw.eq_ignore_ascii_case("GROUP")
-                        || kw.eq_ignore_ascii_case("ORDER")
-                        || kw.eq_ignore_ascii_case("HAVING")
+                    if kw.eq_ignore_ascii_case("HAVING")
                         || kw.eq_ignore_ascii_case("JOIN")
-                        || kw.eq_ignore_ascii_case("INNER")
                         || kw.eq_ignore_ascii_case("LEFT")
+                        || kw.eq_ignore_ascii_case("RIGHT")
+                        || kw.eq_ignore_ascii_case("FULL")
                         || kw.eq_ignore_ascii_case("UNION") =>
                 {
                     Err(SelectError::Unsupported(format!(
@@ -1004,57 +1107,180 @@ impl Parser {
         Ok(SelectQuery {
             projections,
             alias,
+            join,
             where_clause,
+            group_by,
+            order_by,
             limit,
         })
+    }
+
+    fn parse_table_alias(&mut self) -> Result<Option<String>, SelectError> {
+        if self.consume_kw("AS") {
+            return match self.next() {
+                Some(Token::Ident(a)) | Some(Token::QuotedIdent(a)) => Ok(Some(a)),
+                _ => Err(SelectError::Invalid("expected alias after AS".to_string())),
+            };
+        }
+        match self.peek() {
+            Some(Token::Ident(a)) if !is_clause_keyword(a) => {
+                let a = a.clone();
+                self.pos += 1;
+                Ok(Some(a))
+            }
+            Some(Token::QuotedIdent(a)) => {
+                let a = a.clone();
+                self.pos += 1;
+                Ok(Some(a))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// `[INNER] JOIN S3Object <alias> ON <expr>`, `CROSS JOIN S3Object <alias>`,
+    /// or `, S3Object <alias>`. Both sides need distinct aliases.
+    fn parse_join(&mut self, left_alias: Option<&str>) -> Result<Option<JoinSpec>, SelectError> {
+        let needs_on = if matches!(self.peek(), Some(Token::Comma)) {
+            self.next();
+            false
+        } else if self.is_kw("CROSS") {
+            self.next();
+            if !self.consume_kw("JOIN") {
+                return Err(SelectError::Invalid(
+                    "expected JOIN after CROSS".to_string(),
+                ));
+            }
+            false
+        } else if self.is_kw("INNER") || self.is_kw("JOIN") {
+            if self.consume_kw("INNER") && !self.is_kw("JOIN") {
+                return Err(SelectError::Invalid(
+                    "expected JOIN after INNER".to_string(),
+                ));
+            }
+            self.next();
+            true
+        } else {
+            return Ok(None);
+        };
+        match self.next() {
+            Some(Token::Ident(name)) if name.eq_ignore_ascii_case("S3Object") => {}
+            _ => {
+                return Err(SelectError::Invalid(
+                    "JOIN target must be S3Object".to_string(),
+                ));
+            }
+        }
+        let right_alias = self.parse_table_alias()?;
+        let (Some(left), Some(right)) = (left_alias, right_alias) else {
+            return Err(SelectError::Invalid(
+                "both sides of a JOIN need a table alias".to_string(),
+            ));
+        };
+        if left.eq_ignore_ascii_case(&right) {
+            return Err(SelectError::Invalid(
+                "JOIN table aliases must differ".to_string(),
+            ));
+        }
+        let on = if needs_on {
+            if !self.consume_kw("ON") {
+                return Err(SelectError::Invalid("expected ON after JOIN".to_string()));
+            }
+            Some(self.parse_or_expr()?)
+        } else {
+            None
+        };
+        if matches!(self.peek(), Some(Token::Comma)) || self.is_kw("JOIN") {
+            return Err(SelectError::Unsupported(
+                "joining more than two tables is not supported".to_string(),
+            ));
+        }
+        Ok(Some(JoinSpec {
+            right_alias: right,
+            on,
+        }))
+    }
+
+    fn parse_order_item(&mut self) -> Result<OrderItem, SelectError> {
+        let key = match (self.peek(), self.peek_at(1)) {
+            (Some(Token::Int(n)), next)
+                if matches!(next, None | Some(Token::Comma) | Some(Token::Semicolon))
+                    || matches!(next, Some(Token::Ident(w)) if is_clause_keyword(w)
+                        || w.eq_ignore_ascii_case("ASC")
+                        || w.eq_ignore_ascii_case("DESC")) =>
+            {
+                let n = *n;
+                self.next();
+                if n < 1 {
+                    return Err(SelectError::Invalid(
+                        "ORDER BY position must be at least 1".to_string(),
+                    ));
+                }
+                OrderKey::Position(n as usize)
+            }
+            _ => match self.parse_aggregate_call()? {
+                Some(ProjectionKind::Aggregate { func, arg }) => OrderKey::Aggregate { func, arg },
+                _ => OrderKey::Expr(self.parse_or_expr()?),
+            },
+        };
+        let descending = if self.consume_kw("DESC") {
+            true
+        } else {
+            self.consume_kw("ASC");
+            false
+        };
+        Ok(OrderItem { key, descending })
+    }
+
+    /// `COUNT(*)` / `COUNT|SUM|AVG|MIN|MAX(<expr>)` at the cursor, if present.
+    fn parse_aggregate_call(&mut self) -> Result<Option<ProjectionKind>, SelectError> {
+        let Some(Token::Ident(name)) = self.peek() else {
+            return Ok(None);
+        };
+        if !matches!(self.peek_at(1), Some(Token::LParen)) {
+            return Ok(None);
+        }
+        let Some(func) = parse_agg_func(name) else {
+            return Ok(None);
+        };
+        self.pos += 2; // consume name and '('
+        let arg = if func == AggFunc::Count && matches!(self.peek(), Some(Token::Star)) {
+            self.next();
+            None
+        } else {
+            Some(self.parse_primary_or_func()?)
+        };
+        if !matches!(self.next(), Some(Token::RParen)) {
+            return Err(SelectError::Invalid(
+                "expected ')' after aggregate argument".to_string(),
+            ));
+        }
+        Ok(Some(ProjectionKind::Aggregate { func, arg }))
     }
 
     fn parse_projection_item(&mut self) -> Result<ProjectionItem, SelectError> {
         if matches!(self.peek(), Some(Token::Star)) {
             self.next();
             return Ok(ProjectionItem {
-                kind: ProjectionKind::Wildcard,
+                kind: ProjectionKind::Wildcard(None),
                 alias: None,
             });
         }
         // alias.*
-        if matches!(self.peek(), Some(Token::Ident(_)))
-            && matches!(self.peek_at(1), Some(Token::Dot))
-            && matches!(self.peek_at(2), Some(Token::Star))
+        if let (Some(Token::Ident(qualifier)), Some(Token::Dot), Some(Token::Star)) =
+            (self.peek(), self.peek_at(1), self.peek_at(2))
         {
+            let qualifier = qualifier.clone();
             self.pos += 3;
             return Ok(ProjectionItem {
-                kind: ProjectionKind::Wildcard,
+                kind: ProjectionKind::Wildcard(Some(qualifier)),
                 alias: None,
             });
         }
 
         // Check aggregate function: COUNT/SUM/AVG/MIN/MAX(...)
-        let kind = if let Some(Token::Ident(name)) = self.peek() {
-            if matches!(self.peek_at(1), Some(Token::LParen)) {
-                if let Some(func) = parse_agg_func(name) {
-                    self.pos += 2; // consume name and '('
-                    let arg = if func == AggFunc::Count && matches!(self.peek(), Some(Token::Star))
-                    {
-                        self.next();
-                        None
-                    } else {
-                        Some(self.parse_primary_or_func()?)
-                    };
-                    if !matches!(self.next(), Some(Token::RParen)) {
-                        return Err(SelectError::Invalid(
-                            "expected ')' after aggregate argument".to_string(),
-                        ));
-                    }
-                    ProjectionKind::Aggregate { func, arg }
-                } else {
-                    ProjectionKind::Expr(self.parse_or_expr()?)
-                }
-            } else {
-                ProjectionKind::Expr(self.parse_or_expr()?)
-            }
-        } else {
-            ProjectionKind::Expr(self.parse_or_expr()?)
+        let kind = match self.parse_aggregate_call()? {
+            Some(kind) => kind,
+            None => ProjectionKind::Expr(self.parse_or_expr()?),
         };
 
         let alias = if self.consume_kw("AS") {
@@ -1363,7 +1589,21 @@ fn parse_agg_func(name: &str) -> Option<AggFunc> {
 fn is_clause_keyword(word: &str) -> bool {
     matches!(
         word.to_ascii_uppercase().as_str(),
-        "FROM" | "WHERE" | "LIMIT" | "GROUP" | "ORDER" | "HAVING" | "JOIN" | "UNION" | "AS"
+        "FROM"
+            | "WHERE"
+            | "LIMIT"
+            | "GROUP"
+            | "ORDER"
+            | "HAVING"
+            | "JOIN"
+            | "INNER"
+            | "CROSS"
+            | "LEFT"
+            | "RIGHT"
+            | "FULL"
+            | "ON"
+            | "UNION"
+            | "AS"
     )
 }
 
@@ -1375,33 +1615,32 @@ fn project_record(
     alias: Option<&str>,
     is_csv_input: bool,
 ) -> OutputRow {
-    if projections.len() == 1 && matches!(projections[0].kind, ProjectionKind::Wildcard) {
-        return match rec {
-            Record::Csv { fields, .. } => OutputRow::CsvRaw(fields.clone()),
-            Record::Json(v) => OutputRow::JsonRaw(v.clone()),
-        };
+    if let [ProjectionItem {
+        kind: ProjectionKind::Wildcard(_),
+        ..
+    }] = projections
+    {
+        match rec {
+            Record::Csv { fields, .. } => return OutputRow::CsvRaw(fields.clone()),
+            Record::Json(v) => return OutputRow::JsonRaw(v.clone()),
+            Record::Joined(_) => {}
+        }
     }
     let mut pairs = Vec::new();
     for (idx, item) in projections.iter().enumerate() {
         match &item.kind {
-            ProjectionKind::Wildcard => match rec {
-                Record::Csv { headers, fields } => {
-                    for (fi, field) in fields.iter().enumerate() {
-                        let name = headers
-                            .as_ref()
-                            .and_then(|h| h.get(fi).cloned())
-                            .unwrap_or_else(|| format!("_{}", fi + 1));
-                        pairs.push((name, SqlVal::Str(field.clone())));
+            ProjectionKind::Wildcard(qualifier) => match rec {
+                Record::Joined(sides) => {
+                    for (side_alias, side) in sides {
+                        if qualifier
+                            .as_deref()
+                            .is_none_or(|q| q.eq_ignore_ascii_case(side_alias))
+                        {
+                            wildcard_pairs(side, idx, &mut pairs);
+                        }
                     }
                 }
-                Record::Json(Value::Object(map)) => {
-                    for (k, v) in map {
-                        pairs.push((k.clone(), SqlVal::from_json(v)));
-                    }
-                }
-                Record::Json(other) => {
-                    pairs.push((format!("_{}", idx + 1), SqlVal::from_json(other)));
-                }
+                other => wildcard_pairs(other, idx, &mut pairs),
             },
             ProjectionKind::Expr(expr) => {
                 let val = eval_expr(expr, rec, alias);
@@ -1416,6 +1655,161 @@ fn project_record(
         }
     }
     OutputRow::Named(pairs)
+}
+
+fn wildcard_pairs(rec: &Record, idx: usize, pairs: &mut Vec<(String, SqlVal)>) {
+    match rec {
+        Record::Csv { headers, fields } => {
+            for (fi, field) in fields.iter().enumerate() {
+                let name = headers
+                    .as_ref()
+                    .and_then(|h| h.get(fi).cloned())
+                    .unwrap_or_else(|| format!("_{}", fi + 1));
+                pairs.push((name, SqlVal::Str(field.clone())));
+            }
+        }
+        Record::Json(Value::Object(map)) => {
+            for (k, v) in map {
+                pairs.push((k.clone(), SqlVal::from_json(v)));
+            }
+        }
+        Record::Json(other) => {
+            pairs.push((format!("_{}", idx + 1), SqlVal::from_json(other)));
+        }
+        Record::Joined(sides) => {
+            for (_, side) in sides {
+                wildcard_pairs(side, idx, pairs);
+            }
+        }
+    }
+}
+
+/// Upper bound on joined rows, so a self-join of a large object fails fast.
+const MAX_JOIN_ROWS: usize = 25_000_000;
+
+fn join_records(
+    records: Vec<Record>,
+    join: &JoinSpec,
+    left_alias: Option<&str>,
+) -> Result<Vec<Record>, SelectError> {
+    if records.len().saturating_mul(records.len()) > MAX_JOIN_ROWS {
+        return Err(SelectError::Unsupported(
+            "JOIN input is too large to evaluate locally".to_string(),
+        ));
+    }
+    let left_alias = left_alias.unwrap_or_default().to_string();
+    let mut joined = Vec::new();
+    for left in &records {
+        for right in &records {
+            let row = Record::Joined(vec![
+                (left_alias.clone(), left.clone()),
+                (join.right_alias.clone(), right.clone()),
+            ]);
+            if join
+                .on
+                .as_ref()
+                .is_none_or(|on| eval_expr(on, &row, None).is_truthy())
+            {
+                joined.push(row);
+            }
+        }
+    }
+    Ok(joined)
+}
+
+/// Groups records by the `GROUP BY` values, in order of first appearance.
+fn group_records(records: Vec<Record>, keys: &[Expr], alias: Option<&str>) -> Vec<Vec<Record>> {
+    let mut index: std::collections::HashMap<Vec<String>, usize> = std::collections::HashMap::new();
+    let mut groups: Vec<Vec<Record>> = Vec::new();
+    for rec in records {
+        let key: Vec<String> = keys
+            .iter()
+            .map(|expr| group_key(&eval_expr(expr, &rec, alias)))
+            .collect();
+        match index.get(&key) {
+            Some(&i) => groups[i].push(rec),
+            None => {
+                index.insert(key, groups.len());
+                groups.push(vec![rec]);
+            }
+        }
+    }
+    groups
+}
+
+/// A type-tagged string so `1`, `'1'`, and NULL land in different groups while
+/// `1` and `1.0` share one.
+fn group_key(val: &SqlVal) -> String {
+    match val {
+        SqlVal::Null => "null".to_string(),
+        SqlVal::Bool(b) => format!("b:{b}"),
+        SqlVal::Int(i) => format!("n:{i}"),
+        SqlVal::Float(f) if f.fract() == 0.0 && f.abs() < 9.0e15 => format!("n:{}", *f as i64),
+        SqlVal::Float(f) => format!("n:{f}"),
+        SqlVal::Str(s) => format!("s:{s}"),
+        SqlVal::Json(v) => format!("j:{v}"),
+    }
+}
+
+/// The value an `ORDER BY` item sorts `row` by: an output column (by position
+/// or by name), an aggregate over the group, or an expression over the record.
+fn order_key(
+    item: &OrderItem,
+    row: &OutputRow,
+    rec: Option<&Record>,
+    group: Option<&[Record]>,
+    alias: Option<&str>,
+) -> Result<SqlVal, SelectError> {
+    match &item.key {
+        OrderKey::Position(n) => Ok(match row {
+            OutputRow::Named(pairs) => pairs.get(n - 1).map(|(_, v)| v.clone()),
+            OutputRow::CsvRaw(fields) => fields.get(n - 1).cloned().map(SqlVal::Str),
+            OutputRow::JsonRaw(Value::Object(map)) => {
+                map.values().nth(n - 1).map(SqlVal::from_json)
+            }
+            OutputRow::JsonRaw(_) => None,
+        }
+        .unwrap_or(SqlVal::Null)),
+        OrderKey::Aggregate { func, arg } => {
+            let Some(group) = group else {
+                return Err(SelectError::Invalid(
+                    "ORDER BY an aggregate needs an aggregate or GROUP BY query".to_string(),
+                ));
+            };
+            let item = ProjectionItem {
+                kind: ProjectionKind::Aggregate {
+                    func: *func,
+                    arg: arg.clone(),
+                },
+                alias: None,
+            };
+            eval_aggregate(&item, group, alias)
+        }
+        OrderKey::Expr(expr) => {
+            if let (Expr::Path(steps), OutputRow::Named(pairs)) = (expr, row) {
+                if let [PathStep::Field(name)] = steps.as_slice() {
+                    if let Some((_, v)) = pairs.iter().find(|(col, _)| col == name) {
+                        return Ok(v.clone());
+                    }
+                }
+            }
+            Ok(rec
+                .map(|rec| eval_expr(expr, rec, alias))
+                .unwrap_or(SqlVal::Null))
+        }
+    }
+}
+
+/// Ascending order: NULLs last, then values by `compare_vals`, falling back to
+/// their string forms for values of different types.
+fn order_cmp(a: &SqlVal, b: &SqlVal) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (a.is_null(), b.is_null()) {
+        (true, true) => Ordering::Equal,
+        (true, false) => Ordering::Greater,
+        (false, true) => Ordering::Less,
+        _ => compare_vals(a, b).unwrap_or_else(|| a.as_str().cmp(&b.as_str())),
+    }
 }
 
 fn default_column_name(expr: &Expr, _is_csv_input: bool) -> Option<String> {
@@ -1751,7 +2145,25 @@ fn resolve_path(steps: &[PathStep], rec: &Record, alias: Option<&str>) -> SqlVal
             }
             SqlVal::from_json(cur)
         }
+        Record::Joined(sides) => resolve_joined_path(steps, sides),
     }
+}
+
+/// `<alias>.<path>` resolves in that table; an unqualified path resolves in
+/// the first table that has it.
+fn resolve_joined_path(steps: &[PathStep], sides: &[(String, Record)]) -> SqlVal {
+    if let [PathStep::Field(first), rest @ ..] = steps {
+        if !rest.is_empty() {
+            if let Some((_, side)) = sides.iter().find(|(a, _)| a.eq_ignore_ascii_case(first)) {
+                return resolve_path(rest, side, None);
+            }
+        }
+    }
+    sides
+        .iter()
+        .map(|(_, side)| resolve_path(steps, side, None))
+        .find(|v| !v.is_null())
+        .unwrap_or(SqlVal::Null)
 }
 
 fn compare_vals(a: &SqlVal, b: &SqlVal) -> Option<std::cmp::Ordering> {

@@ -1,24 +1,38 @@
-//! Local bucket policy and canned ACL enforcement for `strict` auth mode.
+//! Local bucket policy, canned ACL, and IAM identity policy enforcement for
+//! `strict` auth mode.
 //!
 //! In `relaxed` mode (the default), authorization checks are bypassed so local
 //! tooling and the dashboard continue working unchanged. In `strict` mode:
-//! - Authenticated callers (valid SigV4 / SigV4a / SigV2) are subject to
-//!   explicit `Deny` statements in the target bucket's policy and are otherwise
-//!   allowed as the bucket owner.
+//! - The configured credential is the bucket owner (account `000000000000`). It
+//!   is subject to explicit `Deny` statements in the target bucket's policy and
+//!   is otherwise allowed.
 //! - Anonymous (unsigned) callers are allowed only when the target bucket's
 //!   policy explicitly allows the action without a matching `Deny`, or when the
 //!   target bucket/object canned ACL grants public access (`public-read` /
 //!   `public-read-write`) and no explicit `Deny` blocks it.
+//! - IAM users and assumed-role sessions from the local registry
+//!   (`identities.rs`) are evaluated like AWS: an explicit `Deny` in the bucket
+//!   policy, the principal's identity policies, or its session policy wins. A
+//!   principal in the owner account needs an `Allow` from its identity policies
+//!   or from the bucket policy; a principal from another account needs both. A
+//!   session policy must also allow the action (it limits both grants). Public
+//!   canned ACL grants apply to every caller.
 
 use serde_json::Value;
 
 use crate::http::{parse_path_style, AuthConfig, Request};
+use crate::identities::{Principal, OWNER_ACCOUNT};
 use crate::store::FileBucketStore;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Caller<'a> {
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum Caller {
     Anonymous,
-    Authenticated { access_key_id: &'a str },
+    /// The configured credential: the owner of every local bucket.
+    Owner {
+        access_key_id: String,
+    },
+    /// A user or assumed-role session from the local IAM registry.
+    Iam(Box<Principal>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,6 +40,16 @@ enum PolicyDecision {
     Allow,
     Deny,
     ImplicitDeny,
+}
+
+/// Which kind of policy document is evaluated: resource-based (bucket) and
+/// trust policies name a `Principal`; identity and session policies do not;
+/// trust policies have no `Resource`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PolicyKind {
+    Bucket,
+    Identity,
+    Trust,
 }
 
 #[derive(Debug, Clone)]
@@ -36,28 +60,62 @@ struct ActionContext {
     resource_arn: String,
 }
 
-/// Evaluates bucket policy and canned ACLs for `req` in `strict` mode.
-/// Returns `Ok(())` if authorized or `Err(())` for `403 AccessDenied`.
+impl ActionContext {
+    fn global(action: &'static str, resource_arn: &str) -> Self {
+        ActionContext {
+            action,
+            bucket: String::new(),
+            key: String::new(),
+            resource_arn: resource_arn.to_string(),
+        }
+    }
+}
+
+fn is_control_path(path: &str) -> bool {
+    path.starts_with(crate::identities::IAM_PREFIX) || path.starts_with(crate::kms::KMS_PREFIX)
+}
+
+/// Evaluates bucket policy, canned ACLs, and IAM policies for `req` in `strict`
+/// mode. Returns `Ok(())` if authorized or `Err(())` for `403 AccessDenied`.
 pub(crate) fn authorize_request(
     store: &FileBucketStore,
     req: &Request,
     auth: &AuthConfig,
-    caller: Caller<'_>,
+    caller: &Caller,
 ) -> Result<(), ()> {
     if !auth.auth_mode.eq_ignore_ascii_case("strict") {
         return Ok(());
     }
-    if req.path == "/" || crate::introspect::is_introspect_path(&req.path) {
+    let owner_only = || match caller {
+        Caller::Owner { .. } => Ok(()),
+        _ => Err(()),
+    };
+    if is_control_path(&req.path) {
+        // Any principal may call AssumeRole; the trust policy decides.
+        if req.method == "POST" && req.path == crate::identities::ASSUME_ROLE_PATH {
+            if let Caller::Iam(_) = caller {
+                return Ok(());
+            }
+        }
+        return owner_only();
+    }
+    if req.path == "/" {
         return match caller {
-            Caller::Authenticated { .. } => Ok(()),
-            Caller::Anonymous => Err(()),
+            Caller::Iam(p) if req.method == "GET" => {
+                if identity_allows(p, req, "s3:ListAllMyBuckets", "*", caller) {
+                    Ok(())
+                } else {
+                    Err(())
+                }
+            }
+            _ => owner_only(),
         };
     }
+    if crate::introspect::is_introspect_path(&req.path) {
+        return owner_only();
+    }
     let Some(ctx) = resolve_action_context(req) else {
-        return match caller {
-            Caller::Authenticated { .. } => Ok(()),
-            Caller::Anonymous => Err(()),
-        };
+        return owner_only();
     };
 
     let policy_decision = evaluate_bucket_policy(store, req, &ctx, caller);
@@ -66,7 +124,7 @@ pub(crate) fn authorize_request(
     }
 
     match caller {
-        Caller::Authenticated { .. } => Ok(()),
+        Caller::Owner { .. } => Ok(()),
         Caller::Anonymous => {
             if policy_decision == PolicyDecision::Allow {
                 return Ok(());
@@ -77,7 +135,71 @@ pub(crate) fn authorize_request(
                 Err(())
             }
         }
+        Caller::Iam(p) => {
+            let identity = evaluate_documents(&p.identity_policies, req, &ctx, caller);
+            let session = p
+                .session_policy
+                .as_ref()
+                .map(|doc| evaluate_document(doc, req, &ctx, caller, PolicyKind::Identity));
+            if identity == PolicyDecision::Deny || session == Some(PolicyDecision::Deny) {
+                return Err(());
+            }
+            let session_ok = session.is_none_or(|d| d == PolicyDecision::Allow);
+            let identity_allow = identity == PolicyDecision::Allow && session_ok;
+            let bucket_allow = policy_decision == PolicyDecision::Allow && session_ok;
+            let granted = if p.account == OWNER_ACCOUNT {
+                identity_allow || bucket_allow
+            } else {
+                identity_allow && bucket_allow
+            };
+            if granted || acl_allows_anonymous(store, req, &ctx) {
+                Ok(())
+            } else {
+                Err(())
+            }
+        }
     }
+}
+
+/// Whether `p`'s identity policies (and session policy, if any) allow `action`
+/// on `resource_arn` without an explicit `Deny`.
+pub(crate) fn identity_allows(
+    p: &Principal,
+    req: &Request,
+    action: &'static str,
+    resource_arn: &str,
+    caller: &Caller,
+) -> bool {
+    let ctx = ActionContext::global(action, resource_arn);
+    let identity = evaluate_documents(&p.identity_policies, req, &ctx, caller);
+    let session = p
+        .session_policy
+        .as_ref()
+        .map(|doc| evaluate_document(doc, req, &ctx, caller, PolicyKind::Identity));
+    identity == PolicyDecision::Allow && session.is_none_or(|d| d == PolicyDecision::Allow)
+}
+
+/// Whether the role trust policy `doc` allows `caller` to `sts:AssumeRole`.
+pub(crate) fn trust_allows(doc: &Value, role_arn: &str, req: &Request, caller: &Caller) -> bool {
+    let ctx = ActionContext::global("sts:AssumeRole", role_arn);
+    evaluate_document(doc, req, &ctx, caller, PolicyKind::Trust) == PolicyDecision::Allow
+}
+
+fn evaluate_documents(
+    docs: &[Value],
+    req: &Request,
+    ctx: &ActionContext,
+    caller: &Caller,
+) -> PolicyDecision {
+    let mut decision = PolicyDecision::ImplicitDeny;
+    for doc in docs {
+        match evaluate_document(doc, req, ctx, caller, PolicyKind::Identity) {
+            PolicyDecision::Deny => return PolicyDecision::Deny,
+            PolicyDecision::Allow => decision = PolicyDecision::Allow,
+            PolicyDecision::ImplicitDeny => {}
+        }
+    }
+    decision
 }
 
 fn resolve_action_context(req: &Request) -> Option<ActionContext> {
@@ -243,7 +365,7 @@ fn evaluate_bucket_policy(
     store: &FileBucketStore,
     req: &Request,
     ctx: &ActionContext,
-    caller: Caller<'_>,
+    caller: &Caller,
 ) -> PolicyDecision {
     let Ok(Some((raw, true))) = store.get_bucket_policy(&ctx.bucket) else {
         return PolicyDecision::ImplicitDeny;
@@ -251,6 +373,16 @@ fn evaluate_bucket_policy(
     let Ok(doc) = serde_json::from_slice::<Value>(&raw) else {
         return PolicyDecision::ImplicitDeny;
     };
+    evaluate_document(&doc, req, ctx, caller, PolicyKind::Bucket)
+}
+
+fn evaluate_document(
+    doc: &Value,
+    req: &Request,
+    ctx: &ActionContext,
+    caller: &Caller,
+    kind: PolicyKind,
+) -> PolicyDecision {
     let statements = match doc.get("Statement") {
         Some(Value::Array(arr)) => arr.iter().collect::<Vec<_>>(),
         Some(obj @ Value::Object(_)) => vec![obj],
@@ -262,7 +394,7 @@ fn evaluate_bucket_policy(
         let Some(effect) = stmt.get("Effect").and_then(Value::as_str) else {
             continue;
         };
-        if !statement_matches(stmt, req, ctx, caller) {
+        if !statement_matches(stmt, req, ctx, caller, kind) {
             continue;
         }
         if effect.eq_ignore_ascii_case("Deny") {
@@ -279,8 +411,17 @@ fn evaluate_bucket_policy(
     }
 }
 
-fn statement_matches(stmt: &Value, req: &Request, ctx: &ActionContext, caller: Caller<'_>) -> bool {
-    let principal_ok = if let Some(p) = stmt.get("Principal") {
+fn statement_matches(
+    stmt: &Value,
+    req: &Request,
+    ctx: &ActionContext,
+    caller: &Caller,
+    kind: PolicyKind,
+) -> bool {
+    let principal_ok = if kind == PolicyKind::Identity {
+        // Identity and session policies apply to the principal they are attached to.
+        true
+    } else if let Some(p) = stmt.get("Principal") {
         principal_matches(p, caller)
     } else if let Some(np) = stmt.get("NotPrincipal") {
         !principal_matches(np, caller)
@@ -307,7 +448,8 @@ fn statement_matches(stmt: &Value, req: &Request, ctx: &ActionContext, caller: C
     } else if let Some(nr) = stmt.get("NotResource") {
         !string_or_list_matches(nr, &ctx.resource_arn, false)
     } else {
-        false
+        // Trust policies have no Resource: the role itself is the resource.
+        kind == PolicyKind::Trust
     };
     if !resource_ok {
         return false;
@@ -321,7 +463,7 @@ fn statement_matches(stmt: &Value, req: &Request, ctx: &ActionContext, caller: C
     true
 }
 
-fn principal_matches(principal: &Value, caller: Caller<'_>) -> bool {
+fn principal_matches(principal: &Value, caller: &Caller) -> bool {
     match principal {
         Value::String(s) => principal_pattern_matches(s, caller),
         Value::Object(map) => {
@@ -342,22 +484,21 @@ fn principal_matches(principal: &Value, caller: Caller<'_>) -> bool {
     }
 }
 
-fn principal_pattern_matches(pattern: &str, caller: Caller<'_>) -> bool {
+fn principal_pattern_matches(pattern: &str, caller: &Caller) -> bool {
     if pattern == "*" {
         return true;
     }
-    match caller {
-        Caller::Anonymous => false,
-        Caller::Authenticated { access_key_id } => {
-            let candidates = [
-                access_key_id.to_string(),
-                format!("arn:aws:iam::000000000000:user/{access_key_id}"),
-                "arn:aws:iam::000000000000:root".to_string(),
-                "000000000000".to_string(),
-            ];
-            candidates.iter().any(|c| wildcard_match(pattern, c, false))
-        }
-    }
+    let candidates = match caller {
+        Caller::Anonymous => return false,
+        Caller::Owner { access_key_id } => vec![
+            access_key_id.clone(),
+            format!("arn:aws:iam::{OWNER_ACCOUNT}:user/{access_key_id}"),
+            format!("arn:aws:iam::{OWNER_ACCOUNT}:root"),
+            OWNER_ACCOUNT.to_string(),
+        ],
+        Caller::Iam(p) => p.principal_candidates(),
+    };
+    candidates.iter().any(|c| wildcard_match(pattern, c, false))
 }
 
 fn string_or_list_matches(value: &Value, candidate: &str, case_insensitive: bool) -> bool {
@@ -371,7 +512,7 @@ fn string_or_list_matches(value: &Value, candidate: &str, case_insensitive: bool
     }
 }
 
-fn condition_matches(condition: &Value, req: &Request, caller: Caller<'_>) -> bool {
+fn condition_matches(condition: &Value, req: &Request, caller: &Caller) -> bool {
     let Some(ops) = condition.as_object() else {
         return false;
     };
@@ -419,7 +560,7 @@ fn expected_strings(value: &Value) -> Vec<String> {
     }
 }
 
-fn resolve_condition_key(key: &str, req: &Request, caller: Caller<'_>) -> String {
+fn resolve_condition_key(key: &str, req: &Request, caller: &Caller) -> String {
     match key.to_ascii_lowercase().as_str() {
         "s3:prefix" => req.query.get("prefix").cloned().unwrap_or_default(),
         "s3:delimiter" => req.query.get("delimiter").cloned().unwrap_or_default(),
@@ -427,13 +568,20 @@ fn resolve_condition_key(key: &str, req: &Request, caller: Caller<'_>) -> String
         "s3:x-amz-server-side-encryption" => req.header("x-amz-server-side-encryption").to_string(),
         "aws:securetransport" => "false".to_string(),
         "aws:username" => match caller {
-            Caller::Authenticated { access_key_id } => access_key_id.to_string(),
+            Caller::Owner { access_key_id } => access_key_id.clone(),
+            Caller::Iam(p) => p.user_name.clone(),
             Caller::Anonymous => String::new(),
         },
         "aws:principalarn" => match caller {
-            Caller::Authenticated { access_key_id } => {
-                format!("arn:aws:iam::000000000000:user/{access_key_id}")
+            Caller::Owner { access_key_id } => {
+                format!("arn:aws:iam::{OWNER_ACCOUNT}:user/{access_key_id}")
             }
+            Caller::Iam(p) => p.principal_arn.clone(),
+            Caller::Anonymous => String::new(),
+        },
+        "aws:principalaccount" => match caller {
+            Caller::Owner { .. } => OWNER_ACCOUNT.to_string(),
+            Caller::Iam(p) => p.account.clone(),
             Caller::Anonymous => String::new(),
         },
         _ => String::new(),
