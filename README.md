@@ -408,7 +408,7 @@ Completed resumable uploads retain a small metadata receipt and notification mar
 | Backups and restore | Partial | Local backup metadata and restore flow. |
 | Tags and resource policies | Partial | Local metadata only; no IAM enforcement. |
 | DescribeLimits / DescribeEndpoints | Yes | Local compatibility responses. |
-| AWS SigV4 header auth | Partial | Relaxed mode is default; strict mode validates local credentials. |
+| AWS SigV4 header auth | Partial | Relaxed mode is default; strict mode validates local credentials and `aws-chunked` (`STREAMING-*`) chunk and trailer signatures. |
 | DAX, global tables, autoscaling | No | Not implemented. |
 | Real capacity accounting/throttling | No | Local deterministic behavior, not AWS capacity simulation. |
 | IAM condition enforcement | No | Not implemented. |
@@ -494,7 +494,7 @@ Pub/Sub dashboard actions are available under `/dashboard/pubsub`:
 | Tags / account settings | Yes | `/2017-03-31/tags/{arn}` list/tag/untag and `GetAccountSettings`. |
 | Function URLs | Partial | `CreateFunctionUrlConfig` / `GetFunctionUrlConfig` / `UpdateFunctionUrlConfig` / `DeleteFunctionUrlConfig` / `ListFunctionUrlConfigs` under `/2021-10-31/functions/{name}/url` (`$LATEST` only). The returned `FunctionUrl` is `http://<url-id>.lambda-url.<region>.localhost:<lambdaPort>/`, where `<url-id>` is derived from the account, region, and function name, so it stays the same when the URL, the function, or the data directory is recreated. Clients that cannot use that host can call `http://127.0.0.1:<lambdaPort>/_url/<url-id>/<path>`, or address the URL by function name: `http://127.0.0.1:<lambdaPort>/urls/<function>/<path>`. Requests reach the handler as a payload format 2.0 event through the same synchronous invoke path as `Invoke` (recorded in recent invocations), and the result is mapped like AWS: an object with `statusCode` sets status, `headers`, `multiValueHeaders`, `cookies` (`Set-Cookie`), `body`, and `isBase64Encoded`; any other JSON value becomes a `200` `application/json` body; a function error is `502`. `Cors` answers preflight requests itself and replaces the function's `Access-Control-*` headers. `AuthType: AWS_IAM` refuses unsigned requests (`403`) in every auth mode; `strict` verifies the SigV4 signature (service `lambda`) against `auth.lambda` credentials, `relaxed` / `signed-relaxed` only check that it is well formed. The mode is `auth.lambda.mode` unless `services.lambda.urlAuthMode` (`DEVCLOUD_LAMBDA_URL_AUTH_MODE`) sets one for URLs alone, e.g. `strict` URLs with a `relaxed` API. `AuthType: NONE` is public: resource-based policies are not evaluated, so no `AddPermission` is needed, and URLs bypass the API's browser (CSRF) guard. `InvokeMode: RESPONSE_STREAM` is accepted but served buffered. `sourceIp` is always `127.0.0.1`. |
 | Versions, aliases, layers, event source mappings, concurrency | No | Only `$LATEST` exists. The layer APIs (`PublishLayerVersion`, `Layers`) are not supported; put the layer contents in the `/opt` directory instead. |
-| Auth | Partial | `relaxed`, `signed-relaxed`, and `strict` SigV4 (service `lambda`), like Application Auto Scaling. `strict` requires the credential scope's date to match `X-Amz-Date` and accepts a signature over the path either normalized as most SDKs sign it (`//x` and dot segments collapsed) or exactly as sent; there is no clock-skew check, so requests signed with fixed timestamps keep working. |
+| Auth | Partial | `relaxed`, `signed-relaxed`, and `strict` SigV4 (service `lambda`), like Application Auto Scaling, including `aws-chunked` (`STREAMING-*`) chunk and trailer signature verification. `strict` requires the credential scope's date to match `X-Amz-Date` and accepts a signature over the path either normalized as most SDKs sign it (`//x` and dot segments collapsed) or exactly as sent; there is no clock-skew check, so requests signed with fixed timestamps keep working. |
 | Browser (CSRF) guard | Yes | Non-GET requests carrying a non-loopback `Origin` (or `Sec-Fetch-Site: cross-site`) are rejected with 403, so a web page cannot create or invoke functions; SDKs/CLIs (no `Origin`) and loopback front-ends are unaffected. The dashboard's test invoke applies the same rule. Requests whose `Host` is a public DNS name are refused too (DNS rebinding; see the Dashboard API notes). |
 
 ### SSM Parameter Store-Compatible API
@@ -504,7 +504,7 @@ Pub/Sub dashboard actions are available under `/dashboard/pubsub`:
 | Parameters | Partial | `PutParameter` (`String`, `StringList`, `SecureString`; `Overwrite`; `Standard`/`Advanced` value limits), `GetParameter` (with a `:<version>` selector for the current version only), `DeleteParameter`, and `DescribeParameters` (`MaxResults`/`NextToken`; filters are rejected). AWS JSON 1.1 under `X-Amz-Target: AmazonSSM.<Op>`. Persisted to `.devcloud/data/ssm/state.json`. |
 | `SecureString` | Partial | No KMS: values are stored in plaintext in `state.json`. `GetParameter` returns the value only with `WithDecryption: true`; without it the value is an opaque placeholder, never the plaintext. |
 | Not supported | No | `GetParameters`, `GetParametersByPath`, labels, version history, tags, policies. |
-| Auth | Partial | `relaxed` / `signed-relaxed` / `strict` SigV4 (service `ssm`). `strict` only accepts `auth.ssm` credentials, so STS temporary credentials are rejected there. |
+| Auth | Partial | `relaxed` / `signed-relaxed` / `strict` SigV4 (service `ssm`), including `aws-chunked` (`STREAMING-*`) chunk and trailer signature verification. `strict` only accepts `auth.ssm` credentials, so STS temporary credentials are rejected there. |
 | Dashboard | Partial | `/dashboard/ssm` lists names, types, and versions through `DescribeParameters`; values never reach the dashboard. |
 
 ### STS-Compatible API
@@ -513,7 +513,7 @@ Pub/Sub dashboard actions are available under `/dashboard/pubsub`:
 | --- | --- | --- |
 | `AssumeRole` | Partial | AWS Query protocol (form `POST /` or `GET /?Action=`), XML responses. Validates `RoleArn`, `RoleSessionName`, and `DurationSeconds` (900–43200), and issues new `ASIA…` temporary credentials per call. An inline session `Policy` must be JSON of at most 2048 characters; it is accepted but not evaluated. Stateless. |
 | `GetCallerIdentity` | Partial | Always reports the configured account's root identity, not the assumed role. |
-| Auth | Partial | `relaxed` / `signed-relaxed` / `strict` SigV4 (service `sts`). |
+| Auth | Partial | `relaxed` / `signed-relaxed` / `strict` SigV4 (service `sts`), including `aws-chunked` (`STREAMING-*`) chunk and trailer signature verification. |
 
 ### Cloud Run-Compatible API
 

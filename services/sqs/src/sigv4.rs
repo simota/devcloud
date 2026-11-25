@@ -13,6 +13,11 @@ type HmacSha256 = Hmac<Sha256>;
 
 pub const SIGV4_ALGORITHM: &str = "AWS4-HMAC-SHA256";
 pub const SIGV4_SERVICE: &str = "sqs";
+pub const SIGV4_CHUNK_ALGORITHM: &str = "AWS4-HMAC-SHA256-PAYLOAD";
+pub const SIGV4_TRAILER_ALGORITHM: &str = "AWS4-HMAC-SHA256-TRAILER";
+pub const STREAMING_SIGNED: &str = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD";
+pub const STREAMING_SIGNED_TRAILER: &str = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER";
+pub const STREAMING_UNSIGNED_TRAILER: &str = "STREAMING-UNSIGNED-PAYLOAD-TRAILER";
 
 /// A signature failure carrying the AWS error code + HTTP status from the legacy
 /// server.
@@ -103,6 +108,12 @@ pub fn verify_signature(req: &SignedRequest, creds: &Credentials) -> Result<(), 
     if !constant_time_eq(signature.as_bytes(), expected.as_bytes()) {
         return Err(err("SignatureDoesNotMatch", 403));
     }
+    if matches!(
+        payload_hash.as_str(),
+        STREAMING_SIGNED | STREAMING_SIGNED_TRAILER
+    ) {
+        verify_streaming_chunks(req, &date_stamp, &region, &expected, creds, &payload_hash)?;
+    }
     Ok(())
 }
 
@@ -116,12 +127,148 @@ fn verify_payload_hash(req: &SignedRequest, payload_hash: &str) -> Result<(), Si
     if payload_hash == "UNSIGNED-PAYLOAD" {
         return Ok(());
     }
+    if matches!(
+        payload_hash,
+        STREAMING_SIGNED | STREAMING_SIGNED_TRAILER | STREAMING_UNSIGNED_TRAILER
+    ) {
+        verify_chunked_framing(req)?;
+        return Ok(());
+    }
     if payload_hash.starts_with("STREAMING-") {
         return Err(err("NotImplemented", 501));
     }
     let got = sha256_hex(req.body);
     if !constant_time_eq(payload_hash.to_ascii_lowercase().as_bytes(), got.as_bytes()) {
         return Err(err("SignatureDoesNotMatch", 403));
+    }
+    Ok(())
+}
+
+struct Chunk<'a> {
+    signature: Option<&'a str>,
+    data: &'a [u8],
+}
+
+struct ChunkedBody<'a> {
+    chunks: Vec<Chunk<'a>>,
+    trailers: Vec<(&'a str, &'a str)>,
+    trailer_signature: Option<&'a str>,
+}
+
+impl ChunkedBody<'_> {
+    fn payload_len(&self) -> usize {
+        self.chunks.iter().map(|c| c.data.len()).sum()
+    }
+}
+
+fn parse_chunked_body(body: &[u8]) -> Option<ChunkedBody<'_>> {
+    let mut rest = body;
+    let mut chunks = Vec::new();
+    loop {
+        let line = take_chunk_line(&mut rest)?;
+        let (size, extension) = line.split_once(';').unwrap_or((line, ""));
+        let size = usize::from_str_radix(size.trim(), 16).ok()?;
+        let signature = extension.trim().strip_prefix("chunk-signature=");
+        let data = rest.get(..size)?;
+        rest = &rest[size..];
+        chunks.push(Chunk { signature, data });
+        if size == 0 {
+            break;
+        }
+        rest = rest.strip_prefix(b"\r\n")?;
+    }
+    let mut trailers = Vec::new();
+    let mut trailer_signature = None;
+    loop {
+        let line = take_chunk_line(&mut rest)?;
+        if line.is_empty() {
+            break;
+        }
+        let (name, value) = line.split_once(':')?;
+        if name.trim().eq_ignore_ascii_case("x-amz-trailer-signature") {
+            trailer_signature = Some(value.trim());
+        } else {
+            trailers.push((name.trim(), value.trim()));
+        }
+    }
+    if !rest.is_empty() {
+        return None;
+    }
+    Some(ChunkedBody {
+        chunks,
+        trailers,
+        trailer_signature,
+    })
+}
+
+fn take_chunk_line<'a>(rest: &mut &'a [u8]) -> Option<&'a str> {
+    let end = rest.windows(2).position(|w| w == b"\r\n")?;
+    let line = std::str::from_utf8(&rest[..end]).ok()?;
+    *rest = &rest[end + 2..];
+    Some(line)
+}
+
+fn verify_chunked_framing(req: &SignedRequest) -> Result<(), SignatureError> {
+    let parsed =
+        parse_chunked_body(req.body).ok_or_else(|| err("AuthorizationHeaderMalformed", 400))?;
+    if let Some(decoded_length) = (req.header)("x-amz-decoded-content-length") {
+        let decoded_length = decoded_length.trim();
+        if !decoded_length.is_empty()
+            && decoded_length.parse::<usize>().ok() != Some(parsed.payload_len())
+        {
+            return Err(err("AuthorizationHeaderMalformed", 400));
+        }
+    }
+    Ok(())
+}
+
+fn verify_streaming_chunks(
+    req: &SignedRequest,
+    date_stamp: &str,
+    region: &str,
+    seed_signature: &str,
+    creds: &Credentials,
+    payload_hash: &str,
+) -> Result<(), SignatureError> {
+    let parsed =
+        parse_chunked_body(req.body).ok_or_else(|| err("AuthorizationHeaderMalformed", 400))?;
+    let signing_key = derive_signing_key(creds.secret_access_key, date_stamp, region);
+    let scope = [date_stamp, region, SIGV4_SERVICE, "aws4_request"].join("/");
+    let sign = |algorithm: &str, previous: &str, parts: &[&str]| {
+        let mut fields = vec![algorithm, req.amz_date, &scope, previous];
+        fields.extend_from_slice(parts);
+        hex_lower(&hmac_sha256(&signing_key, fields.join("\n").as_bytes()))
+    };
+    let mismatch = || err("SignatureDoesNotMatch", 403);
+    let empty_hash = sha256_hex(b"");
+    let mut previous = seed_signature.to_string();
+    for chunk in &parsed.chunks {
+        let expected = sign(
+            SIGV4_CHUNK_ALGORITHM,
+            &previous,
+            &[&empty_hash, &sha256_hex(chunk.data)],
+        );
+        let actual = chunk.signature.ok_or_else(mismatch)?;
+        if !constant_time_eq(actual.as_bytes(), expected.as_bytes()) {
+            return Err(mismatch());
+        }
+        previous = expected;
+    }
+    if payload_hash == STREAMING_SIGNED_TRAILER {
+        let canonical_trailers: String = parsed
+            .trailers
+            .iter()
+            .map(|(name, value)| format!("{}:{value}\n", name.to_ascii_lowercase()))
+            .collect();
+        let expected = sign(
+            SIGV4_TRAILER_ALGORITHM,
+            &previous,
+            &[&sha256_hex(canonical_trailers.as_bytes())],
+        );
+        let actual = parsed.trailer_signature.ok_or_else(mismatch)?;
+        if !constant_time_eq(actual.as_bytes(), expected.as_bytes()) {
+            return Err(mismatch());
+        }
     }
     Ok(())
 }
