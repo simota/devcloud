@@ -1,21 +1,26 @@
-//! `strict` auth mode: caller identity from bearer tokens and dataset/table
-//! IAM enforcement.
+//! `strict` auth mode: caller identity from bearer tokens and project /
+//! dataset / table IAM enforcement.
 //!
 //! Only active when the auth mode is `strict`; `relaxed`, `oauth-relaxed`, and
 //! `bearer-dev` keep the plain [`crate::routes`] token check.
 //!
 //! - The configured bearer token is the project owner and may do anything.
 //! - Tokens registered with [`Server::add_principal`] authenticate as an IAM
-//!   member and are authorized against the dataset IAM policy
-//!   (`datasets/{d}:setIamPolicy`) and, for table calls, the table policy
-//!   (`tables/{t}:setIamPolicy`) as well. Project-level calls (jobs, queries,
-//!   dataset list/create, introspection, uploads) are owner-only.
+//!   member. Dataset-scoped calls are authorized against the union of the
+//!   project IAM policy (`/v1/projects/{p}:setIamPolicy`), the dataset IAM
+//!   policy, the dataset `access` entries and, for table calls, the table
+//!   policy. Dataset creation needs `bigquery.datasets.create` on the project
+//!   and project IAM reads/writes need `roles/owner` on the project; other
+//!   project-level calls (jobs, queries, dataset list, introspection, uploads)
+//!   stay owner-only, because the local query engine cannot attribute the
+//!   tables a query reads to the caller.
+//! - The Storage API (gRPC) uses the same callers and policies; see
+//!   [`crate::storage_api`].
 //! - Requests without a token are anonymous and only reach resources whose
 //!   policy grants the permission to `allUsers`.
-//! - Conditional bindings never grant access; dataset `access` entries are not
-//!   consulted.
+//! - Conditional bindings never grant access.
 
-use crate::model::IamPolicy;
+use crate::model::{DatasetAccessEntry, IamBinding, IamPolicy};
 use crate::responses::ApiResponse;
 use crate::routes::{
     bearer_token_from_request, constant_time_eq, resource_parts, split_resource_action, Request,
@@ -23,14 +28,15 @@ use crate::routes::{
 use crate::server::Server;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum Caller {
+pub(crate) enum Caller {
     Owner,
     Principal(String),
     Anonymous,
 }
 
 /// The resource a permission is checked on.
-enum Target {
+pub(crate) enum Target {
+    Project(String),
     Dataset(String, String),
     Table(String, String, String),
 }
@@ -73,19 +79,38 @@ fn role_grants(role: &str, permission: &str) -> bool {
         "bigquery.routines.get",
         "bigquery.routines.list",
     ];
+    const READ_SESSIONS: &[&str] = &[
+        "bigquery.readsessions.create",
+        "bigquery.readsessions.getData",
+        "bigquery.readsessions.update",
+    ];
+    let data_editor = |permission: &str| {
+        VIEWER.contains(&permission)
+            || permission == "bigquery.datasets.create"
+            || (["bigquery.tables.", "bigquery.models.", "bigquery.routines."]
+                .iter()
+                .any(|p| permission.starts_with(p))
+                && permission != "bigquery.tables.setIamPolicy")
+    };
     match role {
-        "roles/owner" | "roles/bigquery.admin" | "roles/bigquery.dataOwner" => {
+        "roles/owner" => {
             permission.starts_with("bigquery.")
+                || permission == "resourcemanager.projects.getIamPolicy"
+                || permission == "resourcemanager.projects.setIamPolicy"
         }
-        "roles/editor" | "roles/bigquery.dataEditor" => {
-            VIEWER.contains(&permission)
-                || (["bigquery.tables.", "bigquery.models.", "bigquery.routines."]
-                    .iter()
-                    .any(|p| permission.starts_with(p))
-                    && permission != "bigquery.tables.setIamPolicy")
+        "roles/bigquery.admin" => permission.starts_with("bigquery."),
+        "roles/bigquery.dataOwner" => {
+            permission.starts_with("bigquery.")
+                && !permission.starts_with("bigquery.readsessions.")
+                && !permission.starts_with("bigquery.jobs.")
         }
+        "roles/editor" | "roles/bigquery.dataEditor" => data_editor(permission),
         "roles/viewer" | "roles/bigquery.dataViewer" => VIEWER.contains(&permission),
         "roles/bigquery.metadataViewer" => METADATA_VIEWER.contains(&permission),
+        "roles/bigquery.readSessionUser" => READ_SESSIONS.contains(&permission),
+        "roles/bigquery.user" => {
+            READ_SESSIONS.contains(&permission) || permission == "bigquery.datasets.create"
+        }
         _ => false,
     }
 }
@@ -121,12 +146,33 @@ fn policy_allows(policy: &IamPolicy, caller: &Caller, permission: &str) -> bool 
 /// `Some((target, permission))`, `Some(None)` for calls any caller may make
 /// (`testIamPermissions`), `None` for owner-only project-level calls.
 fn required_permission(req: &Request) -> Option<Option<(Target, &'static str)>> {
+    let method = req.method.as_str();
+    if req.path.starts_with("/v1/projects/") {
+        let parts = resource_parts(&req.path, "/v1/projects/")?;
+        let [resource] = parts.as_slice() else {
+            return None;
+        };
+        let (project, action) = split_resource_action(resource);
+        let permission = match action {
+            "getIamPolicy" => "resourcemanager.projects.getIamPolicy",
+            "setIamPolicy" => "resourcemanager.projects.setIamPolicy",
+            _ => return None,
+        };
+        return Some(Some((Target::Project(project.to_string()), permission)));
+    }
     let parts = resource_parts(&req.path, "/bigquery/v2/projects/")?;
-    if !req.path.starts_with("/bigquery/v2/projects/") || parts.len() < 3 || parts[1] != "datasets"
+    if !req.path.starts_with("/bigquery/v2/projects/") || parts.len() < 2 || parts[1] != "datasets"
     {
         return None;
     }
-    let method = req.method.as_str();
+    if parts.len() == 2 {
+        return (method == "POST").then(|| {
+            Some((
+                Target::Project(parts[0].clone()),
+                "bigquery.datasets.create",
+            ))
+        });
+    }
     let project = parts[0].clone();
     let by_method = |get, update, delete| match method {
         "GET" => get,
@@ -225,13 +271,14 @@ fn access_denied(member: &str, permission: &str, resource: &str) -> ApiResponse 
     )
 }
 
-/// Strict-mode authentication + authorization. `Err` carries the 401/403.
-pub(crate) fn authorize_strict(server: &Server, req: &Request) -> Result<(), ApiResponse> {
+/// Strict-mode authentication + authorization. `Ok` carries the caller;
+/// `Err` carries the 401/403.
+pub(crate) fn authorize_strict(server: &Server, req: &Request) -> Result<Caller, ApiResponse> {
     let caller = server
         .strict_caller(&bearer_token_from_request(req))
         .ok_or_else(unauthenticated)?;
     if caller == Caller::Owner {
-        return Ok(());
+        return Ok(caller);
     }
     let denied = |permission: &str, resource: &str| match &caller {
         Caller::Principal(member) => access_denied(member, permission, resource),
@@ -241,29 +288,112 @@ pub(crate) fn authorize_strict(server: &Server, req: &Request) -> Result<(), Api
         return Err(denied("project-level", "Project"));
     };
     let Some((target, permission)) = required else {
-        return Ok(());
+        return Ok(caller);
     };
-    let read = |path: std::path::PathBuf| server.read_iam_policy(&path).unwrap_or_default();
-    let (resource, policies) = match &target {
-        Target::Dataset(p, d) => (
-            format!("Dataset {p}:{d}"),
-            vec![read(server.dataset_iam_policy_path(p, d))],
-        ),
-        Target::Table(p, d, t) => (
-            format!("Table {p}:{d}.{t}"),
-            vec![
-                read(server.table_iam_policy_path(p, d, t)),
-                read(server.dataset_iam_policy_path(p, d)),
-            ],
-        ),
-    };
-    if policies
-        .iter()
-        .any(|policy| policy_allows(policy, &caller, permission))
-    {
-        Ok(())
+    if is_allowed(server, &caller, &target, permission) {
+        Ok(caller)
     } else {
-        Err(denied(permission, &resource))
+        Err(denied(permission, &describe(&target)))
+    }
+}
+
+pub(crate) fn describe(target: &Target) -> String {
+    match target {
+        Target::Project(p) => format!("Project {p}"),
+        Target::Dataset(p, d) => format!("Dataset {p}:{d}"),
+        Target::Table(p, d, t) => format!("Table {p}:{d}.{t}"),
+    }
+}
+
+/// Whether `caller` holds `permission` on `target` through the project IAM
+/// policy, the dataset IAM policy and `access` entries, or the table policy.
+pub(crate) fn is_allowed(
+    server: &Server,
+    caller: &Caller,
+    target: &Target,
+    permission: &str,
+) -> bool {
+    if *caller == Caller::Owner {
+        return true;
+    }
+    let read = |path: std::path::PathBuf| server.read_iam_policy(&path).unwrap_or_default();
+    let project_id = match target {
+        Target::Project(p) | Target::Dataset(p, _) | Target::Table(p, _, _) => p,
+    };
+    let project = read(server.project_iam_policy_path(project_id));
+    let mut policies = Vec::new();
+    if let Target::Table(p, d, t) = target {
+        policies.push(read(server.table_iam_policy_path(p, d, t)));
+    }
+    if let Target::Dataset(p, d) | Target::Table(p, d, _) = target {
+        policies.push(read(server.dataset_iam_policy_path(p, d)));
+        if let Ok(Some(dataset)) = server.read_dataset(p, d) {
+            policies.push(access_policy(
+                dataset.access.as_deref().unwrap_or_default(),
+                &project,
+            ));
+        }
+    }
+    policies.push(project);
+    policies
+        .iter()
+        .any(|policy| policy_allows(policy, caller, permission))
+}
+
+/// Dataset `access` entries as IAM bindings: legacy roles map to
+/// `roles/bigquery.data{Viewer,Editor,Owner}`, `userByEmail` matches `user:`
+/// and `serviceAccount:` members, and `projectOwners`/`projectWriters`/
+/// `projectReaders` expand to the project's `roles/owner`/`editor`/`viewer`
+/// members. Authorized view/routine/dataset entries grant callers nothing.
+fn access_policy(entries: &[DatasetAccessEntry], project: &IamPolicy) -> IamPolicy {
+    let project_members = |role: &str| -> Vec<String> {
+        project
+            .bindings
+            .iter()
+            .filter(|b| b.condition.is_none() && b.role == role)
+            .flat_map(|b| b.members.iter().cloned())
+            .collect()
+    };
+    let bindings = entries
+        .iter()
+        .filter(|entry| !entry.role.is_empty())
+        .map(|entry| {
+            let role = match entry.role.as_str() {
+                "READER" => "roles/bigquery.dataViewer",
+                "WRITER" => "roles/bigquery.dataEditor",
+                "OWNER" => "roles/bigquery.dataOwner",
+                role => role,
+            };
+            let members = if !entry.user_by_email.is_empty() {
+                vec![
+                    format!("user:{}", entry.user_by_email),
+                    format!("serviceAccount:{}", entry.user_by_email),
+                ]
+            } else if !entry.group_by_email.is_empty() {
+                vec![format!("group:{}", entry.group_by_email)]
+            } else if !entry.domain.is_empty() {
+                vec![format!("domain:{}", entry.domain)]
+            } else if !entry.iam_member.is_empty() {
+                vec![entry.iam_member.clone()]
+            } else {
+                match entry.special_group.as_str() {
+                    "allAuthenticatedUsers" => vec!["allAuthenticatedUsers".to_string()],
+                    "projectOwners" => project_members("roles/owner"),
+                    "projectWriters" => project_members("roles/editor"),
+                    "projectReaders" => project_members("roles/viewer"),
+                    _ => Vec::new(),
+                }
+            };
+            IamBinding {
+                role: role.to_string(),
+                members,
+                condition: None,
+            }
+        })
+        .collect();
+    IamPolicy {
+        bindings,
+        ..Default::default()
     }
 }
 
@@ -278,7 +408,7 @@ impl Server {
         self.principals.push((token.into(), member.into()));
     }
 
-    fn strict_caller(&self, token: &str) -> Option<Caller> {
+    pub(crate) fn strict_caller(&self, token: &str) -> Option<Caller> {
         if token.is_empty() {
             return Some(Caller::Anonymous);
         }

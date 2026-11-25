@@ -264,6 +264,13 @@ impl Server {
             )
             .map_err(|err| err.to_string())?;
         }
+        // Query results carry no insert time.
+        self.mark_rows_history_reset(
+            &destination_ref.project_id,
+            &destination_ref.dataset_id,
+            &destination_ref.table_id,
+        )
+        .map_err(|err| err.to_string())?;
         self.refresh_table_row_stats(&destination)
             .map_err(|err| err.to_string())
     }

@@ -129,6 +129,55 @@ pub struct DatasetResource {
         skip_serializing_if = "String::is_empty"
     )]
     pub last_modified_time: String,
+    /// Dataset `access` entries. `None` (absent) and an empty list are both
+    /// omitted on output; a PATCH without `access` keeps the stored entries.
+    #[serde(default, skip_serializing_if = "access_empty")]
+    pub access: Option<Vec<DatasetAccessEntry>>,
+}
+
+fn access_empty(access: &Option<Vec<DatasetAccessEntry>>) -> bool {
+    access.as_ref().is_none_or(Vec::is_empty)
+}
+
+/// One dataset `access` entry: a legacy role (`READER`/`WRITER`/`OWNER`) or
+/// IAM role granted to exactly one member kind, or an authorized
+/// view/routine/dataset (stored only).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct DatasetAccessEntry {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub role: String,
+    #[serde(
+        rename = "userByEmail",
+        default,
+        skip_serializing_if = "String::is_empty"
+    )]
+    pub user_by_email: String,
+    #[serde(
+        rename = "groupByEmail",
+        default,
+        skip_serializing_if = "String::is_empty"
+    )]
+    pub group_by_email: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub domain: String,
+    #[serde(
+        rename = "specialGroup",
+        default,
+        skip_serializing_if = "String::is_empty"
+    )]
+    pub special_group: String,
+    #[serde(
+        rename = "iamMember",
+        default,
+        skip_serializing_if = "String::is_empty"
+    )]
+    pub iam_member: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub view: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routine: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dataset: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -530,7 +579,7 @@ pub struct InsertErrorItem {
     pub message: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredRow {
     #[serde(rename = "insertId", default, skip_serializing_if = "String::is_empty")]
     pub insert_id: String,

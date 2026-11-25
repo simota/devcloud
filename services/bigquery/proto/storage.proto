@@ -13,7 +13,12 @@ service BigQueryRead {
 }
 
 service BigQueryWrite {
+  rpc CreateWriteStream(CreateWriteStreamRequest) returns (WriteStream);
   rpc AppendRows(stream AppendRowsRequest) returns (stream AppendRowsResponse);
+  rpc GetWriteStream(GetWriteStreamRequest) returns (WriteStream);
+  rpc FinalizeWriteStream(FinalizeWriteStreamRequest) returns (FinalizeWriteStreamResponse);
+  rpc BatchCommitWriteStreams(BatchCommitWriteStreamsRequest) returns (BatchCommitWriteStreamsResponse);
+  rpc FlushRows(FlushRowsRequest) returns (FlushRowsResponse);
 }
 
 enum DataFormat {
@@ -24,6 +29,28 @@ enum DataFormat {
 
 message AvroSchema {
   string schema = 1;
+}
+
+message ArrowSchema {
+  bytes serialized_schema = 1;
+}
+
+message ArrowRecordBatch {
+  bytes serialized_record_batch = 1;
+  int64 row_count = 2;
+}
+
+message ArrowSerializationOptions {
+  enum CompressionCodec {
+    COMPRESSION_UNSPECIFIED = 0;
+    LZ4_FRAME = 1;
+    ZSTD = 2;
+  }
+  CompressionCodec buffer_compression = 2;
+}
+
+message AvroSerializationOptions {
+  bool enable_display_name_attribute = 1;
 }
 
 message AvroRows {
@@ -42,10 +69,9 @@ message ReadSession {
   message TableReadOptions {
     repeated string selected_fields = 1;
     string row_restriction = 2;
-    // Opaque fields let the server reject unsupported serialization options.
     oneof output_format_serialization_options {
-      bytes arrow_serialization_options = 3;
-      bytes avro_serialization_options = 4;
+      ArrowSerializationOptions arrow_serialization_options = 3;
+      AvroSerializationOptions avro_serialization_options = 4;
     }
     optional double sample_percentage = 5;
     optional int32 response_compression_codec = 6;
@@ -55,6 +81,7 @@ message ReadSession {
   DataFormat data_format = 3;
   oneof schema {
     AvroSchema avro_schema = 4;
+    ArrowSchema arrow_schema = 5;
   }
   string table = 6;
   TableModifiers table_modifiers = 7;
@@ -80,10 +107,12 @@ message ReadRowsRequest {
 message ReadRowsResponse {
   oneof rows {
     AvroRows avro_rows = 3;
+    ArrowRecordBatch arrow_record_batch = 4;
   }
   int64 row_count = 6;
   oneof schema {
     AvroSchema avro_schema = 7;
+    ArrowSchema arrow_schema = 8;
   }
 }
 
@@ -135,4 +164,81 @@ message RowError {
   int64 index = 1;
   RowErrorCode code = 2;
   string message = 3;
+}
+
+message WriteStream {
+  enum Type {
+    TYPE_UNSPECIFIED = 0;
+    COMMITTED = 1;
+    PENDING = 2;
+    BUFFERED = 3;
+  }
+  enum WriteMode {
+    WRITE_MODE_UNSPECIFIED = 0;
+    INSERT = 1;
+  }
+  string name = 1;
+  Type type = 2;
+  google.protobuf.Timestamp create_time = 3;
+  google.protobuf.Timestamp commit_time = 4;
+  WriteMode write_mode = 7;
+  string location = 8;
+}
+
+enum WriteStreamView {
+  WRITE_STREAM_VIEW_UNSPECIFIED = 0;
+  BASIC = 1;
+  FULL = 2;
+}
+
+message CreateWriteStreamRequest {
+  string parent = 1;
+  WriteStream write_stream = 2;
+}
+
+message GetWriteStreamRequest {
+  string name = 1;
+  WriteStreamView view = 3;
+}
+
+message FinalizeWriteStreamRequest {
+  string name = 1;
+}
+
+message FinalizeWriteStreamResponse {
+  int64 row_count = 1;
+}
+
+message BatchCommitWriteStreamsRequest {
+  string parent = 1;
+  repeated string write_streams = 2;
+}
+
+message BatchCommitWriteStreamsResponse {
+  google.protobuf.Timestamp commit_time = 1;
+  repeated StorageError stream_errors = 2;
+}
+
+message FlushRowsRequest {
+  string write_stream = 1;
+  google.protobuf.Int64Value offset = 2;
+}
+
+message FlushRowsResponse {
+  int64 offset = 1;
+}
+
+message StorageError {
+  enum StorageErrorCode {
+    STORAGE_ERROR_CODE_UNSPECIFIED = 0;
+    TABLE_NOT_FOUND = 1;
+    STREAM_ALREADY_COMMITTED = 2;
+    STREAM_NOT_FOUND = 3;
+    INVALID_STREAM_TYPE = 4;
+    INVALID_STREAM_STATE = 5;
+    STREAM_FINALIZED = 6;
+  }
+  StorageErrorCode code = 1;
+  string entity = 2;
+  string error_message = 3;
 }

@@ -223,6 +223,72 @@ fn dataset_list_paginates_with_next_page_token() {
     );
 }
 
+#[test]
+fn dataset_access_entries_round_trip_and_are_validated() {
+    let dir = tempdir();
+    let server = new_server(&dir, "US");
+    let access = r#"[{"role":"READER","userByEmail":"a@example.com"},
+        {"role":"roles/bigquery.dataEditor","iamMember":"group:g@example.com"},
+        {"view":{"projectId":"local-project","datasetId":"d","tableId":"v"}}]"#;
+    let body = format!(r#"{{"datasetReference":{{"datasetId":"acl"}},"access":{access}}}"#);
+    let created = server.create_dataset("local-project", body.as_bytes());
+    assert_eq!(created.status, 200, "{}", created.body_str());
+    let read = |server: &Server| -> serde_json::Value {
+        serde_json::from_str(server.get_dataset("local-project", "acl").body_str()).unwrap()
+    };
+    let expected: serde_json::Value = serde_json::from_str(access).unwrap();
+    assert_eq!(read(&server)["access"], expected);
+
+    // PATCH without `access` keeps it; with `access` replaces it.
+    let patched = server.patch_dataset("local-project", "acl", false, br#"{"description":"x"}"#);
+    assert_eq!(patched.status, 200);
+    assert_eq!(read(&server)["access"], expected);
+    let patched = server.patch_dataset(
+        "local-project",
+        "acl",
+        false,
+        br#"{"access":[{"role":"OWNER","specialGroup":"projectOwners"}]}"#,
+    );
+    assert_eq!(patched.status, 200);
+    assert_eq!(
+        read(&server)["access"],
+        serde_json::json!([{"role": "OWNER", "specialGroup": "projectOwners"}])
+    );
+    // PUT without `access` clears it.
+    assert_eq!(
+        server
+            .patch_dataset("local-project", "acl", true, b"{}")
+            .status,
+        200
+    );
+    assert!(read(&server).get("access").is_none());
+
+    for invalid in [
+        r#"[{"role":"READER"}]"#,
+        r#"[{"role":"READER","userByEmail":"a@example.com","domain":"example.com"}]"#,
+        r#"[{"role":"VIEWER","userByEmail":"a@example.com"}]"#,
+        r#"[{"role":"READER","specialGroup":"everyone"}]"#,
+        r#"[{"role":"READER","view":{"projectId":"p","datasetId":"d","tableId":"v"}}]"#,
+    ] {
+        let body = format!(r#"{{"datasetReference":{{"datasetId":"bad"}},"access":{invalid}}}"#);
+        assert_eq!(
+            server
+                .create_dataset("local-project", body.as_bytes())
+                .status,
+            400,
+            "{invalid}"
+        );
+        let patch = format!(r#"{{"access":{invalid}}}"#);
+        assert_eq!(
+            server
+                .patch_dataset("local-project", "acl", false, patch.as_bytes())
+                .status,
+            400,
+            "{invalid}"
+        );
+    }
+}
+
 // --- minimal tempdir --------------------------------------------------------
 
 fn tempdir() -> std::path::PathBuf {

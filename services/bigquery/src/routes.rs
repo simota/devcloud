@@ -51,8 +51,16 @@ impl Request {
 /// adds).
 pub fn handle(server: &Server, req: &Request) -> ApiResponse {
     if server.is_strict_auth() {
-        if let Err(resp) = crate::strict_auth::authorize_strict(server, req) {
-            return resp;
+        match crate::strict_auth::authorize_strict(server, req) {
+            Err(resp) => return resp,
+            Ok(crate::strict_auth::Caller::Principal(member)) => {
+                if let Some(project) =
+                    dataset_collection_project(req).filter(|_| req.method == "POST")
+                {
+                    return server.create_dataset_as(&project, &req.body, Some(&member));
+                }
+            }
+            Ok(_) => {}
         }
     } else if !authorize(server, &req.authorization) {
         return ApiResponse::error(401, "authError", "invalid authentication credentials")
@@ -77,11 +85,30 @@ pub fn handle(server: &Server, req: &Request) -> ApiResponse {
     ApiResponse::error(404, "notFound", "not found")
 }
 
-/// BigQuery Reservation API v1 routes (`/v1/projects/{p}/locations/{l}/biReservation`).
+/// `/bigquery/v2/projects/{p}/datasets` → `p`.
+fn dataset_collection_project(req: &Request) -> Option<String> {
+    if !req.path.starts_with("/bigquery/v2/projects/") {
+        return None;
+    }
+    match resource_parts(&req.path, "/bigquery/v2/projects/")?.as_slice() {
+        [project, datasets] if datasets == "datasets" => Some(project.clone()),
+        _ => None,
+    }
+}
+
+/// BigQuery Reservation API v1 routes (`/v1/projects/{p}/locations/{l}/biReservation`)
+/// and the local project IAM policy (Resource Manager v1
+/// `/v1/projects/{p}:getIamPolicy` / `:setIamPolicy`).
 fn handle_v1_project_resource(server: &Server, req: &Request) -> ApiResponse {
     let Some(parts) = resource_parts(&req.path, "/v1/projects/") else {
         return ApiResponse::error(400, "invalid", "invalid resource path");
     };
+    if let [resource] = parts.as_slice() {
+        let (project_id, action) = split_resource_action(resource);
+        if matches!(action, "getIamPolicy" | "setIamPolicy") {
+            return server.handle_project_iam_policy(&req.method, project_id, action, &req.body);
+        }
+    }
     if parts.len() == 4
         && parts[1] == "locations"
         && parts[3] == "biReservation"

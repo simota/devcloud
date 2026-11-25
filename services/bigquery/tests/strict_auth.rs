@@ -198,3 +198,174 @@ fn non_strict_modes_ignore_principals_and_policies() {
     assert_eq!(status(&s, "GET", &data, "", OWNER), 200);
     assert_eq!(status(&s, "GET", &data, "", ALICE), 401);
 }
+
+const PROJECT_IAM: &str = "/v1/projects/p";
+
+#[test]
+fn project_policy_is_inherited_by_datasets_and_tables() {
+    let s = server("strict");
+    seed(&s);
+    let data = format!("{DS}/tables/people/data");
+    assert_eq!(status(&s, "GET", &data, "", ALICE), 403);
+    set_policy(
+        &s,
+        PROJECT_IAM,
+        r#"[{"role":"roles/bigquery.dataViewer","members":["user:alice@example.com"]}]"#,
+    );
+    assert_eq!(status(&s, "GET", &data, "", ALICE), 200);
+    assert_eq!(status(&s, "GET", DS, "", ALICE), 200);
+    let insert = format!("{DS}/tables/people/insertAll");
+    let rows = r#"{"rows":[{"json":{"id":"2"}}]}"#;
+    assert_eq!(status(&s, "POST", &insert, rows, ALICE), 403);
+    // Queries stay owner-only even with project grants.
+    assert_eq!(
+        status(
+            &s,
+            "POST",
+            "/bigquery/v2/projects/p/queries",
+            r#"{"query":"SELECT 1"}"#,
+            ALICE
+        ),
+        403
+    );
+
+    // Project IAM itself needs roles/owner on the project.
+    let get = format!("{PROJECT_IAM}:getIamPolicy");
+    assert_eq!(status(&s, "POST", &get, "{}", ALICE), 403);
+    assert_eq!(status(&s, "POST", &get, "{}", ""), 401);
+    let policy = call(&s, "POST", &get, "{}", OWNER);
+    assert_eq!(policy.status, 200);
+    assert!(policy.body_str().contains("roles/bigquery.dataViewer"));
+    set_policy(
+        &s,
+        PROJECT_IAM,
+        r#"[{"role":"roles/owner","members":["serviceAccount:bob@other.test"]}]"#,
+    );
+    assert_eq!(status(&s, "POST", &get, "{}", BOB), 200);
+    assert_eq!(status(&s, "POST", &insert, rows, BOB), 200);
+    assert_eq!(
+        status(
+            &s,
+            "POST",
+            &format!("{PROJECT_IAM}:setIamPolicy"),
+            r#"{"policy":{}}"#,
+            BOB
+        ),
+        200
+    );
+    assert_eq!(status(&s, "GET", &data, "", ALICE), 403);
+    assert_eq!(
+        status(
+            &s,
+            "POST",
+            "/v1/projects/bad%2Fid:getIamPolicy",
+            "{}",
+            OWNER
+        ),
+        400
+    );
+}
+
+#[test]
+fn principals_with_dataset_create_own_the_datasets_they_create() {
+    let s = server("strict");
+    let datasets = "/bigquery/v2/projects/p/datasets";
+    let body = r#"{"datasetReference":{"datasetId":"mine"}}"#;
+    assert_eq!(status(&s, "POST", datasets, body, ALICE), 403);
+    set_policy(
+        &s,
+        PROJECT_IAM,
+        r#"[{"role":"roles/bigquery.user","members":["user:alice@example.com"]},
+            {"role":"roles/viewer","members":["serviceAccount:bob@other.test"]}]"#,
+    );
+    let created = call(&s, "POST", datasets, body, ALICE);
+    assert_eq!(created.status, 200, "{}", created.body_str());
+    let created: serde_json::Value = serde_json::from_str(created.body_str()).unwrap();
+    assert_eq!(
+        created["access"],
+        serde_json::json!([
+            {"role": "WRITER", "specialGroup": "projectWriters"},
+            {"role": "OWNER", "specialGroup": "projectOwners"},
+            {"role": "READER", "specialGroup": "projectReaders"},
+            {"role": "OWNER", "userByEmail": "alice@example.com"}
+        ])
+    );
+    let mine = format!("{datasets}/mine");
+    let table =
+        r#"{"tableReference":{"tableId":"t"},"schema":{"fields":[{"name":"id","type":"STRING"}]}}"#;
+    assert_eq!(
+        status(&s, "POST", &format!("{mine}/tables"), table, ALICE),
+        200
+    );
+    // projectReaders covers bob's project roles/viewer.
+    assert_eq!(
+        status(&s, "GET", &format!("{mine}/tables/t/data"), "", BOB),
+        200
+    );
+    assert_eq!(
+        status(&s, "POST", &format!("{mine}/tables"), table, BOB),
+        403
+    );
+    // The owner token creating a dataset adds no access entries.
+    let owner = call(
+        &s,
+        "POST",
+        datasets,
+        r#"{"datasetReference":{"datasetId":"o"}}"#,
+        OWNER,
+    );
+    assert!(!owner.body_str().contains("access"));
+    assert_eq!(
+        status(
+            &s,
+            "DELETE",
+            &format!("{mine}?deleteContents=true"),
+            "",
+            ALICE
+        ),
+        204
+    );
+}
+
+#[test]
+fn dataset_access_entries_authorize_principals() {
+    let s = server("strict");
+    seed(&s);
+    let data = format!("{DS}/tables/people/data");
+    let insert = format!("{DS}/tables/people/insertAll");
+    let rows = r#"{"rows":[{"json":{"id":"2"}}]}"#;
+    let patch = |access: &str| {
+        let r = call(&s, "PATCH", DS, &format!(r#"{{"access":{access}}}"#), OWNER);
+        assert_eq!(r.status, 200, "{}", r.body_str());
+    };
+    patch(r#"[{"role":"READER","userByEmail":"alice@example.com"}]"#);
+    assert_eq!(status(&s, "GET", &data, "", ALICE), 200);
+    assert_eq!(status(&s, "GET", DS, "", ALICE), 200);
+    assert_eq!(status(&s, "POST", &insert, rows, ALICE), 403);
+    assert_eq!(status(&s, "GET", &data, "", BOB), 403);
+    // userByEmail also matches service accounts; WRITER can insert.
+    patch(
+        r#"[{"role":"WRITER","userByEmail":"bob@other.test"},{"role":"roles/bigquery.dataViewer","domain":"example.com"}]"#,
+    );
+    assert_eq!(status(&s, "POST", &insert, rows, BOB), 200);
+    assert_eq!(status(&s, "GET", &data, "", ALICE), 200);
+    assert_eq!(status(&s, "DELETE", DS, "", BOB), 403);
+    patch(
+        r#"[{"role":"OWNER","iamMember":"user:alice@example.com"},{"role":"READER","specialGroup":"allAuthenticatedUsers"}]"#,
+    );
+    assert_eq!(status(&s, "GET", &data, "", BOB), 200);
+    assert_eq!(status(&s, "GET", &data, "", ""), 401);
+    assert_eq!(
+        status(
+            &s,
+            "POST",
+            &format!("{DS}/tables/people:setIamPolicy"),
+            r#"{"policy":{}}"#,
+            ALICE
+        ),
+        200
+    );
+    // Authorized views grant callers nothing.
+    patch(r#"[{"view":{"projectId":"p","datasetId":"analytics","tableId":"v"}}]"#);
+    assert_eq!(status(&s, "GET", &data, "", ALICE), 403);
+}
