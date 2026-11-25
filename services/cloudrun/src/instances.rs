@@ -1,8 +1,8 @@
 //! Local "container instances" for Cloud Run services.
 //!
-//! Each service runs at most one instance: the latest revision's first
-//! container, started lazily on the first request (scale-from-zero) and kept
-//! until the service gets a new revision, is deleted, or devcloud shuts down.
+//! Each serving revision runs at most one instance of its first container.
+//! Instances start on demand and are stopped when retired, when the service
+//! is deleted, or when devcloud shuts down.
 //! A container with a `command` runs as a local process (the image is not
 //! pulled); an image-only container runs under `docker run` when Docker
 //! execution is enabled. Either way the instance listens on a free loopback
@@ -10,6 +10,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::net::TcpListener as StdListener;
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -18,6 +19,8 @@ use serde::Serialize;
 use serde_json::Value;
 use tokio::io::AsyncReadExt;
 use tokio::process::{Child, Command};
+
+use crate::secrets::SecretRef;
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long readiness insists that the child's own process group holds the
@@ -44,6 +47,7 @@ pub struct LaunchSpec {
     pub command: Vec<String>,
     pub args: Vec<String>,
     pub env: BTreeMap<String, String>,
+    secret_env: BTreeMap<String, SecretRef>,
     pub working_dir: String,
     pub container_port: u16,
 }
@@ -51,10 +55,22 @@ pub struct LaunchSpec {
 impl LaunchSpec {
     /// Builds the spec from a stored Service resource.
     pub fn from_service(service: &Value) -> Option<LaunchSpec> {
-        let name = service.get("name")?.as_str()?.to_string();
+        let name = service.get("name")?.as_str()?;
+        let revision = service["latestCreatedRevision"].as_str().unwrap_or("");
+        Self::from_container(name, revision, service.pointer("/template/containers/0")?)
+    }
+
+    pub(crate) fn from_revision(revision: &Value) -> Option<LaunchSpec> {
+        Self::from_container(
+            revision["service"].as_str()?,
+            revision["name"].as_str()?,
+            revision.pointer("/containers/0")?,
+        )
+    }
+
+    fn from_container(name: &str, revision: &str, container: &Value) -> Option<LaunchSpec> {
         let service_id = name.rsplit('/').next()?.to_string();
-        let template = service.get("template")?;
-        let container = template.get("containers")?.as_array()?.first()?;
+        let revision_id = revision.rsplit('/').next()?.to_string();
         let strings = |key: &str| -> Vec<String> {
             container
                 .get(key)
@@ -67,37 +83,32 @@ impl LaunchSpec {
                 })
                 .unwrap_or_default()
         };
-        let env = container
-            .get("env")
-            .and_then(Value::as_array)
-            .map(|a| {
-                a.iter()
-                    .filter_map(|e| {
-                        Some((
-                            e.get("name")?.as_str()?.to_string(),
-                            e.get("value")
-                                .and_then(Value::as_str)
-                                .unwrap_or("")
-                                .to_string(),
-                        ))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+        let mut env = BTreeMap::new();
+        let mut secret_env = BTreeMap::new();
+        for entry in container["env"].as_array().into_iter().flatten() {
+            let Some(name) = entry["name"].as_str() else {
+                continue;
+            };
+            if let Some(secret) = SecretRef::parse(&entry["valueSource"]) {
+                env.remove(name);
+                secret_env.insert(name.to_string(), secret);
+            } else {
+                secret_env.remove(name);
+                // Legacy state may contain an empty valueSource.
+                env.insert(
+                    name.to_string(),
+                    entry["value"].as_str().unwrap_or("").to_string(),
+                );
+            }
+        }
         let container_port = container
             .pointer("/ports/0/containerPort")
             .and_then(Value::as_u64)
             .and_then(|n| u16::try_from(n).ok())
             .filter(|n| *n != 0)
             .unwrap_or(8080);
-        let revision_id = service
-            .get("latestCreatedRevision")
-            .and_then(Value::as_str)
-            .and_then(|r| r.rsplit('/').next())
-            .unwrap_or("")
-            .to_string();
         Some(LaunchSpec {
-            service: name,
+            service: name.into(),
             service_id,
             revision_id,
             image: container
@@ -108,6 +119,7 @@ impl LaunchSpec {
             command: strings("command"),
             args: strings("args"),
             env,
+            secret_env,
             working_dir: container
                 .get("workingDir")
                 .and_then(Value::as_str)
@@ -267,7 +279,8 @@ pub struct InstanceInfo {
 /// cold start only blocks requests for that service.
 #[derive(Default)]
 struct Slot {
-    instance: Option<Instance>,
+    instances: BTreeMap<String, Instance>,
+    traffic_bucket: u64,
     /// Set by `stop`: the slot left the map and must not get a new instance.
     retired: bool,
 }
@@ -282,6 +295,7 @@ struct Slots {
 
 pub struct Manager {
     docker_bin: Option<String>,
+    storage: PathBuf,
     /// Distinguishes this devcloud run's Docker containers from other runs'.
     run_id: String,
     /// Short critical sections only — never held across an `.await`.
@@ -310,8 +324,13 @@ impl Drop for StartingPort<'_> {
 
 impl Manager {
     pub fn new(docker_bin: Option<String>) -> Self {
+        Self::with_storage(docker_bin, PathBuf::new())
+    }
+
+    pub(crate) fn with_storage(docker_bin: Option<String>, storage: PathBuf) -> Self {
         Manager {
             docker_bin,
+            storage,
             run_id: new_run_id(),
             slots: Mutex::new(Slots::default()),
             logs: Arc::new(Mutex::new(HashMap::new())),
@@ -341,6 +360,19 @@ impl Manager {
         service: &str,
         current: impl Fn() -> Result<LaunchSpec, StartError>,
     ) -> Result<u16, StartError> {
+        self.ensure_routed(service, |_| {
+            let spec = current()?;
+            let active = vec![spec.revision_id.clone()];
+            Ok((spec, active))
+        })
+        .await
+    }
+
+    pub(crate) async fn ensure_routed(
+        &self,
+        service: &str,
+        current: impl FnOnce(u64) -> Result<(LaunchSpec, Vec<String>), StartError>,
+    ) -> Result<u16, StartError> {
         let Some(slot) = self.slot(service) else {
             return Err(StartError::Gone);
         };
@@ -349,7 +381,7 @@ impl Manager {
             // `stop` ran while we waited: the service was deleted.
             return Err(StartError::Gone);
         }
-        let spec = match current() {
+        let (spec, active) = match current(guard.traffic_bucket) {
             Ok(spec) => spec,
             Err(error) => {
                 // Deleted or unauthorized before we got the slot.
@@ -358,19 +390,33 @@ impl Manager {
                 return Err(error);
             }
         };
-        if let Some(inst) = guard.instance.as_mut() {
+        // 37 is coprime to 100, so every bucket is visited once per cycle
+        // without grouping requests for each revision into long runs.
+        guard.traffic_bucket = (guard.traffic_bucket + 37) % 100;
+        let mut retiring = Vec::new();
+        for id in guard.instances.keys() {
+            if !active.contains(id) {
+                retiring.push(id.clone());
+            }
+        }
+        for id in retiring {
+            if let Some(old) = guard.instances.remove(&id) {
+                self.terminate(old).await;
+            }
+        }
+        if let Some(inst) = guard.instances.get_mut(&spec.revision_id) {
             if inst.alive() && inst.spec == spec {
                 inst.requests += 1;
                 return Ok(inst.port);
             }
         }
-        if let Some(old) = guard.instance.take() {
+        if let Some(old) = guard.instances.remove(&spec.revision_id) {
             self.terminate(old).await;
         }
         let mut inst = self.start(&spec).await?;
         inst.requests = 1;
         let port = inst.port;
-        guard.instance = Some(inst);
+        guard.instances.insert(spec.revision_id, inst);
         Ok(port)
     }
 
@@ -378,14 +424,15 @@ impl Manager {
     /// gone, unless someone else has started using it meanwhile.
     fn discard_empty_slot(&self, service: &str, slot: &Arc<tokio::sync::Mutex<Slot>>) {
         let mut slots = self.slots.lock().unwrap();
-        let unused = slots.map.get(service).is_some_and(|s| Arc::ptr_eq(s, slot))
-            && slot.try_lock().is_ok_and(|g| g.instance.is_none());
+        let unused = Arc::strong_count(slot) == 2
+            && slots.map.get(service).is_some_and(|s| Arc::ptr_eq(s, slot))
+            && slot.try_lock().is_ok_and(|g| g.instances.is_empty());
         if unused {
             slots.map.remove(service);
         }
     }
 
-    /// Stops the instance of `service`, if any (delete).
+    /// Stops all instances of `service` (delete).
     pub async fn stop(&self, service: &str) {
         let removed = self.slots.lock().unwrap().map.remove(service);
         if let Some(slot) = removed {
@@ -421,6 +468,23 @@ impl Manager {
         }
     }
 
+    pub(crate) async fn stop_revision(
+        &self,
+        service: &str,
+        revision: &str,
+        still_deleted: impl FnOnce() -> bool,
+    ) {
+        let slot = self.slots.lock().unwrap().map.get(service).cloned();
+        if let Some(slot) = slot {
+            let mut guard = slot.lock().await;
+            if still_deleted() {
+                if let Some(inst) = guard.instances.remove(revision) {
+                    self.terminate(inst).await;
+                }
+            }
+        }
+    }
+
     /// A port no other instance of this manager holds.
     fn reserve_port(&self) -> Result<u16, String> {
         for _ in 0..32 {
@@ -439,7 +503,7 @@ impl Manager {
     async fn retire(&self, slot: Arc<tokio::sync::Mutex<Slot>>) {
         let mut guard = slot.lock().await;
         guard.retired = true;
-        if let Some(inst) = guard.instance.take() {
+        for inst in std::mem::take(&mut guard.instances).into_values() {
             self.terminate(inst).await;
         }
     }
@@ -453,27 +517,26 @@ impl Manager {
             let Ok(mut guard) = slot.try_lock() else {
                 continue;
             };
-            let Some(i) = guard.instance.as_mut() else {
-                continue;
-            };
-            if !i.alive() {
-                continue;
+            for i in guard.instances.values_mut() {
+                if !i.alive() {
+                    continue;
+                }
+                out.push(InstanceInfo {
+                    service: i.spec.service.clone(),
+                    revision: i.spec.revision_id.clone(),
+                    port: i.port,
+                    pid: i.pid,
+                    mode: if i.docker_name.is_some() {
+                        "docker"
+                    } else {
+                        "process"
+                    },
+                    started_at: i.started_at.clone(),
+                    request_count: i.requests,
+                });
             }
-            out.push(InstanceInfo {
-                service: i.spec.service.clone(),
-                revision: i.spec.revision_id.clone(),
-                port: i.port,
-                pid: i.pid,
-                mode: if i.docker_name.is_some() {
-                    "docker"
-                } else {
-                    "process"
-                },
-                started_at: i.started_at.clone(),
-                request_count: i.requests,
-            });
         }
-        out.sort_by(|a, b| a.service.cmp(&b.service));
+        out.sort_by(|a, b| (&a.service, &a.revision).cmp(&(&b.service, &b.revision)));
         out
     }
 
@@ -507,10 +570,14 @@ impl Manager {
 
     async fn start_on(&self, spec: &LaunchSpec, port: u16) -> Result<Instance, StartError> {
         let (mut cmd, docker_name) = self.command_for(spec, port)?;
-        cmd.stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .stdin(Stdio::null())
-            .kill_on_drop(true);
+        // A secret-bearing process can print its environment. Do not retain
+        // its stdout or stderr in the service's introspection log.
+        if spec.secret_env.is_empty() {
+            cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        } else {
+            cmd.stdout(Stdio::null()).stderr(Stdio::null());
+        }
+        cmd.stdin(Stdio::null()).kill_on_drop(true);
         // Own process group: stopping the instance must also stop whatever the
         // command forked (`sh -c 'server & wait'`, npm scripts, ...).
         #[cfg(unix)]
@@ -611,6 +678,19 @@ impl Manager {
         spec: &LaunchSpec,
         port: u16,
     ) -> Result<(Command, Option<String>), StartError> {
+        let project = spec.service.split('/').nth(1).unwrap_or("");
+        let secrets = spec
+            .secret_env
+            .iter()
+            .map(|(name, reference)| {
+                reference
+                    .read(&self.storage, project)
+                    .map(|value| (name, value))
+            })
+            .collect::<std::io::Result<BTreeMap<_, _>>>()
+            .map_err(|_| {
+                StartError::NotRunnable("Unable to resolve a container environment secret".into())
+            })?;
         let platform_env = [
             ("K_SERVICE", spec.service_id.clone()),
             ("K_REVISION", spec.revision_id.clone()),
@@ -625,6 +705,7 @@ impl Manager {
                 }
             }
             cmd.envs(&spec.env)
+                .envs(&secrets)
                 .envs(platform_env.iter().map(|(k, v)| (*k, v.as_str())))
                 .env("PORT", port.to_string());
             if !spec.working_dir.is_empty() {
@@ -637,7 +718,7 @@ impl Manager {
         };
         let name = docker_container_name(spec, &self.run_id);
         let mut cmd = Command::new(docker);
-        cmd.args(docker_run_args(spec, port, &name));
+        cmd.args(docker_run_args(spec, port, &name)).envs(&secrets);
         Ok((cmd, Some(name)))
     }
 
@@ -812,10 +893,13 @@ pub fn docker_run_args(spec: &LaunchSpec, host_port: u16, name: &str) -> Vec<Str
         format!("K_REVISION={}", spec.revision_id),
         format!("K_CONFIGURATION={}", spec.service_id),
     ];
+    // A bare Docker env name imports the value from the CLI environment
+    // without putting it in the process argument list.
     for kv in spec
         .env
         .iter()
         .map(|(k, v)| format!("{k}={v}"))
+        .chain(spec.secret_env.keys().cloned())
         .chain(platform)
     {
         args.push("-e".to_string());
@@ -1023,6 +1107,41 @@ mod tests {
         };
         assert_eq!(last("PORT"), "PORT=3000", "published container port wins");
         assert_eq!(last("K_SERVICE"), "K_SERVICE=web");
+    }
+
+    #[test]
+    fn docker_imports_secret_values_without_placing_them_in_arguments() {
+        let storage = std::env::temp_dir().join(format!("devcloud-cloudrun-env-{}", new_run_id()));
+        let directory = storage.join("secrets/p/example");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("1"), "fixture-value").unwrap();
+        let mut service = service();
+        service["template"]["containers"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("command");
+        service["template"]["containers"][0]["env"] = json!([{
+            "name": "EXAMPLE", "valueSource": { "secretKeyRef": { "secret": "example", "version": "1" } }
+        }]);
+        let spec = LaunchSpec::from_service(&service).unwrap();
+        let manager = Manager::with_storage(Some("docker".into()), storage.clone());
+        let (command, _) = manager.command_for(&spec, 45000).unwrap();
+        let command = command.as_std();
+        let _ = std::fs::remove_dir_all(storage);
+
+        let args: Vec<_> = command.get_args().collect();
+        assert!(args.windows(2).any(|pair| pair == ["-e", "EXAMPLE"]));
+        assert!(args
+            .iter()
+            .all(|arg| !arg.to_string_lossy().contains("fixture-value")));
+        assert_eq!(
+            command
+                .get_envs()
+                .find(|(key, _)| *key == "EXAMPLE")
+                .and_then(|(_, value)| value)
+                .and_then(|value| value.to_str()),
+            Some("fixture-value")
+        );
     }
 
     #[tokio::test]
@@ -1337,13 +1456,14 @@ mod tests {
                     200
                 );
             }
-            let current = || server.authorized_launch_spec(service_name, "");
-            assert!(current().is_ok(), "the original grant allows invocation");
+            let peer = "127.0.0.1".parse().unwrap();
+            let current = |bucket| server.routed_launch_spec(service_name, "", peer, bucket);
+            assert!(current(0).is_ok(), "the original grant allows invocation");
             // Simulate a request queued behind another cold start. Poll it
             // into the lock wait before changing the service's permission.
             let slot = server.instances.slot(service_name).unwrap();
             let held = slot.lock().await;
-            let mut request = Box::pin(server.instances.ensure(service_name, current));
+            let mut request = Box::pin(server.instances.ensure_routed(service_name, current));
             tokio::select! {
                 biased;
                 result = &mut request => panic!("locked slot completed early: {result:?}"),
@@ -1362,11 +1482,12 @@ mod tests {
             };
             assert_eq!(revoked.status, 200);
             drop(held);
+            drop(slot);
             assert_eq!(request.await, Err(StartError::Forbidden));
             assert!(server.instances.slots.lock().unwrap().map.is_empty());
             assert!(
                 server
-                    .authorized_launch_spec(service_name, "Bearer test-token")
+                    .routed_launch_spec(service_name, "Bearer test-token", peer, 0)
                     .is_ok(),
                 "a valid bearer token still grants invocation"
             );

@@ -2,7 +2,7 @@
 //!
 //! Serves the Cloud Run Admin API v2 (services, revisions, operations, IAM
 //! policies) and a data plane that reverse-proxies requests to each service's
-//! latest revision, run as a local process (`containers[0].command`) or, when
+//! selected revision, run as a local process (`containers[0].command`) or, when
 //! enabled, under `docker run`. State persists to `state.json` under the
 //! configured storage path.
 
@@ -24,7 +24,9 @@ pub(crate) fn event_sink() -> Option<&'static UnboundedSender<String>> {
 pub mod body;
 pub mod http;
 pub mod instances;
+mod secrets;
 pub mod server;
 pub mod time_fmt;
+mod traffic;
 
 pub use server::{Config, Server};

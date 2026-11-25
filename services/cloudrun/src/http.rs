@@ -8,6 +8,7 @@
 //! (`/_introspect/...`), answered one request per connection.
 
 use std::collections::{BTreeMap, HashMap};
+use std::net::IpAddr;
 use std::sync::Arc;
 
 use serde_json::json;
@@ -61,7 +62,7 @@ pub async fn serve(
         tokio::select! {
             _ = &mut shutdown => break Ok(()),
             accepted = listener.accept() => {
-                let (stream, _) = match accepted {
+                let (stream, peer) = match accepted {
                     Ok(a) => a,
                     // Out of descriptors, or a peer gone before the accept:
                     // back off and keep serving instead of stopping (which
@@ -86,7 +87,7 @@ pub async fn serve(
                 while connections.try_join_next().is_some() {}
                 let server = Arc::clone(&server);
                 connections.spawn(async move {
-                    let _ = handle_conn(stream, server).await;
+                    let _ = handle_conn(stream, server, peer.ip()).await;
                 });
             }
         }
@@ -98,7 +99,11 @@ pub async fn serve(
     result
 }
 
-async fn handle_conn(mut stream: TcpStream, server: Arc<Server>) -> std::io::Result<()> {
+async fn handle_conn(
+    mut stream: TcpStream,
+    server: Arc<Server>,
+    peer: IpAddr,
+) -> std::io::Result<()> {
     let Some(head) = read_head(&mut stream).await? else {
         return Ok(());
     };
@@ -119,7 +124,7 @@ async fn handle_conn(mut stream: TcpStream, server: Arc<Server>) -> std::io::Res
     }
 
     if let Some(route) = data_plane_route(&head) {
-        return proxy(stream, &server, head, route).await;
+        return proxy(stream, &server, head, route, peer).await;
     }
 
     // Content-Length or chunked; an unreadable body is answered, never
@@ -291,11 +296,21 @@ async fn proxy(
     server: &Server,
     head: Head,
     route: Route,
+    peer: IpAddr,
 ) -> std::io::Result<()> {
     let service_name = format!(
         "projects/{}/locations/{}/services/{}",
         route.project, route.location, route.service_id
     );
+    let authorization = head
+        .headers
+        .get("authorization")
+        .map(String::as_str)
+        .unwrap_or("");
+    let check = || server.check_data_plane(&service_name, authorization, peer);
+    if let Err(error) = check() {
+        return write_start_error(&mut client, &service_name, error).await;
+    }
     if route.needs_trailing_slash {
         // `/_run/p/l/web` → `/_run/p/l/web/`: without the slash a relative
         // `login` or `app.js` would resolve next to the service, not in it.
@@ -311,41 +326,20 @@ async fn proxy(
         );
         return client.write_all(resp.as_bytes()).await;
     }
-    let authorization = head
-        .headers
-        .get("authorization")
-        .map(String::as_str)
-        .unwrap_or("");
-    let current = || server.authorized_launch_spec(&service_name, authorization);
-    // Reject immediately when possible, and re-check the same snapshot after
-    // acquiring the instance slot so a queued request cannot outlive its grant.
-    let started = match current() {
-        Ok(_) => server.instances.ensure(&service_name, current).await,
-        Err(error) => Err(error),
-    };
+    let started = server
+        .instances
+        .ensure_routed(&service_name, |bucket| {
+            server.routed_launch_spec(&service_name, authorization, peer, bucket)
+        })
+        .await;
     let port = match started {
         Ok(p) => p,
-        Err(StartError::Forbidden) => return write_plain(
-            &mut client,
-            403,
-            "Error: Forbidden\nYour client does not have permission to get URL from this server.\n",
-        )
-        .await,
-        Err(StartError::Gone) => {
-            return write_plain(
-                &mut client,
-                404,
-                &format!("Cloud Run service {service_name} not found\n"),
-            )
-            .await
-        }
-        Err(StartError::NotRunnable(msg)) => {
-            return write_plain(&mut client, 503, &format!("{msg}\n")).await
-        }
-        Err(e) => {
-            return write_plain(&mut client, 503, &format!("Service Unavailable: {e}\n")).await
-        }
+        Err(error) => return write_start_error(&mut client, &service_name, error).await,
     };
+    // A cold start can take long enough for the invocation policy to change.
+    if let Err(error) = check() {
+        return write_start_error(&mut client, &service_name, error).await;
+    }
     let mut upstream = match TcpStream::connect(("127.0.0.1", port)).await {
         Ok(s) => s,
         Err(e) => {
@@ -441,6 +435,31 @@ async fn proxy(
         }
     }
     Ok(())
+}
+
+async fn write_start_error(
+    stream: &mut TcpStream,
+    service_name: &str,
+    error: StartError,
+) -> std::io::Result<()> {
+    match error {
+        StartError::Forbidden => write_plain(
+            stream,
+            403,
+            "Error: Forbidden\nYour client does not have permission to get URL from this server.\n",
+        )
+        .await,
+        StartError::Gone => {
+            write_plain(
+                stream,
+                404,
+                &format!("Cloud Run service {service_name} not found\n"),
+            )
+            .await
+        }
+        StartError::NotRunnable(msg) => write_plain(stream, 503, &format!("{msg}\n")).await,
+        e => write_plain(stream, 503, &format!("Service Unavailable: {e}\n")).await,
+    }
 }
 
 fn is_upgrade(head: &Head) -> bool {
@@ -685,7 +704,7 @@ pub async fn process(server: &Arc<Server>, req: &Request) -> Reply {
             let revision = format!("{service}/revisions/{r}");
             match m {
                 "GET" => server.get_revision(&revision),
-                "DELETE" => server.delete_revision(&service, &revision, &query),
+                "DELETE" => server.delete_revision(&service, &revision, &query).await,
                 _ => not_allowed(),
             }
         }
