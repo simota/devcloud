@@ -44,7 +44,11 @@ Strict mode checks header-signed and presigned requests for SigV4
 `X-Amz-Region-Set`), and SigV2 (`Authorization: AWS ...` and query-string
 `AWSAccessKeyId`/`Expires`/`Signature`), the payload hash, and SigV4
 `aws-chunked` uploads (`STREAMING-AWS4-HMAC-SHA256-PAYLOAD[-TRAILER]`, whose
-chunks and trailer are each verified, and `STREAMING-UNSIGNED-PAYLOAD-TRAILER`).
+chunks and trailer are each verified, and `STREAMING-UNSIGNED-PAYLOAD-TRAILER`),
+and SigV4a `aws-chunked` uploads (`STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD[-TRAILER]`,
+whose ECDSA chunk and trailer signatures are each verified; `*`-padded
+signatures are accepted). Streaming payloads on presigned URLs return
+`NotImplemented`.
 It also requires:
 
 - `x-amz-date` (or `Date` for SigV2) within 15 minutes of the server clock
@@ -60,8 +64,7 @@ Strict mode also evaluates bucket policies (`Allow`/`Deny`, `Principal`,
 ACLs (`public-read`, `public-read-write`), allowing anonymous public access when
 granted and enforcing explicit `Deny` statements even on authenticated requests.
 Trailer checksums such as `x-amz-checksum-crc32` are accepted but not validated.
-SigV4a streaming chunked payloads and multi-account IAM/STS session policies are
-not implemented.
+Multi-account IAM/STS session policies are not implemented.
 
 ## CORS
 

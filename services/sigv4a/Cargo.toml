@@ -1,0 +1,14 @@
+[package]
+name = "devcloud-sigv4a"
+version = "0.1.0"
+edition = "2021"
+description = "SigV4a (AWS4-ECDSA-P256-SHA256) key derivation, ECDSA P-256 signing/verification, and aws-chunked chunk-signature chaining shared by the devcloud AWS-compatible services."
+
+[lib]
+name = "devcloud_sigv4a"
+path = "src/lib.rs"
+
+[dependencies]
+sha2 = "0.10"
+hmac = "0.12"
+hex = "0.4"

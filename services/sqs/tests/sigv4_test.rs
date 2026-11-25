@@ -6,9 +6,9 @@
 use std::collections::HashMap;
 
 use devcloud_sqs::sigv4::{
-    aws_percent_encode, canonical_query_string, normalize_header_value, sha256_hex,
-    signature_for_request, verify_signature, Credentials, SignatureError, SignedRequest,
-    SIGV4_ALGORITHM,
+    aws_percent_encode, canonical_query_string, canonical_request, normalize_header_value,
+    sha256_hex, signature_for_request, verify_signature, Credentials, SignatureError,
+    SignedRequest, SIGV4_ALGORITHM,
 };
 
 // --- canonicalization oracle (values captured from legacy) ---
@@ -549,18 +549,197 @@ fn strict_mode_verifies_streaming_payloads() {
         })
     );
 
-    // Unknown STREAMING-* algorithm still returns NotImplemented (501).
+    // SigV4a chunk signatures cannot be chained from an HMAC seed signature.
     assert_eq!(
         run(
-            "STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD",
+            devcloud_sigv4a::STREAMING_PAYLOAD,
             &[],
             None,
             None,
             Some(b"0\r\n\r\n"),
         ),
         Err(SignatureError {
-            code: "NotImplemented",
-            status: 501,
+            code: "AuthorizationHeaderMalformed",
+            status: 400,
         })
     );
+}
+
+// --- SigV4a (AWS4-ECDSA-P256-SHA256) ---
+
+/// Signs a SigV4a request as `dev`/`dev`, frames `chunks` when the payload is
+/// streaming, applies `tamper` to the body, and verifies it under `creds`.
+fn sigv4a_check(
+    creds: &Credentials,
+    payload_hash: &str,
+    chunks: &[&[u8]],
+    trailers: Option<&[(&str, &str)]>,
+    region_set: &str,
+    tamper: fn(&mut Vec<u8>),
+) -> Result<(), SignatureError> {
+    let amz_date = "20261125T000000Z";
+    let scope = devcloud_sigv4a::credential_scope("20261125", "sqs");
+    let signed_headers = "host;x-amz-content-sha256;x-amz-date;x-amz-region-set";
+    let mut hmap = HashMap::new();
+    hmap.insert("x-amz-date".to_string(), amz_date.to_string());
+    hmap.insert("x-amz-region-set".to_string(), region_set.to_string());
+    hmap.insert("x-amz-content-sha256".to_string(), payload_hash.to_string());
+    let header_fn = move |name: &str| hmap.get(name).cloned();
+    let mut req = SignedRequest {
+        method: "POST",
+        path: "/",
+        query: "",
+        host: "127.0.0.1:9324",
+        authorization: "",
+        amz_date,
+        content_sha256: payload_hash,
+        header: &header_fn,
+        body: b"",
+    };
+    let key = devcloud_sigv4a::SigningKey::derive("dev", "dev").unwrap();
+    let canonical = canonical_request(&req, signed_headers, payload_hash);
+    let seed = key.sign(devcloud_sigv4a::string_to_sign(amz_date, &scope, &canonical).as_bytes());
+    let auth = format!(
+        "AWS4-ECDSA-P256-SHA256 Credential=dev/{scope}, SignedHeaders={signed_headers}, Signature={seed}"
+    );
+    let mut body = if devcloud_sigv4a::is_streaming(payload_hash) {
+        let mut chain = devcloud_sigv4a::ChunkChain::new(key, amz_date, &scope, &seed);
+        devcloud_sigv4a::encode_signed_chunks(&mut chain, chunks, trailers, true)
+    } else {
+        chunks.concat()
+    };
+    tamper(&mut body);
+    req.authorization = &auth;
+    req.body = &body;
+    verify_signature(&req, creds)
+}
+
+#[test]
+fn sigv4a_header_and_streaming_payloads_verify() {
+    use devcloud_sqs::sigv4::STREAMING_SIGNED;
+
+    let strict = strict_creds();
+    let wrong_secret = Credentials {
+        secret_access_key: "other",
+        ..strict_creds()
+    };
+    let relaxed = Credentials {
+        auth_mode: "relaxed",
+        ..strict_creds()
+    };
+    let keep: fn(&mut Vec<u8>) = |_| {};
+    let flip_data: fn(&mut Vec<u8>) = |body| {
+        let at = body.windows(5).position(|w| w == b"hello").unwrap();
+        body[at] = b'j';
+    };
+    let trailer = [("x-amz-checksum-crc32", "AAAA")];
+    let streaming = devcloud_sigv4a::STREAMING_PAYLOAD;
+    let streaming_trailer = devcloud_sigv4a::STREAMING_PAYLOAD_TRAILER;
+    let body_hash = sha256_hex(b"hello world");
+    let malformed = Err(SignatureError {
+        code: "AuthorizationHeaderMalformed",
+        status: 400,
+    });
+    let mismatch = Err(SignatureError {
+        code: "SignatureDoesNotMatch",
+        status: 403,
+    });
+
+    for (name, creds, hash, trailers, region_set, tamper, expected) in [
+        (
+            "signed body",
+            &strict,
+            body_hash.as_str(),
+            None,
+            "*",
+            keep,
+            Ok(()),
+        ),
+        (
+            "unsigned payload",
+            &strict,
+            "UNSIGNED-PAYLOAD",
+            None,
+            "us-east-1",
+            keep,
+            Ok(()),
+        ),
+        (
+            "streaming",
+            &strict,
+            streaming,
+            None,
+            "eu-west-1,us-east-1",
+            keep,
+            Ok(()),
+        ),
+        (
+            "streaming trailer",
+            &strict,
+            streaming_trailer,
+            Some(&trailer[..]),
+            "*",
+            keep,
+            Ok(()),
+        ),
+        ("relaxed", &relaxed, streaming, None, "*", flip_data, Ok(())),
+        (
+            "tampered chunk",
+            &strict,
+            streaming,
+            None,
+            "*",
+            flip_data,
+            mismatch.clone(),
+        ),
+        (
+            "tampered body",
+            &strict,
+            body_hash.as_str(),
+            None,
+            "*",
+            flip_data,
+            mismatch.clone(),
+        ),
+        (
+            "wrong secret",
+            &wrong_secret,
+            streaming,
+            None,
+            "*",
+            keep,
+            mismatch.clone(),
+        ),
+        (
+            "region set",
+            &strict,
+            streaming,
+            None,
+            "eu-west-1",
+            keep,
+            malformed.clone(),
+        ),
+        (
+            "hmac chain with ecdsa seed",
+            &strict,
+            STREAMING_SIGNED,
+            None,
+            "*",
+            keep,
+            malformed.clone(),
+        ),
+    ] {
+        assert_eq!(
+            sigv4a_check(
+                creds,
+                hash,
+                &[b"hello ", b"world"],
+                trailers,
+                region_set,
+                tamper
+            ),
+            expected,
+            "{name}"
+        );
+    }
 }

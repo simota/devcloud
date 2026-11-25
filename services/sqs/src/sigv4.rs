@@ -4,8 +4,10 @@
 //! error codes + HTTP statuses the legacy server returns. Relaxed mode (default)
 //! accepts everything; strict mode performs a full canonical-request signature
 //! comparison. The signer is exposed (`signature_for_request`) so tests can sign
-//! a request and assert round-trip acceptance.
+//! a request and assert round-trip acceptance. SigV4a (`AWS4-ECDSA-P256-SHA256`)
+//! headers and their `aws-chunked` chunk signatures are verified too.
 
+use devcloud_sigv4a::{ChunkChain, SigningKey};
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 
@@ -70,6 +72,9 @@ pub fn verify_signature(req: &SignedRequest, creds: &Credentials) -> Result<(), 
     if auth.is_empty() {
         return Err(err("AccessDenied", 403));
     }
+    if devcloud_sigv4a::is_authorization(auth) {
+        return verify_sigv4a(req, auth, creds);
+    }
     let prefix = format!("{SIGV4_ALGORITHM} ");
     if !auth.starts_with(&prefix) {
         return Err(err("AuthorizationHeaderMalformed", 400));
@@ -88,7 +93,8 @@ pub fn verify_signature(req: &SignedRequest, creds: &Credentials) -> Result<(), 
     if !valid_credential(&access_key, &region, &service, creds) {
         return Err(err("InvalidAccessKeyId", 403));
     }
-    if req.amz_date.is_empty() {
+    // SigV4a chunk signatures need a SigV4a seed signature.
+    if req.amz_date.is_empty() || devcloud_sigv4a::is_streaming(req.content_sha256) {
         return Err(err("AuthorizationHeaderMalformed", 400));
     }
     let payload_hash = if req.content_sha256.is_empty() {
@@ -117,6 +123,63 @@ pub fn verify_signature(req: &SignedRequest, creds: &Credentials) -> Result<(), 
     Ok(())
 }
 
+/// SigV4a (`AWS4-ECDSA-P256-SHA256`) verification: the scope has no region
+/// (`X-Amz-Region-Set` must cover the configured one) and the signature is
+/// ECDSA P-256 over the same canonical request.
+fn verify_sigv4a(
+    req: &SignedRequest,
+    auth: &str,
+    creds: &Credentials,
+) -> Result<(), SignatureError> {
+    let malformed = || err("AuthorizationHeaderMalformed", 400);
+    let parsed = devcloud_sigv4a::parse_authorization(auth).ok_or_else(malformed)?;
+    if parsed.access_key != default_str(creds.access_key_id, "dev")
+        || parsed.service != SIGV4_SERVICE
+    {
+        return Err(err("InvalidAccessKeyId", 403));
+    }
+    let region_set = (req.header)("x-amz-region-set").unwrap_or_default();
+    // An ECDSA seed signature cannot start an HMAC chunk chain.
+    if req.amz_date.is_empty()
+        || !devcloud_sigv4a::region_set_matches(&region_set, default_str(creds.region, "us-east-1"))
+        || matches!(
+            req.content_sha256,
+            STREAMING_SIGNED | STREAMING_SIGNED_TRAILER
+        )
+    {
+        return Err(malformed());
+    }
+    let payload_hash = if req.content_sha256.is_empty() {
+        "UNSIGNED-PAYLOAD"
+    } else {
+        verify_payload_hash(req, req.content_sha256)?;
+        req.content_sha256
+    };
+    let canonical = canonical_request(req, parsed.signed_headers, payload_hash);
+    let scope = devcloud_sigv4a::credential_scope(parsed.date_stamp, SIGV4_SERVICE);
+    let string_to_sign = devcloud_sigv4a::string_to_sign(req.amz_date, &scope, &canonical);
+    let mismatch = || err("SignatureDoesNotMatch", 403);
+    let key = SigningKey::derive(
+        parsed.access_key,
+        default_str(creds.secret_access_key, "dev"),
+    )
+    .ok_or_else(mismatch)?;
+    if !key.verify(string_to_sign.as_bytes(), parsed.signature) {
+        return Err(mismatch());
+    }
+    if devcloud_sigv4a::is_streaming(payload_hash) {
+        let body = parse_chunked_body(req.body).ok_or_else(malformed)?;
+        let chain = ChunkChain::new(key, req.amz_date, &scope, parsed.signature);
+        let trailer = (payload_hash == devcloud_sigv4a::STREAMING_PAYLOAD_TRAILER)
+            .then_some((body.trailer_signature, body.trailers.as_slice()));
+        let chunks = body.chunks.iter().map(|c| (c.signature, c.data));
+        if !devcloud_sigv4a::verify_chunk_chain(chain, chunks, trailer) {
+            return Err(mismatch());
+        }
+    }
+    Ok(())
+}
+
 fn valid_credential(access_key: &str, region: &str, service: &str, creds: &Credentials) -> bool {
     access_key == default_str(creds.access_key_id, "dev")
         && region == default_str(creds.region, "us-east-1")
@@ -129,7 +192,11 @@ fn verify_payload_hash(req: &SignedRequest, payload_hash: &str) -> Result<(), Si
     }
     if matches!(
         payload_hash,
-        STREAMING_SIGNED | STREAMING_SIGNED_TRAILER | STREAMING_UNSIGNED_TRAILER
+        STREAMING_SIGNED
+            | STREAMING_SIGNED_TRAILER
+            | STREAMING_UNSIGNED_TRAILER
+            | devcloud_sigv4a::STREAMING_PAYLOAD
+            | devcloud_sigv4a::STREAMING_PAYLOAD_TRAILER
     ) {
         verify_chunked_framing(req)?;
         return Ok(());
@@ -307,15 +374,7 @@ pub fn signature_for_request(
     payload_hash: &str,
     creds: &Credentials,
 ) -> String {
-    let canonical_request = [
-        req.method,
-        &canonical_uri(req.path),
-        &canonical_query_string(req.query),
-        &canonical_headers(req, signed_headers),
-        &signed_headers.to_ascii_lowercase(),
-        payload_hash,
-    ]
-    .join("\n");
+    let canonical_request = canonical_request(req, signed_headers, payload_hash);
     let scope = [date_stamp, region, SIGV4_SERVICE, "aws4_request"].join("/");
     let string_to_sign = [
         SIGV4_ALGORITHM,
@@ -326,6 +385,19 @@ pub fn signature_for_request(
     .join("\n");
     let key = derive_signing_key(creds.secret_access_key, date_stamp, region);
     hex_lower(&hmac_sha256(&key, string_to_sign.as_bytes()))
+}
+
+/// The SigV4 canonical request (shared by SigV4 and SigV4a). Public so tests can sign.
+pub fn canonical_request(req: &SignedRequest, signed_headers: &str, payload_hash: &str) -> String {
+    [
+        req.method,
+        &canonical_uri(req.path),
+        &canonical_query_string(req.query),
+        &canonical_headers(req, signed_headers),
+        &signed_headers.to_ascii_lowercase(),
+        payload_hash,
+    ]
+    .join("\n")
 }
 
 fn parse_credential_scope(credential: &str) -> Option<(String, String, String, String)> {

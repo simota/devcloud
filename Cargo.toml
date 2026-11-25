@@ -21,7 +21,13 @@ members = [
   "services/redis-control",
   "services/redshift",
   "services/s3",
+  "services/sigv4a",
   "services/sqs",
   "services/ssm",
   "services/sts",
 ]
+
+# The hand-written P-256 arithmetic is ~50x slower unoptimized, which makes
+# SigV4a tests in every dependent crate take seconds per signature.
+[profile.dev.package.devcloud-sigv4a]
+opt-level = 3
