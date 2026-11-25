@@ -128,6 +128,7 @@ pub struct Server {
     global_tables: BTreeMap<String, crate::global_tables::GlobalTableRecord>,
     dax: crate::dax::DaxState,
     active_caller: Option<String>,
+    active_auth_mode: Option<String>,
     load_err: Option<String>,
     /// Encoded (HTML-escaped, no trailing newline) `PersistedTable` JSON per
     /// table, valid as of the last successful `persist()`. Reused verbatim
@@ -158,6 +159,7 @@ impl Server {
             global_tables: BTreeMap::new(),
             dax: crate::dax::DaxState::default(),
             active_caller: None,
+            active_auth_mode: None,
             load_err: None,
             table_cache: BTreeMap::new(),
             dirty_tables: std::collections::BTreeSet::new(),
@@ -178,6 +180,19 @@ impl Server {
         self.active_caller = access_key;
     }
 
+    /// Sets the transient auth mode for the current dispatched request.
+    pub fn set_active_auth_mode(&mut self, auth_mode: Option<String>) {
+        self.active_auth_mode = auth_mode;
+    }
+
+    fn enforces_iam_policy(&self) -> bool {
+        let mode = self
+            .active_auth_mode
+            .as_deref()
+            .unwrap_or(&self.config.auth_mode);
+        mode.eq_ignore_ascii_case("strict")
+    }
+
     fn caller_identity(&self) -> crate::iam::CallerIdentity {
         let key = self
             .active_caller
@@ -192,6 +207,9 @@ impl Server {
         action: &str,
         build: impl FnOnce(&TableState, &mut crate::iam::EvalContext),
     ) -> Result<(), ApiError> {
+        if !self.enforces_iam_policy() {
+            return Ok(());
+        }
         let Some(state) = self.tables.get(table_name) else {
             return Ok(());
         };

@@ -98,7 +98,9 @@ impl Server {
             .and_then(|req| req.headers.get("authorization"))
             .and_then(|auth| crate::iam::access_key_from_auth_header(auth));
         self.set_active_caller(caller_override);
+        self.set_active_auth_mode(Some(creds_mode.to_string()));
         let outcome = self.dispatch_dynamodb_op(op, body);
+        self.set_active_auth_mode(None);
         self.set_active_caller(None);
         outcome
     }

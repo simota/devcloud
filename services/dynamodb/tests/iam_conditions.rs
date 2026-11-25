@@ -15,15 +15,19 @@ use devcloud_dynamodb::requests::{
     TagResourceRequest, TransactGet, TransactGetItem, TransactGetItemsRequest, UpdateItemRequest,
 };
 use devcloud_dynamodb::server::{Config, Server};
-use devcloud_dynamodb::sigv4::SignedRequest;
+use devcloud_dynamodb::sigv4::{signature_for_request, Credentials, SignedRequest};
 use serde_json::{json, Value};
 
 const ARN: &str = "arn:aws:dynamodb:us-east-1:000000000000:table/Docs";
 
 fn server(dir: &std::path::Path) -> Server {
+    server_with_mode(dir, "strict")
+}
+
+fn server_with_mode(dir: &std::path::Path, auth_mode: &str) -> Server {
     let mut s = Server::new(Config {
         region: "us-east-1".to_string(),
-        auth_mode: "relaxed".to_string(),
+        auth_mode: auth_mode.to_string(),
         access_key_id: "alice".to_string(),
         secret_access_key: "dev".to_string(),
         storage_path: dir.to_string_lossy().to_string(),
@@ -235,30 +239,95 @@ fn leading_keys_condition_enforced_with_policy_variable_and_denies_scan() {
         "AccessDeniedException"
     );
 
-    // Dispatch extracts principal from SigV4 Authorization header even in relaxed mode.
-    let mut headers = BTreeMap::new();
-    headers.insert(
-        "authorization".to_string(),
-        "AWS4-HMAC-SHA256 Credential=bob/20260501/us-east-1/dynamodb/aws4_request, SignedHeaders=host, Signature=00"
-            .to_string(),
-    );
-    let body = br#"{"TableName":"Docs","Key":{"pk":{"S":"bob"},"sk":{"S":"1"}}}"#;
-    let signed = SignedRequest {
+    // Strict-mode dispatch verifies SigV4 and extracts the principal from Authorization.
+    let make_signed_headers = |body: &[u8], target: &str| {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(body);
+        let payload_hash = hex::encode(hasher.finalize());
+        let date_stamp = "20260501";
+        let amz_date = "20260501T000000Z";
+        let signed_headers = "content-type;host;x-amz-content-sha256;x-amz-date;x-amz-target";
+        let mut h = BTreeMap::new();
+        h.insert(
+            "content-type".to_string(),
+            "application/x-amz-json-1.0".to_string(),
+        );
+        h.insert("x-amz-content-sha256".to_string(), payload_hash.clone());
+        h.insert("x-amz-date".to_string(), amz_date.to_string());
+        h.insert("x-amz-target".to_string(), target.to_string());
+        let creds = Credentials {
+            auth_mode: "strict",
+            region: "us-east-1",
+            access_key_id: "alice",
+            secret_access_key: "dev",
+        };
+        let unsigned = SignedRequest {
+            method: "POST",
+            path: "/",
+            query: "",
+            host: "127.0.0.1:18000",
+            headers: &h,
+            body,
+        };
+        let sig = signature_for_request(
+            &creds,
+            &unsigned,
+            date_stamp,
+            "us-east-1",
+            signed_headers,
+            &payload_hash,
+        );
+        h.insert(
+            "authorization".to_string(),
+            format!(
+                "AWS4-HMAC-SHA256 Credential=alice/{date_stamp}/us-east-1/dynamodb/aws4_request, SignedHeaders={signed_headers}, Signature={sig}"
+            ),
+        );
+        h
+    };
+
+    let alice_body = br#"{"TableName":"Docs","Key":{"pk":{"S":"alice"},"sk":{"S":"1"}}}"#;
+    let alice_headers = make_signed_headers(alice_body, "DynamoDB_20120810.GetItem");
+    let alice_signed = SignedRequest {
         method: "POST",
         path: "/",
         query: "",
         host: "127.0.0.1:18000",
-        headers: &headers,
-        body,
+        headers: &alice_headers,
+        body: alice_body,
     };
-    let bob_get = s.dispatch(
+    let alice_get = s.dispatch(
         "DynamoDB_20120810.GetItem",
-        body,
-        "relaxed",
-        Some(&signed),
+        alice_body,
+        "strict",
+        Some(&alice_signed),
         1_780_300_000,
     );
-    assert_eq!(bob_get.status, 200);
+    assert_eq!(alice_get.status, 200);
+
+    let bob_body = br#"{"TableName":"Docs","Key":{"pk":{"S":"bob"},"sk":{"S":"1"}}}"#;
+    let bob_headers = make_signed_headers(bob_body, "DynamoDB_20120810.GetItem");
+    let bob_signed = SignedRequest {
+        method: "POST",
+        path: "/",
+        query: "",
+        host: "127.0.0.1:18000",
+        headers: &bob_headers,
+        body: bob_body,
+    };
+    let bob_denied = s.dispatch(
+        "DynamoDB_20120810.GetItem",
+        bob_body,
+        "strict",
+        Some(&bob_signed),
+        1_780_300_000,
+    );
+    assert_eq!(bob_denied.status, 400);
+    assert_eq!(
+        bob_denied.error_type.as_deref(),
+        Some("AccessDeniedException")
+    );
 
     // Deleting the resource policy restores open access.
     s.delete_resource_policy(&ResourceArnRequest {
@@ -546,7 +615,7 @@ fn numeric_null_ifexists_batch_write_transact_write_and_batch_partiql() {
     let dir = tempdir();
     let mut s = Server::new(Config {
         region: "us-east-1".to_string(),
-        auth_mode: "relaxed".to_string(),
+        auth_mode: "strict".to_string(),
         access_key_id: "alice".to_string(),
         storage_path: dir.to_string_lossy().to_string(),
         ..Default::default()
@@ -703,6 +772,82 @@ fn numeric_null_ifexists_batch_write_transact_write_and_batch_partiql() {
         .expect_err("etx denied")
         .name,
         "AccessDeniedException"
+    );
+}
+
+#[test]
+fn relaxed_mode_keeps_resource_policy_metadata_only() {
+    let dir = tempdir();
+    let mut s = server_with_mode(&dir, "relaxed");
+
+    // Attach a deny-all resource policy.
+    put_policy(
+        &mut s,
+        json!({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Deny",
+                "Principal": "*",
+                "Action": "dynamodb:*",
+                "Resource": "*"
+            }]
+        }),
+    );
+
+    // Direct PutItem and GetItem still succeed in relaxed mode.
+    let mut item = Item::new();
+    item.insert("pk".to_string(), json!({"S": "charlie"}));
+    item.insert("sk".to_string(), json!({"S": "1"}));
+    item.insert("title".to_string(), json!({"S": "Charlie Doc"}));
+    s.put_item(&PutItemRequest {
+        table_name: "Docs".to_string(),
+        item,
+        ..Default::default()
+    })
+    .expect("relaxed put succeeds despite deny-all policy");
+
+    let got = s
+        .get_item(&GetItemRequest {
+            table_name: "Docs".to_string(),
+            key: key("charlie", "1"),
+            ..Default::default()
+        })
+        .expect("relaxed get succeeds despite deny-all policy");
+    let got_json: Value = serde_json::from_slice(&got).unwrap();
+    assert_eq!(got_json["Item"]["title"]["S"], "Charlie Doc");
+
+    // Dispatch in relaxed and signed-relaxed modes also keeps resource policies metadata-only.
+    let get_body = br#"{"TableName":"Docs","Key":{"pk":{"S":"charlie"},"sk":{"S":"1"}}}"#;
+    let relaxed_out = s.dispatch(
+        "DynamoDB_20120810.GetItem",
+        get_body,
+        "relaxed",
+        None,
+        1_780_300_000,
+    );
+    assert_eq!(relaxed_out.status, 200);
+
+    let signed_relaxed_out = s.dispatch(
+        "DynamoDB_20120810.GetItem",
+        get_body,
+        "signed-relaxed",
+        None,
+        1_780_300_000,
+    );
+    assert_eq!(signed_relaxed_out.status, 200);
+
+    // Same server + policy enforced when dispatched in strict mode.
+    let strict_out = s.dispatch(
+        "DynamoDB_20120810.GetItem",
+        get_body,
+        "strict",
+        None,
+        1_780_300_000,
+    );
+    assert_eq!(strict_out.status, 400);
+    assert_eq!(
+        strict_out.error_type.as_deref(),
+        Some("AccessDeniedException")
     );
 }
 
