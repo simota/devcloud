@@ -70,6 +70,12 @@ impl FileBucketStore {
         self.put_object_locked(input)
     }
 
+    /// Stores an object encrypted at rest with an SSE-C customer key.
+    pub fn put_object_with_sse_c(&self, input: PutObjectInput, key: &[u8; 32]) -> Result<Object> {
+        let _guard = self.lock_object_writes();
+        self.put_object_inner_locked(input, "", Some(key), None)
+    }
+
     /// Checks the current object and stores its replacement under one shared
     /// root write lock. Missing objects and delete markers are passed as None.
     /// The predicate must not call any locking API on a store over this root.
@@ -83,8 +89,20 @@ impl FileBucketStore {
         Ok(self.put_object_locked(input)?)
     }
 
+    /// Like `put_object_if`, optionally encrypting the stored body with SSE-C.
+    pub fn put_object_if_with_sse_c<E>(
+        &self,
+        input: PutObjectInput,
+        sse_c_key: Option<&[u8; 32]>,
+        predicate: impl FnOnce(Option<&Object>) -> std::result::Result<(), E>,
+    ) -> std::result::Result<Object, ConditionalError<E>> {
+        let _guard = self.lock_object_writes();
+        self.check_current_object_locked(&input.bucket, &input.key, predicate)?;
+        Ok(self.put_object_inner_locked(input, "", sse_c_key, None)?)
+    }
+
     /// The caller must retain the root write lock through the mutation.
-    fn check_current_object_locked<E>(
+    pub(crate) fn check_current_object_locked<E>(
         &self,
         bucket: &str,
         key: &str,
@@ -98,13 +116,33 @@ impl FileBucketStore {
 
     /// `put_object` for a caller already holding `lock_object_writes`.
     pub(crate) fn put_object_locked(&self, input: PutObjectInput) -> Result<Object> {
-        self.put_object_with_resumable_id_locked(input, "")
+        self.put_object_inner_locked(input, "", None, None)
+    }
+
+    /// Stores a pre-encrypted SSE-C multipart body (already framed) whose
+    /// decrypted plaintext length is `plaintext_size`.
+    pub(crate) fn put_pre_encrypted_object_locked(
+        &self,
+        input: PutObjectInput,
+        plaintext_size: i64,
+    ) -> Result<Object> {
+        self.put_object_inner_locked(input, "", None, Some(plaintext_size))
     }
 
     fn put_object_with_resumable_id_locked(
         &self,
         input: PutObjectInput,
         upload_id: &str,
+    ) -> Result<Object> {
+        self.put_object_inner_locked(input, upload_id, None, None)
+    }
+
+    fn put_object_inner_locked(
+        &self,
+        input: PutObjectInput,
+        upload_id: &str,
+        sse_c_key: Option<&[u8; 32]>,
+        pre_encrypted_size: Option<i64>,
     ) -> Result<Object> {
         if !valid_bucket_name(&input.bucket) {
             return Err(StoreError::InvalidBucketName);
@@ -121,19 +159,27 @@ impl FileBucketStore {
             Err(ContentMd5Error::Mismatch) => return Err(StoreError::ContentMd5Mismatch),
         }
 
+        let size = pre_encrypted_size.unwrap_or(input.body.len() as i64);
+        let etag = md5_etag(&input.body);
+        let crc32c = crc32c_base64(&input.body);
+        let disk_body = match sse_c_key {
+            Some(key) => crate::sse_c::encrypt_frame(key, &input.body),
+            None => input.body,
+        };
+
         let now = self.now();
         let mut object = Object {
             bucket: input.bucket.clone(),
             key: input.key.clone(),
-            etag: md5_etag(&input.body),
-            size: input.body.len() as i64,
+            etag,
+            size,
             created_at: now.clone(),
             last_modified: now.clone(),
             updated_at: now.clone(),
             metageneration: 1,
             content_type: input.content_type.clone(),
             content_encoding: input.content_encoding.clone(),
-            crc32c: crc32c_base64(&input.body),
+            crc32c,
             cache_control: input.cache_control.clone(),
             content_disposition: input.content_disposition.clone(),
             metadata: clean_metadata(&input.metadata),
@@ -158,10 +204,10 @@ impl FileBucketStore {
         let path = self.object_path(&input.bucket, &input.key);
         fs::create_dir_all(&path)?;
         self.preserve_current_resumable_upload(&input.bucket, &input.key)?;
-        write_atomic(&path.join("body"), &input.body)?;
+        write_atomic(&path.join("body"), &disk_body)?;
         Self::write_json(&path.join("object.json"), &object)?;
         if !object.version_id.is_empty() {
-            self.write_object_version(&path, &object, &input.body)?;
+            self.write_object_version(&path, &object, &disk_body)?;
         }
         Ok(object)
     }
@@ -771,6 +817,48 @@ impl FileBucketStore {
             other => other,
         });
         Ok(Some(versions))
+    }
+
+    /// Updates the storage class of an object (or a specific version) without
+    /// altering its `last_modified` timestamp. Returns whether it changed.
+    pub(crate) fn update_object_storage_class(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: &str,
+        storage_class: &str,
+    ) -> Result<bool> {
+        let _guard = self.lock_object_writes();
+        self.require_bucket_and_key(bucket, key)?;
+        let obj_path = self.object_path(bucket, key);
+        let mut changed = false;
+
+        if !version_id.is_empty() {
+            let v_path = Self::version_path(&obj_path, version_id)?.join("object.json");
+            if let Some(mut v_obj) = read_object(&v_path)? {
+                if !v_obj.delete_marker && v_obj.effective_storage_class() != storage_class {
+                    v_obj.storage_class = storage_class.to_string();
+                    Self::write_json(&v_path, &v_obj)?;
+                    changed = true;
+                }
+            }
+        }
+
+        let cur_path = obj_path.join("object.json");
+        if let Some(mut cur_obj) = read_object(&cur_path)? {
+            let matches_current = version_id.is_empty()
+                || cur_obj.version_id == version_id
+                || (version_id == NULL_VERSION_ID && cur_obj.version_id.is_empty());
+            if matches_current
+                && !cur_obj.delete_marker
+                && cur_obj.effective_storage_class() != storage_class
+            {
+                cur_obj.storage_class = storage_class.to_string();
+                Self::write_json(&cur_path, &cur_obj)?;
+                changed = true;
+            }
+        }
+        Ok(changed)
     }
 
     // --- version internals --------------------------------------------------

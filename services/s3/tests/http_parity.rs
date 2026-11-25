@@ -465,12 +465,13 @@ fn bucket_lifecycle_subresource_persists_deletes_and_rejects_transitions() {
         .contains("<Code>NoSuchLifecycleConfiguration</Code>"));
 
     let transition = br#"<LifecycleConfiguration><Rule><ID>transition</ID><Status>Enabled</Status><Expiration><Days>30</Days></Expiration><Transition><Days>1</Days><StorageClass>GLACIER</StorageClass></Transition></Rule></LifecycleConfiguration>"#;
-    let unsupported = Request::new("PUT", "/data?lifecycle", transition.to_vec());
-    let unsupported_resp = route(&store, &unsupported);
-    assert_eq!(unsupported_resp.status, 501);
-    assert!(String::from_utf8(unsupported_resp.body)
-        .unwrap()
-        .contains("<Code>NotImplemented</Code>"));
+    let supported = Request::new("PUT", "/data?lifecycle", transition.to_vec());
+    assert_eq!(route(&store, &supported).status, 200);
+    let got_transition = route(&store, &req("GET", "/data?lifecycle"));
+    assert_eq!(got_transition.status, 200);
+    let body = String::from_utf8(got_transition.body).unwrap();
+    assert!(body
+        .contains("<Transition><Days>1</Days><StorageClass>GLACIER</StorageClass></Transition>"));
 }
 
 #[test]
@@ -1208,12 +1209,26 @@ fn select_object_content_supports_csv_json_and_rejects_unsupported_sql() {
         "{\"age\":31,\"name\":\"alice\"}\n{\"age\":28,\"name\":\"bob\"}\n"
     );
 
+    let filtered = route(
+        &store,
+        &Request::new(
+            "POST",
+            "/demo-bucket/reports/users.csv?select&select-type=2",
+            br#"<SelectObjectContentRequest><Expression>SELECT name FROM S3Object WHERE age &gt; 30</Expression><ExpressionType>SQL</ExpressionType><InputSerialization><CSV><FileHeaderInfo>USE</FileHeaderInfo></CSV></InputSerialization><OutputSerialization><CSV /></OutputSerialization></SelectObjectContentRequest>"#.to_vec(),
+        ),
+    );
+    assert_eq!(filtered.status, 200);
+    assert_eq!(
+        String::from_utf8(event_stream_records(&filtered.body)).unwrap(),
+        "alice\n"
+    );
+
     let unsupported = route(
         &store,
         &Request::new(
             "POST",
             "/demo-bucket/reports/users.csv?select&select-type=2",
-            br#"<SelectObjectContentRequest><Expression>SELECT name FROM S3Object WHERE age &gt; 30</Expression><ExpressionType>SQL</ExpressionType><InputSerialization><CSV /></InputSerialization><OutputSerialization><CSV /></OutputSerialization></SelectObjectContentRequest>"#.to_vec(),
+            br#"<SelectObjectContentRequest><Expression>SELECT name FROM S3Object GROUP BY name</Expression><ExpressionType>SQL</ExpressionType><InputSerialization><CSV><FileHeaderInfo>USE</FileHeaderInfo></CSV></InputSerialization><OutputSerialization><CSV /></OutputSerialization></SelectObjectContentRequest>"#.to_vec(),
         ),
     );
     assert_eq!(unsupported.status, 501);
@@ -1539,12 +1554,17 @@ fn put_object_if_none_match_rejects_existing_current_object() {
     assert!(body.contains("<Code>PreconditionFailed</Code>"));
     assert_eq!(route(&store, &req("GET", "/data/lock")).body, b"first");
 
-    let unsupported = route(&store, &if_none_match_put("/data/other", b"x", "\"etag\""));
-    assert_eq!(unsupported.status, 501);
-    assert!(String::from_utf8(unsupported.body)
-        .unwrap()
-        .contains("<Code>NotImplemented</Code>"));
-    assert_eq!(route(&store, &req("GET", "/data/other")).status, 404);
+    let created_etag = created.headers.get("ETag").unwrap().clone();
+    let etag_conflict = route(
+        &store,
+        &if_none_match_put("/data/lock", b"second", &created_etag),
+    );
+    assert_eq!(etag_conflict.status, 412);
+    assert_eq!(route(&store, &req("GET", "/data/lock")).body, b"first");
+
+    let non_matching_etag = route(&store, &if_none_match_put("/data/other", b"x", "\"etag\""));
+    assert_eq!(non_matching_etag.status, 200);
+    assert_eq!(route(&store, &req("GET", "/data/other")).body, b"x");
 
     assert_eq!(route(&store, &req("DELETE", "/data/lock")).status, 204);
     let recreated = route(&store, &if_none_match_put("/data/lock", b"third", "*"));
@@ -1823,11 +1843,23 @@ fn copy_object_if_none_match_guards_destination_and_source() {
         .contains("<Code>PreconditionFailed</Code>"));
     assert_eq!(route(&store, &req("GET", "/data/dst")).body, b"source");
 
-    let unsupported = route(
+    let dst_etag = route(&store, &req("HEAD", "/data/dst"))
+        .headers
+        .get("ETag")
+        .unwrap()
+        .clone();
+    let dst_etag_conflict = route(
+        &store,
+        &with_header(copy("/data/dst"), "if-none-match", &dst_etag),
+    );
+    assert_eq!(dst_etag_conflict.status, 412);
+
+    let dst_non_matching = route(
         &store,
         &with_header(copy("/data/dst2"), "if-none-match", &source_etag),
     );
-    assert_eq!(unsupported.status, 501);
+    assert_eq!(dst_non_matching.status, 200);
+    assert_eq!(route(&store, &req("GET", "/data/dst2")).body, b"changed");
 
     let current_etag = route(&store, &req("HEAD", "/data/src"))
         .headers
@@ -1855,4 +1887,611 @@ fn copy_object_if_none_match_guards_destination_and_source() {
     );
     assert_eq!(source_changed.status, 200);
     assert_eq!(route(&store, &req("GET", "/data/dst3")).body, b"changed");
+}
+
+fn sse_c_headers(raw_key: &[u8; 32]) -> (String, String) {
+    use md5::{Digest as _, Md5};
+    let key_b64 = devcloud_s3::base64::std_encode(raw_key);
+    let md5_b64 = devcloud_s3::base64::std_encode(Md5::digest(raw_key).as_slice());
+    (key_b64, md5_b64)
+}
+
+fn with_sse_c(mut req: Request, raw_key: &[u8; 32]) -> Request {
+    let (key_b64, md5_b64) = sse_c_headers(raw_key);
+    req.headers.insert(
+        "x-amz-server-side-encryption-customer-algorithm".to_string(),
+        "AES256".to_string(),
+    );
+    req.headers.insert(
+        "x-amz-server-side-encryption-customer-key".to_string(),
+        key_b64,
+    );
+    req.headers.insert(
+        "x-amz-server-side-encryption-customer-key-md5".to_string(),
+        md5_b64,
+    );
+    req
+}
+
+#[test]
+fn sse_c_encrypts_at_rest_and_supports_get_head_range_copy_select_and_multipart() {
+    let root = tempdir();
+    let store = FileBucketStore::new(&root);
+    assert_eq!(route(&store, &req("PUT", "/sec")).status, 200);
+
+    let key1 = [0x11u8; 32];
+    let key2 = [0x22u8; 32];
+    let (key1_b64, key1_md5) = sse_c_headers(&key1);
+    let (_, key2_md5) = sse_c_headers(&key2);
+
+    // PutObject with SSE-C.
+    let put = with_sse_c(
+        Request::new(
+            "PUT",
+            "/sec/secret.csv",
+            b"name,age\nalice,31\nbob,28\n".to_vec(),
+        ),
+        &key1,
+    );
+    let put_resp = route(&store, &put);
+    assert_eq!(put_resp.status, 200);
+    assert_eq!(
+        put_resp
+            .headers
+            .get("x-amz-server-side-encryption-customer-algorithm")
+            .unwrap(),
+        "AES256"
+    );
+    assert_eq!(
+        put_resp
+            .headers
+            .get("x-amz-server-side-encryption-customer-key-MD5")
+            .unwrap(),
+        &key1_md5
+    );
+    assert!(!put_resp
+        .headers
+        .contains_key("x-amz-server-side-encryption-customer-key"));
+
+    // Verify raw body on disk is encrypted and customer key is never written to metadata.
+    let obj_dir = store.object_path("sec", "secret.csv");
+    let disk_body = std::fs::read(obj_dir.join("body")).unwrap();
+    assert!(!disk_body.windows(5).any(|w| w == b"alice"));
+    let disk_meta = std::fs::read_to_string(obj_dir.join("object.json")).unwrap();
+    assert!(!disk_meta.contains(&key1_b64));
+    assert!(disk_meta.contains(&key1_md5));
+
+    // Missing SSE-C key on GET/HEAD -> 400 InvalidRequest.
+    let no_key = route(&store, &req("GET", "/sec/secret.csv"));
+    assert_eq!(no_key.status, 400);
+    assert!(String::from_utf8(no_key.body)
+        .unwrap()
+        .contains("<Code>InvalidRequest</Code>"));
+
+    // Wrong SSE-C key -> 403 AccessDenied.
+    assert_eq!(
+        route(&store, &with_sse_c(req("GET", "/sec/secret.csv"), &key2)).status,
+        403
+    );
+    assert_eq!(
+        route(&store, &with_sse_c(req("HEAD", "/sec/secret.csv"), &key2)).status,
+        403
+    );
+
+    // Correct SSE-C key -> 200 with decrypted body and Range support.
+    let got = route(&store, &with_sse_c(req("GET", "/sec/secret.csv"), &key1));
+    assert_eq!(got.status, 200);
+    assert_eq!(got.body, b"name,age\nalice,31\nbob,28\n");
+    assert_eq!(
+        got.headers
+            .get("x-amz-server-side-encryption-customer-key-MD5")
+            .unwrap(),
+        &key1_md5
+    );
+
+    let ranged = with_header(
+        with_sse_c(req("GET", "/sec/secret.csv"), &key1),
+        "range",
+        "bytes=9-13",
+    );
+    let ranged_resp = route(&store, &ranged);
+    assert_eq!(ranged_resp.status, 206);
+    assert_eq!(ranged_resp.body, b"alice");
+
+    let head = route(&store, &with_sse_c(req("HEAD", "/sec/secret.csv"), &key1));
+    assert_eq!(head.status, 200);
+    assert_eq!(head.headers.get("Content-Length").unwrap(), "25");
+
+    // S3 Select on SSE-C object works with matching key and rejects without key.
+    let select_xml = br#"<SelectObjectContentRequest><Expression>SELECT name FROM S3Object WHERE age &gt; 30</Expression><ExpressionType>SQL</ExpressionType><InputSerialization><CSV><FileHeaderInfo>USE</FileHeaderInfo></CSV></InputSerialization><OutputSerialization><CSV /></OutputSerialization></SelectObjectContentRequest>"#;
+    let select_no_key = route(
+        &store,
+        &Request::new(
+            "POST",
+            "/sec/secret.csv?select&select-type=2",
+            select_xml.to_vec(),
+        ),
+    );
+    assert_eq!(select_no_key.status, 400);
+    let select_ok = route(
+        &store,
+        &with_sse_c(
+            Request::new(
+                "POST",
+                "/sec/secret.csv?select&select-type=2",
+                select_xml.to_vec(),
+            ),
+            &key1,
+        ),
+    );
+    assert_eq!(select_ok.status, 200);
+    assert_eq!(
+        String::from_utf8(event_stream_records(&select_ok.body)).unwrap(),
+        "alice\n"
+    );
+
+    // CopyObject re-encrypting from key1 to key2.
+    let mut copy_req = with_sse_c(
+        with_header(
+            req("PUT", "/sec/rekeyed.csv"),
+            "x-amz-copy-source",
+            "/sec/secret.csv",
+        ),
+        &key2,
+    );
+    copy_req.headers.insert(
+        "x-amz-copy-source-server-side-encryption-customer-algorithm".to_string(),
+        "AES256".to_string(),
+    );
+    copy_req.headers.insert(
+        "x-amz-copy-source-server-side-encryption-customer-key".to_string(),
+        key1_b64,
+    );
+    copy_req.headers.insert(
+        "x-amz-copy-source-server-side-encryption-customer-key-md5".to_string(),
+        key1_md5,
+    );
+    let copied = route(&store, &copy_req);
+    assert_eq!(copied.status, 200);
+    assert_eq!(
+        copied
+            .headers
+            .get("x-amz-server-side-encryption-customer-key-MD5")
+            .unwrap(),
+        &key2_md5
+    );
+    assert_eq!(
+        route(&store, &with_sse_c(req("GET", "/sec/rekeyed.csv"), &key2)).body,
+        b"name,age\nalice,31\nbob,28\n"
+    );
+
+    // Multipart upload with SSE-C (CompleteMultipartUpload does not require key headers).
+    store.push_version_ids(&["cccccccccccccccccccccccccccccccc"]);
+    let upload_id = "cccccccccccccccccccccccccccccccc";
+    let init = route(
+        &store,
+        &with_sse_c(req("POST", "/sec/multi.bin?uploads"), &key1),
+    );
+    assert_eq!(init.status, 200);
+    // Wrong key on UploadPart -> 403.
+    let bad_part = route(
+        &store,
+        &with_sse_c(
+            Request::new(
+                "PUT",
+                &format!("/sec/multi.bin?uploadId={upload_id}&partNumber=1"),
+                b"hello ".to_vec(),
+            ),
+            &key2,
+        ),
+    );
+    assert_eq!(bad_part.status, 403);
+    assert_eq!(
+        route(
+            &store,
+            &with_sse_c(
+                Request::new(
+                    "PUT",
+                    &format!("/sec/multi.bin?uploadId={upload_id}&partNumber=1"),
+                    b"hello ".to_vec(),
+                ),
+                &key1,
+            ),
+        )
+        .status,
+        200
+    );
+    assert_eq!(
+        route(
+            &store,
+            &with_sse_c(
+                Request::new(
+                    "PUT",
+                    &format!("/sec/multi.bin?uploadId={upload_id}&partNumber=2"),
+                    b"multipart".to_vec(),
+                ),
+                &key1,
+            ),
+        )
+        .status,
+        200
+    );
+    let complete = route(
+        &store,
+        &Request::new(
+            "POST",
+            &format!("/sec/multi.bin?uploadId={upload_id}"),
+            br#"<CompleteMultipartUpload><Part><PartNumber>1</PartNumber></Part><Part><PartNumber>2</PartNumber></Part></CompleteMultipartUpload>"#.to_vec(),
+        ),
+    );
+    assert_eq!(complete.status, 200);
+    let got_multi = route(&store, &with_sse_c(req("GET", "/sec/multi.bin"), &key1));
+    assert_eq!(got_multi.status, 200);
+    assert_eq!(got_multi.body, b"hello multipart");
+
+    // Validation: bad MD5, combining SSE-C with SSE-S3, and unsupported SSE algorithm.
+    let mut bad_md5 = with_sse_c(Request::new("PUT", "/sec/bad", b"x".to_vec()), &key1);
+    bad_md5.headers.insert(
+        "x-amz-server-side-encryption-customer-key-md5".to_string(),
+        key2_md5,
+    );
+    assert_eq!(route(&store, &bad_md5).status, 400);
+
+    let mixed = with_header(
+        with_sse_c(Request::new("PUT", "/sec/mix", b"x".to_vec()), &key1),
+        "x-amz-server-side-encryption",
+        "AES256",
+    );
+    assert_eq!(route(&store, &mixed).status, 400);
+
+    let unsupported_sse = with_header(
+        Request::new("PUT", "/sec/unsup", b"x".to_vec()),
+        "x-amz-server-side-encryption",
+        "AES128",
+    );
+    assert_eq!(route(&store, &unsupported_sse).status, 501);
+}
+
+#[test]
+fn select_object_content_supports_filtering_projections_aggregates_and_cross_format() {
+    let root = tempdir();
+    let store = FileBucketStore::new(&root);
+    assert_eq!(route(&store, &req("PUT", "/sel")).status, 200);
+    assert_eq!(
+        route(
+            &store,
+            &Request::new(
+                "PUT",
+                "/sel/people.csv",
+                b"name,age,city\nalice,31,Tokyo\nbob,28,Osaka\ncharlie,35,\"New, York\"\n".to_vec(),
+            ),
+        )
+        .status,
+        200
+    );
+
+    // Projection + WHERE + LIKE + CSV-to-JSON output.
+    let csv_to_json = route(
+        &store,
+        &Request::new(
+            "POST",
+            "/sel/people.csv?select&select-type=2",
+            br#"<SelectObjectContentRequest><Expression>SELECT UPPER(s.name) AS uname, s.city FROM S3Object s WHERE s.age &gt;= 30 AND s.city LIKE '%o%'</Expression><ExpressionType>SQL</ExpressionType><InputSerialization><CSV><FileHeaderInfo>USE</FileHeaderInfo></CSV></InputSerialization><OutputSerialization><JSON /></OutputSerialization></SelectObjectContentRequest>"#.to_vec(),
+        ),
+    );
+    assert_eq!(csv_to_json.status, 200);
+    assert_eq!(
+        String::from_utf8(event_stream_records(&csv_to_json.body)).unwrap(),
+        "{\"city\":\"Tokyo\",\"uname\":\"ALICE\"}\n{\"city\":\"New, York\",\"uname\":\"CHARLIE\"}\n"
+    );
+
+    // Aggregate query (COUNT, SUM, MAX) + LIMIT on CSV.
+    let agg = route(
+        &store,
+        &Request::new(
+            "POST",
+            "/sel/people.csv?select&select-type=2",
+            br#"<SelectObjectContentRequest><Expression>SELECT COUNT(*), SUM(age), MAX(age) FROM S3Object WHERE age BETWEEN 28 AND 35</Expression><ExpressionType>SQL</ExpressionType><InputSerialization><CSV><FileHeaderInfo>USE</FileHeaderInfo></CSV></InputSerialization><OutputSerialization><CSV /></OutputSerialization></SelectObjectContentRequest>"#.to_vec(),
+        ),
+    );
+    assert_eq!(agg.status, 200);
+    assert_eq!(
+        String::from_utf8(event_stream_records(&agg.body)).unwrap(),
+        "3,94,35\n"
+    );
+
+    // Positional CSV (_1, _2) with FileHeaderInfo=IGNORE and LIMIT.
+    let positional = route(
+        &store,
+        &Request::new(
+            "POST",
+            "/sel/people.csv?select&select-type=2",
+            br#"<SelectObjectContentRequest><Expression>SELECT _1 FROM S3Object WHERE _1 IN ('alice', 'bob') LIMIT 1</Expression><ExpressionType>SQL</ExpressionType><InputSerialization><CSV><FileHeaderInfo>IGNORE</FileHeaderInfo></CSV></InputSerialization><OutputSerialization><CSV /></OutputSerialization></SelectObjectContentRequest>"#.to_vec(),
+        ),
+    );
+    assert_eq!(positional.status, 200);
+    assert_eq!(
+        String::from_utf8(event_stream_records(&positional.body)).unwrap(),
+        "alice\n"
+    );
+
+    // JSON DOCUMENT with nested paths and array indexing, emitting CSV.
+    assert_eq!(
+        route(
+            &store,
+            &Request::new(
+                "PUT",
+                "/sel/items.json",
+                br#"[{"user":{"name":"alice"},"tags":["rust","s3"],"active":true},{"user":{"name":"bob"},"tags":["go"],"active":false}]"#.to_vec(),
+            ),
+        )
+        .status,
+        200
+    );
+    let json_doc = route(
+        &store,
+        &Request::new(
+            "POST",
+            "/sel/items.json?select&select-type=2",
+            br#"<SelectObjectContentRequest><Expression>SELECT s.user.name, s.tags[0] FROM S3Object s WHERE s.active = true</Expression><ExpressionType>SQL</ExpressionType><InputSerialization><JSON><Type>DOCUMENT</Type></JSON></InputSerialization><OutputSerialization><CSV /></OutputSerialization></SelectObjectContentRequest>"#.to_vec(),
+        ),
+    );
+    assert_eq!(json_doc.status, 200);
+    assert_eq!(
+        String::from_utf8(event_stream_records(&json_doc.body)).unwrap(),
+        "alice,rust\n"
+    );
+}
+
+#[test]
+fn lifecycle_transitions_noncurrent_actions_expired_delete_marker_and_abort_multipart() {
+    let root = tempdir();
+    let mut store = FileBucketStore::new(&root);
+    store.set_fixed_now("2026-01-01T00:00:00Z");
+    store.push_version_ids(&[
+        "11111111111111111111111111111111",
+        "22222222222222222222222222222222",
+        "33333333333333333333333333333333",
+        "44444444444444444444444444444444",
+        "55555555555555555555555555555555",
+        "66666666666666666666666666666666",
+    ]);
+
+    assert_eq!(route(&store, &req("PUT", "/lc-bucket")).status, 200);
+    assert_eq!(
+        route(
+            &store,
+            &Request::new(
+                "PUT",
+                "/lc-bucket?versioning",
+                br#"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>"#
+                    .to_vec(),
+            ),
+        )
+        .status,
+        200
+    );
+
+    // Put object under archive/ for current Transition.
+    assert_eq!(
+        route(
+            &store,
+            &Request::new("PUT", "/lc-bucket/archive/a.txt", b"a".to_vec())
+        )
+        .status,
+        200
+    );
+
+    // Put 3 versions under ver/k.txt at different timestamps.
+    assert_eq!(
+        route(
+            &store,
+            &Request::new("PUT", "/lc-bucket/ver/k.txt", b"v1".to_vec())
+        )
+        .status,
+        200
+    );
+    store.set_fixed_now("2026-01-05T00:00:00Z");
+    assert_eq!(
+        route(
+            &store,
+            &Request::new("PUT", "/lc-bucket/ver/k.txt", b"v2".to_vec())
+        )
+        .status,
+        200
+    );
+    store.set_fixed_now("2026-01-10T00:00:00Z");
+    assert_eq!(
+        route(
+            &store,
+            &Request::new("PUT", "/lc-bucket/ver/k.txt", b"v3".to_vec())
+        )
+        .status,
+        200
+    );
+
+    // Create a lone delete marker under dm/gone.txt.
+    let dm_put = route(
+        &store,
+        &Request::new("PUT", "/lc-bucket/dm/gone.txt", b"x".to_vec()),
+    );
+    let dm_ver = dm_put.headers.get("x-amz-version-id").unwrap().clone();
+    assert_eq!(
+        route(&store, &req("DELETE", "/lc-bucket/dm/gone.txt")).status,
+        204
+    );
+    assert_eq!(
+        route(
+            &store,
+            &req(
+                "DELETE",
+                &format!("/lc-bucket/dm/gone.txt?versionId={dm_ver}")
+            )
+        )
+        .status,
+        204
+    );
+
+    // Start an incomplete multipart upload under tmp/upload.bin.
+    assert_eq!(
+        route(&store, &req("POST", "/lc-bucket/tmp/upload.bin?uploads")).status,
+        200
+    );
+
+    // Configure all lifecycle rule actions.
+    let lifecycle_xml = br#"<LifecycleConfiguration>
+        <Rule>
+            <ID>archive-transition</ID>
+            <Filter><Prefix>archive/</Prefix></Filter>
+            <Status>Enabled</Status>
+            <Transition><Days>10</Days><StorageClass>GLACIER</StorageClass></Transition>
+        </Rule>
+        <Rule>
+            <ID>noncurrent-policy</ID>
+            <Filter><Prefix>ver/</Prefix></Filter>
+            <Status>Enabled</Status>
+            <NoncurrentVersionTransition><NoncurrentDays>5</NoncurrentDays><StorageClass>STANDARD_IA</StorageClass></NoncurrentVersionTransition>
+            <NoncurrentVersionExpiration><NoncurrentDays>10</NoncurrentDays><NewerNoncurrentVersions>1</NewerNoncurrentVersions></NoncurrentVersionExpiration>
+        </Rule>
+        <Rule>
+            <ID>clean-dm</ID>
+            <Filter><Prefix>dm/</Prefix></Filter>
+            <Status>Enabled</Status>
+            <Expiration><ExpiredObjectDeleteMarker>true</ExpiredObjectDeleteMarker></Expiration>
+        </Rule>
+        <Rule>
+            <ID>abort-mpu</ID>
+            <Filter><Prefix>tmp/</Prefix></Filter>
+            <Status>Enabled</Status>
+            <AbortIncompleteMultipartUpload><DaysAfterInitiation>7</DaysAfterInitiation></AbortIncompleteMultipartUpload>
+        </Rule>
+    </LifecycleConfiguration>"#;
+    assert_eq!(
+        route(
+            &store,
+            &Request::new("PUT", "/lc-bucket?lifecycle", lifecycle_xml.to_vec())
+        )
+        .status,
+        200
+    );
+
+    // Round-trip GET ?lifecycle contains all rule actions.
+    let get_lc =
+        String::from_utf8(route(&store, &req("GET", "/lc-bucket?lifecycle")).body).unwrap();
+    assert!(get_lc.contains("<StorageClass>GLACIER</StorageClass>"));
+    assert!(get_lc.contains("<NoncurrentVersionTransition>"));
+    assert!(get_lc.contains("<NoncurrentVersionExpiration>"));
+    assert!(get_lc.contains("<ExpiredObjectDeleteMarker>true</ExpiredObjectDeleteMarker>"));
+    assert!(get_lc.contains("<DaysAfterInitiation>7</DaysAfterInitiation>"));
+
+    // Advance clock to 2026-01-20T00:00:00Z and trigger lifecycle via reads/lists.
+    store.set_fixed_now("2026-01-20T00:00:00Z");
+
+    // 1. Current transition applied -> x-amz-storage-class: GLACIER and ListObjects StorageClass.
+    let head = route(&store, &req("HEAD", "/lc-bucket/archive/a.txt"));
+    assert_eq!(head.status, 200);
+    assert_eq!(head.headers.get("x-amz-storage-class").unwrap(), "GLACIER");
+    let list_xml =
+        String::from_utf8(route(&store, &req("GET", "/lc-bucket?prefix=archive/")).body).unwrap();
+    assert!(list_xml.contains("<StorageClass>GLACIER</StorageClass>"));
+
+    // 2. Noncurrent version expiration kept v3 (current) and v2 (1 newer noncurrent, transitioned to STANDARD_IA), expired v1!
+    let ver_xml =
+        String::from_utf8(route(&store, &req("GET", "/lc-bucket?versions&prefix=ver/")).body)
+            .unwrap();
+    assert!(!ver_xml.contains("<VersionId>22222222222222222222222222222222</VersionId>"));
+    assert!(ver_xml.contains("<VersionId>33333333333333333333333333333333</VersionId>"));
+    assert!(ver_xml.contains("<VersionId>44444444444444444444444444444444</VersionId>"));
+    assert!(ver_xml.contains("<StorageClass>STANDARD_IA</StorageClass>"));
+
+    // 3. ExpiredObjectDeleteMarker removed the lone delete marker under dm/.
+    let dm_xml =
+        String::from_utf8(route(&store, &req("GET", "/lc-bucket?versions&prefix=dm/")).body)
+            .unwrap();
+    assert!(!dm_xml.contains("<DeleteMarker>"));
+
+    // 4. AbortIncompleteMultipartUpload aborted the stale multipart upload under tmp/.
+    let uploads_xml =
+        String::from_utf8(route(&store, &req("GET", "/lc-bucket?uploads")).body).unwrap();
+    assert!(!uploads_xml.contains("<Upload>"));
+}
+
+#[test]
+fn conditional_writes_support_etag_values_for_put_copy_and_complete_multipart() {
+    let root = tempdir();
+    let store = FileBucketStore::new(&root);
+    assert_eq!(route(&store, &req("PUT", "/cond")).status, 200);
+
+    let first = route(&store, &Request::new("PUT", "/cond/doc", b"v1".to_vec()));
+    let v1_etag = first.headers.get("ETag").unwrap().clone();
+    let v1_bare = v1_etag.trim_matches('"').to_string();
+
+    // Exact ETag, weak ETag, bare hex, and comma-separated ETag list all fail with 412.
+    for val in [
+        v1_etag.clone(),
+        v1_bare,
+        format!("W/{v1_etag}"),
+        format!("\"other\", {v1_etag}"),
+    ] {
+        let r = route(&store, &if_none_match_put("/cond/doc", b"v2", &val));
+        assert_eq!(r.status, 412, "If-None-Match: {val}");
+    }
+    assert_eq!(route(&store, &req("GET", "/cond/doc")).body, b"v1");
+
+    // Non-matching ETag allows overwrite.
+    let updated = route(&store, &if_none_match_put("/cond/doc", b"v2", "\"other\""));
+    assert_eq!(updated.status, 200);
+    let v2_etag = updated.headers.get("ETag").unwrap().clone();
+    assert_eq!(route(&store, &req("GET", "/cond/doc")).body, b"v2");
+
+    // CompleteMultipartUpload with matching ETag -> 412 (upload retained); non-matching -> 200.
+    store.push_version_ids(&["dddddddddddddddddddddddddddddddd"]);
+    let upload_id = "dddddddddddddddddddddddddddddddd";
+    assert_eq!(route(&store, &req("POST", "/cond/doc?uploads")).status, 200);
+    assert_eq!(
+        route(
+            &store,
+            &Request::new(
+                "PUT",
+                &format!("/cond/doc?uploadId={upload_id}&partNumber=1"),
+                b"v3-multipart".to_vec(),
+            ),
+        )
+        .status,
+        200
+    );
+    let complete_body =
+        br#"<CompleteMultipartUpload><Part><PartNumber>1</PartNumber></Part></CompleteMultipartUpload>"#;
+    let blocked = route(
+        &store,
+        &with_header(
+            Request::new(
+                "POST",
+                &format!("/cond/doc?uploadId={upload_id}"),
+                complete_body.to_vec(),
+            ),
+            "if-none-match",
+            &v2_etag,
+        ),
+    );
+    assert_eq!(blocked.status, 412);
+    assert_eq!(route(&store, &req("GET", "/cond/doc")).body, b"v2");
+
+    let allowed = route(
+        &store,
+        &with_header(
+            Request::new(
+                "POST",
+                &format!("/cond/doc?uploadId={upload_id}"),
+                complete_body.to_vec(),
+            ),
+            "if-none-match",
+            &v1_etag,
+        ),
+    );
+    assert_eq!(allowed.status, 200);
+    assert_eq!(
+        route(&store, &req("GET", "/cond/doc")).body,
+        b"v3-multipart"
+    );
 }

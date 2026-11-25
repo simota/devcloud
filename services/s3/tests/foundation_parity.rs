@@ -114,6 +114,7 @@ fn object_full_matches_oracle() {
             algorithm: "aws:kms".to_string(),
             kms_key_id: "key-1".to_string(),
             bucket_key_enabled: None,
+            ..Default::default()
         },
         retention: ObjectRetention {
             mode: "GOVERNANCE".to_string(),

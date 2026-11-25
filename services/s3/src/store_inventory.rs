@@ -181,10 +181,16 @@ fn inventory_report_row(
                 None => object.last_modified.clone(),
             },
             "ETag" => object.etag.clone(),
-            "StorageClass" => "STANDARD".to_string(),
+            "StorageClass" => object.effective_storage_class().to_string(),
             "VersionId" => object.version_id.clone(),
             "IsLatest" => (latest.get(&object.key) == Some(&object.version_id)).to_string(),
-            "EncryptionStatus" => object.encryption.algorithm.clone(),
+            "EncryptionStatus" => {
+                if object.encryption.is_sse_c() {
+                    "SSE-C".to_string()
+                } else {
+                    object.encryption.algorithm.clone()
+                }
+            }
             "ObjectLockRetainUntilDate" => object.retention.retain_until_date.clone(),
             "ObjectLockRetentionMode" => object.retention.mode.clone(),
             "ObjectLockLegalHoldStatus" => object.legal_hold.status.clone(),

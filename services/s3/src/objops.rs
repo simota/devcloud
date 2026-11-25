@@ -71,6 +71,8 @@ pub fn clean_server_side_encryption(e: &ServerSideEncryption) -> ServerSideEncry
         algorithm: e.algorithm.trim().to_string(),
         kms_key_id: e.kms_key_id.trim().to_string(),
         bucket_key_enabled: e.bucket_key_enabled,
+        customer_algorithm: e.customer_algorithm.trim().to_string(),
+        customer_key_md5: e.customer_key_md5.trim().to_string(),
     }
 }
 
