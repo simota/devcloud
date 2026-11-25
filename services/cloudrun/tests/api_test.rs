@@ -573,6 +573,15 @@ async fn strict_mode_requires_bearer_token_and_invoker_binding() {
     )
     .await;
     assert_eq!(status, 403);
+    let (status, _) = raw_http(
+        port,
+        format!("GET /_run/demo/us-central1/img HTTP/1.1\r\nHost: localhost:{port}\r\n\r\n"),
+    )
+    .await;
+    assert_eq!(
+        status, 403,
+        "the trailing-slash redirect also requires access"
+    );
     // With the bearer token it reaches the (non-runnable) instance → 503.
     let (status, _) = raw_http(port, format!("GET / HTTP/1.1\r\nHost: img.us-central1.demo.run.localhost:{port}\r\nAuthorization: Bearer secret\r\n\r\n")).await;
     assert_eq!(status, 503);
@@ -591,6 +600,24 @@ async fn strict_mode_requires_bearer_token_and_invoker_binding() {
     )
     .await;
     assert_eq!(status, 503);
+
+    // Disabling the default URI hides both aliases, even for an invoker.
+    let (status, _) = call_auth(
+        &server,
+        "PATCH",
+        &format!("{PARENT}/services/img"),
+        json!({"defaultUriDisabled": true}),
+        "Bearer secret",
+    )
+    .await;
+    assert_eq!(status, 200);
+    for request in [
+        format!("GET / HTTP/1.1\r\nHost: img.us-central1.demo.run.localhost:{port}\r\nAuthorization: Bearer secret\r\n\r\n"),
+        format!("GET /_run/demo/us-central1/img/ HTTP/1.1\r\nHost: localhost:{port}\r\n\r\n"),
+    ] {
+        assert_eq!(raw_http(port, request).await.0, 404);
+    }
+    assert!(server.instances.list().await.is_empty());
 
     // Introspection exposes env values and logs: it needs the token too.
     let (status, _) = call(&server, "GET", "/_introspect/services", Value::Null).await;
@@ -791,6 +818,259 @@ async fn malformed_traffic_is_rejected_without_poisoning_state() {
     )
     .await;
     assert_eq!(status, 200);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn splits_traffic_between_live_revisions_and_can_roll_back() {
+    assert!(
+        has_python(),
+        "python3 is required for the local serving test"
+    );
+    let (server, port, dir, stop, task) = serve_on_free_port("split").await;
+    let service = format!("{PARENT}/services/web");
+    let mut blue = service_body("blue");
+    blue["template"]["revision"] = json!("web-blue");
+    assert_eq!(
+        call(
+            &server,
+            "POST",
+            &format!("{PARENT}/services?serviceId=web"),
+            blue
+        )
+        .await
+        .0,
+        200
+    );
+    let mut green = service_body("green");
+    green["template"]["revision"] = json!("web-green");
+    green["traffic"] = json!([
+        { "type": "TRAFFIC_TARGET_ALLOCATION_TYPE_REVISION", "revision": "web-blue", "percent": 75 },
+        { "type": "TRAFFIC_TARGET_ALLOCATION_TYPE_LATEST", "percent": 25 },
+    ]);
+    let (status, op) = call(&server, "PATCH", &service, green).await;
+    assert_eq!(status, 200, "{op}");
+    let statuses = &op["response"]["trafficStatuses"];
+    assert_eq!(statuses[0]["revision"], "web-blue");
+    assert_eq!(statuses[1]["revision"], "web-green");
+    let reopened = Arc::new(Server::new(config(&dir, "127.0.0.1:0")));
+    assert_eq!(
+        call(&reopened, "GET", &service, Value::Null).await.1["trafficStatuses"],
+        *statuses
+    );
+
+    let request = |host_based| async move {
+        let request = if host_based {
+            format!("GET / HTTP/1.1\r\nHost: web.us-central1.demo.run.localhost:{port}\r\n\r\n")
+        } else {
+            format!("GET /_run/demo/us-central1/web/ HTTP/1.1\r\nHost: localhost:{port}\r\n\r\n")
+        };
+        let (status, body) = raw_http(port, request).await;
+        assert_eq!(status, 200, "{body}");
+        serde_json::from_str::<Value>(&body).unwrap()
+    };
+    let mut blue_count = 0;
+    for i in 0..100 {
+        let response = request(i % 2 == 0).await;
+        match response["k_revision"].as_str() {
+            Some("web-blue") => {
+                assert_eq!(response["greeting"], "blue");
+                blue_count += 1;
+            }
+            Some("web-green") => assert_eq!(response["greeting"], "green"),
+            _ => panic!("unexpected revision"),
+        }
+    }
+    assert_eq!(blue_count, 75);
+    let running = server.instances.list().await;
+    assert_eq!(running.len(), 2);
+    assert_eq!(running[0].request_count, 75);
+    assert_eq!(running[1].request_count, 25);
+
+    let old_revision = format!("{service}/revisions/web-blue");
+    assert_eq!(
+        call(&server, "DELETE", &old_revision, Value::Null).await.0,
+        400
+    );
+    for invalid_traffic in [
+        json!([{ "type": "TRAFFIC_TARGET_ALLOCATION_TYPE_REVISION", "revision": "other-blue", "percent": 100 }]),
+        json!([{ "type": "TRAFFIC_TARGET_ALLOCATION_TYPE_LATEST", "revision": "web-blue", "percent": 100 }]),
+        json!([{ "type": "unsupported", "percent": 100 }]),
+    ] {
+        let (status, _) = call(
+            &server,
+            "PATCH",
+            &service,
+            json!({ "traffic": invalid_traffic }),
+        )
+        .await;
+        assert_eq!(status, 400);
+    }
+    let (_, unchanged) = call(&server, "GET", &service, Value::Null).await;
+    assert_eq!(unchanged["trafficStatuses"], *statuses);
+
+    let old_only = json!({ "traffic": [
+        { "type": "TRAFFIC_TARGET_ALLOCATION_TYPE_REVISION", "revision": "web-blue", "percent": 100 },
+        { "type": "TRAFFIC_TARGET_ALLOCATION_TYPE_LATEST", "percent": 0 },
+    ]});
+    assert_eq!(call(&server, "PATCH", &service, old_only).await.0, 200);
+    assert_eq!(request(true).await["k_revision"], "web-blue");
+    let remaining = server.instances.list().await;
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].pid, running[0].pid);
+    assert!(
+        tokio::net::TcpStream::connect(("127.0.0.1", running[1].port))
+            .await
+            .is_err()
+    );
+
+    assert_eq!(
+        call(&server, "PATCH", &service, json!({"traffic": []}))
+            .await
+            .0,
+        200
+    );
+    assert_eq!(
+        call(&server, "DELETE", &old_revision, Value::Null).await.0,
+        200
+    );
+    assert!(
+        tokio::net::TcpStream::connect(("127.0.0.1", running[0].port))
+            .await
+            .is_err()
+    );
+    assert_eq!(request(false).await["k_revision"], "web-green");
+    let last_port = server.instances.list().await[0].port;
+    let _ = stop.send(());
+    task.await.unwrap().unwrap();
+    assert!(tokio::net::TcpStream::connect(("127.0.0.1", last_port))
+        .await
+        .is_err());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn resolves_secret_versions_at_cold_start_without_persisting_values() {
+    use sha2::{Digest, Sha256};
+    assert!(
+        has_python(),
+        "python3 is required for the local serving test"
+    );
+    let (server, port, dir, stop, task) = serve_on_free_port("secrets").await;
+    let service = format!("{PARENT}/services/web");
+    let same_project = dir.join("secrets/demo/greeting");
+    let other_project = dir.join("secrets/123456/greeting");
+    std::fs::create_dir_all(&same_project).unwrap();
+    std::fs::create_dir_all(&other_project).unwrap();
+    std::fs::write(same_project.join("2"), "fixture-older").unwrap();
+    std::fs::write(same_project.join("10"), "fixture-latest\n").unwrap();
+
+    let mut body = service_body("");
+    body["template"]["containers"][0]["env"] = json!([
+        { "name": "GREETING", "valueSource": { "secretKeyRef": {
+            "secret": "greeting", "version": "latest"
+        } } },
+        { "name": "PINNED", "valueSource": { "secretKeyRef": {
+            "secret": "projects/123456/secrets/greeting", "version": "3"
+        } } },
+        { "name": "ALIAS", "valueSource": { "secretKeyRef": {
+            "secret": "greeting", "version": "stable"
+        } } }
+    ]);
+    let pinned_hash = hex::encode(Sha256::digest(b"fixture-cross-project"));
+    let alias_hash = hex::encode(Sha256::digest(b"fixture-alias"));
+    body["template"]["containers"][0]["command"][2] = json!(APP.replace(
+        "        out = ",
+        &format!("        import hashlib\n        print(os.environ['PINNED'], flush=True)\n        assert hashlib.sha256(os.environ['ALIAS'].encode()).hexdigest() == '{alias_hash}'\n        assert hashlib.sha256(os.environ['PINNED'].encode()).hexdigest() == '{pinned_hash}'\n        out = ")
+    ));
+    std::fs::write(same_project.join("stable"), "fixture-alias").unwrap();
+    let create = format!("{PARENT}/services?serviceId=web");
+    let mut invalid = body.clone();
+    invalid["template"]["containers"][0]["env"][0]["value"] = json!("literal");
+    assert_eq!(call(&server, "POST", &create, invalid).await.0, 400);
+    let mut traversal = body.clone();
+    traversal["template"]["containers"][0]["env"][0]["valueSource"]["secretKeyRef"]["secret"] =
+        json!("projects/../secrets/greeting");
+    assert_eq!(call(&server, "POST", &create, traversal).await.0, 400);
+    assert_eq!(call(&server, "POST", &create, body.clone()).await.0, 200);
+
+    let request = || {
+        raw_http(
+            port,
+            format!("GET /_run/demo/us-central1/web/ HTTP/1.1\r\nHost: localhost:{port}\r\n\r\n"),
+        )
+    };
+    assert_eq!(
+        request().await,
+        (
+            503,
+            "Unable to resolve a container environment secret\n".into()
+        )
+    );
+    assert!(server.instances.list().await.is_empty());
+
+    std::fs::write(other_project.join("3"), "fixture-cross-project").unwrap();
+    let greeting = || async {
+        let (status, body) = request().await;
+        assert_eq!(status, 200);
+        serde_json::from_str::<Value>(&body).unwrap()["greeting"].clone()
+    };
+    assert_eq!(greeting().await, "fixture-latest\n");
+    std::fs::write(same_project.join("11"), "fixture-newest").unwrap();
+    assert_eq!(greeting().await, "fixture-latest\n");
+    body["template"]["revision"] = json!("web-new");
+    assert_eq!(call(&server, "PATCH", &service, body).await.0, 200);
+    assert_eq!(greeting().await, "fixture-newest");
+
+    let (_, stored) = call(&server, "GET", &service, Value::Null).await;
+    assert_eq!(
+        stored["template"]["containers"][0]["env"][0]["valueSource"]["secretKeyRef"]["secret"],
+        "greeting"
+    );
+    assert!(stored["template"]["containers"][0]["env"][0]
+        .get("value")
+        .is_none());
+    let persisted = std::fs::read_to_string(dir.join("state.json")).unwrap();
+    for value in [
+        "fixture-newest",
+        "fixture-latest",
+        "fixture-cross-project",
+        "fixture-alias",
+    ] {
+        assert!(!persisted.contains(value));
+    }
+    assert!(server
+        .instances
+        .logs("projects/demo/locations/us-central1/services/web")
+        .is_empty());
+    let _ = stop.send(());
+    task.await.unwrap().unwrap();
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn relaxed_data_plane_ignores_invoker_ingress_and_default_uri_settings() {
+    let (server, port, dir, stop, task) = serve_on_free_port("relaxed-ingress").await;
+    let (status, _) = call(
+        &server,
+        "POST",
+        &format!("{PARENT}/services?serviceId=web"),
+        json!({
+            "ingress": "INGRESS_TRAFFIC_INTERNAL_ONLY",
+            "defaultUriDisabled": true,
+            "template": { "containers": [{ "image": "x" }] },
+        }),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let (status, text) = raw_http(
+        port,
+        format!("GET /_run/demo/us-central1/web/ HTTP/1.1\r\nHost: localhost:{port}\r\nAuthorization: Bearer invalid\r\n\r\n"),
+    ).await;
+    assert_eq!(status, 503);
+    assert!(text.contains("has no command"));
+    let _ = stop.send(());
+    task.await.unwrap().unwrap();
     let _ = std::fs::remove_dir_all(dir);
 }
 

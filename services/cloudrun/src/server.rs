@@ -8,6 +8,7 @@
 //! echo user-supplied fields verbatim.
 
 use std::collections::{BTreeMap, VecDeque};
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -17,7 +18,9 @@ use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 
 use crate::instances::{LaunchSpec, Manager, StartError};
+use crate::secrets::SecretRef;
 use crate::time_fmt::now_rfc3339;
+use crate::traffic;
 
 const SERVICE_TYPE: &str = "type.googleapis.com/google.cloud.run.v2.Service";
 const REVISION_TYPE: &str = "type.googleapis.com/google.cloud.run.v2.Revision";
@@ -87,7 +90,7 @@ fn not_found(name: &str) -> Reply {
     )
 }
 
-fn invalid(message: &str) -> Reply {
+pub(crate) fn invalid(message: &str) -> Reply {
     Reply::error(400, "INVALID_ARGUMENT", message)
 }
 
@@ -118,7 +121,10 @@ pub struct Server {
 
 impl Server {
     pub fn new(config: Config) -> Self {
-        let instances = Manager::new(config.docker_bin.clone());
+        let instances = Manager::with_storage(
+            config.docker_bin.clone(),
+            PathBuf::from(&config.storage_path),
+        );
         let mut server = Server {
             config,
             state: Mutex::new(State::default()),
@@ -163,6 +169,18 @@ impl Server {
                 let (uri, urls) = self.public_urls(project, location, service_id);
                 service["urls"] = json!(urls);
                 service["uri"] = json!(uri);
+            }
+            let latest = latest_revision_id(service);
+            let statuses = traffic::statuses(&service["traffic"], latest, |id| {
+                state
+                    .revisions
+                    .contains_key(&format!("{name}/revisions/{id}"))
+            })
+            // Old state can have traffic targets that were accepted but never
+            // served. Preserve latest-only routing for those invalid targets.
+            .or_else(|_| traffic::statuses(&traffic::default_targets(), latest, |_| false));
+            if let Ok(statuses) = statuses {
+                service["trafficStatuses"] = json!(statuses);
             }
         }
         for (name, revision) in state.revisions.iter_mut() {
@@ -501,8 +519,7 @@ impl Server {
                 ),
             ),
             Ok(svc) => {
-                // No restart here: the next request compares the launch spec
-                // and replaces the instance only if the revision changed.
+                // The next invocation reconciles the serving instances.
                 emit("cloudrun.service.updated", json!({ "service": name }));
                 let parent = format!("projects/{project}/locations/{location}");
                 Reply::json(200, &self.record_operation(&parent, svc, SERVICE_TYPE))
@@ -629,23 +646,14 @@ impl Server {
                 .to_string()
         };
 
-        let traffic = service.get("traffic").cloned().unwrap_or_else(
-            || json!([{ "type": "TRAFFIC_TARGET_ALLOCATION_TYPE_LATEST", "percent": 100 }]),
-        );
-        let traffic_statuses: Vec<Value> = traffic
-            .as_array()
-            .map(|a| {
-                a.iter()
-                    .map(|t| {
-                        let mut s = t.clone();
-                        if s.get("type").is_none() {
-                            s["type"] = json!("TRAFFIC_TARGET_ALLOCATION_TYPE_REVISION");
-                        }
-                        s
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+        let traffic = service
+            .get("traffic")
+            .cloned()
+            .unwrap_or_else(traffic::default_targets);
+        let latest_id = latest_revision.rsplit('/').next().unwrap_or("");
+        let traffic_statuses = traffic::statuses(&traffic, latest_id, |id| {
+            previous.is_some() && st.revisions.contains_key(&format!("{name}/revisions/{id}"))
+        })?;
         let ready = json!({
             "type": "Ready",
             "state": "CONDITION_SUCCEEDED",
@@ -775,7 +783,7 @@ impl Server {
         }
     }
 
-    pub fn delete_revision(
+    pub async fn delete_revision(
         &self,
         service_name: &str,
         revision_name: &str,
@@ -794,6 +802,19 @@ impl Server {
                     "Revision is the latest revision of its service and cannot be deleted",
                 ));
             }
+            let id = revision_name.rsplit('/').next().unwrap_or("");
+            if service["trafficStatuses"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|t| t["revision"] == id)
+            {
+                return Err(Reply::error(
+                    400,
+                    "FAILED_PRECONDITION",
+                    "Revision is referenced by its service's traffic configuration",
+                ));
+            }
             st.revisions
                 .remove(revision_name)
                 .ok_or_else(|| not_found(revision_name))
@@ -807,7 +828,20 @@ impl Server {
             Ok(rev) if validate_only => {
                 Reply::json(200, &validation_operation(&parent, rev, REVISION_TYPE))
             }
-            Ok(rev) => Reply::json(200, &self.record_operation(&parent, rev, REVISION_TYPE)),
+            Ok(rev) => {
+                let id = revision_name.rsplit('/').next().unwrap_or("");
+                self.instances
+                    .stop_revision(service_name, id, || {
+                        !self
+                            .state
+                            .lock()
+                            .unwrap()
+                            .revisions
+                            .contains_key(revision_name)
+                    })
+                    .await;
+                Reply::json(200, &self.record_operation(&parent, rev, REVISION_TYPE))
+            }
             Err(r) => r,
         }
     }
@@ -946,20 +980,79 @@ impl Server {
         ))
     }
 
-    /// Reads the launch spec and its invocation policy from one state snapshot.
-    /// Call again after waiting for the instance slot: its service may have
-    /// been reconfigured or recreated, or public invocation revoked meanwhile.
-    pub(crate) fn authorized_launch_spec(
+    pub(crate) fn check_data_plane(
         &self,
         service_name: &str,
         authorization: &str,
-    ) -> Result<LaunchSpec, StartError> {
-        let st = self.state.lock().unwrap();
-        let service = st.services.get(service_name).ok_or(StartError::Gone)?;
-        if !self.authorized(authorization) && !self.public_invoke_allowed(&st, service_name) {
-            return Err(StartError::Forbidden);
+        peer: IpAddr,
+    ) -> Result<(), StartError> {
+        if !is_strict(&self.config.auth_mode) {
+            return Ok(());
         }
-        LaunchSpec::from_service(service).ok_or(StartError::Gone)
+        self.invokable_service(
+            &self.state.lock().unwrap(),
+            service_name,
+            authorization,
+            peer,
+        )?;
+        Ok(())
+    }
+
+    fn invokable_service<'a>(
+        &self,
+        st: &'a State,
+        service_name: &str,
+        authorization: &str,
+        peer: IpAddr,
+    ) -> Result<&'a Value, StartError> {
+        let service = st.services.get(service_name).ok_or(StartError::Gone)?;
+        if is_strict(&self.config.auth_mode) {
+            let internal_only = matches!(
+                service["ingress"].as_str(),
+                Some("INGRESS_TRAFFIC_INTERNAL_ONLY" | "INGRESS_TRAFFIC_INTERNAL_LOAD_BALANCER")
+            );
+            if service["defaultUriDisabled"] == true
+                || (internal_only && !peer.to_canonical().is_loopback())
+            {
+                return Err(StartError::Gone);
+            }
+            if !self.authorized(authorization) && !self.public_invoke_allowed(st, service_name) {
+                return Err(StartError::Forbidden);
+            }
+        }
+        Ok(service)
+    }
+
+    /// Reads routing and authorization from the same snapshot once the service
+    /// slot is acquired, since both can change while the request is waiting.
+    pub(crate) fn routed_launch_spec(
+        &self,
+        service_name: &str,
+        authorization: &str,
+        peer: IpAddr,
+        mut bucket: u64,
+    ) -> Result<(LaunchSpec, Vec<String>), StartError> {
+        let st = self.state.lock().unwrap();
+        let service = self.invokable_service(&st, service_name, authorization, peer)?;
+        let mut active = Vec::new();
+        let mut selected = None;
+        for (id, percent) in traffic::active(service) {
+            active.push(id.to_owned());
+            if selected.is_none() {
+                if bucket < percent {
+                    selected = Some(id);
+                } else {
+                    bucket -= percent;
+                }
+            }
+        }
+        let id = selected.ok_or(StartError::Gone)?;
+        let spec = st
+            .revisions
+            .get(&format!("{service_name}/revisions/{id}"))
+            .and_then(LaunchSpec::from_revision)
+            .ok_or(StartError::Gone)?;
+        Ok((spec, active))
     }
 
     /// Whether unauthenticated callers may invoke the service: always in relaxed
@@ -988,7 +1081,8 @@ impl Server {
             .and_then(Value::as_array)
             .map(|bindings| {
                 bindings.iter().any(|b| {
-                    b.get("role").and_then(Value::as_str) == Some("roles/run.invoker")
+                    b.get("condition").is_none_or(Value::is_null)
+                        && b.get("role").and_then(Value::as_str) == Some("roles/run.invoker")
                         && b.get("members")
                             .and_then(Value::as_array)
                             .map(|m| m.iter().any(|x| x.as_str() == Some("allUsers")))
@@ -1063,7 +1157,7 @@ fn copy_writable(input: &Value, out: &mut Map<String, Value>) {
 
 /// RFC 1035 label: lowercase letter first, then lowercase letters, digits or
 /// hyphens, not ending with a hyphen.
-fn validate_id(id: &str, field: &str, max: usize) -> Result<(), Reply> {
+pub(crate) fn validate_id(id: &str, field: &str, max: usize) -> Result<(), Reply> {
     let ok = !id.is_empty()
         && id.len() <= max
         && id.starts_with(|c: char| c.is_ascii_lowercase())
@@ -1168,38 +1262,27 @@ fn apply_mask_path(target: &mut Value, input: &Value, path: &[String]) {
 /// derived from it (template, containers, traffic targets).
 fn validate_service(service: &Value) -> Result<(), Reply> {
     validate_template(service.get("template"))?;
-    let Some(traffic) = service.get("traffic") else {
-        return Ok(());
-    };
-    let Some(targets) = traffic.as_array() else {
-        return Err(invalid("traffic must be a list of traffic targets"));
-    };
-    let mut total = 0i64;
-    for (i, t) in targets.iter().enumerate() {
-        let Some(obj) = t.as_object() else {
-            return Err(invalid(&format!("traffic[{i}] must be an object")));
-        };
-        if obj.get("type").is_some_and(|v| !v.is_string()) {
-            return Err(invalid(&format!("traffic[{i}].type must be a string")));
+    if let Some(ingress) = service.get("ingress") {
+        if !matches!(
+            ingress.as_str(),
+            Some(
+                "INGRESS_TRAFFIC_UNSPECIFIED"
+                    | "INGRESS_TRAFFIC_ALL"
+                    | "INGRESS_TRAFFIC_INTERNAL_ONLY"
+                    | "INGRESS_TRAFFIC_INTERNAL_LOAD_BALANCER"
+            )
+        ) {
+            return Err(invalid("ingress must be a Cloud Run ingress setting"));
         }
-        match obj.get("percent") {
-            None => {}
-            Some(p) => match p.as_i64() {
-                Some(n) if (0..=100).contains(&n) => total += n,
-                _ => {
-                    return Err(invalid(&format!(
-                        "traffic[{i}].percent must be an integer between 0 and 100"
-                    )))
-                }
-            },
-        }
-    }
-    if !targets.is_empty() && total != 100 {
-        return Err(invalid(&format!(
-            "traffic percentages must sum to 100, got {total}"
-        )));
     }
     Ok(())
+}
+
+fn latest_revision_id(service: &Value) -> &str {
+    service["latestCreatedRevision"]
+        .as_str()
+        .and_then(|name| name.rsplit('/').next())
+        .unwrap_or("")
 }
 
 fn validate_template(template: Option<&Value>) -> Result<(), Reply> {
@@ -1240,13 +1323,23 @@ fn validate_template(template: Option<&Value>) -> Result<(), Reply> {
         if let Some(env) = c.get("env") {
             let ok = env.as_array().is_some_and(|a| {
                 a.iter().all(|e| {
-                    e.get("name").is_some_and(Value::is_string)
-                        && e.get("value").is_none_or(Value::is_string)
+                    let Some(name) = e["name"].as_str() else {
+                        return false;
+                    };
+                    match e.get("valueSource") {
+                        None => e.get("value").is_none_or(Value::is_string),
+                        Some(source) => {
+                            !name.is_empty()
+                                && !name.contains(['=', '\0'])
+                                && e.get("value").is_none()
+                                && SecretRef::parse(source).is_some()
+                        }
+                    }
                 })
             });
             if !ok {
                 return Err(invalid(&format!(
-                    "template.containers[{i}].env must be a list of {{name, value}} with string fields"
+                    "template.containers[{i}].env entries require a name and either a string value or a valid valueSource.secretKeyRef"
                 )));
             }
         }
@@ -1374,5 +1467,58 @@ mod tests {
         );
         assert_eq!(s["template"]["timeout"], "300s");
         assert_eq!(s["ingress"], "INGRESS_TRAFFIC_ALL");
+    }
+
+    #[test]
+    fn strict_ingress_uses_the_socket_peer_and_still_requires_invoker_access() {
+        let name = "projects/p/locations/us-central1/services/web";
+        let external = "192.0.2.1".parse().unwrap();
+        let loopback = "::ffff:127.0.0.1".parse().unwrap();
+        let create = BTreeMap::from([("serviceId".into(), "web".into())]);
+
+        for mode in ["relaxed", "strict"] {
+            let server = Server::new(Config {
+                auth_mode: mode.into(),
+                bearer_token: "test-token".into(),
+                ..Config::default()
+            });
+            let service = br#"{"template":{"containers":[{"image":"test"}]}}"#;
+            assert_eq!(
+                server
+                    .create_service("p", "us-central1", &create, service)
+                    .status,
+                200
+            );
+            assert!(server
+                .check_data_plane(name, "Bearer test-token", external)
+                .is_ok());
+            for ingress in [
+                "INGRESS_TRAFFIC_INTERNAL_ONLY",
+                "INGRESS_TRAFFIC_INTERNAL_LOAD_BALANCER",
+            ] {
+                let patch = serde_json::to_vec(&json!({"ingress": ingress})).unwrap();
+                assert_eq!(
+                    server
+                        .update_service("p", "us-central1", "web", &BTreeMap::new(), &patch)
+                        .status,
+                    200
+                );
+                assert!(server
+                    .check_data_plane(name, "Bearer test-token", loopback)
+                    .is_ok());
+                if mode == "strict" {
+                    assert_eq!(
+                        server.check_data_plane(name, "Bearer test-token", external),
+                        Err(StartError::Gone)
+                    );
+                    assert_eq!(
+                        server.check_data_plane(name, "", loopback),
+                        Err(StartError::Forbidden)
+                    );
+                } else {
+                    assert!(server.check_data_plane(name, "", external).is_ok());
+                }
+            }
+        }
     }
 }
