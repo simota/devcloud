@@ -373,9 +373,12 @@ The standalone S3 image also ships a web console and a server-wide CORS default;
 | Preconditions | Yes | Generation/metageneration mismatch returns `412`. |
 | Pagination and prefix filters | Partial | Useful local subset for object listing. |
 | OAuth bearer validation | Partial | Local relaxed modes only; no real Google IAM validation. |
-| XML API | No | JSON API subset only. |
-| IAM/ACLs, retention, lifecycle | No | Not implemented. |
-| Pub/Sub notifications, signed URLs | No | Not implemented. |
+| XML API | Partial | Path-style (`/{bucket}/{object}`) and virtual-host (`{bucket}.localhost`, `{bucket}.storage.googleapis.com`) service/bucket/object CRUD, v1/v2 listing, copy (`x-goog-copy-source`), range/preconditions, and `?acl`/`?lifecycle`/`?location`/`?storageClass`/`?versioning`; XML multipart uploads are not implemented. |
+| IAM / ACLs | Partial | Bucket IAM policy (`GET`/`PUT /iam`, ETag check, `/iam/testPermissions`), bucket/defaultObject/object ACL CRUD (JSON + XML `?acl`), predefined ACLs, and Uniform Bucket-Level Access enforcement; real Google IAM identity/auth enforcement is not implemented. |
+| Retention | Partial | Bucket `retentionPolicy` (with `lockRetentionPolicy`), object holds (`temporaryHold`, `eventBasedHold`, `defaultEventBasedHold`), per-object retention (`Unlocked`/`Locked`, `overrideUnlockedRetention`), and delete/overwrite guards. |
+| Lifecycle | Partial | Bucket lifecycle configuration (JSON + XML `?lifecycle`) with deterministic local evaluation of `Delete` and `SetStorageClass` rules (`age`, `createdBefore`, `matchesPrefix`, `matchesSuffix`, `matchesStorageClass`, `isLive`) on object reads/lists, honoring active retention/holds. |
+| Pub/Sub notifications | Partial | `notificationConfigs` CRUD with `event_types`/`object_name_prefix`/`custom_attributes` and `JSON_API_V1`/`NONE` payload formats; matching `OBJECT_FINALIZE`/`OBJECT_METADATA_UPDATE`/`OBJECT_DELETE` flows append local event records (inspectable via `/_introspect/buckets/{b}/notification-events`) and optionally forward to a configured loopback Pub/Sub REST address (`DEVCLOUD_GCS_PUBSUB_REST_ADDR`). |
+| Signed URLs | Partial | V4 `GOOG4-HMAC-SHA256` (full cryptographic signature, canonical request, signed-header coverage, and expiry verification), V4 `GOOG4-RSA-SHA256` and V2 (`GoogleAccessId`/`Expires`/`Signature`) parameter/header/expiry validation, and `response-*` header overrides; real Google IAM RSA public-key verification is not implemented. |
 
 Completed resumable uploads retain a small metadata receipt and notification marker in the shared object-store root until the workspace is reset; these contain no uploaded body and let retries return the original result after restarts, overwrites, or deletions.
 

@@ -32,7 +32,7 @@ const SIDECAR_FILES: &[&str] = &[
     "object-lock.json",
     "replication.json",
 ];
-const SIDECAR_DIRS: &[&str] = &["inventory", "analytics"];
+const SIDECAR_DIRS: &[&str] = &["inventory", "analytics", "gcs"];
 
 /// A `FileBucketStore` error. The legacy store returns `error`; callers distinguish
 /// only a few cases (invalid name, non-empty bucket), so we model those plus a
@@ -133,6 +133,11 @@ impl FileBucketStore {
 
     pub(crate) fn now(&self) -> String {
         self.fixed_now.clone().unwrap_or_else(now_rfc3339nano)
+    }
+
+    /// Returns the store's current RFC3339Nano timestamp (respecting `fixed_now`).
+    pub fn current_time(&self) -> String {
+        self.now()
     }
 
     /// A new 32-hex version/upload ID. Uses the test queue when primed, otherwise
