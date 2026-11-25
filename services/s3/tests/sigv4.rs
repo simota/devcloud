@@ -490,20 +490,19 @@ fn unsigned_trailer_upload_is_decoded_in_strict_mode() {
 }
 
 #[test]
-fn unsupported_streaming_algorithm_is_not_implemented_in_strict_mode() {
+fn sigv4a_streaming_payload_cannot_be_seeded_by_an_hmac_signature() {
     let store = store();
     let signed = sign_at(
         "PUT",
         "/data/k",
         b"0\r\n\r\n".to_vec(),
         &[],
-        "STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD",
+        devcloud_sigv4a::STREAMING_PAYLOAD,
         now(),
     );
-    assert_eq!(
-        route_with_auth(&store, &signed.request, &auth()).status,
-        501
-    );
+    let response = route_with_auth(&store, &signed.request, &auth());
+    assert_eq!(response.status, 400);
+    assert_eq!(code(&response), "InvalidArgument");
 }
 
 #[test]
@@ -793,10 +792,24 @@ fn sigv2_header_and_presigned_urls_verify_and_reject_tampering() {
     assert_eq!(route_with_auth(&store, &expired_req, &auth).status, 403);
 }
 
-fn sign_sigv4a(method: &str, target: &str, body: &[u8], region_set: &str, unix: i64) -> Request {
+fn sigv4a_key() -> devcloud_sigv4a::SigningKey {
+    devcloud_sigv4a::SigningKey::derive("test-key", SECRET).unwrap()
+}
+
+/// Signs a SigV4a header request, returning it with its seed signature and
+/// `x-amz-date`. Every header is signed.
+fn sign_sigv4a_with(
+    method: &str,
+    target: &str,
+    body: &[u8],
+    region_set: &str,
+    unix: i64,
+    payload_hash: Option<&str>,
+    extra_headers: &[(&str, &str)],
+) -> (Request, String, String) {
     let date = amz_date(unix);
     let date_stamp = &date[..8];
-    let payload_hash = sha256_hex(body);
+    let payload_hash = payload_hash.map_or_else(|| sha256_hex(body), str::to_string);
     let mut req = Request::new(method, target, body.to_vec());
     req.headers
         .insert("host".to_string(), "s3.test:9000".to_string());
@@ -805,6 +818,9 @@ fn sign_sigv4a(method: &str, target: &str, body: &[u8], region_set: &str, unix: 
         .insert("x-amz-content-sha256".to_string(), payload_hash.clone());
     req.headers
         .insert("x-amz-region-set".to_string(), region_set.to_string());
+    for (name, value) in extra_headers {
+        req.headers.insert(name.to_string(), value.to_string());
+    }
     let signed_headers: String = req
         .headers
         .keys()
@@ -830,18 +846,163 @@ fn sign_sigv4a(method: &str, target: &str, body: &[u8], region_set: &str, unix: 
         "AWS4-ECDSA-P256-SHA256\n{date}\n{scope}\n{}",
         sha256_hex(canonical_request.as_bytes())
     );
-    let d = devcloud_s3::auth::derive_sigv4a_private_key("test-key", SECRET).unwrap();
-    let digest: [u8; 32] = Sha256::digest(string_to_sign.as_bytes()).into();
-    let z = devcloud_s3::auth::p256::U256::from_be_bytes(&digest);
-    let k = devcloud_s3::auth::p256::U256([0x1111, 0x2222, 0x3333, 0x4445]);
-    let sig_hex = hex::encode(devcloud_s3::auth::p256::ecdsa_sign_der_with_k(&d, &z, &k));
+    let sig_hex = sigv4a_key().sign(string_to_sign.as_bytes());
     req.headers.insert(
         "authorization".to_string(),
         format!(
             "AWS4-ECDSA-P256-SHA256 Credential=test-key/{scope}, SignedHeaders={signed_headers}, Signature={sig_hex}"
         ),
     );
-    req
+    (req, sig_hex, date)
+}
+
+fn sign_sigv4a(method: &str, target: &str, body: &[u8], region_set: &str, unix: i64) -> Request {
+    sign_sigv4a_with(method, target, body, region_set, unix, None, &[]).0
+}
+
+/// A SigV4a `aws-chunked` PUT of `chunks`, with optional signed trailers.
+fn sigv4a_streaming_put(
+    target: &str,
+    chunks: &[&[u8]],
+    trailers: Option<&[(&str, &str)]>,
+    pad: bool,
+) -> (Request, String, String) {
+    let decoded_len = chunks.iter().map(|c| c.len()).sum::<usize>().to_string();
+    let mut headers = vec![
+        ("content-encoding", "aws-chunked"),
+        ("x-amz-decoded-content-length", decoded_len.as_str()),
+    ];
+    let payload_hash = if trailers.is_some() {
+        headers.push(("x-amz-trailer", "x-amz-checksum-crc32"));
+        devcloud_sigv4a::STREAMING_PAYLOAD_TRAILER
+    } else {
+        devcloud_sigv4a::STREAMING_PAYLOAD
+    };
+    let (mut req, seed, date) =
+        sign_sigv4a_with("PUT", target, b"", "*", now(), Some(payload_hash), &headers);
+    let mut chain = devcloud_sigv4a::ChunkChain::new(
+        sigv4a_key(),
+        &date,
+        &format!("{}/s3/aws4_request", &date[..8]),
+        &seed,
+    );
+    req.body = devcloud_sigv4a::encode_signed_chunks(&mut chain, chunks, trailers, pad);
+    (req, seed, date)
+}
+
+#[test]
+fn sigv4a_streaming_payload_is_verified_and_decoded() {
+    let store = store();
+    let auth = auth();
+    for pad in [true, false] {
+        let (put, _, _) =
+            sigv4a_streaming_put("/data/v4a-stream.txt", &[b"hello ", b"world"], None, pad);
+        let response = route_with_auth(&store, &put, &auth);
+        assert_eq!(response.status, 200, "pad={pad}");
+        let got = stored(&store, "v4a-stream.txt");
+        assert_eq!(got.body, b"hello world");
+        assert!(!got.headers.contains_key("Content-Encoding"));
+    }
+
+    // Altered data, a swapped chunk order, and dropped chunk signatures all
+    // break the chain.
+    let (mut put, _, _) =
+        sigv4a_streaming_put("/data/v4a-bad.txt", &[b"hello ", b"world"], None, true);
+    let at = put.body.windows(6).position(|w| w == b"hello ").unwrap();
+    put.body[at] = b'j';
+    assert_eq!(
+        code(&route_with_auth(&store, &put, &auth)),
+        "SignatureDoesNotMatch"
+    );
+
+    let (mut put, _, _) =
+        sigv4a_streaming_put("/data/v4a-bad.txt", &[b"hello ", b"world"], None, true);
+    let text = String::from_utf8(put.body.clone()).unwrap();
+    let parts: Vec<&str> = text.split_inclusive("\r\n").collect();
+    put.body = [parts[2], parts[3], parts[0], parts[1], parts[4], parts[5]]
+        .concat()
+        .into_bytes();
+    assert_eq!(
+        code(&route_with_auth(&store, &put, &auth)),
+        "SignatureDoesNotMatch"
+    );
+
+    let (mut put, _, _) = sigv4a_streaming_put("/data/v4a-bad.txt", &[b"hello world"], None, true);
+    put.body = b"b\r\nhello world\r\n0\r\n\r\n".to_vec();
+    assert_eq!(
+        code(&route_with_auth(&store, &put, &auth)),
+        "SignatureDoesNotMatch"
+    );
+    assert_eq!(stored(&store, "v4a-bad.txt").status, 404);
+
+    // A SigV4a seed cannot start an HMAC chunk chain.
+    let (put, _, _) = sign_sigv4a_with(
+        "PUT",
+        "/data/v4a-bad.txt",
+        b"",
+        "*",
+        now(),
+        Some(STREAMING),
+        &[("content-encoding", "aws-chunked")],
+    );
+    assert_eq!(
+        code(&route_with_auth(&store, &put, &auth)),
+        "InvalidArgument"
+    );
+}
+
+#[test]
+fn sigv4a_streaming_trailer_is_verified() {
+    let store = store();
+    let auth = auth();
+    let trailer = [("x-amz-checksum-crc32", "DQpIDQ==")];
+    let (put, _, _) = sigv4a_streaming_put(
+        "/data/v4a-trailer.txt",
+        &[b"hello world"],
+        Some(&trailer),
+        true,
+    );
+    assert_eq!(route_with_auth(&store, &put, &auth).status, 200);
+    assert_eq!(stored(&store, "v4a-trailer.txt").body, b"hello world");
+
+    let (mut put, _, _) = sigv4a_streaming_put(
+        "/data/v4a-trailer2.txt",
+        &[b"hello world"],
+        Some(&trailer),
+        true,
+    );
+    let text = String::from_utf8(put.body.clone()).unwrap();
+    put.body = text.replace("DQpIDQ==", "AAAAAA==").into_bytes();
+    assert_eq!(
+        code(&route_with_auth(&store, &put, &auth)),
+        "SignatureDoesNotMatch"
+    );
+
+    let (mut put, _, _) = sigv4a_streaming_put(
+        "/data/v4a-trailer2.txt",
+        &[b"hello world"],
+        Some(&trailer),
+        true,
+    );
+    let text = String::from_utf8(put.body.clone()).unwrap();
+    let without_signature: String = text
+        .split_inclusive("\r\n")
+        .filter(|line| !line.starts_with("x-amz-trailer-signature:"))
+        .collect();
+    put.body = without_signature.into_bytes();
+    assert_eq!(
+        code(&route_with_auth(&store, &put, &auth)),
+        "SignatureDoesNotMatch"
+    );
+    assert_eq!(stored(&store, "v4a-trailer2.txt").status, 404);
+}
+
+#[test]
+fn sigv4a_streaming_payload_is_decoded_in_relaxed_mode() {
+    let store = store();
+    let (put, _, _) = sigv4a_streaming_put("/data/v4a-relaxed.txt", &[b"hello"], None, true);
+    assert_eq!(route(&store, &put).status, 200);
+    assert_eq!(stored(&store, "v4a-relaxed.txt").body, b"hello");
 }
 
 #[test]
@@ -888,11 +1049,7 @@ fn sigv4a_header_and_presigned_urls_verify_and_enforce_region_set() {
         "AWS4-ECDSA-P256-SHA256\n{date}\n{scope}\n{}",
         sha256_hex(canonical_request.as_bytes())
     );
-    let d = devcloud_s3::auth::derive_sigv4a_private_key("test-key", SECRET).unwrap();
-    let digest: [u8; 32] = Sha256::digest(string_to_sign.as_bytes()).into();
-    let z = devcloud_s3::auth::p256::U256::from_be_bytes(&digest);
-    let k = devcloud_s3::auth::p256::U256([0xaaaa, 0xbbbb, 0xcccc, 0xddd1]);
-    let sig_hex = hex::encode(devcloud_s3::auth::p256::ecdsa_sign_der_with_k(&d, &z, &k));
+    let sig_hex = sigv4a_key().sign(string_to_sign.as_bytes());
     let mut presigned = Request::new(
         "GET",
         &format!("/data/v4a.txt?{query}&X-Amz-Signature={sig_hex}"),

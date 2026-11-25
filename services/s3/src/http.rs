@@ -2237,7 +2237,12 @@ pub(crate) struct SignatureError {
 }
 
 /// What `aws-chunked` verification needs from an already verified seed signature.
-struct ChunkSigning {
+enum ChunkSigning {
+    Hmac(HmacChunkSigning),
+    Ecdsa(auth::EcdsaChunkSigning),
+}
+
+struct HmacChunkSigning {
     signing_key: Vec<u8>,
     amz_date: String,
     scope: String,
@@ -2277,8 +2282,8 @@ fn authenticate_request<'a>(
         return Ok((None, authed));
     }
     if auth::is_sigv4a_header(req) {
-        auth::verify_sigv4a_header(req, auth)?;
-        return Ok((None, authed));
+        let chunk = auth::verify_sigv4a_header(req, auth)?;
+        return Ok((chunk.map(ChunkSigning::Ecdsa), authed));
     }
     if auth::is_sigv2_header(req) {
         auth::verify_sigv2_header(req, auth)?;
@@ -2468,13 +2473,13 @@ fn verify_authorization_header(
     if payload_hash != STREAMING_SIGNED && payload_hash != STREAMING_SIGNED_TRAILER {
         return Ok(None);
     }
-    Ok(Some(ChunkSigning {
+    Ok(Some(ChunkSigning::Hmac(HmacChunkSigning {
         signing_key: derive_signing_key(&auth.secret_access_key, date_stamp, region),
         amz_date: amz_date.to_string(),
         scope: format!("{date_stamp}/{region}/{SIGV4_SERVICE}/aws4_request"),
         seed_signature: expected,
         has_trailer: payload_hash == STREAMING_SIGNED_TRAILER,
-    }))
+    })))
 }
 
 /// Rebuilds a request with its `aws-chunked` framing removed. With `signing`
@@ -2521,6 +2526,34 @@ fn decode_streaming_request(
 fn verify_chunk_signatures(
     parsed: &aws_chunked::ChunkedBody<'_>,
     signing: &ChunkSigning,
+) -> Result<(), SignatureError> {
+    match signing {
+        ChunkSigning::Hmac(signing) => verify_hmac_chunk_signatures(parsed, signing),
+        ChunkSigning::Ecdsa(signing) => verify_ecdsa_chunk_signatures(parsed, signing),
+    }
+}
+
+fn verify_ecdsa_chunk_signatures(
+    parsed: &aws_chunked::ChunkedBody<'_>,
+    signing: &auth::EcdsaChunkSigning,
+) -> Result<(), SignatureError> {
+    let chunks = parsed.chunks.iter().map(|c| (c.signature, c.data));
+    let trailer = signing
+        .has_trailer
+        .then_some((parsed.trailer_signature, parsed.trailers.as_slice()));
+    if devcloud_sigv4a::verify_chunk_chain(signing.chain.clone(), chunks, trailer) {
+        Ok(())
+    } else {
+        Err(SignatureError {
+            code: "SignatureDoesNotMatch",
+            status: 403,
+        })
+    }
+}
+
+fn verify_hmac_chunk_signatures(
+    parsed: &aws_chunked::ChunkedBody<'_>,
+    signing: &HmacChunkSigning,
 ) -> Result<(), SignatureError> {
     let sign = |algorithm: &str, previous: &str, parts: &[&str]| {
         let mut fields = vec![algorithm, &signing.amz_date, &signing.scope, previous];
@@ -2636,6 +2669,14 @@ pub(crate) fn verify_payload_hash(req: &Request, payload_hash: &str) -> Result<(
             | STREAMING_UNSIGNED_TRAILER
     ) {
         return Ok(());
+    }
+    // SigV4a streaming payloads are accepted only with a SigV4a seed signature
+    // (`auth::verify_sigv4a_header` handles them before reaching here).
+    if devcloud_sigv4a::is_streaming(payload_hash) {
+        return Err(SignatureError {
+            code: "InvalidArgument",
+            status: 400,
+        });
     }
     if payload_hash.starts_with("STREAMING-") {
         return Err(SignatureError {
@@ -4657,7 +4698,7 @@ mod tests {
     #[test]
     fn chunk_signatures_match_the_aws_documented_example() {
         let date_stamp = "20130524";
-        let signing = ChunkSigning {
+        let signing = ChunkSigning::Hmac(HmacChunkSigning {
             signing_key: derive_signing_key(
                 "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
                 date_stamp,
@@ -4668,7 +4709,7 @@ mod tests {
             seed_signature: "4f232c4386841ef735655705268965c44a0e4690baa4adea153f7db9fa80a0a9"
                 .to_string(),
             has_trailer: false,
-        };
+        });
         let mut body = Vec::new();
         for (size, signature) in [
             (

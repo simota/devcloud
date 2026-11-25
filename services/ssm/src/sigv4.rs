@@ -1,6 +1,7 @@
 //! AWS SigV4 verification (relaxed / signed-relaxed / strict), shared shape
 //! with `services/applicationautoscaling/src/sigv4.rs`.
 
+use devcloud_sigv4a::{ChunkChain, SigningKey};
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 
@@ -65,8 +66,16 @@ pub fn verify_signature(req: &SignedRequest, creds: &Credentials) -> Result<(), 
     if auth.is_empty() {
         return Err(err("AccessDeniedException", 403));
     }
+    let sigv4a = devcloud_sigv4a::is_authorization(auth);
     if creds.auth_mode.eq_ignore_ascii_case("signed-relaxed") {
-        return verify_shape(req, auth);
+        return if sigv4a {
+            verify_shape_sigv4a(req, auth)
+        } else {
+            verify_shape(req, auth)
+        };
+    }
+    if sigv4a {
+        return verify_full_sigv4a(req, auth, creds);
     }
     verify_full(req, auth, creds)
 }
@@ -90,7 +99,7 @@ fn verify_full(req: &SignedRequest, auth: &str, creds: &Credentials) -> Result<(
     if !valid_credential(&access_key, &region, &service, creds) {
         return Err(err("UnrecognizedClientException", 403));
     }
-    if req.amz_date.is_empty() {
+    if req.amz_date.is_empty() || devcloud_sigv4a::is_streaming(req.content_sha256) {
         return Err(err("IncompleteSignatureException", 400));
     }
     // SDKs sign the body's SHA-256 for this service without sending the
@@ -140,7 +149,7 @@ fn verify_shape(req: &SignedRequest, auth: &str) -> Result<(), SignatureError> {
     if service != SIGV4_SERVICE || !is_lower_hex(&signature, 64) {
         return Err(err("IncompleteSignatureException", 400));
     }
-    if req.amz_date.is_empty() {
+    if req.amz_date.is_empty() || devcloud_sigv4a::is_streaming(req.content_sha256) {
         return Err(err("IncompleteSignatureException", 400));
     }
     if !req.content_sha256.is_empty() {
@@ -168,7 +177,11 @@ fn verify_payload_hash(req: &SignedRequest, payload_hash: &str) -> Result<(), Si
     }
     if matches!(
         payload_hash,
-        STREAMING_SIGNED | STREAMING_SIGNED_TRAILER | STREAMING_UNSIGNED_TRAILER
+        STREAMING_SIGNED
+            | STREAMING_SIGNED_TRAILER
+            | STREAMING_UNSIGNED_TRAILER
+            | devcloud_sigv4a::STREAMING_PAYLOAD
+            | devcloud_sigv4a::STREAMING_PAYLOAD_TRAILER
     ) {
         verify_chunked_framing(req, payload_hash)?;
         return Ok(());
@@ -299,7 +312,93 @@ fn verify_chunked_framing(req: &SignedRequest, payload_hash: &str) -> Result<(),
     {
         return Err(err("InvalidSignatureException", 403));
     }
+    if devcloud_sigv4a::is_streaming(payload_hash) {
+        let shaped = |s: Option<&str>| s.is_some_and(devcloud_sigv4a::is_signature_shape);
+        if !parsed.chunks.iter().all(|c| shaped(c.signature))
+            || (payload_hash == devcloud_sigv4a::STREAMING_PAYLOAD_TRAILER
+                && !shaped(parsed.trailer_signature))
+        {
+            return Err(err("InvalidSignatureException", 403));
+        }
+    }
     Ok(())
+}
+
+/// SigV4a (`AWS4-ECDSA-P256-SHA256`) counterpart of `verify_full`: the scope
+/// has no region (`X-Amz-Region-Set` must cover the configured one) and the
+/// signature is ECDSA P-256 over the same canonical request.
+fn verify_full_sigv4a(
+    req: &SignedRequest,
+    auth: &str,
+    creds: &Credentials,
+) -> Result<(), SignatureError> {
+    let parsed = devcloud_sigv4a::parse_authorization(auth)
+        .ok_or_else(|| err("IncompleteSignatureException", 400))?;
+    if parsed.access_key != default_str(creds.access_key_id, "dev")
+        || parsed.service != SIGV4_SERVICE
+    {
+        return Err(err("UnrecognizedClientException", 403));
+    }
+    let payload_hash = sigv4a_payload_hash(req)?;
+    let region_set = (req.header)("x-amz-region-set").unwrap_or_default();
+    if !devcloud_sigv4a::region_set_matches(&region_set, default_str(creds.region, "us-east-1")) {
+        return Err(err("IncompleteSignatureException", 400));
+    }
+    let canonical = canonical_request(req, parsed.signed_headers, &payload_hash);
+    let scope = devcloud_sigv4a::credential_scope(parsed.date_stamp, SIGV4_SERVICE);
+    let string_to_sign = devcloud_sigv4a::string_to_sign(req.amz_date, &scope, &canonical);
+    let mismatch = || err("InvalidSignatureException", 403);
+    let key = SigningKey::derive(
+        parsed.access_key,
+        default_str(creds.secret_access_key, "dev"),
+    )
+    .ok_or_else(mismatch)?;
+    if !key.verify(string_to_sign.as_bytes(), parsed.signature) {
+        return Err(mismatch());
+    }
+    if devcloud_sigv4a::is_streaming(&payload_hash) {
+        let body =
+            parse_chunked_body(req.body).ok_or_else(|| err("IncompleteSignatureException", 400))?;
+        let chain = ChunkChain::new(key, req.amz_date, &scope, parsed.signature);
+        let trailer = (payload_hash == devcloud_sigv4a::STREAMING_PAYLOAD_TRAILER)
+            .then_some((body.trailer_signature, body.trailers.as_slice()));
+        let chunks = body.chunks.iter().map(|c| (c.signature, c.data));
+        if !devcloud_sigv4a::verify_chunk_chain(chain, chunks, trailer) {
+            return Err(mismatch());
+        }
+    }
+    Ok(())
+}
+
+/// SigV4a counterpart of `verify_shape` for `signed-relaxed`.
+fn verify_shape_sigv4a(req: &SignedRequest, auth: &str) -> Result<(), SignatureError> {
+    let parsed = devcloud_sigv4a::parse_authorization(auth)
+        .ok_or_else(|| err("IncompleteSignatureException", 400))?;
+    if parsed.service != SIGV4_SERVICE || !devcloud_sigv4a::is_signature_shape(parsed.signature) {
+        return Err(err("IncompleteSignatureException", 400));
+    }
+    sigv4a_payload_hash(req).map(|_| ())
+}
+
+/// Checks the headers every SigV4a request carries and returns the payload
+/// hash it signs (the body's SHA-256 when `x-amz-content-sha256` is absent).
+fn sigv4a_payload_hash(req: &SignedRequest) -> Result<String, SignatureError> {
+    let region_set = (req.header)("x-amz-region-set").unwrap_or_default();
+    // An ECDSA seed signature cannot start an HMAC chunk chain.
+    if req.amz_date.is_empty()
+        || region_set.trim().is_empty()
+        || matches!(
+            req.content_sha256,
+            STREAMING_SIGNED | STREAMING_SIGNED_TRAILER
+        )
+    {
+        return Err(err("IncompleteSignatureException", 400));
+    }
+    if req.content_sha256.is_empty() {
+        return Ok(sha256_hex(req.body));
+    }
+    verify_payload_hash(req, req.content_sha256)?;
+    Ok(req.content_sha256.to_string())
 }
 
 fn verify_streaming_chunks(
@@ -361,15 +460,7 @@ fn signature_for_request(
     payload_hash: &str,
     creds: &Credentials,
 ) -> String {
-    let canonical_request = [
-        req.method,
-        &canonical_uri(req.path),
-        &canonical_query_string(req.query),
-        &canonical_headers(req, signed_headers),
-        &signed_headers.to_ascii_lowercase(),
-        payload_hash,
-    ]
-    .join("\n");
+    let canonical_request = canonical_request(req, signed_headers, payload_hash);
     let scope = [date_stamp, region, SIGV4_SERVICE, "aws4_request"].join("/");
     let string_to_sign = [
         SIGV4_ALGORITHM,
@@ -380,6 +471,18 @@ fn signature_for_request(
     .join("\n");
     let signing_key = derive_signing_key(creds.secret_access_key, date_stamp, region);
     hex::encode(hmac_sha256(&signing_key, string_to_sign.as_bytes()))
+}
+
+fn canonical_request(req: &SignedRequest, signed_headers: &str, payload_hash: &str) -> String {
+    [
+        req.method,
+        &canonical_uri(req.path),
+        &canonical_query_string(req.query),
+        &canonical_headers(req, signed_headers),
+        &signed_headers.to_ascii_lowercase(),
+        payload_hash,
+    ]
+    .join("\n")
 }
 
 fn parse_credential_scope(credential: &str) -> Option<(String, String, String, String)> {
@@ -731,13 +834,203 @@ mod percent_decode_tests {
         assert_eq!(
             check(
                 &strict,
-                "STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD",
+                devcloud_sigv4a::STREAMING_PAYLOAD,
                 &[],
                 None,
                 None,
                 Some(b"0\r\n\r\n")
             ),
-            Err(err("NotImplemented", 501))
+            Err(err("IncompleteSignatureException", 400))
         );
+    }
+
+    /// Signs a SigV4a request as `dev`/`dev`, frames `chunks` when the payload
+    /// is streaming, applies `tamper` to the body, and verifies under `creds`.
+    fn sigv4a_check(
+        creds: &Credentials,
+        payload_hash: &str,
+        chunks: &[&[u8]],
+        trailers: Option<&[(&str, &str)]>,
+        region_set: &str,
+        tamper: fn(&mut Vec<u8>),
+    ) -> Result<(), SignatureError> {
+        let amz_date = "20261125T000000Z";
+        let scope = devcloud_sigv4a::credential_scope("20261125", SIGV4_SERVICE);
+        let mut hmap = std::collections::HashMap::new();
+        hmap.insert("x-amz-date".to_string(), amz_date.to_string());
+        hmap.insert("x-amz-region-set".to_string(), region_set.to_string());
+        let mut signed_headers = "host;x-amz-date;x-amz-region-set".to_string();
+        if !payload_hash.is_empty() {
+            hmap.insert("x-amz-content-sha256".to_string(), payload_hash.to_string());
+            signed_headers = "host;x-amz-content-sha256;x-amz-date;x-amz-region-set".to_string();
+        }
+        let plain: Vec<u8> = chunks.concat();
+        let streaming = devcloud_sigv4a::is_streaming(payload_hash);
+        let signed_hash = if payload_hash.is_empty() {
+            sha256_hex(&plain)
+        } else {
+            payload_hash.to_string()
+        };
+        let header_fn = move |name: &str| hmap.get(name).cloned();
+        let mut req = SignedRequest {
+            method: "POST",
+            path: "/",
+            query: "",
+            host: "localhost",
+            authorization: "",
+            amz_date,
+            content_sha256: payload_hash,
+            header: &header_fn,
+            body: b"",
+        };
+        let key = SigningKey::derive("dev", "dev").unwrap();
+        let canonical = canonical_request(&req, &signed_headers, &signed_hash);
+        let seed =
+            key.sign(devcloud_sigv4a::string_to_sign(amz_date, &scope, &canonical).as_bytes());
+        let auth = format!(
+            "{} Credential=dev/{scope}, SignedHeaders={signed_headers}, Signature={seed}",
+            devcloud_sigv4a::ALGORITHM
+        );
+        let mut body = if streaming {
+            let mut chain = ChunkChain::new(key, amz_date, &scope, &seed);
+            devcloud_sigv4a::encode_signed_chunks(&mut chain, chunks, trailers, true)
+        } else {
+            plain
+        };
+        tamper(&mut body);
+        req.authorization = &auth;
+        req.body = &body;
+        verify_signature(&req, creds)
+    }
+
+    #[test]
+    fn sigv4a_header_and_streaming_payloads_verify() {
+        let strict = Credentials {
+            auth_mode: "strict",
+            access_key_id: "dev",
+            secret_access_key: "dev",
+            region: "us-east-1",
+        };
+        let signed_relaxed = Credentials {
+            auth_mode: "signed-relaxed",
+            ..strict
+        };
+        let wrong_secret = Credentials {
+            secret_access_key: "other",
+            ..strict
+        };
+        let relaxed = Credentials {
+            auth_mode: "relaxed",
+            ..wrong_secret
+        };
+        let keep: fn(&mut Vec<u8>) = |_| {};
+        let flip_data: fn(&mut Vec<u8>) = |body| {
+            let at = body.iter().position(|&b| b == b'{').unwrap();
+            body[at] = b'[';
+        };
+        let trailer = [("x-amz-checksum-crc32", "AAAA")];
+        let streaming = devcloud_sigv4a::STREAMING_PAYLOAD;
+        let streaming_trailer = devcloud_sigv4a::STREAMING_PAYLOAD_TRAILER;
+        let body_hash = sha256_hex(b"{}");
+
+        for (name, creds, hash, trailers, region_set, tamper, expected) in [
+            (
+                "signed body",
+                &strict,
+                body_hash.as_str(),
+                None,
+                "*",
+                keep,
+                Ok(()),
+            ),
+            (
+                "implicit body hash",
+                &strict,
+                "",
+                None,
+                "us-east-1",
+                keep,
+                Ok(()),
+            ),
+            (
+                "streaming",
+                &strict,
+                streaming,
+                None,
+                "eu-west-1,us-east-1",
+                keep,
+                Ok(()),
+            ),
+            (
+                "streaming trailer",
+                &strict,
+                streaming_trailer,
+                Some(&trailer[..]),
+                "*",
+                keep,
+                Ok(()),
+            ),
+            (
+                "shape only",
+                &signed_relaxed,
+                streaming,
+                None,
+                "*",
+                keep,
+                Ok(()),
+            ),
+            ("relaxed", &relaxed, streaming, None, "*", flip_data, Ok(())),
+            (
+                "tampered chunk",
+                &strict,
+                streaming,
+                None,
+                "*",
+                flip_data,
+                Err(err("InvalidSignatureException", 403)),
+            ),
+            (
+                "tampered body",
+                &strict,
+                "",
+                None,
+                "*",
+                flip_data,
+                Err(err("InvalidSignatureException", 403)),
+            ),
+            (
+                "wrong secret",
+                &wrong_secret,
+                streaming,
+                None,
+                "*",
+                keep,
+                Err(err("InvalidSignatureException", 403)),
+            ),
+            (
+                "region set",
+                &strict,
+                streaming,
+                None,
+                "eu-west-1",
+                keep,
+                Err(err("IncompleteSignatureException", 400)),
+            ),
+            (
+                "hmac chain with ecdsa seed",
+                &strict,
+                STREAMING_SIGNED,
+                None,
+                "*",
+                keep,
+                Err(err("IncompleteSignatureException", 400)),
+            ),
+        ] {
+            assert_eq!(
+                sigv4a_check(creds, hash, &[b"{", b"}"], trailers, region_set, tamper),
+                expected,
+                "{name}"
+            );
+        }
     }
 }

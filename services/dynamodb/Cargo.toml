@@ -20,4 +20,5 @@ serde_json = "1"
 sha2 = "0.10"
 hmac = "0.12"
 hex = "0.4"
+devcloud-sigv4a = { path = "../sigv4a" }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "io-util", "signal", "time"] }
