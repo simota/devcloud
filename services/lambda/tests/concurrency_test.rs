@@ -424,10 +424,11 @@ async fn provisioned_concurrency_crud_validation_and_persistence() {
     )
     .await;
     assert_eq!(put_v1.status, 202);
-    assert_eq!(put_v1.json()["Status"], "READY");
+    // Environments start in the background, as on AWS.
+    assert_eq!(put_v1.json()["Status"], "IN_PROGRESS");
     assert_eq!(put_v1.json()["RequestedProvisionedConcurrentExecutions"], 2);
-    assert_eq!(put_v1.json()["AllocatedProvisionedConcurrentExecutions"], 2);
-    assert_eq!(put_v1.json()["AvailableProvisionedConcurrentExecutions"], 2);
+    assert_eq!(put_v1.json()["AllocatedProvisionedConcurrentExecutions"], 0);
+    assert_eq!(put_v1.json()["AvailableProvisionedConcurrentExecutions"], 0);
 
     let put_alias = call(
         &e.server,
@@ -550,4 +551,174 @@ async fn provisioned_concurrency_crud_validation_and_persistence() {
         gone.header("X-Amzn-ErrorType"),
         Some("ProvisionedConcurrencyConfigNotFoundException")
     );
+    reloaded.shutdown().await;
+    e.server.shutdown().await;
+}
+
+async fn create_published(server: &Arc<Server>, name: &str, source: &[u8]) {
+    let zip = build_stored(&[("app.py", source)]);
+    let created = call(
+        server,
+        "POST",
+        "/2015-03-31/functions",
+        &[],
+        json!({
+            "FunctionName": name,
+            "Runtime": "python3.12",
+            "Role": "r",
+            "Handler": "app.handler",
+            "Publish": true,
+            "Code": { "ZipFile": b64(&zip) },
+        })
+        .to_string()
+        .as_bytes(),
+    )
+    .await;
+    assert_eq!(created.status, 201, "{:?}", created.json());
+}
+
+/// Polls GetProvisionedConcurrencyConfig until its Status leaves IN_PROGRESS.
+async fn settled_provisioned(server: &Arc<Server>, target: &str) -> Value {
+    for _ in 0..200 {
+        let got = call(server, "GET", target, &[], b"").await;
+        assert_eq!(got.status, 200, "{:?}", got.json());
+        if got.json()["Status"] != "IN_PROGRESS" {
+            return got.json();
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let last = call(server, "GET", target, &[], b"").await.json();
+    panic!("provisioned concurrency stayed IN_PROGRESS: {last}");
+}
+
+fn log_tail(r: &Resp) -> String {
+    let raw = r.header("X-Amz-Log-Result").unwrap_or("");
+    String::from_utf8(
+        base64::engine::general_purpose::STANDARD
+            .decode(raw)
+            .unwrap(),
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn provisioned_concurrency_pre_starts_environments_that_outlive_the_idle_timeout() {
+    if !has_python() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let dir = temp_dir("prewarm");
+    let server = Arc::new(Server::new(Config {
+        idle_timeout: Some(Duration::from_millis(200)),
+        ..config_for(&dir)
+    }));
+    let e = Env { server, dir };
+    create_published(
+        &e.server,
+        "warm-fn",
+        b"print('module init')\ndef handler(e, c):\n    return {'ok': True}\n",
+    )
+    .await;
+    let cfg_path = "/2019-09-30/functions/warm-fn/provisioned-concurrency?Qualifier=1";
+    let put = call(
+        &e.server,
+        "PUT",
+        cfg_path,
+        &[],
+        br#"{"ProvisionedConcurrentExecutions": 2}"#,
+    )
+    .await;
+    assert_eq!(put.status, 202);
+    assert_eq!(put.json()["Status"], "IN_PROGRESS");
+
+    let ready = settled_provisioned(&e.server, cfg_path).await;
+    assert_eq!(ready["Status"], "READY", "{ready}");
+    assert_eq!(ready["AvailableProvisionedConcurrentExecutions"], 2);
+    assert_eq!(ready["AllocatedProvisionedConcurrentExecutions"], 2);
+    assert_eq!(e.server.idle_environments("warm-fn"), 2);
+
+    // Pre-started environments do not expire with the idle timeout.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert_eq!(e.server.idle_environments("warm-fn"), 2);
+
+    // The first invocation is served warm: no init phase in its log.
+    let invoked = call(
+        &e.server,
+        "POST",
+        "/2015-03-31/functions/warm-fn/invocations?Qualifier=1",
+        &[("X-Amz-Log-Type", "Tail")],
+        b"{}",
+    )
+    .await;
+    assert_eq!(invoked.status, 200);
+    assert_eq!(invoked.json(), json!({ "ok": true }));
+    let log = log_tail(&invoked);
+    assert!(!log.contains("Init Duration"), "{log}");
+    assert!(!log.contains("module init"), "{log}");
+    assert_eq!(e.server.idle_environments("warm-fn"), 2);
+
+    // $LATEST is not provisioned: it still cold-starts.
+    let latest = call(
+        &e.server,
+        "POST",
+        "/2015-03-31/functions/warm-fn/invocations",
+        &[("X-Amz-Log-Type", "Tail")],
+        b"{}",
+    )
+    .await;
+    assert!(log_tail(&latest).contains("Init Duration"));
+
+    // Lowering the target stops the surplus environment.
+    call(
+        &e.server,
+        "PUT",
+        cfg_path,
+        &[],
+        br#"{"ProvisionedConcurrentExecutions": 1}"#,
+    )
+    .await;
+    let lowered = settled_provisioned(&e.server, cfg_path).await;
+    assert_eq!(lowered["AvailableProvisionedConcurrentExecutions"], 1);
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert_eq!(e.server.idle_environments("warm-fn"), 1);
+
+    // Deleting the config stops the pre-started environments.
+    let deleted = call(&e.server, "DELETE", cfg_path, &[], b"").await;
+    assert_eq!(deleted.status, 204);
+    assert_eq!(e.server.idle_environments("warm-fn"), 0);
+    e.server.shutdown().await;
+}
+
+#[tokio::test]
+async fn provisioned_concurrency_reports_init_failures() {
+    if !has_python() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let e = env("prewarm-fail");
+    create_published(
+        &e.server,
+        "broken-fn",
+        // The interpreter dies during init (an import error would instead be
+        // reported by the first invocation, as for on-demand environments).
+        b"import os, sys\nprint('boom at import')\nsys.stdout.flush()\nos._exit(3)\ndef handler(e, c):\n    return 1\n",
+    )
+    .await;
+    let cfg_path = "/2019-09-30/functions/broken-fn/provisioned-concurrency?Qualifier=1";
+    let put = call(
+        &e.server,
+        "PUT",
+        cfg_path,
+        &[],
+        br#"{"ProvisionedConcurrentExecutions": 1}"#,
+    )
+    .await;
+    assert_eq!(put.status, 202);
+    let failed = settled_provisioned(&e.server, cfg_path).await;
+    assert_eq!(failed["Status"], "FAILED", "{failed}");
+    assert_eq!(failed["AvailableProvisionedConcurrentExecutions"], 0);
+    let reason = failed["StatusReason"].as_str().unwrap_or("");
+    assert!(reason.contains("Runtime.ExitError"), "{reason}");
+    assert_eq!(e.server.idle_environments("broken-fn"), 0);
+    e.server.shutdown().await;
 }

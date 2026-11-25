@@ -24,13 +24,17 @@ pub(crate) fn event_sink() -> Option<&'static UnboundedSender<String>> {
     EVENT_SINK.get()
 }
 
+pub mod aws_client;
 pub mod body;
 pub mod code_store;
 mod concurrency;
 pub mod container;
+mod event_filter;
+pub mod event_poller;
 mod event_source;
 mod function_url;
 pub mod http;
+mod layer_policy;
 mod layers;
 pub mod runtime;
 mod runtime_api;

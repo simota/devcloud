@@ -121,6 +121,7 @@ fn main() {
             function_credentials,
             opt_dir: (!opt_dir.is_empty()).then(|| PathBuf::from(opt_dir)),
             idle_timeout,
+            event_sources: Default::default(),
         };
         let server = Arc::new(Server::new(config));
         if let Some(err) = server.load_err() {

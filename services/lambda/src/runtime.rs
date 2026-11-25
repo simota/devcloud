@@ -253,7 +253,47 @@ struct PoolState {
     /// `function/runtime` pairs whose interpreter-version mismatch has
     /// already been reported on stderr.
     version_warned: HashSet<String>,
+    /// Provisioned concurrency targets, by configuration key.
+    pins: HashMap<String, Pin>,
     closed: bool,
+}
+
+/// Provisioned concurrency for one configuration key: `target` environments
+/// are kept started (idle ones never expire). Every pinned environment holds
+/// a clone of `token`, so the number alive is its strong count minus one.
+struct Pin {
+    function: String,
+    target: usize,
+    token: Arc<()>,
+    /// Environments being started for this pin right now.
+    starting: usize,
+    /// Why the last start failed; cleared when the configuration changes.
+    failure: Option<String>,
+    /// Identifies the configuration the pin was set from (its
+    /// `LastModified`), so re-putting it retries after a failure.
+    generation: String,
+}
+
+impl Pin {
+    fn alive(&self) -> usize {
+        Arc::strong_count(&self.token) - 1
+    }
+}
+
+/// One desired provisioned concurrency target (see [`Pool::set_provisioned`]).
+pub struct ProvisionedTarget {
+    pub function: String,
+    pub key: String,
+    pub target: usize,
+    pub generation: String,
+}
+
+/// How far a provisioned concurrency target is met.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProvisionedStatus {
+    /// Started environments (idle or serving an invocation).
+    pub available: usize,
+    pub failure: Option<String>,
 }
 
 impl Pool {
@@ -300,6 +340,135 @@ impl Pool {
             .then(|| format!("function {}: {warning}", inv.function_name))
     }
 
+    /// Replaces the provisioned concurrency targets with `desired` and
+    /// returns, per key, how many environments the caller must now start
+    /// (and report through [`Pool::adopt_provisioned`] or
+    /// [`Pool::provision_failed`]). Idle pinned environments beyond a lowered
+    /// or removed target are stopped; busy ones are released when their
+    /// invocation ends.
+    pub fn set_provisioned(&self, desired: &[ProvisionedTarget]) -> Vec<(String, usize)> {
+        let mut stopped = Vec::new();
+        let mut to_start = Vec::new();
+        {
+            let mut st = self.state.lock().unwrap();
+            let st = &mut *st;
+            st.pins
+                .retain(|key, _| desired.iter().any(|d| &d.key == key));
+            for d in desired {
+                if st.closed || st.retired.contains(&d.key) {
+                    st.pins.remove(&d.key);
+                    continue;
+                }
+                let pin = st.pins.entry(d.key.clone()).or_insert_with(|| Pin {
+                    function: d.function.clone(),
+                    target: d.target,
+                    token: Arc::new(()),
+                    starting: 0,
+                    failure: None,
+                    generation: d.generation.clone(),
+                });
+                pin.target = d.target;
+                if pin.generation != d.generation {
+                    pin.generation = d.generation.clone();
+                    pin.failure = None;
+                }
+                if pin.failure.is_some() {
+                    continue;
+                }
+                let have = pin.alive() + pin.starting;
+                if have < pin.target {
+                    let n = pin.target - have;
+                    pin.starting += n;
+                    to_start.push((d.key.clone(), n));
+                }
+            }
+            // Idle environments whose pin is gone or over target (stopped
+            // ones still count as alive until dropped, hence `excess`).
+            let mut excess: HashMap<String, usize> = st
+                .pins
+                .iter()
+                .map(|(k, pin)| (k.clone(), pin.alive().saturating_sub(pin.target)))
+                .collect();
+            let pins = &st.pins;
+            for list in st.idle.values_mut() {
+                let mut i = 0;
+                while i < list.len() {
+                    let release = match &list[i].pin {
+                        None => false,
+                        Some(token) => match pins.get(&list[i].key) {
+                            Some(pin) if Arc::ptr_eq(token, &pin.token) => {
+                                let n = excess.get_mut(&list[i].key).expect("pin has an entry");
+                                let over = *n > 0;
+                                *n = n.saturating_sub(1);
+                                over
+                            }
+                            _ => true,
+                        },
+                    };
+                    if release {
+                        stopped.push(list.swap_remove(i));
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+            st.idle.retain(|_, list| !list.is_empty());
+        }
+        drop(stopped);
+        to_start
+    }
+
+    /// How far the provisioned concurrency target of `key` is met; `None`
+    /// when no target is set for it.
+    pub fn provisioned_status(&self, key: &str) -> Option<ProvisionedStatus> {
+        let st = self.state.lock().unwrap();
+        st.pins.get(key).map(|pin| ProvisionedStatus {
+            available: pin.alive(),
+            failure: pin.failure.clone(),
+        })
+    }
+
+    /// Keeps a freshly started environment as provisioned concurrency for
+    /// its key, or stops it when the target no longer needs it.
+    fn adopt_provisioned(&self, mut env: Environment) {
+        let rejected = {
+            let mut st = self.state.lock().unwrap();
+            let st = &mut *st;
+            match st.pins.get_mut(&env.key) {
+                Some(pin) => {
+                    pin.starting = pin.starting.saturating_sub(1);
+                    if st.closed || pin.alive() >= pin.target {
+                        Some(env)
+                    } else {
+                        env.pin = Some(Arc::clone(&pin.token));
+                        env.idle_since = Instant::now();
+                        let function = pin.function.clone();
+                        st.idle.entry(function).or_default().push(env);
+                        None
+                    }
+                }
+                None => Some(env),
+            }
+        };
+        drop(rejected);
+    }
+
+    /// A start reserved by [`Pool::set_provisioned`] that will not happen.
+    pub fn provision_abandoned(&self, key: &str) {
+        let mut st = self.state.lock().unwrap();
+        if let Some(pin) = st.pins.get_mut(key) {
+            pin.starting = pin.starting.saturating_sub(1);
+        }
+    }
+
+    fn provision_failed(&self, key: &str, reason: String) {
+        let mut st = self.state.lock().unwrap();
+        if let Some(pin) = st.pins.get_mut(key) {
+            pin.starting = pin.starting.saturating_sub(1);
+            pin.failure = Some(reason);
+        }
+    }
+
     /// Retires configuration `key` of `function` (updated or deleted): its
     /// idle environments stop now (leaving other published versions of the
     /// same function warm), and environments still running an invocation stop
@@ -309,6 +478,7 @@ impl Pool {
         {
             let mut st = self.state.lock().unwrap();
             st.retired.insert(key.to_string());
+            st.pins.remove(key);
             if let Some(list) = st.idle.get_mut(function) {
                 let mut i = 0;
                 while i < list.len() {
@@ -332,6 +502,7 @@ impl Pool {
             let mut st = self.state.lock().unwrap();
             for key in keys {
                 st.retired.insert(key.clone());
+                st.pins.remove(key);
             }
             st.idle.remove(function)
         };
@@ -345,6 +516,7 @@ impl Pool {
         let stopped = {
             let mut st = self.state.lock().unwrap();
             st.closed = true;
+            st.pins.clear();
             std::mem::take(&mut st.idle)
         };
         for mut env in stopped.into_values().flatten() {
@@ -404,10 +576,25 @@ impl Pool {
     }
 
     fn give_back(self: &Arc<Self>, function: &str, mut env: Environment) {
+        env.idle_since = Instant::now();
+        if let Some(token) = env.pin.take() {
+            // Still part of its provisioned target: kept without an idle
+            // timer. Otherwise it continues as an ordinary environment.
+            let mut st = self.state.lock().unwrap();
+            let keep = !st.closed
+                && !st.retired.contains(&env.key)
+                && st.pins.get(&env.key).is_some_and(|pin| {
+                    Arc::ptr_eq(&token, &pin.token) && pin.alive() <= pin.target
+                });
+            if keep {
+                env.pin = Some(token);
+                st.idle.entry(function.to_string()).or_default().push(env);
+                return;
+            }
+        }
         if self.idle_timeout.is_zero() {
             return;
         }
-        env.idle_since = Instant::now();
         let id = env.id;
         {
             let mut st = self.state.lock().unwrap();
@@ -437,10 +624,9 @@ impl Pool {
             let Some(list) = st.idle.get_mut(function) else {
                 return;
             };
-            let Some(pos) = list
-                .iter()
-                .position(|e| e.id == id && e.idle_since.elapsed() >= self.idle_timeout)
-            else {
+            let Some(pos) = list.iter().position(|e| {
+                e.id == id && e.pin.is_none() && e.idle_since.elapsed() >= self.idle_timeout
+            }) else {
                 return;
             };
             let env = list.swap_remove(pos);
@@ -536,6 +722,8 @@ struct Environment {
     tasks: Vec<tokio::task::AbortHandle>,
     work_dir: PathBuf,
     idle_since: Instant,
+    /// Set while the environment counts toward provisioned concurrency.
+    pin: Option<Arc<()>>,
     /// Keeps the code tree the environment runs from in place.
     _code: Box<dyn Send>,
 }
@@ -849,6 +1037,69 @@ pub async fn run(
     })
 }
 
+/// Starts one provisioned concurrency environment for `inv`'s function
+/// configuration and hands it to the pool (which counts it toward the target
+/// reserved by [`Pool::set_provisioned`]). `inv`'s request id and payload are
+/// unused. A failure is recorded on the target, which then stops retrying
+/// until its configuration changes. Container image functions are not
+/// pre-started.
+pub async fn provision(
+    inv: &Invocation,
+    interpreters: &Interpreters,
+    pool: &Arc<Pool>,
+    code: Box<dyn Send>,
+) {
+    match start_environment(inv, interpreters, pool, code).await {
+        Ok(env) => pool.adopt_provisioned(env),
+        Err(reason) => pool.provision_failed(&inv.env_key, reason),
+    }
+}
+
+async fn start_environment(
+    inv: &Invocation,
+    interpreters: &Interpreters,
+    pool: &Arc<Pool>,
+    code: Box<dyn Send>,
+) -> Result<Environment, String> {
+    if inv.image.is_some() {
+        return Err("container image functions are not pre-started".to_string());
+    }
+    let family = family(&inv.runtime)
+        .ok_or_else(|| format!("devcloud cannot execute runtime {} locally", inv.runtime))?;
+    let spawn_error = |e: RuntimeError| match e {
+        RuntimeError::Unsupported(rt) => format!("devcloud cannot execute runtime {rt} locally"),
+        RuntimeError::Spawn(msg) => msg,
+    };
+    let started = Instant::now();
+    let mut env = if family == Family::Provided {
+        match spawn_provided(inv, pool, code).await.map_err(spawn_error)? {
+            Ok(env) => env,
+            Err(failed) => return Err(init_failure_reason(&failed)),
+        }
+    } else {
+        spawn(family, inv, interpreters, pool, code).map_err(spawn_error)?
+    };
+    let timeout = Duration::from_secs(inv.timeout_seconds.max(1) as u64);
+    match env.wait(tokio::time::Instant::now() + timeout).await {
+        Wait::Marker { tag, .. } if tag == "ready" => Ok(env),
+        other => {
+            let failed = failed_init(inv, other, started.elapsed(), &env.work_dir);
+            Err(init_failure_reason(&failed))
+        }
+    }
+}
+
+/// `<errorType>: <errorMessage>` of a failed init.
+fn init_failure_reason(failed: &Completed) -> String {
+    let body = match &failed.outcome {
+        Outcome::FunctionError(b) | Outcome::Success(b) => b,
+    };
+    let doc: serde_json::Value = serde_json::from_slice(body).unwrap_or_default();
+    let error_type = doc["errorType"].as_str().unwrap_or("Runtime.Unknown");
+    let message = doc["errorMessage"].as_str().unwrap_or("init failed");
+    format!("{error_type}: {message}")
+}
+
 /// The invocation's result when the environment never became ready.
 fn failed_init(inv: &Invocation, waited: Wait, init: Duration, work_dir: &Path) -> Completed {
     let (outcome, log, timed_out) = match waited {
@@ -1022,6 +1273,7 @@ fn spawn(
         tasks,
         work_dir,
         idle_since: Instant::now(),
+        pin: None,
         _code: code,
     })
 }
@@ -1186,6 +1438,7 @@ async fn spawn_provided(
         tasks: vec![out_task.abort_handle()],
         work_dir,
         idle_since: Instant::now(),
+        pin: None,
         _code: code,
     }))
 }
@@ -1495,6 +1748,7 @@ async fn start_container(
         tasks: vec![out_task.abort_handle(), err_task.abort_handle()],
         work_dir,
         idle_since: Instant::now(),
+        pin: None,
         _code: code,
     };
 

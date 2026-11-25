@@ -1,10 +1,8 @@
 //! Event source mapping control plane records and validation.
 //!
 //! Stores and validates AWS Lambda event source mapping configurations
-//! (`/2015-03-31/event-source-mappings`). Automatic background polling of
-//! external queues/streams (SQS, DynamoDB Streams, Kinesis, Kafka) is not
-//! performed by `devcloud-lambda`; callers can invoke the target function
-//! directly with matching event payloads.
+//! (`/2015-03-31/event-source-mappings`). Polling of the local SQS and
+//! DynamoDB Streams services lives in `event_poller`.
 
 use std::collections::BTreeMap;
 
@@ -342,6 +340,16 @@ fn validate_scaling_config(v: &Value) -> Result<(), Reply> {
 }
 
 impl Server {
+    /// The mapping as returned by Get/List, with the poller's
+    /// `LastProcessingResult` once it has been polled.
+    fn mapping_json(&self, rec: &EventSourceMappingRecord) -> Value {
+        let mut v = rec.to_json(self.region(), self.account_id());
+        if let Some(result) = self.last_processing_result(&rec.uuid) {
+            v["LastProcessingResult"] = json!(result);
+        }
+        v
+    }
+
     fn esm_not_found(&self, uuid: &str) -> Reply {
         Reply::error(
             404,
@@ -432,7 +440,7 @@ impl Server {
     pub fn get_event_source_mapping(&self, uuid: &str) -> Reply {
         let st = self.state.lock().unwrap();
         match st.event_source_mappings.get(uuid) {
-            Some(rec) => Reply::json(200, &rec.to_json(self.region(), self.account_id())),
+            Some(rec) => Reply::json(200, &self.mapping_json(rec)),
             None => self.esm_not_found(uuid),
         }
     }
@@ -474,7 +482,7 @@ impl Server {
                 }
                 true
             })
-            .map(|m| m.to_json(self.region(), self.account_id()))
+            .map(|m| self.mapping_json(m))
             .collect();
         let page: Vec<Value> = matching
             .iter()

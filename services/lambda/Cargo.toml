@@ -32,3 +32,6 @@ devcloud-s3 = { path = "../s3" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "io-util", "process", "time"] }
+# Event source polling tests run the local SQS and DynamoDB services.
+devcloud-sqs = { path = "../sqs" }
+devcloud-dynamodb = { path = "../dynamodb" }

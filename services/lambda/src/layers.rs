@@ -49,6 +49,12 @@ pub(crate) struct LayerVersionRecord {
     pub compatible_architectures: Vec<String>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub license_info: String,
+    /// Resource-based policy statements (`AddLayerVersionPermission`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub policy: Vec<crate::layer_policy::LayerStatement>,
+    /// Revision of `policy`; empty until the first statement is added.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub policy_revision_id: String,
 }
 
 /// Layer version attached to a function (`$LATEST` or a published version).
@@ -401,7 +407,7 @@ fn remove_existing_entry(path: &Path) -> Result<(), String> {
     }
 }
 
-fn parse_version_number(raw: &str) -> Result<u64, Reply> {
+pub(crate) fn parse_version_number(raw: &str) -> Result<u64, Reply> {
     raw.parse::<u64>()
         .ok()
         .filter(|&v| v >= 1)
@@ -409,7 +415,7 @@ fn parse_version_number(raw: &str) -> Result<u64, Reply> {
 }
 
 impl Server {
-    fn layer_not_found(&self, name: &str, version: u64) -> Reply {
+    pub(crate) fn layer_not_found(&self, name: &str, version: u64) -> Reply {
         Reply::error(
             404,
             "ResourceNotFoundException",
@@ -475,6 +481,8 @@ impl Server {
                 compatible_runtimes: compatible_runtimes.clone(),
                 compatible_architectures: compatible_architectures.clone(),
                 license_info: license_info.clone(),
+                policy: Vec::new(),
+                policy_revision_id: String::new(),
             };
             entry.versions.insert(ver_num, rec.clone());
             Ok(rec)

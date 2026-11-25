@@ -1,6 +1,7 @@
 //! Lambda Layers: PublishLayerVersion, GetLayerVersion, GetLayerVersionByArn,
 //! ListLayers, ListLayerVersions, DeleteLayerVersion, Content.Location download,
-//! attaching Layers to functions/versions, and executing Python & Node handlers
+//! layer version permissions (Add/Get/Remove), attaching Layers to
+//! functions/versions, and executing Python & Node handlers
 //! with attached layers overlaid in order.
 
 use std::collections::HashMap;
@@ -578,4 +579,155 @@ async fn python_and_node_execute_with_attached_layers_and_overlay_order() {
     assert_eq!(new_fn_missing.status, 400);
 
     e.server.shutdown().await;
+}
+
+#[tokio::test]
+async fn layer_version_permissions_add_get_remove_and_persist() {
+    let e = env("policy");
+    let zip = build_stored(&[("python/helper.py", b"VALUE = 1\n")]);
+    let published = call(
+        &e.server,
+        "POST",
+        "/2018-10-31/layers/shared/versions",
+        &[],
+        json!({ "Content": { "ZipFile": b64(&zip) } })
+            .to_string()
+            .as_bytes(),
+    )
+    .await;
+    assert_eq!(published.status, 201);
+    let policy_path = "/2018-10-31/layers/shared/versions/1/policy";
+    let resource = "arn:aws:lambda:us-east-1:000000000000:layer:shared:1";
+
+    // No policy yet.
+    let none = call(&e.server, "GET", policy_path, &[], b"").await;
+    assert_eq!(none.status, 404);
+    assert_eq!(
+        none.header("X-Amzn-ErrorType"),
+        Some("ResourceNotFoundException")
+    );
+
+    let added = call(
+        &e.server,
+        "POST",
+        policy_path,
+        &[],
+        json!({
+            "StatementId": "acct",
+            "Action": "lambda:GetLayerVersion",
+            "Principal": "123456789012",
+        })
+        .to_string()
+        .as_bytes(),
+    )
+    .await;
+    assert_eq!(added.status, 201, "{:?}", added.json());
+    let statement: Value =
+        serde_json::from_str(added.json()["Statement"].as_str().unwrap()).unwrap();
+    assert_eq!(statement["Sid"], "acct");
+    assert_eq!(statement["Effect"], "Allow");
+    assert_eq!(statement["Action"], "lambda:GetLayerVersion");
+    assert_eq!(
+        statement["Principal"]["AWS"],
+        "arn:aws:iam::123456789012:root"
+    );
+    assert_eq!(statement["Resource"], resource);
+    let rev1 = added.json()["RevisionId"].as_str().unwrap().to_string();
+
+    // Duplicate statement id, invalid action, unknown layer version.
+    let dup = call(
+        &e.server,
+        "POST",
+        policy_path,
+        &[],
+        br#"{"StatementId":"acct","Action":"lambda:GetLayerVersion","Principal":"*"}"#,
+    )
+    .await;
+    assert_eq!(dup.status, 409);
+    let bad = call(
+        &e.server,
+        "POST",
+        policy_path,
+        &[],
+        br#"{"StatementId":"x","Action":"lambda:InvokeFunction","Principal":"*"}"#,
+    )
+    .await;
+    assert_eq!(bad.status, 400);
+    let missing = call(
+        &e.server,
+        "POST",
+        "/2018-10-31/layers/shared/versions/9/policy",
+        &[],
+        br#"{"StatementId":"x","Action":"lambda:GetLayerVersion","Principal":"*"}"#,
+    )
+    .await;
+    assert_eq!(missing.status, 404);
+
+    // A stale RevisionId is refused; the current one is accepted.
+    let stale = call(
+        &e.server,
+        "POST",
+        &format!("{policy_path}?RevisionId=not-current"),
+        &[],
+        br#"{"StatementId":"org","Action":"lambda:GetLayerVersion","Principal":"*","OrganizationId":"o-abcdefghij"}"#,
+    )
+    .await;
+    assert_eq!(stale.status, 412);
+    let org = call(
+        &e.server,
+        "POST",
+        &format!("{policy_path}?RevisionId={rev1}"),
+        &[],
+        br#"{"StatementId":"org","Action":"lambda:GetLayerVersion","Principal":"*","OrganizationId":"o-abcdefghij"}"#,
+    )
+    .await;
+    assert_eq!(org.status, 201, "{:?}", org.json());
+
+    // GetLayerVersionPolicy returns both statements, and survives a restart.
+    let reloaded = Arc::new(Server::new(config_for(&e.dir)));
+    let got = call(&reloaded, "GET", policy_path, &[], b"").await;
+    assert_eq!(got.status, 200);
+    assert_eq!(got.json()["RevisionId"], org.json()["RevisionId"]);
+    let policy: Value = serde_json::from_str(got.json()["Policy"].as_str().unwrap()).unwrap();
+    assert_eq!(policy["Version"], "2012-10-17");
+    let statements = policy["Statement"].as_array().unwrap();
+    assert_eq!(statements.len(), 2);
+    assert_eq!(statements[1]["Principal"], "*");
+    assert_eq!(
+        statements[1]["Condition"]["StringEquals"]["aws:PrincipalOrgID"],
+        "o-abcdefghij"
+    );
+
+    // RemoveLayerVersionPermission.
+    let removed = call(
+        &reloaded,
+        "DELETE",
+        &format!("{policy_path}/acct"),
+        &[],
+        b"",
+    )
+    .await;
+    assert_eq!(removed.status, 204);
+    let again = call(
+        &reloaded,
+        "DELETE",
+        &format!("{policy_path}/acct"),
+        &[],
+        b"",
+    )
+    .await;
+    assert_eq!(again.status, 404);
+    let left = call(&reloaded, "GET", policy_path, &[], b"").await;
+    let policy: Value = serde_json::from_str(left.json()["Policy"].as_str().unwrap()).unwrap();
+    assert_eq!(policy["Statement"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        call(&reloaded, "DELETE", &format!("{policy_path}/org"), &[], b"")
+            .await
+            .status,
+        204
+    );
+    assert_eq!(
+        call(&reloaded, "GET", policy_path, &[], b"").await.status,
+        404
+    );
 }

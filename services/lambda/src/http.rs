@@ -42,6 +42,9 @@ pub async fn serve(
     shutdown: impl std::future::Future<Output = ()>,
 ) -> std::io::Result<()> {
     tokio::pin!(shutdown);
+    // Provisioned concurrency persisted by a previous run starts again.
+    server.reconcile_provisioned();
+    server.start_event_source_polling();
     // Tracked, not detached: on shutdown every in-flight request is aborted
     // and awaited, so `runtime::Cleanup` kills its handler process group.
     let mut connections = tokio::task::JoinSet::new();
@@ -285,7 +288,7 @@ pub async fn process(server: &Arc<Server>, req: &Request) -> Reply {
         },
         ["2015-03-31", "functions", id] => match m {
             "GET" => server.get_function(id, &query),
-            "DELETE" => server.delete_function(id, &query),
+            "DELETE" => reconciled(server, server.delete_function(id, &query)),
             _ => method_not_allowed(),
         },
         ["2015-03-31", "functions", id, "configuration"] => match m {
@@ -326,8 +329,8 @@ pub async fn process(server: &Arc<Server>, req: &Request) -> Reply {
         },
         ["2015-03-31", "functions", id, "aliases", alias] => match m {
             "GET" => server.get_alias(id, alias),
-            "PUT" => server.update_alias(id, alias, &req.body),
-            "DELETE" => server.delete_alias(id, alias),
+            "PUT" => reconciled(server, server.update_alias(id, alias, &req.body)),
+            "DELETE" => reconciled(server, server.delete_alias(id, alias)),
             _ => method_not_allowed(),
         },
         ["2018-10-31", "layers"] | ["2018-10-31", "layers", ""] => match m {
@@ -351,6 +354,15 @@ pub async fn process(server: &Arc<Server>, req: &Request) -> Reply {
         ["2018-10-31", "layers", name, "versions", version] => match m {
             "GET" => server.get_layer_version(name, version),
             "DELETE" => server.delete_layer_version(name, version),
+            _ => method_not_allowed(),
+        },
+        ["2018-10-31", "layers", name, "versions", version, "policy"] => match m {
+            "POST" => server.add_layer_version_permission(name, version, &query, body),
+            "GET" => server.get_layer_version_policy(name, version),
+            _ => method_not_allowed(),
+        },
+        ["2018-10-31", "layers", name, "versions", version, "policy", sid] => match m {
+            "DELETE" => server.remove_layer_version_permission(name, version, sid, &query),
             _ => method_not_allowed(),
         },
         ["2015-03-31", "event-source-mappings"] | ["2015-03-31", "event-source-mappings", ""] => {
@@ -377,9 +389,15 @@ pub async fn process(server: &Arc<Server>, req: &Request) -> Reply {
             _ => method_not_allowed(),
         },
         ["2019-09-30", "functions", id, "provisioned-concurrency"] => match m {
-            "PUT" => server.put_provisioned_concurrency_config(id, &query, &req.body),
+            "PUT" => reconciled(
+                server,
+                server.put_provisioned_concurrency_config(id, &query, &req.body),
+            ),
             "GET" => server.get_or_list_provisioned_concurrency(id, &query),
-            "DELETE" => server.delete_provisioned_concurrency_config(id, &query),
+            "DELETE" => reconciled(
+                server,
+                server.delete_provisioned_concurrency_config(id, &query),
+            ),
             _ => method_not_allowed(),
         },
         ["2021-10-31", "functions", id, "url"] => match m {
@@ -412,6 +430,15 @@ pub async fn process(server: &Arc<Server>, req: &Request) -> Reply {
             &format!("devcloud lambda does not implement {m} {}", req.raw_path),
         ),
     }
+}
+
+/// Passes `reply` through, first bringing provisioned concurrency
+/// environments in line with the configuration a successful call changed.
+fn reconciled(server: &Arc<Server>, reply: Reply) -> Reply {
+    if (200..300).contains(&reply.status) {
+        server.reconcile_provisioned();
+    }
+    reply
 }
 
 /// Runs a handler that unzips, extracts or reads whole packages (and holds
