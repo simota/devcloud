@@ -11,6 +11,7 @@
 //!   DEVCLOUD_PUBSUB_PROJECT          default project
 //!   DEVCLOUD_PUBSUB_AUTH_MODE        relaxed | oauth-relaxed | bearer-dev | strict
 //!   DEVCLOUD_PUBSUB_BEARER_TOKEN     expected bearer token (strict/bearer-dev)
+//!   DEVCLOUD_PUBSUB_PRINCIPALS       strict-mode `token=member[,token=member]` IAM callers
 //!   DEVCLOUD_PUBSUB_STORAGE          resource storage dir (resources.json)
 //!   DEVCLOUD_PUBSUB_MESSAGE_STORAGE  message storage dir (pubsub.json)
 //!   DEVCLOUD_PUBSUB_DEFAULT_ACK_DEADLINE, _MAX_ACK_DEADLINE,
@@ -59,7 +60,12 @@ fn main() {
         streaming_pull_disabled: env("DEVCLOUD_PUBSUB_STREAMING_PULL_DISABLED") == "1",
     };
 
-    let server = Server::new(config);
+    let mut server = Server::new(config);
+    for (token, member) in
+        devcloud_pubsub::strict_auth::parse_principals(&env("DEVCLOUD_PUBSUB_PRINCIPALS"))
+    {
+        server.add_principal(token, member);
+    }
     if let Some(err) = server.load_err() {
         eprintln!("devcloud-pubsub: failed to load state: {err}");
         std::process::exit(1);

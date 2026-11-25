@@ -1013,3 +1013,56 @@ async fn a_failed_delivery_ends_the_transaction() {
     c.close().await;
     let _ = done.await;
 }
+
+#[tokio::test]
+async fn smtp_strict_requires_auth_before_mail_from() {
+    let store = Arc::new(RecordingStore::new());
+    let cfg = SmtpConfig {
+        max_message_bytes: 1024,
+        auth_mode: "strict".to_string(),
+        username: "configured".to_string(),
+        password: "secret".to_string(),
+        ..Default::default()
+    };
+    let (mut c, done) = start_session(cfg, store.clone());
+
+    c.expect_reply("220").await;
+    c.send_line("EHLO localhost").await;
+    c.expect_reply("250").await;
+    c.send_line("MAIL FROM:<a@x.test>").await;
+    c.expect_reply("530").await;
+    // A failed AUTH does not open the transaction either.
+    let wrong = BASE64.encode(b"\x00configured\x00wrong");
+    c.send_line(&format!("AUTH PLAIN {wrong}")).await;
+    c.expect_reply("535").await;
+    c.send_line("MAIL FROM:<a@x.test>").await;
+    c.expect_reply("530").await;
+    let good = BASE64.encode(b"\x00configured\x00secret");
+    c.send_line(&format!("AUTH PLAIN {good}")).await;
+    c.expect_reply("235").await;
+    c.send_line("MAIL FROM:<a@x.test>").await;
+    c.expect_reply("250").await;
+    c.send_line("QUIT").await;
+    c.expect_reply("221").await;
+    c.close().await;
+    let _ = done.await;
+}
+
+#[tokio::test]
+async fn smtp_relaxed_accepts_mail_from_without_auth() {
+    let store = Arc::new(RecordingStore::new());
+    let cfg = SmtpConfig {
+        auth_mode: "relaxed".to_string(),
+        ..Default::default()
+    };
+    let (mut c, done) = start_session(cfg, store);
+    c.expect_reply("220").await;
+    c.send_line("EHLO localhost").await;
+    c.expect_reply("250").await;
+    c.send_line("MAIL FROM:<a@x.test>").await;
+    c.expect_reply("250").await;
+    c.send_line("QUIT").await;
+    c.expect_reply("221").await;
+    c.close().await;
+    let _ = done.await;
+}

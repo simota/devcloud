@@ -251,8 +251,12 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "devcloud-applicationautoscaling",
+ "devcloud-bigquery",
  "devcloud-cloudrun",
+ "devcloud-gcs",
  "devcloud-lambda",
+ "devcloud-pubsub",
+ "devcloud-s3",
  "futures-util",
  "hex",
  "hmac",

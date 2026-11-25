@@ -6,8 +6,9 @@
 //!   DEVCLOUD_GCS_ADDR          listen address (host:port)
 //!   DEVCLOUD_GCS_PROJECT       default project
 //!   DEVCLOUD_GCS_LOCATION      default bucket location
-//!   DEVCLOUD_GCS_AUTH_MODE     relaxed | oauth-relaxed | bearer-dev
-//!   DEVCLOUD_GCS_BEARER_TOKEN  expected bearer token for bearer-dev
+//!   DEVCLOUD_GCS_AUTH_MODE     relaxed | oauth-relaxed | bearer-dev | strict
+//!   DEVCLOUD_GCS_BEARER_TOKEN  expected bearer token for bearer-dev / strict (owner)
+//!   DEVCLOUD_GCS_PRINCIPALS    strict-mode `token=member[,token=member]` IAM callers
 //!   DEVCLOUD_GCS_STORAGE       shared bucket storage root
 //!   DEVCLOUD_GCS_UPLOAD_SESSIONS resumable upload session storage
 
@@ -31,7 +32,7 @@ fn main() {
         eprintln!("devcloud-gcs: DEVCLOUD_GCS_STORAGE is required");
         std::process::exit(2);
     }
-    let server = Server::new(
+    let mut server = Server::new(
         Config {
             project: env("DEVCLOUD_GCS_PROJECT"),
             location: env("DEVCLOUD_GCS_LOCATION"),
@@ -41,6 +42,11 @@ fn main() {
         },
         FileBucketStore::new(storage),
     );
+    for (token, member) in
+        devcloud_gcs::iam_enforce::parse_principals(&env("DEVCLOUD_GCS_PRINCIPALS"))
+    {
+        server.add_access_token(token, member);
+    }
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()

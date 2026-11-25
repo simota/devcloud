@@ -390,7 +390,13 @@ async fn forward_rest(
         base: &config.pubsub_base,
         method,
         path: &full_path,
-        headers,
+        headers: headers
+            .into_iter()
+            .chain(crate::forward::bearer_auth_headers(
+                &config.pubsub_auth_mode,
+                &config.pubsub_bearer_token,
+            ))
+            .collect(),
         body,
     })
     .await
@@ -422,7 +428,10 @@ async fn introspect(config: &Config, path: &str) -> Result<ForwardResponse, Forw
         base: &config.pubsub_base,
         method: "GET",
         path,
-        headers: Vec::new(),
+        headers: crate::forward::bearer_auth_headers(
+            &config.pubsub_auth_mode,
+            &config.pubsub_bearer_token,
+        ),
         body: Vec::new(),
     })
     .await

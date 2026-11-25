@@ -56,8 +56,16 @@ fn is_iam_action(action: &str) -> bool {
 /// Routes a parsed request to the matching `Server` operation. The path is the
 /// raw (still percent-encoded) request path.
 pub fn route(server: &mut Server, req: &Request) -> RestResponse {
-    // Auth (applies to all paths, mirroring `authorize`).
-    if !server.authorized(&req.bearer_token()) {
+    // Auth (applies to all paths, mirroring `authorize`). Strict mode also
+    // authorizes the caller against topic/subscription IAM policies.
+    if server.is_strict_auth() {
+        let authorization = req.headers.get("authorization").map_or("", String::as_str);
+        if let Err(err) = server.authorize_rest(&req.method, &req.path, authorization) {
+            let mut resp = render_error(&err);
+            resp.www_authenticate = err.status == 401;
+            return resp;
+        }
+    } else if !server.authorized(&req.bearer_token()) {
         let mut resp = render_error(&ApiError::new(
             401,
             "UNAUTHENTICATED",

@@ -66,6 +66,8 @@ fn build_config(cfg: &AppConfig) -> Config {
         gcs_base: enabled_ep(cfg.services.gcs.enabled, cfg.server.gcs_port),
         gcs_endpoint: http_ep(cfg.server.gcs_port),
         gcs_storage_path: join(s, "gcs"),
+        gcs_auth_mode: cfg.auth.gcs.mode.clone(),
+        gcs_bearer_token: cfg.auth.gcs.bearer_token.clone(),
 
         dynamodb_base: enabled_ep(cfg.services.dynamodb.enabled, cfg.server.dynamodb_port),
         dynamodb_endpoint: http_ep(cfg.server.dynamodb_port),
@@ -74,6 +76,8 @@ fn build_config(cfg: &AppConfig) -> Config {
         bigquery_base: enabled_ep(cfg.services.bigquery.enabled, cfg.server.bigquery_port),
         bigquery_endpoint: http_ep(cfg.server.bigquery_port),
         bigquery_storage_path: join(s, "bigquery"),
+        bigquery_auth_mode: cfg.auth.bigquery.mode.clone(),
+        bigquery_bearer_token: cfg.auth.bigquery.bearer_token.clone(),
 
         redshift_base: enabled_ep(cfg.services.redshift.enabled, cfg.server.redshift_api_port),
         redshift_sql_endpoint: format!("127.0.0.1:{}", cfg.server.redshift_port),
@@ -90,6 +94,8 @@ fn build_config(cfg: &AppConfig) -> Config {
         pubsub_base: enabled_ep(cfg.services.pubsub.enabled, cfg.server.pubsub_rest_port),
         pubsub_endpoint: http_ep(cfg.server.pubsub_rest_port),
         pubsub_storage_path: default_string(&cfg.services.pubsub.data_dir, &join(s, "pubsub")),
+        pubsub_auth_mode: cfg.auth.pubsub.mode.clone(),
+        pubsub_bearer_token: cfg.auth.pubsub.bearer_token.clone(),
 
         app_auto_scaling_base: enabled_ep(
             cfg.services.app_auto_scaling.enabled,

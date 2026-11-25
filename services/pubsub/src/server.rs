@@ -77,7 +77,7 @@ impl RestResponse {
 }
 
 pub struct Server {
-    config: Config,
+    pub(crate) config: Config,
     pub(crate) topics: BTreeMap<String, Topic>,
     pub(crate) subscriptions: BTreeMap<String, Subscription>,
     pub(crate) snapshots: BTreeMap<String, Snapshot>,
@@ -98,6 +98,10 @@ pub struct Server {
     /// clone-the-whole-backlog + `cleanup_unreferenced_messages` + file write
     /// for mutations that never touch a message (e.g. CreateTopic).
     messages_dirty: bool,
+    /// Strict-mode `(bearer token, IAM member)` pairs; see `strict_auth`.
+    pub(crate) principals: Vec<(String, String)>,
+    /// Topic/subscription IAM policies keyed by full resource name.
+    pub(crate) iam_policies: BTreeMap<String, Value>,
 }
 
 impl Server {
@@ -116,10 +120,12 @@ impl Server {
             fixed_now: None,
             resource_dirty: false,
             messages_dirty: false,
+            principals: Vec::new(),
+            iam_policies: BTreeMap::new(),
         };
         if !server.config.storage_path.is_empty() || !server.config.message_storage_path.is_empty()
         {
-            if let Err(err) = server.load() {
+            if let Err(err) = server.load().and_then(|_| server.load_iam_policies()) {
                 server.load_err = Some(err);
             }
         }
@@ -286,6 +292,7 @@ impl Server {
     /// message state is embedded in `resources.json` itself, so that write is
     /// still required whenever messages are dirty.
     pub(crate) fn persist(&mut self) -> Result<(), ApiError> {
+        self.prune_iam_policies()?;
         if self.messages_dirty {
             self.cleanup_unreferenced_messages();
         }
@@ -1944,11 +1951,11 @@ impl Server {
         Some((topic.to_string(), max))
     }
 
-    // --- IAM (stub) -------------------------------------------------------
+    // --- IAM (policies stored; enforced in strict mode, see `strict_auth`) --
 
     /// IAM action for a topic, mirroring `handleTopicIAM` + `handleIAMAction`.
     pub fn topic_iam(
-        &self,
+        &mut self,
         project: &str,
         topic_id: &str,
         action: &str,
@@ -1964,12 +1971,12 @@ impl Server {
         if !self.topics.contains_key(&name) {
             return Err(ApiError::not_found("topic not found"));
         }
-        iam_action(action, body)
+        self.iam_action(&name, action, body)
     }
 
     /// IAM action for a subscription, mirroring `handleSubscriptionIAM`.
     pub fn subscription_iam(
-        &self,
+        &mut self,
         project: &str,
         subscription_id: &str,
         action: &str,
@@ -1985,7 +1992,7 @@ impl Server {
         if !self.subscriptions.contains_key(&name) {
             return Err(ApiError::not_found("subscription not found"));
         }
-        iam_action(action, body)
+        self.iam_action(&name, action, body)
     }
 
     // --- Seek -------------------------------------------------------------
@@ -3889,35 +3896,6 @@ fn grpc_list_schema_view(view: &str) -> String {
         "BASIC".to_string()
     } else {
         view.to_string()
-    }
-}
-
-/// Renders an IAM action, mirroring `handleIAMAction`.
-fn iam_action(action: &str, body: &Value) -> Result<RestResponse, ApiError> {
-    match action {
-        "getIamPolicy" => Ok(RestResponse::ok_struct(&serde_json::json!({
-            "version": 1, "bindings": [],
-        }))),
-        "setIamPolicy" => {
-            let policy = body
-                .get("policy")
-                .filter(|p| p.is_object())
-                .cloned()
-                .unwrap_or_else(|| serde_json::json!({"version": 1, "bindings": []}));
-            Ok(RestResponse::ok_struct(&policy))
-        }
-        "testIamPermissions" => {
-            let perms = body.get("permissions").cloned().unwrap_or(Value::Null);
-            let perms = if perms.is_array() {
-                perms
-            } else {
-                Value::Array(Vec::new())
-            };
-            Ok(RestResponse::ok_struct(&serde_json::json!({
-                "permissions": perms,
-            })))
-        }
-        _ => Err(ApiError::not_found("not found")),
     }
 }
 
