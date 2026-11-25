@@ -2285,10 +2285,50 @@ impl Server {
         } else {
             None
         };
+        let content_sha256 = req
+            .headers
+            .get("x-amz-content-sha256")
+            .map(String::as_str)
+            .unwrap_or("");
+        let content_encoding = req
+            .headers
+            .get("content-encoding")
+            .map(String::as_str)
+            .unwrap_or("");
+        let decoded_req = if crate::sigv4::is_aws_chunked(content_sha256, content_encoding) {
+            let decoded_len = req
+                .headers
+                .get("x-amz-decoded-content-length")
+                .map(String::as_str)
+                .unwrap_or("");
+            let decoded_body = match crate::sigv4::decode_aws_chunked(&req.body, decoded_len) {
+                Ok(b) => b,
+                Err(e) => return Reply::error(e.status, e.name, e.name),
+            };
+            let mut headers = req.headers.clone();
+            match crate::sigv4::strip_aws_chunked_encoding(content_encoding) {
+                Some(enc) => {
+                    headers.insert("content-encoding".to_string(), enc);
+                }
+                None => {
+                    headers.remove("content-encoding");
+                }
+            }
+            Some(Request {
+                method: req.method.clone(),
+                raw_path: req.raw_path.clone(),
+                query: req.query.clone(),
+                headers,
+                body: decoded_body,
+            })
+        } else {
+            None
+        };
+        let event_req = decoded_req.as_ref().unwrap_or(req);
         let url_id = url.url_id.as_str();
         let request_id = self.new_id();
         let event = function_url::build_event(
-            req,
+            event_req,
             &function_url::EventContext {
                 url_id,
                 raw_path,

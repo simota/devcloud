@@ -11,7 +11,9 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::server::{error_outcome, Outcome, Server};
-use crate::sigv4::{verify_signature, Credentials, SignedRequest};
+use crate::sigv4::{
+    decode_aws_chunked, is_aws_chunked, verify_signature, Credentials, SignedRequest,
+};
 
 const TARGET_PREFIX: &str = "AmazonSSM.";
 const MAX_HEADER_BYTES: usize = 64 * 1024;
@@ -233,11 +235,24 @@ fn process(server: &Server, req: &Request) -> Outcome {
         return error_outcome(e.status, e.name, e.name);
     }
 
+    let decoded_body = if is_aws_chunked(
+        req.header("x-amz-content-sha256"),
+        req.header("content-encoding"),
+    ) {
+        match decode_aws_chunked(&req.body, req.header("x-amz-decoded-content-length")) {
+            Ok(b) => Some(b),
+            Err(e) => return error_outcome(e.status, e.name, e.name),
+        }
+    } else {
+        None
+    };
+    let body = decoded_body.as_deref().unwrap_or(&req.body);
+
     let target = req.header("x-amz-target");
     if !target.starts_with(TARGET_PREFIX) {
         return error_outcome(400, "UnknownOperationException", "unknown operation");
     }
-    server.dispatch(&target[TARGET_PREFIX.len()..], &req.body)
+    server.dispatch(&target[TARGET_PREFIX.len()..], body)
 }
 
 fn reason_phrase(status: u16) -> &'static str {

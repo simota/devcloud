@@ -64,8 +64,8 @@ impl Server {
         signed: Option<&SignedRequest>,
         now_unix: i64,
     ) -> Outcome {
-        // SigV4 (no-op in relaxed mode).
-        if let Some(req) = signed {
+        // SigV4 (no-op in relaxed mode) and aws-chunked payload decoding.
+        let decoded_body = if let Some(req) = signed {
             let creds = Credentials {
                 auth_mode: creds_mode,
                 region: self.sigv4_region(),
@@ -75,7 +75,24 @@ impl Server {
             if let Err(sig) = crate::sigv4::verify_signature(&creds, req) {
                 return Outcome::error(sig.status, sig.code, sig.code);
             }
-        }
+            if crate::sigv4::is_aws_chunked(
+                req.header("x-amz-content-sha256"),
+                req.header("content-encoding"),
+            ) {
+                match crate::sigv4::decode_aws_chunked(
+                    body,
+                    req.header("x-amz-decoded-content-length"),
+                ) {
+                    Ok(decoded) => Some(decoded),
+                    Err(sig) => return Outcome::error(sig.status, sig.code, sig.code),
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let body = decoded_body.as_deref().unwrap_or(body);
 
         let Some(op) = target.strip_prefix(TARGET_PREFIX) else {
             return Outcome::error(400, "UnknownOperationException", "unknown operation");

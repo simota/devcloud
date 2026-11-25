@@ -414,7 +414,7 @@ Completed resumable uploads retain a small metadata receipt and notification mar
 | Backups and restore | Partial | Local backup metadata and restore flow. |
 | Tags and resource policies | Partial | Local metadata only; no IAM enforcement. |
 | DescribeLimits / DescribeEndpoints | Yes | Local compatibility responses. |
-| AWS SigV4 header auth | Partial | Relaxed mode is default; strict mode validates local credentials. |
+| AWS SigV4 header auth | Partial | Relaxed mode is default; strict mode validates local credentials and `aws-chunked` (`STREAMING-*`) chunk and trailer signatures. |
 | DAX, global tables, autoscaling | No | Not implemented. |
 | Real capacity accounting/throttling | No | Local deterministic behavior, not AWS capacity simulation. |
 | IAM condition enforcement | No | Not implemented. |
@@ -504,7 +504,7 @@ Pub/Sub dashboard actions are available under `/dashboard/pubsub`:
 | Layers | Partial | `PublishLayerVersion` (`ZipFile` or local `S3Bucket`/`S3Key`), `GetLayerVersion`, `GetLayerVersionByArn`, `ListLayers`, `ListLayerVersions` (runtime/architecture filters), `DeleteLayerVersion`, and up to 5 `Layers` on Zip functions. Attached layers are overlaid in order into a per-environment `/opt` stand-in (`PYTHONPATH`, `NODE_PATH`, `PATH` `bin/`, and `provided*` `bootstrap` lookup) ahead of `services.lambda.optDir`. Layer resource policies (`AddLayerVersionPermission`) are not implemented. |
 | Event source mappings | Partial | `CreateEventSourceMapping`, `GetEventSourceMapping`, `ListEventSourceMappings` (`EventSourceArn`/`FunctionName` filters and pagination), `UpdateEventSourceMapping`, and `DeleteEventSourceMapping` with field and `FilterCriteria` JSON pattern validation and persistence. Automatic background polling of external queues or streams (SQS, DynamoDB Streams, Kinesis, Kafka/MSK) is not implemented. |
 | Concurrency | Partial | `PutFunctionConcurrency`, `GetFunctionConcurrency`, and `DeleteFunctionConcurrency` update `AccountLimit.UnreservedConcurrentExecutions` and enforce per-function reserved concurrency on `Invoke` and Function URLs with `429 TooManyRequestsException`. `PutProvisionedConcurrencyConfig`, `GetProvisionedConcurrencyConfig`, `ListProvisionedConcurrencyConfigs`, and `DeleteProvisionedConcurrencyConfig` persist configs for published versions and aliases in `READY` state (validated against reserved/account limits) without pre-spawning idle processes. |
-| Auth | Partial | `relaxed`, `signed-relaxed`, and `strict` SigV4 (service `lambda`), like Application Auto Scaling. `strict` requires the credential scope's date to match `X-Amz-Date` and accepts a signature over the path either normalized as most SDKs sign it (`//x` and dot segments collapsed) or exactly as sent; there is no clock-skew check, so requests signed with fixed timestamps keep working. |
+| Auth | Partial | `relaxed`, `signed-relaxed`, and `strict` SigV4 (service `lambda`), like Application Auto Scaling, including `aws-chunked` (`STREAMING-*`) chunk and trailer signature verification. `strict` requires the credential scope's date to match `X-Amz-Date` and accepts a signature over the path either normalized as most SDKs sign it (`//x` and dot segments collapsed) or exactly as sent; there is no clock-skew check, so requests signed with fixed timestamps keep working. |
 | Browser (CSRF) guard | Yes | Non-GET requests carrying a non-loopback `Origin` (or `Sec-Fetch-Site: cross-site`) are rejected with 403, so a web page cannot create or invoke functions; SDKs/CLIs (no `Origin`) and loopback front-ends are unaffected. The dashboard's test invoke applies the same rule. Requests whose `Host` is a public DNS name are refused too (DNS rebinding; see the Dashboard API notes). |
 
 ### SSM Parameter Store-Compatible API
@@ -515,7 +515,7 @@ Pub/Sub dashboard actions are available under `/dashboard/pubsub`:
 | Labels & version history | Yes | `LabelParameterVersion`, `UnlabelParameterVersion`, `GetParameterHistory`, and `:<version>` / `:<label>` selectors on `GetParameter` and `GetParameters` (up to 100 versions retained per parameter and up to 10 labels per version). |
 | Tags & policies | Partial | `AddTagsToResource`, `RemoveTagsFromResource`, `ListTagsForResource` (`ResourceType: Parameter`), initial `Tags` on `PutParameter`, and `Policies` (`Expiration`, `ExpirationNotification`, `NoChangeNotification`) validated and stored as `Advanced`-tier inline policy metadata; expiration/notification policies are not evaluated asynchronously in the background. |
 | `SecureString` | Partial | No KMS: values are stored in plaintext in `state.json` and `KeyId` (default `alias/aws/ssm`) is persisted as metadata. `GetParameter`, `GetParameters`, `GetParametersByPath`, and `GetParameterHistory` return the value only with `WithDecryption: true`; without it the value is an opaque placeholder, never the plaintext. |
-| Auth | Partial | `relaxed` / `signed-relaxed` / `strict` SigV4 (service `ssm`). `strict` only accepts `auth.ssm` credentials, so STS temporary credentials are rejected there. |
+| Auth | Partial | `relaxed` / `signed-relaxed` / `strict` SigV4 (service `ssm`), including `aws-chunked` (`STREAMING-*`) chunk and trailer signature verification. `strict` only accepts `auth.ssm` credentials, so STS temporary credentials are rejected there. |
 | Dashboard | Partial | `/dashboard/ssm` lists names, types, and versions through `DescribeParameters`; values never reach the dashboard. |
 
 ### STS-Compatible API
@@ -524,7 +524,7 @@ Pub/Sub dashboard actions are available under `/dashboard/pubsub`:
 | --- | --- | --- |
 | `AssumeRole` | Partial | AWS Query protocol (form `POST /` or `GET /?Action=`), XML responses. Validates `RoleArn`, `RoleSessionName`, and `DurationSeconds` (900–43200), and issues new `ASIA…` temporary credentials per call. An inline session `Policy` must be JSON of at most 2048 characters; it is accepted but not evaluated. Stateless. |
 | `GetCallerIdentity` | Partial | Always reports the configured account's root identity, not the assumed role. |
-| Auth | Partial | `relaxed` / `signed-relaxed` / `strict` SigV4 (service `sts`). |
+| Auth | Partial | `relaxed` / `signed-relaxed` / `strict` SigV4 (service `sts`), including `aws-chunked` (`STREAMING-*`) chunk and trailer signature verification. |
 
 ### Cloud Run-Compatible API
 

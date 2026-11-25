@@ -10,7 +10,9 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::server::{error_outcome, Outcome, Server};
-use crate::sigv4::{verify_signature, Credentials, SignedRequest};
+use crate::sigv4::{
+    decode_aws_chunked, is_aws_chunked, verify_signature, Credentials, SignedRequest,
+};
 
 const MAX_HEADER_BYTES: usize = 64 * 1024;
 const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
@@ -225,10 +227,23 @@ fn process(server: &Server, req: &Request) -> Outcome {
         return error_outcome(e.status, e.name, e.name);
     }
 
+    let decoded_body = if is_aws_chunked(
+        req.header("x-amz-content-sha256"),
+        req.header("content-encoding"),
+    ) {
+        match decode_aws_chunked(&req.body, req.header("x-amz-decoded-content-length")) {
+            Ok(b) => Some(b),
+            Err(e) => return error_outcome(e.status, e.name, e.name),
+        }
+    } else {
+        None
+    };
+    let body = decoded_body.as_deref().unwrap_or(&req.body);
+
     let mut params = BTreeMap::new();
     parse_form(&req.query, &mut params);
     if req.method == "POST" {
-        parse_form(&String::from_utf8_lossy(&req.body), &mut params);
+        parse_form(&String::from_utf8_lossy(body), &mut params);
     }
     server.dispatch(&params)
 }

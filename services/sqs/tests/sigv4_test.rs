@@ -272,3 +272,295 @@ fn strict_mode_error_codes() {
         "AuthorizationHeaderMalformed"
     );
 }
+
+// --- streaming (aws-chunked) payload verification ---
+
+fn sign_streaming_chunks(
+    chunks: &[&[u8]],
+    seed: &str,
+    amz_date: &str,
+    trailer: Option<&str>,
+) -> Vec<u8> {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    fn hmac(key: &[u8], val: &[u8]) -> String {
+        let mut mac = Hmac::<Sha256>::new_from_slice(key).unwrap();
+        mac.update(val);
+        mac.finalize()
+            .into_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+    fn hmac_bytes(key: &[u8], val: &[u8]) -> Vec<u8> {
+        let mut mac = Hmac::<Sha256>::new_from_slice(key).unwrap();
+        mac.update(val);
+        mac.finalize().into_bytes().to_vec()
+    }
+    let date_stamp = &amz_date[..8];
+    let date_key = hmac_bytes(b"AWS4dev", date_stamp.as_bytes());
+    let region_key = hmac_bytes(&date_key, b"us-east-1");
+    let service_key = hmac_bytes(&region_key, b"sqs");
+    let key = hmac_bytes(&service_key, b"aws4_request");
+    let scope = format!("{date_stamp}/us-east-1/sqs/aws4_request");
+    let empty = sha256_hex(b"");
+    let mut previous = seed.to_string();
+    let mut out = Vec::new();
+    for chunk in chunks.iter().copied().chain([&b""[..]]) {
+        let to_sign = format!(
+            "AWS4-HMAC-SHA256-PAYLOAD\n{amz_date}\n{scope}\n{previous}\n{empty}\n{}",
+            sha256_hex(chunk)
+        );
+        previous = hmac(&key, to_sign.as_bytes());
+        out.extend(format!("{:x};chunk-signature={previous}\r\n", chunk.len()).into_bytes());
+        out.extend_from_slice(chunk);
+        out.extend_from_slice(b"\r\n");
+    }
+    if let Some(trailer) = trailer {
+        out.truncate(out.len() - 2);
+        let to_sign = format!(
+            "AWS4-HMAC-SHA256-TRAILER\n{amz_date}\n{scope}\n{previous}\n{}",
+            sha256_hex(format!("{trailer}\n").as_bytes())
+        );
+        let sig = hmac(&key, to_sign.as_bytes());
+        out.extend(format!("{trailer}\r\nx-amz-trailer-signature:{sig}\r\n\r\n").into_bytes());
+    }
+    out
+}
+
+#[test]
+fn strict_mode_verifies_streaming_payloads() {
+    use devcloud_sqs::sigv4::{
+        STREAMING_SIGNED, STREAMING_SIGNED_TRAILER, STREAMING_UNSIGNED_TRAILER,
+    };
+
+    let creds = strict_creds();
+    let date_stamp = "20260430";
+    let amz_date = "20260430T100000Z";
+    let signed_headers = "host;x-amz-content-sha256;x-amz-date";
+    let host = "127.0.0.1:9324";
+
+    let run = |payload_hash: &str,
+               chunks: &[&[u8]],
+               trailer: Option<&str>,
+               decoded_len: Option<&str>,
+               override_body: Option<&[u8]>| {
+        let mut hmap = HashMap::new();
+        hmap.insert("x-amz-date".to_string(), amz_date.to_string());
+        hmap.insert("x-amz-content-sha256".to_string(), payload_hash.to_string());
+        if let Some(len) = decoded_len {
+            hmap.insert("x-amz-decoded-content-length".to_string(), len.to_string());
+        }
+        let h1 = hmap.clone();
+        let header_fn1 = move |name: &str| h1.get(name).cloned();
+        let req_for_sig = SignedRequest {
+            method: "POST",
+            path: "/",
+            query: "",
+            host,
+            authorization: "",
+            amz_date,
+            content_sha256: payload_hash,
+            header: &header_fn1,
+            body: b"",
+        };
+        let seed = signature_for_request(
+            &req_for_sig,
+            date_stamp,
+            "us-east-1",
+            signed_headers,
+            payload_hash,
+            &creds,
+        );
+        let auth = format!(
+            "{SIGV4_ALGORITHM} Credential=dev/{date_stamp}/us-east-1/sqs/aws4_request, \
+             SignedHeaders={signed_headers}, Signature={seed}"
+        );
+        let framed = sign_streaming_chunks(chunks, &seed, amz_date, trailer);
+        let body = override_body.unwrap_or(&framed);
+        let header_fn2 = move |name: &str| hmap.get(name).cloned();
+        let req = SignedRequest {
+            method: "POST",
+            path: "/",
+            query: "",
+            host,
+            authorization: &auth,
+            amz_date,
+            content_sha256: payload_hash,
+            header: &header_fn2,
+            body,
+        };
+        verify_signature(&req, &creds)
+    };
+
+    // Valid signed chunks.
+    assert_eq!(
+        run(
+            STREAMING_SIGNED,
+            &[b"hello ", b"world"],
+            None,
+            Some("11"),
+            None
+        ),
+        Ok(())
+    );
+    // Tampered chunk byte fails with SignatureDoesNotMatch.
+    let mut hmap = HashMap::new();
+    hmap.insert("x-amz-date".to_string(), amz_date.to_string());
+    hmap.insert(
+        "x-amz-content-sha256".to_string(),
+        STREAMING_SIGNED.to_string(),
+    );
+    let h1 = hmap.clone();
+    let header_fn1 = move |name: &str| h1.get(name).cloned();
+    let seed = signature_for_request(
+        &SignedRequest {
+            method: "POST",
+            path: "/",
+            query: "",
+            host,
+            authorization: "",
+            amz_date,
+            content_sha256: STREAMING_SIGNED,
+            header: &header_fn1,
+            body: b"",
+        },
+        date_stamp,
+        "us-east-1",
+        signed_headers,
+        STREAMING_SIGNED,
+        &creds,
+    );
+    let mut bad_body = sign_streaming_chunks(&[b"hello ", b"world"], &seed, amz_date, None);
+    let pos = bad_body.windows(5).position(|w| w == b"hello").unwrap();
+    bad_body[pos] = b'j';
+    assert_eq!(
+        run(
+            STREAMING_SIGNED,
+            &[b"hello ", b"world"],
+            None,
+            None,
+            Some(&bad_body)
+        ),
+        Err(SignatureError {
+            code: "SignatureDoesNotMatch",
+            status: 403,
+        })
+    );
+
+    // Valid signed trailer and tampered trailer.
+    assert_eq!(
+        run(
+            STREAMING_SIGNED_TRAILER,
+            &[b"hello world"],
+            Some("x-amz-checksum-crc32:DQpIDQ=="),
+            Some("11"),
+            None,
+        ),
+        Ok(())
+    );
+    let mut bad_trailer = sign_streaming_chunks(
+        &[b"hello world"],
+        &signature_for_request(
+            &SignedRequest {
+                method: "POST",
+                path: "/",
+                query: "",
+                host,
+                authorization: "",
+                amz_date,
+                content_sha256: STREAMING_SIGNED_TRAILER,
+                header: &move |name: &str| {
+                    if name == "x-amz-date" {
+                        Some(amz_date.to_string())
+                    } else if name == "x-amz-content-sha256" {
+                        Some(STREAMING_SIGNED_TRAILER.to_string())
+                    } else {
+                        None
+                    }
+                },
+                body: b"",
+            },
+            date_stamp,
+            "us-east-1",
+            signed_headers,
+            STREAMING_SIGNED_TRAILER,
+            &creds,
+        ),
+        amz_date,
+        Some("x-amz-checksum-crc32:DQpIDQ=="),
+    );
+    let tpos = bad_trailer
+        .windows(8)
+        .position(|w| w == b"DQpIDQ==")
+        .unwrap();
+    bad_trailer[tpos] = b'A';
+    assert_eq!(
+        run(
+            STREAMING_SIGNED_TRAILER,
+            &[b"hello world"],
+            Some("x-amz-checksum-crc32:DQpIDQ=="),
+            None,
+            Some(&bad_trailer),
+        ),
+        Err(SignatureError {
+            code: "SignatureDoesNotMatch",
+            status: 403,
+        })
+    );
+
+    // Unsigned trailer framing.
+    assert_eq!(
+        run(
+            STREAMING_UNSIGNED_TRAILER,
+            &[],
+            None,
+            Some("11"),
+            Some(b"b\r\nhello world\r\n0\r\nx-amz-checksum-crc32:DQpIDQ==\r\n\r\n"),
+        ),
+        Ok(())
+    );
+
+    // Malformed framing or mismatched decoded length.
+    assert_eq!(
+        run(
+            STREAMING_UNSIGNED_TRAILER,
+            &[],
+            None,
+            None,
+            Some(b"not chunked"),
+        ),
+        Err(SignatureError {
+            code: "AuthorizationHeaderMalformed",
+            status: 400,
+        })
+    );
+    assert_eq!(
+        run(
+            STREAMING_UNSIGNED_TRAILER,
+            &[],
+            None,
+            Some("99"),
+            Some(b"b\r\nhello world\r\n0\r\n\r\n"),
+        ),
+        Err(SignatureError {
+            code: "AuthorizationHeaderMalformed",
+            status: 400,
+        })
+    );
+
+    // Unknown STREAMING-* algorithm still returns NotImplemented (501).
+    assert_eq!(
+        run(
+            "STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD",
+            &[],
+            None,
+            None,
+            Some(b"0\r\n\r\n"),
+        ),
+        Err(SignatureError {
+            code: "NotImplemented",
+            status: 501,
+        })
+    );
+}
