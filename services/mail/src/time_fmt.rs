@@ -8,6 +8,10 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
+const MONTHS: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+
 /// Current UTC time formatted as RFC 3339 (e.g. `2026-04-30T10:00:00Z`, or with
 /// a trimmed fractional part when sub-second precision is present).
 pub fn now_rfc3339() -> String {
@@ -53,9 +57,6 @@ pub fn unix_from_rfc3339(s: &str) -> (i64, u32) {
 /// Formats an RFC 3339 UTC timestamp as an IMAP4rev1 `INTERNALDATE` string
 /// (`DD-Mon-YYYY HH:MM:SS +0000`). Falls back to the UNIX epoch if malformed.
 pub fn imap_internaldate_from_rfc3339(s: &str) -> String {
-    const MONTHS: [&str; 12] = [
-        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-    ];
     let secs = parse_rfc3339(s).map(|(sec, _)| sec).unwrap_or(0);
     let days = secs.div_euclid(86_400);
     let secs_of_day = secs.rem_euclid(86_400);
@@ -68,6 +69,60 @@ pub fn imap_internaldate_from_rfc3339(s: &str) -> String {
         .copied()
         .unwrap_or("Jan");
     format!("{day:02}-{mon}-{year:04} {hour:02}:{minute:02}:{second:02} +0000")
+}
+
+pub(crate) fn rfc3339_from_imap_internaldate(s: &str) -> Option<String> {
+    if !s.is_ascii() || s.len() != 26 {
+        return None;
+    }
+    let bytes = s.as_bytes();
+    if [
+        bytes[2], bytes[6], bytes[11], bytes[14], bytes[17], bytes[20],
+    ] != *b"-- :: "
+    {
+        return None;
+    }
+    let number = |part: &str| -> Option<i64> {
+        part.bytes()
+            .all(|b| b.is_ascii_digit())
+            .then(|| part.parse().ok())?
+    };
+    let day = number(s[..2].trim_start_matches(' '))?;
+    let month = MONTHS
+        .iter()
+        .position(|m| m.eq_ignore_ascii_case(&s[3..6]))? as i64
+        + 1;
+    let year = number(&s[7..11])?;
+    let hour = number(&s[12..14])?;
+    let minute = number(&s[15..17])?;
+    let second = number(&s[18..20])?;
+    let zone_hour = number(&s[22..24])?;
+    let zone_minute = number(&s[24..26])?;
+    let sign = match bytes[21] {
+        b'+' => 1,
+        b'-' => -1,
+        _ => return None,
+    };
+    if !(1..=31).contains(&day)
+        || year == 0
+        || hour > 23
+        || minute > 59
+        || second > 59
+        || zone_hour > 23
+        || zone_minute > 59
+    {
+        return None;
+    }
+    let days = days_from_civil(year, month, day);
+    if civil_from_days(days) != (year, month as u32, day as u32) {
+        return None;
+    }
+    let utc = days * 86_400 + hour * 3_600 + minute * 60 + second
+        - sign * (zone_hour * 3_600 + zone_minute * 60);
+    if !(1..=9999).contains(&civil_from_days(utc.div_euclid(86_400)).0) {
+        return None;
+    }
+    Some(rfc3339_from_unix(utc, 0))
 }
 
 fn parse_rfc3339(s: &str) -> Option<(i64, u32)> {
