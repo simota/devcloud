@@ -8,6 +8,7 @@
 //!   DEVCLOUD_MAIL_AUTH_MODE     off | relaxed | strict
 //!   DEVCLOUD_MAIL_USERNAME      strict-mode username
 //!   DEVCLOUD_MAIL_PASSWORD      strict-mode password
+//!   DEVCLOUD_MAIL_ACCOUNTS      optional strict-mode JSON array of accounts
 //!   DEVCLOUD_MAIL_TLS_ENABLED   true/1 to enable TLS (self-signed if no cert/key)
 //!   DEVCLOUD_MAIL_TLS_CERT_FILE PEM certificate chain file
 //!   DEVCLOUD_MAIL_TLS_KEY_FILE  PEM private key file
@@ -22,7 +23,7 @@ use std::sync::Arc;
 
 use devcloud_mail::{
     mail_tls_from_config, BlobStore, FileBlobStore, FileStore, ImapConfig, ImapServer, Pop3Config,
-    Pop3Server, Service, SmtpConfig, SmtpServer, Store,
+    Pop3Server, Service, SmtpConfig, SmtpServer,
 };
 use tokio::net::TcpListener;
 use tokio::sync::watch;
@@ -88,8 +89,14 @@ fn main() {
     };
 
     let blobs: Arc<dyn BlobStore> = Arc::new(FileBlobStore::new(blobs_dir));
-    let store: Arc<dyn Store> = Arc::new(FileStore::new(storage, blobs));
-    let service = Arc::new(Service::new(store));
+    let store = Arc::new(FileStore::new(storage, blobs));
+    let accounts = std::env::var("DEVCLOUD_MAIL_ACCOUNTS").unwrap_or_default();
+    let service = Arc::new(
+        Service::with_accounts(store, &auth_mode, &accounts).unwrap_or_else(|e| {
+            eprintln!("devcloud-mail: {e}");
+            std::process::exit(2);
+        }),
+    );
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()

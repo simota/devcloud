@@ -644,7 +644,7 @@ where
                 .tagged(tag, "BAD", "LOGIN requires username and password")
                 .await;
         }
-        if !self.config.verify_credentials(&tokens[0], &tokens[1]) {
+        if !self.authenticate("", &tokens[0], &tokens[1]) {
             return self
                 .tagged(tag, "NO", "[AUTHENTICATIONFAILED] LOGIN failed")
                 .await;
@@ -692,13 +692,25 @@ where
         if fields.len() != 3 {
             return self.tagged(tag, "BAD", "malformed PLAIN credentials").await;
         }
-        if !self.config.verify_credentials(fields[1], fields[2]) {
+        if !self.authenticate(fields[0], fields[1], fields[2]) {
             return self
                 .tagged(tag, "NO", "[AUTHENTICATIONFAILED] AUTHENTICATE failed")
                 .await;
         }
         self.state = ImapState::Authenticated;
         self.tagged(tag, "OK", "AUTHENTICATE completed").await
+    }
+
+    fn authenticate(&mut self, authzid: &str, user: &str, pass: &str) -> bool {
+        if let Some(accounts) = self.service.accounts(&self.config.auth_mode) {
+            let Some(account) = accounts.authenticate(authzid, user, pass) else {
+                return false;
+            };
+            self.service = Arc::clone(&account.mailbox);
+            true
+        } else {
+            self.config.verify_credentials(user, pass)
+        }
     }
 
     async fn handle_list(&mut self, tag: &str, cmd: &str, arg: &str) -> bool {

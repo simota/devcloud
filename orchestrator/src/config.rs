@@ -88,6 +88,7 @@ pub struct SmtpAuthConfig {
     pub mode: String,
     pub username: String,
     pub password: String,
+    pub accounts: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -473,6 +474,7 @@ pub fn default_config() -> Config {
                 mode: "relaxed".to_string(),
                 username: "dev".to_string(),
                 password: "dev".to_string(),
+                accounts: String::new(),
             },
             s3: S3AuthConfig {
                 mode: "relaxed".to_string(),
@@ -884,6 +886,7 @@ pub fn apply_config_value(cfg: &mut Config, path: &[String], value: &str) -> io:
         "auth.smtp.mode" => cfg.auth.smtp.mode = value.to_string(),
         "auth.smtp.user" => cfg.auth.smtp.username = value.to_string(),
         "auth.smtp.password" => cfg.auth.smtp.password = value.to_string(),
+        "auth.smtp.accounts" => cfg.auth.smtp.accounts = value.to_string(),
         "auth.s3.mode" => cfg.auth.s3.mode = value.to_string(),
         "auth.s3.accessKeyId" => cfg.auth.s3.access_key_id = value.to_string(),
         "auth.s3.secretAccessKey" => cfg.auth.s3.secret_access_key = value.to_string(),
@@ -1591,6 +1594,7 @@ pub fn default_config_yaml(cfg: &Config) -> String {
             "    mode: {smtp_mode}\n",
             "    user: {smtp_user}\n",
             "    password: {smtp_password}\n",
+            "{smtp_accounts}",
             "  s3:\n",
             "    mode: {s3_auth_mode}\n",
             "    accessKeyId: {s3_access_key_id}\n",
@@ -1797,6 +1801,11 @@ pub fn default_config_yaml(cfg: &Config) -> String {
         smtp_mode = a.smtp.mode,
         smtp_user = a.smtp.username,
         smtp_password = a.smtp.password,
+        smtp_accounts = if a.smtp.accounts.is_empty() {
+            String::new()
+        } else {
+            format!("    accounts: {}\n", a.smtp.accounts)
+        },
         s3_auth_mode = a.s3.mode,
         s3_access_key_id = a.s3.access_key_id,
         s3_secret_access_key = a.s3.secret_access_key,
@@ -2412,6 +2421,19 @@ mod tests {
         cfg.services.redis.external_tls_ca_file = "certs/redis-ca.pem".into();
         let parsed = parse_yaml_in_memory(&default_config_yaml(&cfg)).unwrap();
         assert_eq!(parsed.services.redis, cfg.services.redis);
+    }
+
+    #[test]
+    fn strict_mail_accounts_round_trip() {
+        let mut cfg = default_config();
+        assert!(cfg.auth.smtp.accounts.is_empty());
+        cfg.auth.smtp.mode = "strict".into();
+        cfg.auth.smtp.accounts = r#"[{"username":"alice","password":"local:password","address":"alice@example.test","allowedSenders":["billing@example.test"]}]"#.into();
+        let yaml = default_config_yaml(&cfg);
+        assert_eq!(
+            parse_yaml_in_memory(&yaml).unwrap().auth.smtp,
+            cfg.auth.smtp
+        );
     }
 
     #[test]

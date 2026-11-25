@@ -321,11 +321,32 @@ Legend:
 | Dashboard inbox | Yes | Inspect messages and raw source. |
 | Delete messages | Yes | Single-message and clear-all paths are available through dashboard API. |
 | Outbound relay | No | devcloud is an inbox emulator, not an SMTP relay. |
-| SMTP AUTH | Partial | `PLAIN` and `LOGIN` are available when `auth.smtp.mode` is not `off`; strict mode validates supplied credentials and answers `MAIL FROM` with `530 5.7.0 Authentication required` until the session has authenticated (`off`/`relaxed` still accept `MAIL FROM` without AUTH). The default mode is `off`. Per-user mailboxes and sender authorization are not emulated. |
-| HTTP API authentication | Partial | Strict mode protects the introspection/control API with the configured SMTP Basic credentials; the dashboard forwards those credentials for reads and mutations. |
+| SMTP AUTH | Partial | `PLAIN` and `LOGIN` are available when `auth.smtp.mode` is not `off`. Strict mode requires authentication before `MAIL FROM` (`530 5.7.0`). With named accounts enabled, each account can submit from its own address or an explicit `allowedSenders` address (`550 5.7.1` otherwise). Authenticated null reverse paths are accepted. The orchestrator defaults to `relaxed`; both `relaxed` and `off` accept `MAIL FROM` without AUTH. |
+| Per-user mailboxes | Yes | In strict mode with named accounts, `RCPT TO` delivers to each configured recipient's isolated, persistent `INBOX`. Unconfigured recipients receive `550 5.1.1`. Authenticate as that user on IMAP or POP3 to read and manage their mailbox. |
+| HTTP API authentication | Partial | Strict mode protects the shared-inbox introspection/control API with `auth.smtp.user` and `auth.smtp.password`; the dashboard forwards those credentials for reads and mutations. Named mailboxes are accessed through IMAP/POP3. |
 | Browser guards | Yes | Direct introspection/control HTTP endpoints reject public DNS Host names and cross-site mutations, using the Dashboard API host allowlist. SDK/CLI requests without Origin remain supported. |
 | TLS / STARTTLS | Yes | Off by default to avoid breaking plaintext clients that auto-upgrade with system CA verification. Set `services.mail.tls.enabled: true` for a locally generated in-memory self-signed certificate (`localhost` / `127.0.0.1` / `::1`), or set `services.mail.tls.certFile` and `services.mail.tls.keyFile` (PEM) for custom CA-signed verification. Enables `STARTTLS` on SMTP/IMAP and `STLS` on POP3 (TLS 1.2/1.3); set `services.mail.tls.require: true` to refuse auth/mail commands before TLS. Optional implicit-TLS ports (`server.smtpsPort`, `server.imapsPort`, `server.pop3sPort`) serve SMTPS/IMAPS/POP3S. Standalone `devcloud-mail` reads `DEVCLOUD_MAIL_TLS_*` and `DEVCLOUD_MAIL_*S_ADDR`. |
-| IMAP / POP3 | Partial | Shared mail store with IMAP4rev1 on `127.0.0.1:11143` and POP3 on `127.0.0.1:11110` (`0` disables a port). SMTP delivers to `INBOX`, which is also the POP3 mailbox. IMAP supports `CAPABILITY`, `STARTTLS`, `LOGIN`, `AUTHENTICATE PLAIN`, `CREATE`, `LIST`/`LSUB`, `STATUS`, `SELECT`/`EXAMINE`, `APPEND`, `IDLE`, `FETCH`/`UID FETCH` (including `ENVELOPE`, `BODY[]`/`BODY.PEEK[]` and partial slices), `STORE`/`UID STORE`, `SEARCH`/`UID SEARCH`, `EXPUNGE`, `CLOSE`, `UNSELECT`, `CHECK`, `NOOP`, and `LOGOUT`. Flat folders, UIDs, system flags and keywords persist across restarts. `APPEND` accepts one byte-counted literal (up to 1 MiB by default) with optional flags and internal date. `IDLE` reports arrivals, expunges and flag changes in the selected folder until `DONE` or the connection idle timeout (5 minutes by default). `LSUB` lists all folders. Folder hierarchy, delete/rename, explicit subscriptions and `COPY`/`MOVE` are outside this subset. POP3 supports `CAPA`, `STLS`, `USER`/`PASS`, `AUTH PLAIN`, `STAT`, `LIST`, `UIDL`, `RETR`, `TOP`, `DELE`, `RSET`, `NOOP`, and `QUIT` (commits deletions only on `QUIT`). Both honor `auth.smtp` (`relaxed`/`off` accept any credentials, `strict` validates configured credentials). |
+| IMAP / POP3 | Partial | IMAP4rev1 on `127.0.0.1:11143` and POP3 on `127.0.0.1:11110` (`0` disables a port). Both expose the same `INBOX` for the authenticated user, or the shared `INBOX` when named accounts are disabled. IMAP supports `CAPABILITY`, `STARTTLS`, `LOGIN`, `AUTHENTICATE PLAIN`, `CREATE`, `LIST`/`LSUB`, `STATUS`, `SELECT`/`EXAMINE`, `APPEND`, `IDLE`, `FETCH`/`UID FETCH` (including `ENVELOPE`, `BODY[]`/`BODY.PEEK[]` and partial slices), `STORE`/`UID STORE`, `SEARCH`/`UID SEARCH`, `EXPUNGE`, `CLOSE`, `UNSELECT`, `CHECK`, `NOOP`, and `LOGOUT`. Flat folders, UIDs, system flags and keywords persist across restarts. `APPEND` accepts one byte-counted literal (up to 1 MiB by default) with optional flags and internal date. `IDLE` reports arrivals, expunges and flag changes in the selected folder until `DONE` or the connection idle timeout (5 minutes by default). `LSUB` lists all folders. Folder hierarchy, delete/rename, explicit subscriptions and `COPY`/`MOVE` are outside this subset. POP3 supports `CAPA`, `STLS`, `USER`/`PASS`, `AUTH PLAIN`, `STAT`, `LIST`, `UIDL`, `RETR`, `TOP`, `DELE`, `RSET`, `NOOP`, and `QUIT` (commits deletions only on `QUIT`). Both honor `auth.smtp` (`relaxed`/`off` accept any credentials, `strict` validates configured credentials). |
+
+To enable named accounts, set `auth.smtp.accounts` to a single-line JSON array
+in `.devcloud/config.yaml`:
+
+```yaml
+auth:
+  smtp:
+    mode: strict
+    accounts: [{"username":"alice","password":"local-alice","address":"alice@example.test","allowedSenders":["billing@example.test"]},{"username":"bob","password":"local-bob","address":"bob@example.test"}]
+```
+
+A nonempty account list supplies the credentials for SMTP, IMAP, and POP3 in
+strict mode. Usernames and recipient addresses must be unique. Credentials use
+printable ASCII. Addresses use
+ASCII dot-atom local parts and DNS-style domains. Address matching preserves
+local-part case and ignores domain case. `allowedSenders` is optional and checks
+the SMTP envelope sender. An absent or empty list uses the existing shared
+inbox and single strict credential pair. Named mailbox metadata is stored under
+`<storage>/mail/accounts` in an orchestrated workspace. Standalone `devcloud-mail` accepts the
+same JSON in `DEVCLOUD_MAIL_ACCOUNTS`. Keep local test passwords private.
 
 ### S3-Compatible API
 
