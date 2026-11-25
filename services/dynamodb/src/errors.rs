@@ -9,6 +9,7 @@
 use serde_json::{Map, Value};
 
 const TYPE_PREFIX: &str = "com.amazonaws.dynamodb.v20120810#";
+const DAX_TYPE_PREFIX: &str = "com.amazonaws.dax.v3#";
 
 /// A DynamoDB API error: an HTTP status, the AWS error name (e.g.
 /// `ValidationException`), a human-readable message, and optional extra body
@@ -19,6 +20,7 @@ pub struct ApiError {
     pub status: u16,
     pub name: String,
     pub message: String,
+    pub type_prefix: &'static str,
     /// Extra top-level body fields merged with `__type`/`message`. legacy builds the
     /// condition-failure body as a `map[string]any`, so the final JSON is fully
     /// key-sorted.
@@ -31,8 +33,23 @@ impl ApiError {
             status,
             name: name.to_string(),
             message: message.into(),
+            type_prefix: TYPE_PREFIX,
             extra: Map::new(),
         }
+    }
+
+    pub fn dax(status: u16, name: &str, message: impl Into<String>) -> Self {
+        ApiError {
+            status,
+            name: name.to_string(),
+            message: message.into(),
+            type_prefix: DAX_TYPE_PREFIX,
+            extra: Map::new(),
+        }
+    }
+
+    pub fn access_denied(message: impl Into<String>) -> Self {
+        ApiError::new(400, "AccessDeniedException", message)
     }
 
     /// 400 ConditionalCheckFailedException, optionally carrying the prior item
@@ -82,7 +99,7 @@ impl ApiError {
         let mut map = self.extra.clone();
         map.insert(
             "__type".to_string(),
-            Value::String(format!("{TYPE_PREFIX}{}", self.name)),
+            Value::String(format!("{}{}", self.type_prefix, self.name)),
         );
         map.insert("message".to_string(), Value::String(self.message.clone()));
         Value::Object(map)

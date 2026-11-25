@@ -83,6 +83,16 @@ impl Credentials<'_> {
 /// Verifies the request signature per the configured auth mode. Mirrors
 /// `verifySignature`.
 pub fn verify_signature(creds: &Credentials, req: &SignedRequest) -> Result<(), SignatureError> {
+    verify_signature_for_service(creds, req, SERVICE)
+}
+
+/// Verifies the request signature against an explicit AWS SigV4 service name
+/// (e.g. `"dynamodb"` or `"dax"`).
+pub fn verify_signature_for_service(
+    creds: &Credentials,
+    req: &SignedRequest,
+    expected_service: &str,
+) -> Result<(), SignatureError> {
     if creds.auth_mode.is_empty() || creds.auth_mode.eq_ignore_ascii_case("relaxed") {
         return Ok(());
     }
@@ -91,15 +101,16 @@ pub fn verify_signature(creds: &Credentials, req: &SignedRequest) -> Result<(), 
         return Err(err("AccessDeniedException", 403));
     }
     if creds.auth_mode.eq_ignore_ascii_case("signed-relaxed") {
-        return verify_header_shape(req, &auth);
+        return verify_header_shape(req, &auth, expected_service);
     }
-    verify_authorization_header(creds, req, &auth)
+    verify_authorization_header(creds, req, &auth, expected_service)
 }
 
 fn verify_authorization_header(
     creds: &Credentials,
     req: &SignedRequest,
     auth: &str,
+    expected_service: &str,
 ) -> Result<(), SignatureError> {
     let prefix = format!("{ALGORITHM} ");
     let Some(rest) = auth.strip_prefix(&prefix) else {
@@ -118,7 +129,7 @@ fn verify_authorization_header(
     if signed_headers.is_empty() || signature.is_empty() {
         return Err(err("IncompleteSignatureException", 400));
     }
-    if access_key != creds.access_key() || region != creds.region() || service != SERVICE {
+    if access_key != creds.access_key() || region != creds.region() || service != expected_service {
         return Err(err("UnrecognizedClientException", 403));
     }
     if req.header("x-amz-date").is_empty() {
@@ -130,11 +141,12 @@ fn verify_authorization_header(
     } else {
         verify_payload_hash(req, &payload_hash)?;
     }
-    let expected = signature_for_request(
+    let expected = signature_for_request_with_service(
         creds,
         req,
         date_stamp,
         region,
+        expected_service,
         signed_headers,
         &payload_hash,
     );
@@ -145,12 +157,24 @@ fn verify_authorization_header(
         payload_hash.as_str(),
         STREAMING_SIGNED | STREAMING_SIGNED_TRAILER
     ) {
-        verify_streaming_chunks(creds, req, date_stamp, region, &expected, &payload_hash)?;
+        verify_streaming_chunks(
+            creds,
+            req,
+            date_stamp,
+            region,
+            expected_service,
+            &expected,
+            &payload_hash,
+        )?;
     }
     Ok(())
 }
 
-fn verify_header_shape(req: &SignedRequest, auth: &str) -> Result<(), SignatureError> {
+fn verify_header_shape(
+    req: &SignedRequest,
+    auth: &str,
+    expected_service: &str,
+) -> Result<(), SignatureError> {
     let prefix = format!("{ALGORITHM} ");
     let Some(rest) = auth.strip_prefix(&prefix) else {
         return Err(err("IncompleteSignatureException", 400));
@@ -168,7 +192,7 @@ fn verify_header_shape(req: &SignedRequest, auth: &str) -> Result<(), SignatureE
     if signed_headers.is_empty() || signature.is_empty() {
         return Err(err("IncompleteSignatureException", 400));
     }
-    if service != SERVICE || !is_lower_hex(signature, 64) {
+    if service != expected_service || !is_lower_hex(signature, 64) {
         return Err(err("IncompleteSignatureException", 400));
     }
     if req.header("x-amz-date").is_empty() {
@@ -324,14 +348,15 @@ fn verify_streaming_chunks(
     req: &SignedRequest,
     date_stamp: &str,
     region: &str,
+    service: &str,
     seed_signature: &str,
     payload_hash: &str,
 ) -> Result<(), SignatureError> {
     let parsed =
         parse_chunked_body(req.body).ok_or_else(|| err("IncompleteSignatureException", 400))?;
-    let signing_key = derive_signing_key(creds.secret(), date_stamp, region);
+    let signing_key = derive_signing_key(creds.secret(), date_stamp, region, service);
     let amz_date = req.header("x-amz-date");
-    let scope = [date_stamp, region, SERVICE, "aws4_request"].join("/");
+    let scope = [date_stamp, region, service, "aws4_request"].join("/");
     let sign = |algorithm: &str, previous: &str, parts: &[&str]| {
         let mut fields = vec![algorithm, amz_date, &scope, previous];
         fields.extend_from_slice(parts);
@@ -380,6 +405,27 @@ pub fn signature_for_request(
     signed_headers: &str,
     payload_hash: &str,
 ) -> String {
+    signature_for_request_with_service(
+        creds,
+        req,
+        date_stamp,
+        region,
+        SERVICE,
+        signed_headers,
+        payload_hash,
+    )
+}
+
+/// Computes the expected request signature for an explicit AWS service name.
+pub fn signature_for_request_with_service(
+    creds: &Credentials,
+    req: &SignedRequest,
+    date_stamp: &str,
+    region: &str,
+    service: &str,
+    signed_headers: &str,
+    payload_hash: &str,
+) -> String {
     let canonical_request = [
         req.method.to_string(),
         canonical_uri(req.path),
@@ -390,7 +436,7 @@ pub fn signature_for_request(
     ]
     .join("\n");
     let amz_date = req.header("x-amz-date");
-    let scope = [date_stamp, region, SERVICE, "aws4_request"].join("/");
+    let scope = [date_stamp, region, service, "aws4_request"].join("/");
     let string_to_sign = [
         ALGORITHM.to_string(),
         amz_date.to_string(),
@@ -398,7 +444,7 @@ pub fn signature_for_request(
         sha256_hex(canonical_request.as_bytes()),
     ]
     .join("\n");
-    let signing_key = derive_signing_key(creds.secret(), date_stamp, region);
+    let signing_key = derive_signing_key(creds.secret(), date_stamp, region, service);
     hex::encode(hmac_sha256(&signing_key, string_to_sign.as_bytes()))
 }
 
@@ -529,10 +575,10 @@ fn url_decode(value: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-fn derive_signing_key(secret: &str, date_stamp: &str, region: &str) -> Vec<u8> {
+fn derive_signing_key(secret: &str, date_stamp: &str, region: &str, service: &str) -> Vec<u8> {
     let date_key = hmac_sha256(format!("AWS4{secret}").as_bytes(), date_stamp.as_bytes());
     let region_key = hmac_sha256(&date_key, region.as_bytes());
-    let service_key = hmac_sha256(&region_key, SERVICE.as_bytes());
+    let service_key = hmac_sha256(&region_key, service.as_bytes());
     hmac_sha256(&service_key, b"aws4_request")
 }
 
@@ -708,7 +754,7 @@ mod tests {
         trailer: Option<&str>,
     ) -> Vec<u8> {
         let date_stamp = &amz_date[..8];
-        let key = derive_signing_key("dev", date_stamp, "us-east-1");
+        let key = derive_signing_key("dev", date_stamp, "us-east-1", SERVICE);
         let scope = format!("{date_stamp}/us-east-1/{SERVICE}/aws4_request");
         let empty = sha256_hex(b"");
         let mut previous = seed.to_string();

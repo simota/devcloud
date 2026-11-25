@@ -101,6 +101,7 @@ pub struct TableState {
     pub continuous_backups: Option<ContinuousBackupsDescription>,
     pub resource_policy: String,
     pub resource_policy_revision: String,
+    pub auto_scaling: Option<crate::global_tables::TableAutoScalingState>,
 }
 
 impl TableState {
@@ -113,6 +114,7 @@ impl TableState {
             continuous_backups: None,
             resource_policy: String::new(),
             resource_policy_revision: String::new(),
+            auto_scaling: None,
         }
     }
 }
@@ -123,6 +125,10 @@ pub struct Server {
     backups: BTreeMap<String, crate::model::BackupDescription>,
     backup_tables: BTreeMap<String, TableDescription>,
     backup_items: BTreeMap<String, BTreeMap<String, Item>>,
+    global_tables: BTreeMap<String, crate::global_tables::GlobalTableRecord>,
+    dax: crate::dax::DaxState,
+    active_caller: Option<String>,
+    active_auth_mode: Option<String>,
     load_err: Option<String>,
     /// Encoded (HTML-escaped, no trailing newline) `PersistedTable` JSON per
     /// table, valid as of the last successful `persist()`. Reused verbatim
@@ -150,6 +156,10 @@ impl Server {
             backups: BTreeMap::new(),
             backup_tables: BTreeMap::new(),
             backup_items: BTreeMap::new(),
+            global_tables: BTreeMap::new(),
+            dax: crate::dax::DaxState::default(),
+            active_caller: None,
+            active_auth_mode: None,
             load_err: None,
             table_cache: BTreeMap::new(),
             dirty_tables: std::collections::BTreeSet::new(),
@@ -162,6 +172,58 @@ impl Server {
             }
         }
         server
+    }
+
+    /// Sets the transient caller access key used for IAM condition evaluation
+    /// during the current request (or test).
+    pub fn set_active_caller(&mut self, access_key: Option<String>) {
+        self.active_caller = access_key;
+    }
+
+    /// Sets the transient auth mode for the current dispatched request.
+    pub fn set_active_auth_mode(&mut self, auth_mode: Option<String>) {
+        self.active_auth_mode = auth_mode;
+    }
+
+    fn enforces_iam_policy(&self) -> bool {
+        let mode = self
+            .active_auth_mode
+            .as_deref()
+            .unwrap_or(&self.config.auth_mode);
+        mode.eq_ignore_ascii_case("strict")
+    }
+
+    fn caller_identity(&self) -> crate::iam::CallerIdentity {
+        let key = self
+            .active_caller
+            .as_deref()
+            .unwrap_or(&self.config.access_key_id);
+        crate::iam::CallerIdentity::from_access_key(key, self.config.region())
+    }
+
+    fn authorize_table_op(
+        &self,
+        table_name: &str,
+        action: &str,
+        build: impl FnOnce(&TableState, &mut crate::iam::EvalContext),
+    ) -> Result<(), ApiError> {
+        if !self.enforces_iam_policy() {
+            return Ok(());
+        }
+        let Some(state) = self.tables.get(table_name) else {
+            return Ok(());
+        };
+        if state.resource_policy.trim().is_empty() {
+            return Ok(());
+        }
+        let mut ctx = crate::iam::EvalContext::new(
+            action,
+            &state.description.table_arn,
+            self.caller_identity(),
+        )
+        .with_resource_tags(&state.tags);
+        build(state, &mut ctx);
+        crate::iam::evaluate_resource_policy(&state.resource_policy, &ctx)
     }
 
     /// Pins the clock for deterministic tests (seconds + matching milliseconds).
@@ -251,6 +313,7 @@ impl Server {
                 continuous_backups: table.continuous_backups,
                 resource_policy: table.resource_policy,
                 resource_policy_revision: table.resource_policy_revision,
+                auto_scaling: table.auto_scaling,
             };
             state.description.item_count = state.items.len() as i64;
             update_index_item_counts(&mut state);
@@ -259,6 +322,10 @@ impl Server {
         self.backups = persisted.backups;
         self.backup_tables = persisted.backup_tables;
         self.backup_items = persisted.backup_items;
+        self.global_tables = persisted.global_tables;
+        self.dax.clusters = persisted.dax_clusters;
+        self.dax.subnet_groups = persisted.dax_subnet_groups;
+        self.dax.parameter_groups = persisted.dax_parameter_groups;
         Ok(())
     }
 
@@ -318,6 +385,22 @@ impl Server {
         if !self.backup_items.is_empty() {
             buf.extend_from_slice(b",\"backupItems\":");
             buf.extend_from_slice(&wire_json::marshal(&self.backup_items));
+        }
+        if !self.global_tables.is_empty() {
+            buf.extend_from_slice(b",\"globalTables\":");
+            buf.extend_from_slice(&wire_json::marshal(&self.global_tables));
+        }
+        if !self.dax.clusters.is_empty() {
+            buf.extend_from_slice(b",\"daxClusters\":");
+            buf.extend_from_slice(&wire_json::marshal(&self.dax.clusters));
+        }
+        if !self.dax.subnet_groups.is_empty() {
+            buf.extend_from_slice(b",\"daxSubnetGroups\":");
+            buf.extend_from_slice(&wire_json::marshal(&self.dax.subnet_groups));
+        }
+        if !self.dax.parameter_groups.is_empty() {
+            buf.extend_from_slice(b",\"daxParameterGroups\":");
+            buf.extend_from_slice(&wire_json::marshal(&self.dax.parameter_groups));
         }
         buf.push(b'}');
         buf.push(b'\n');
@@ -414,6 +497,8 @@ impl Server {
             table_size_bytes: 0,
             table_status: "ACTIVE".to_string(),
             time_to_live_description: None,
+            global_table_version: String::new(),
+            replicas: Vec::new(),
         };
         if request.stream_specification.stream_enabled {
             validate_stream_specification(&request.stream_specification)
@@ -451,6 +536,7 @@ impl Server {
         if table_name.is_empty() {
             return Err(ApiError::validation("table name is required"));
         }
+        self.authorize_table_op(table_name, "dynamodb:DescribeTable", |_, _| {})?;
         match self.tables.get(table_name) {
             Some(state) => Ok(encode(&DescribeTableResponse {
                 table: state.description.clone(),
@@ -464,6 +550,7 @@ impl Server {
         if table_name.is_empty() {
             return Err(ApiError::validation("table name is required"));
         }
+        self.authorize_table_op(table_name, "dynamodb:DeleteTable", |_, _| {})?;
         let removed = self.tables.remove(table_name);
         match removed {
             None => Err(ApiError::not_found("table not found")),
@@ -499,6 +586,7 @@ impl Server {
         if !self.tables.contains_key(&request.table_name) {
             return Err(ApiError::not_found("table not found"));
         }
+        self.authorize_table_op(&request.table_name, "dynamodb:UpdateTable", |_, _| {})?;
         let region = self.config.region().to_string();
         let previous = self.tables[&request.table_name].description.clone();
 
@@ -530,6 +618,12 @@ impl Server {
                 &request.global_secondary_index_updates,
             )
             .map_err(ApiError::validation)?;
+        }
+        if !request.replica_updates.is_empty() {
+            crate::global_tables::apply_replica_updates(
+                &mut description,
+                &request.replica_updates,
+            )?;
         }
 
         let state = self.tables.get_mut(&request.table_name).unwrap();
@@ -632,6 +726,17 @@ impl Server {
             .get(&request.table_name)
             .ok_or_else(|| ApiError::not_found("table not found"))?;
         let key = item_key(&state.description, &request.item).map_err(ApiError::validation)?;
+        self.authorize_table_op(&request.table_name, "dynamodb:PutItem", |st, ctx| {
+            if let Some(lk) = crate::iam::leading_key_from_item(&st.description, &request.item) {
+                ctx.set_key("dynamodb:LeadingKeys", vec![lk]);
+            }
+            ctx.set_key(
+                "dynamodb:Attributes",
+                request.item.keys().cloned().collect(),
+            );
+            ctx.set_key("dynamodb:ReturnValues", vec![return_values.clone()]);
+        })?;
+        let state = self.tables.get(&request.table_name).unwrap();
         let old_item = state.items.get(&key).cloned();
         check_condition(
             &request.condition_expression,
@@ -704,6 +809,22 @@ impl Server {
             .get(&request.table_name)
             .ok_or_else(|| ApiError::not_found("table not found"))?;
         let key = item_key(&state.description, &request.key).map_err(ApiError::validation)?;
+        self.authorize_table_op(&request.table_name, "dynamodb:GetItem", |st, ctx| {
+            if let Some(lk) = crate::iam::leading_key_from_item(&st.description, &request.key) {
+                ctx.set_key("dynamodb:LeadingKeys", vec![lk]);
+            }
+            let proj = crate::iam::projection_attributes(
+                &request.projection_expression,
+                &request.expression_attribute_names,
+            );
+            if proj.is_empty() {
+                ctx.mark_unbounded("dynamodb:Attributes");
+                ctx.set_key("dynamodb:Select", vec!["ALL_ATTRIBUTES".to_string()]);
+            } else {
+                ctx.set_key("dynamodb:Attributes", proj);
+                ctx.set_key("dynamodb:Select", vec!["SPECIFIC_ATTRIBUTES".to_string()]);
+            }
+        })?;
         let mut response = Map::new();
         if let Some(found) = state.items.get(&key) {
             let projected = project_item(
@@ -752,6 +873,14 @@ impl Server {
                 "return consumed capacity must be NONE, TOTAL, or INDEXES",
             ));
         }
+        self.authorize_table_op(&request.table_name, "dynamodb:DeleteItem", |st, ctx| {
+            if let Some(lk) = crate::iam::leading_key_from_item(&st.description, &request.key) {
+                ctx.set_key("dynamodb:LeadingKeys", vec![lk]);
+            }
+            ctx.set_key("dynamodb:Attributes", request.key.keys().cloned().collect());
+            ctx.set_key("dynamodb:ReturnValues", vec![return_values.clone()]);
+        })?;
+        let state = self.tables.get(&request.table_name).unwrap();
         let old_item = state.items.get(&key).cloned();
         check_condition(
             &request.condition_expression,
@@ -831,7 +960,23 @@ impl Server {
                 "return consumed capacity must be NONE, TOTAL, or INDEXES",
             ));
         }
+        self.authorize_table_op(&request.table_name, "dynamodb:UpdateItem", |st, ctx| {
+            if let Some(lk) = crate::iam::leading_key_from_item(&st.description, &request.key) {
+                ctx.set_key("dynamodb:LeadingKeys", vec![lk]);
+            }
+            let mut attrs: std::collections::BTreeSet<String> =
+                request.key.keys().cloned().collect();
+            for attr in crate::iam::update_expression_attributes(
+                &request.update_expression,
+                &request.expression_attribute_names,
+            ) {
+                attrs.insert(attr);
+            }
+            ctx.set_key("dynamodb:Attributes", attrs.into_iter().collect());
+            ctx.set_key("dynamodb:ReturnValues", vec![return_values.clone()]);
+        })?;
 
+        let state = self.tables.get(&request.table_name).unwrap();
         let old_item = state.items.get(&key).cloned();
         // Working item starts as the existing item, or the key when absent.
         let mut updated = old_item.clone().unwrap_or_else(|| request.key.clone());
@@ -957,6 +1102,37 @@ impl Server {
         {
             return Err(ApiError::validation("index not found"));
         }
+        self.authorize_table_op(&request.table_name, "dynamodb:Query", |st, ctx| {
+            if !request.index_name.is_empty() {
+                ctx.set_key("dynamodb:IndexName", vec![request.index_name.clone()]);
+                ctx.index_arn = Some(format!(
+                    "{}/index/{}",
+                    st.description.table_arn, request.index_name
+                ));
+            }
+            if let Some(lk) = crate::iam::leading_key_from_key_condition(
+                &st.description,
+                &request.index_name,
+                &request.key_condition_expression,
+                &request.expression_attribute_names,
+                &request.expression_attribute_values,
+            ) {
+                ctx.set_key("dynamodb:LeadingKeys", vec![lk]);
+            } else {
+                ctx.mark_unbounded("dynamodb:LeadingKeys");
+            }
+            let select = effective_select(&request.select, &request.projection_expression);
+            ctx.set_key("dynamodb:Select", vec![select.clone()]);
+            let proj = crate::iam::projection_attributes(
+                &request.projection_expression,
+                &request.expression_attribute_names,
+            );
+            if !proj.is_empty() {
+                ctx.set_key("dynamodb:Attributes", proj);
+            } else if select != "COUNT" {
+                ctx.mark_unbounded("dynamodb:Attributes");
+            }
+        })?;
         let mut items = crate::query::sorted_items_for_query(
             &state.items,
             &state.description,
@@ -1013,6 +1189,27 @@ impl Server {
         {
             return Err(ApiError::validation("index not found"));
         }
+        self.authorize_table_op(&request.table_name, "dynamodb:Scan", |st, ctx| {
+            if !request.index_name.is_empty() {
+                ctx.set_key("dynamodb:IndexName", vec![request.index_name.clone()]);
+                ctx.index_arn = Some(format!(
+                    "{}/index/{}",
+                    st.description.table_arn, request.index_name
+                ));
+            }
+            ctx.mark_unbounded("dynamodb:LeadingKeys");
+            let select = effective_select(&request.select, &request.projection_expression);
+            ctx.set_key("dynamodb:Select", vec![select.clone()]);
+            let proj = crate::iam::projection_attributes(
+                &request.projection_expression,
+                &request.expression_attribute_names,
+            );
+            if !proj.is_empty() {
+                ctx.set_key("dynamodb:Attributes", proj);
+            } else if select != "COUNT" {
+                ctx.mark_unbounded("dynamodb:Attributes");
+            }
+        })?;
         let start_key =
             crate::query::start_key_string(&state.description, &request.exclusive_start_key)
                 .map_err(ApiError::validation)?;
@@ -1065,6 +1262,31 @@ impl Server {
             if table_request.keys.is_empty() {
                 return Err(ApiError::validation("keys are required"));
             }
+            self.authorize_table_op(table_name, "dynamodb:BatchGetItem", |st, ctx| {
+                ctx.set_key(
+                    "dynamodb:EnclosingOperation",
+                    vec!["BatchGetItem".to_string()],
+                );
+                let lks: Vec<String> = table_request
+                    .keys
+                    .iter()
+                    .filter_map(|k| crate::iam::leading_key_from_item(&st.description, k))
+                    .collect();
+                if !lks.is_empty() {
+                    ctx.set_key("dynamodb:LeadingKeys", lks);
+                }
+                let proj = crate::iam::projection_attributes(
+                    &table_request.projection_expression,
+                    &table_request.expression_attribute_names,
+                );
+                if proj.is_empty() {
+                    ctx.mark_unbounded("dynamodb:Attributes");
+                    ctx.set_key("dynamodb:Select", vec!["ALL_ATTRIBUTES".to_string()]);
+                } else {
+                    ctx.set_key("dynamodb:Attributes", proj);
+                    ctx.set_key("dynamodb:Select", vec!["SPECIFIC_ATTRIBUTES".to_string()]);
+                }
+            })?;
             let mut found_items: Vec<Value> = Vec::new();
             for key_value in &table_request.keys {
                 let key = item_key(&state.description, key_value).map_err(ApiError::validation)?;
@@ -1114,6 +1336,9 @@ impl Server {
             if writes.is_empty() {
                 return Err(ApiError::validation("write requests are required"));
             }
+            let mut batch_lks: Vec<String> = Vec::new();
+            let mut batch_attrs: std::collections::BTreeSet<String> =
+                std::collections::BTreeSet::new();
             for write in writes {
                 if write.put_request.is_some() == write.delete_request.is_some() {
                     return Err(ApiError::validation(
@@ -1128,6 +1353,12 @@ impl Server {
                         .map_err(ApiError::validation)?;
                     let key =
                         item_key(&state.description, &put.item).map_err(ApiError::validation)?;
+                    if let Some(lk) =
+                        crate::iam::leading_key_from_item(&state.description, &put.item)
+                    {
+                        batch_lks.push(lk);
+                    }
+                    batch_attrs.extend(put.item.keys().cloned());
                     plan.push(PlannedWrite {
                         table: table_name.clone(),
                         key,
@@ -1137,6 +1368,12 @@ impl Server {
                 if let Some(del) = &write.delete_request {
                     let key =
                         item_key(&state.description, &del.key).map_err(ApiError::validation)?;
+                    if let Some(lk) =
+                        crate::iam::leading_key_from_item(&state.description, &del.key)
+                    {
+                        batch_lks.push(lk);
+                    }
+                    batch_attrs.extend(del.key.keys().cloned());
                     plan.push(PlannedWrite {
                         table: table_name.clone(),
                         key,
@@ -1144,6 +1381,18 @@ impl Server {
                     });
                 }
             }
+            self.authorize_table_op(table_name, "dynamodb:BatchWriteItem", |_, ctx| {
+                ctx.set_key(
+                    "dynamodb:EnclosingOperation",
+                    vec!["BatchWriteItem".to_string()],
+                );
+                if !batch_lks.is_empty() {
+                    ctx.set_key("dynamodb:LeadingKeys", batch_lks);
+                }
+                if !batch_attrs.is_empty() {
+                    ctx.set_key("dynamodb:Attributes", batch_attrs.into_iter().collect());
+                }
+            })?;
             append_batch_consumed_capacity(
                 &mut consumed,
                 table_name,
@@ -1179,6 +1428,26 @@ impl Server {
                 .get(&get.table_name)
                 .ok_or_else(|| ApiError::not_found("table not found"))?;
             let key = item_key(&state.description, &get.key).map_err(ApiError::validation)?;
+            self.authorize_table_op(&get.table_name, "dynamodb:GetItem", |st, ctx| {
+                ctx.set_key(
+                    "dynamodb:EnclosingOperation",
+                    vec!["TransactGetItems".to_string()],
+                );
+                if let Some(lk) = crate::iam::leading_key_from_item(&st.description, &get.key) {
+                    ctx.set_key("dynamodb:LeadingKeys", vec![lk]);
+                }
+                let proj = crate::iam::projection_attributes(
+                    &get.projection_expression,
+                    &get.expression_attribute_names,
+                );
+                if proj.is_empty() {
+                    ctx.mark_unbounded("dynamodb:Attributes");
+                    ctx.set_key("dynamodb:Select", vec!["ALL_ATTRIBUTES".to_string()]);
+                } else {
+                    ctx.set_key("dynamodb:Attributes", proj);
+                    ctx.set_key("dynamodb:Select", vec!["SPECIFIC_ATTRIBUTES".to_string()]);
+                }
+            })?;
             match state.items.get(&key) {
                 None => responses.push(Value::Object(Map::new())),
                 Some(found) => {
@@ -1238,12 +1507,71 @@ impl Server {
                 }
             }
             if let Some(put) = &transaction_item.put {
+                self.authorize_table_op(&put.table_name, "dynamodb:PutItem", |st, ctx| {
+                    ctx.set_key(
+                        "dynamodb:EnclosingOperation",
+                        vec!["TransactWriteItems".to_string()],
+                    );
+                    if let Some(lk) = crate::iam::leading_key_from_item(&st.description, &put.item)
+                    {
+                        ctx.set_key("dynamodb:LeadingKeys", vec![lk]);
+                    }
+                    ctx.set_key("dynamodb:Attributes", put.item.keys().cloned().collect());
+                })?;
                 plan.push(self.validate_transact_put(put)?);
             } else if let Some(update) = &transaction_item.update {
+                self.authorize_table_op(&update.table_name, "dynamodb:UpdateItem", |st, ctx| {
+                    ctx.set_key(
+                        "dynamodb:EnclosingOperation",
+                        vec!["TransactWriteItems".to_string()],
+                    );
+                    if let Some(lk) =
+                        crate::iam::leading_key_from_item(&st.description, &update.key)
+                    {
+                        ctx.set_key("dynamodb:LeadingKeys", vec![lk]);
+                    }
+                    let mut attrs: std::collections::BTreeSet<String> =
+                        update.key.keys().cloned().collect();
+                    for attr in crate::iam::update_expression_attributes(
+                        &update.update_expression,
+                        &update.expression_attribute_names,
+                    ) {
+                        attrs.insert(attr);
+                    }
+                    ctx.set_key("dynamodb:Attributes", attrs.into_iter().collect());
+                })?;
                 plan.push(self.validate_transact_update(update)?);
             } else if let Some(delete) = &transaction_item.delete {
+                self.authorize_table_op(&delete.table_name, "dynamodb:DeleteItem", |st, ctx| {
+                    ctx.set_key(
+                        "dynamodb:EnclosingOperation",
+                        vec!["TransactWriteItems".to_string()],
+                    );
+                    if let Some(lk) =
+                        crate::iam::leading_key_from_item(&st.description, &delete.key)
+                    {
+                        ctx.set_key("dynamodb:LeadingKeys", vec![lk]);
+                    }
+                    ctx.set_key("dynamodb:Attributes", delete.key.keys().cloned().collect());
+                })?;
                 plan.push(self.validate_transact_delete(delete)?);
             } else if let Some(check) = &transaction_item.condition_check {
+                self.authorize_table_op(
+                    &check.table_name,
+                    "dynamodb:ConditionCheckItem",
+                    |st, ctx| {
+                        ctx.set_key(
+                            "dynamodb:EnclosingOperation",
+                            vec!["TransactWriteItems".to_string()],
+                        );
+                        if let Some(lk) =
+                            crate::iam::leading_key_from_item(&st.description, &check.key)
+                        {
+                            ctx.set_key("dynamodb:LeadingKeys", vec![lk]);
+                        }
+                        ctx.set_key("dynamodb:Attributes", check.key.keys().cloned().collect());
+                    },
+                )?;
                 self.validate_transact_condition_check(check)?;
             }
         }
@@ -1441,6 +1769,7 @@ impl Server {
             .tables
             .get(&statement.table_name)
             .ok_or_else(|| ApiError::not_found("table not found"))?;
+        self.authorize_partiql_select(&statement)?;
         let source = crate::query::sorted_items_for_query(&state.items, &state.description, "");
         let mut items: Vec<Value> = Vec::new();
         for candidate in &source {
@@ -1509,6 +1838,22 @@ impl Server {
                 );
                 continue;
             };
+            if let Err(err) = self.authorize_partiql_select(&statement) {
+                responses.push(BatchStatementResponse {
+                    error: Some(BatchStatementError {
+                        code: "AccessDenied".to_string(),
+                        message: err.message,
+                    }),
+                    table_name: statement.table_name.clone(),
+                    ..Default::default()
+                });
+                append_batch_consumed_capacity(
+                    &mut consumed,
+                    &statement.table_name,
+                    &request.return_consumed_capacity,
+                );
+                continue;
+            }
             if !crate::partiql::conditions_cover_key(&state.description, &statement.conditions) {
                 responses.push(BatchStatementResponse {
                     error: Some(BatchStatementError {
@@ -1583,6 +1928,7 @@ impl Server {
                 .tables
                 .get(&statement.table_name)
                 .ok_or_else(|| ApiError::not_found("table not found"))?;
+            self.authorize_partiql_select(&statement)?;
             if !crate::partiql::conditions_cover_key(&state.description, &statement.conditions) {
                 return Err(ApiError::validation(
                     "SELECT statement must include equality conditions for all key attributes",
@@ -2255,6 +2601,8 @@ impl Server {
                 table_size_bytes: 0,
                 table_status: String::new(),
                 time_to_live_description: None,
+                global_table_version: String::new(),
+                replicas: Vec::new(),
             },
         };
         let new_arn = format!("arn:aws:dynamodb:{region}:{ACCOUNT_ID}:table/{target_table_name}");
@@ -2303,6 +2651,15 @@ impl Server {
         else {
             return Err(ApiError::not_found("resource not found"));
         };
+        let req_tags: Vec<(String, String)> = request
+            .tags
+            .iter()
+            .map(|t| (t.key.clone(), t.value.clone()))
+            .collect();
+        self.authorize_table_op(&name, "dynamodb:TagResource", |_, ctx| {
+            let mut next = ctx.clone().with_request_tags(&req_tags);
+            std::mem::swap(ctx, &mut next);
+        })?;
         let state = self.tables.get(&name).unwrap();
         let mut projected = state.tags.clone();
         for tag in &request.tags {
@@ -2339,6 +2696,7 @@ impl Server {
         let Some(name) = self.table_for_arn(&request.resource_arn) else {
             return Err(ApiError::not_found("resource not found"));
         };
+        self.authorize_table_op(name, "dynamodb:ListTagsOfResource", |_, _| {})?;
         let state = &self.tables[name];
         // BTreeMap iteration is already key-sorted, matching legacy explicit sort.
         let tags: Vec<Tag> = state
@@ -2368,6 +2726,10 @@ impl Server {
         else {
             return Err(ApiError::not_found("resource not found"));
         };
+        self.authorize_table_op(&name, "dynamodb:UntagResource", |_, ctx| {
+            let mut next = ctx.clone().with_tag_keys(request.tag_keys.clone());
+            std::mem::swap(ctx, &mut next);
+        })?;
         let previous = self.tables[&name].tags.clone();
         let state = self.tables.get_mut(&name).unwrap();
         for key in &request.tag_keys {
@@ -2398,6 +2760,9 @@ impl Server {
         else {
             return Err(ApiError::not_found("resource not found"));
         };
+        self.authorize_table_op(&name, "dynamodb:PutResourcePolicy", |_, ctx| {
+            ctx.is_policy_management = true;
+        })?;
         let prev_policy = self.tables[&name].resource_policy.clone();
         let prev_rev = self.tables[&name].resource_policy_revision.clone();
         let revision = resource_policy_revision(&request.policy);
@@ -2424,6 +2789,9 @@ impl Server {
         let Some(name) = self.table_for_arn(&request.resource_arn) else {
             return Err(ApiError::not_found("resource not found"));
         };
+        self.authorize_table_op(name, "dynamodb:GetResourcePolicy", |_, ctx| {
+            ctx.is_policy_management = true;
+        })?;
         let state = &self.tables[name];
         if state.resource_policy.is_empty() {
             return Err(ApiError::new(
@@ -2455,6 +2823,9 @@ impl Server {
         else {
             return Err(ApiError::not_found("resource not found"));
         };
+        self.authorize_table_op(&name, "dynamodb:DeleteResourcePolicy", |_, ctx| {
+            ctx.is_policy_management = true;
+        })?;
         let prev_policy = self.tables[&name].resource_policy.clone();
         let prev_rev = self.tables[&name].resource_policy_revision.clone();
         let state = self.tables.get_mut(&name).unwrap();
@@ -2468,6 +2839,798 @@ impl Server {
             return Err(err);
         }
         Ok(crate::wire_json::to_vec(&Value::Object(Map::new())))
+    }
+
+    fn authorize_partiql_select(
+        &self,
+        statement: &crate::partiql::PartiQLSelect,
+    ) -> Result<(), ApiError> {
+        self.authorize_table_op(
+            &statement.table_name,
+            "dynamodb:PartiQLSelect",
+            |st, ctx| {
+                let hash_attr = crate::validation::table_hash_key(&st.description.key_schema);
+                let lk = statement
+                    .conditions
+                    .iter()
+                    .find(|c| c.attribute == hash_attr)
+                    .and_then(|c| crate::iam::scalar_key_string(&c.value));
+                if let Some(key) = lk {
+                    ctx.set_key("dynamodb:LeadingKeys", vec![key]);
+                } else {
+                    ctx.mark_unbounded("dynamodb:LeadingKeys");
+                }
+                if statement.projections.is_empty() {
+                    ctx.mark_unbounded("dynamodb:Attributes");
+                    ctx.set_key("dynamodb:Select", vec!["ALL_ATTRIBUTES".to_string()]);
+                } else {
+                    ctx.set_key("dynamodb:Attributes", statement.projections.clone());
+                    ctx.set_key("dynamodb:Select", vec!["SPECIFIC_ATTRIBUTES".to_string()]);
+                }
+            },
+        )
+    }
+
+    // --- global tables (v1 2017.11.29) ------------------------------------
+
+    fn global_table_arn(&self, name: &str) -> String {
+        format!("arn:aws:dynamodb::{ACCOUNT_ID}:global-table/{name}")
+    }
+
+    fn default_replica_settings(
+        &self,
+        table_name: &str,
+        region_name: &str,
+    ) -> crate::global_tables::ReplicaSettingsDescription {
+        let billing = self
+            .tables
+            .get(table_name)
+            .and_then(|s| s.description.billing_mode_summary.clone())
+            .or_else(|| {
+                Some(BillingModeSummary {
+                    billing_mode: "PAY_PER_REQUEST".to_string(),
+                })
+            });
+        crate::global_tables::ReplicaSettingsDescription {
+            region_name: region_name.to_string(),
+            replica_status: "ACTIVE".to_string(),
+            replica_billing_mode_summary: billing,
+            ..Default::default()
+        }
+    }
+
+    /// `CreateGlobalTable`.
+    pub fn create_global_table(
+        &mut self,
+        request: &crate::global_tables::CreateGlobalTableRequest,
+    ) -> OpResult {
+        if request.global_table_name.trim().is_empty() {
+            return Err(ApiError::validation("global table name is required"));
+        }
+        if request.replication_group.is_empty() {
+            return Err(ApiError::validation("replication group is required"));
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for replica in &request.replication_group {
+            if replica.region_name.trim().is_empty() {
+                return Err(ApiError::validation("replica region name is required"));
+            }
+            if !seen.insert(replica.region_name.clone()) {
+                return Err(ApiError::validation(
+                    "replication group regions must be unique",
+                ));
+            }
+        }
+        if self.global_tables.contains_key(&request.global_table_name) {
+            return Err(ApiError::new(
+                400,
+                "GlobalTableAlreadyExistsException",
+                "global table already exists",
+            ));
+        }
+        if !self.tables.contains_key(&request.global_table_name) {
+            return Err(ApiError::new(
+                400,
+                "TableNotFoundException",
+                "table not found",
+            ));
+        }
+        self.authorize_table_op(
+            &request.global_table_name,
+            "dynamodb:CreateGlobalTable",
+            |_, _| {},
+        )?;
+
+        let description = crate::global_tables::GlobalTableDescription {
+            creation_date_time: self.now_unix(),
+            global_table_arn: self.global_table_arn(&request.global_table_name),
+            global_table_name: request.global_table_name.clone(),
+            global_table_status: "ACTIVE".to_string(),
+            replication_group: request.replication_group.clone(),
+        };
+        let mut replica_settings = BTreeMap::new();
+        for replica in &request.replication_group {
+            replica_settings.insert(
+                replica.region_name.clone(),
+                self.default_replica_settings(&request.global_table_name, &replica.region_name),
+            );
+        }
+        self.global_tables.insert(
+            request.global_table_name.clone(),
+            crate::global_tables::GlobalTableRecord {
+                description: description.clone(),
+                replica_settings,
+            },
+        );
+        if let Err(err) = self.persist() {
+            self.global_tables.remove(&request.global_table_name);
+            return Err(err);
+        }
+        Ok(encode(
+            &crate::global_tables::GlobalTableDescriptionResponse {
+                global_table_description: description,
+            },
+        ))
+    }
+
+    /// `DescribeGlobalTable`.
+    pub fn describe_global_table(
+        &self,
+        request: &crate::global_tables::GlobalTableNameRequest,
+    ) -> OpResult {
+        if request.global_table_name.trim().is_empty() {
+            return Err(ApiError::validation("global table name is required"));
+        }
+        let Some(rec) = self.global_tables.get(&request.global_table_name) else {
+            return Err(ApiError::new(
+                400,
+                "GlobalTableNotFoundException",
+                "global table not found",
+            ));
+        };
+        Ok(encode(
+            &crate::global_tables::GlobalTableDescriptionResponse {
+                global_table_description: rec.description.clone(),
+            },
+        ))
+    }
+
+    /// `ListGlobalTables`.
+    pub fn list_global_tables(
+        &self,
+        request: &crate::global_tables::ListGlobalTablesRequest,
+    ) -> OpResult {
+        if request.limit < 0 || request.limit > 100 {
+            return Err(ApiError::validation("limit must be between 1 and 100"));
+        }
+        let filtered: Vec<crate::global_tables::GlobalTableSummary> = self
+            .global_tables
+            .values()
+            .filter(|rec| {
+                request.region_name.is_empty()
+                    || rec
+                        .description
+                        .replication_group
+                        .iter()
+                        .any(|r| r.region_name == request.region_name)
+            })
+            .map(|rec| crate::global_tables::GlobalTableSummary {
+                global_table_name: rec.description.global_table_name.clone(),
+                replication_group: rec.description.replication_group.clone(),
+            })
+            .collect();
+        let mut start = 0usize;
+        if !request.exclusive_start_global_table_name.is_empty() {
+            match filtered
+                .iter()
+                .position(|g| g.global_table_name == request.exclusive_start_global_table_name)
+            {
+                Some(i) => start = i + 1,
+                None => {
+                    return Err(ApiError::validation(
+                        "exclusive start global table name does not exist",
+                    ))
+                }
+            }
+        }
+        let mut end = filtered.len();
+        if request.limit > 0 && start + (request.limit as usize) < end {
+            end = start + request.limit as usize;
+        }
+        let last = if end < filtered.len() {
+            Some(filtered[end - 1].global_table_name.clone())
+        } else {
+            None
+        };
+        Ok(encode(&crate::global_tables::ListGlobalTablesResponse {
+            global_tables: filtered[start..end].to_vec(),
+            last_evaluated_global_table_name: last,
+        }))
+    }
+
+    /// `UpdateGlobalTable`.
+    pub fn update_global_table(
+        &mut self,
+        request: &crate::global_tables::UpdateGlobalTableRequest,
+    ) -> OpResult {
+        if request.global_table_name.trim().is_empty() {
+            return Err(ApiError::validation("global table name is required"));
+        }
+        if request.replica_updates.is_empty() {
+            return Err(ApiError::validation("replica updates are required"));
+        }
+        let Some(previous) = self.global_tables.get(&request.global_table_name).cloned() else {
+            return Err(ApiError::new(
+                400,
+                "GlobalTableNotFoundException",
+                "global table not found",
+            ));
+        };
+        let mut next = previous.clone();
+        for upd in &request.replica_updates {
+            if upd.create.is_some() == upd.delete.is_some() {
+                return Err(ApiError::validation(
+                    "each replica update must contain exactly one action",
+                ));
+            }
+            if let Some(create) = &upd.create {
+                if create.region_name.trim().is_empty() {
+                    return Err(ApiError::validation("replica region name is required"));
+                }
+                if next
+                    .description
+                    .replication_group
+                    .iter()
+                    .any(|r| r.region_name == create.region_name)
+                {
+                    return Err(ApiError::new(
+                        400,
+                        "ReplicaAlreadyExistsException",
+                        "replica already exists",
+                    ));
+                }
+                next.description
+                    .replication_group
+                    .push(crate::global_tables::Replica {
+                        region_name: create.region_name.clone(),
+                    });
+                next.replica_settings.insert(
+                    create.region_name.clone(),
+                    self.default_replica_settings(&request.global_table_name, &create.region_name),
+                );
+            }
+            if let Some(delete) = &upd.delete {
+                if delete.region_name.trim().is_empty() {
+                    return Err(ApiError::validation("replica region name is required"));
+                }
+                let Some(pos) = next
+                    .description
+                    .replication_group
+                    .iter()
+                    .position(|r| r.region_name == delete.region_name)
+                else {
+                    return Err(ApiError::new(
+                        400,
+                        "ReplicaNotFoundException",
+                        "replica not found",
+                    ));
+                };
+                next.description.replication_group.remove(pos);
+                next.replica_settings.remove(&delete.region_name);
+            }
+        }
+        let committed_desc = next.description.clone();
+        self.global_tables
+            .insert(request.global_table_name.clone(), next);
+        if let Err(err) = self.persist() {
+            self.global_tables
+                .insert(request.global_table_name.clone(), previous);
+            return Err(err);
+        }
+        Ok(encode(
+            &crate::global_tables::GlobalTableDescriptionResponse {
+                global_table_description: committed_desc,
+            },
+        ))
+    }
+
+    /// `DescribeGlobalTableSettings`.
+    pub fn describe_global_table_settings(
+        &self,
+        request: &crate::global_tables::GlobalTableNameRequest,
+    ) -> OpResult {
+        if request.global_table_name.trim().is_empty() {
+            return Err(ApiError::validation("global table name is required"));
+        }
+        let Some(rec) = self.global_tables.get(&request.global_table_name) else {
+            return Err(ApiError::new(
+                400,
+                "GlobalTableNotFoundException",
+                "global table not found",
+            ));
+        };
+        let replica_settings: Vec<crate::global_tables::ReplicaSettingsDescription> = rec
+            .description
+            .replication_group
+            .iter()
+            .map(|r| {
+                rec.replica_settings
+                    .get(&r.region_name)
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        self.default_replica_settings(&request.global_table_name, &r.region_name)
+                    })
+            })
+            .collect();
+        Ok(encode(&crate::global_tables::GlobalTableSettingsResponse {
+            global_table_name: rec.description.global_table_name.clone(),
+            replica_settings,
+        }))
+    }
+
+    /// `UpdateGlobalTableSettings`.
+    pub fn update_global_table_settings(
+        &mut self,
+        request: &crate::global_tables::UpdateGlobalTableSettingsRequest,
+    ) -> OpResult {
+        if request.global_table_name.trim().is_empty() {
+            return Err(ApiError::validation("global table name is required"));
+        }
+        if !request.global_table_billing_mode.is_empty()
+            && !matches!(
+                request.global_table_billing_mode.as_str(),
+                "PROVISIONED" | "PAY_PER_REQUEST"
+            )
+        {
+            return Err(ApiError::validation(
+                "billing mode must be PAY_PER_REQUEST or PROVISIONED",
+            ));
+        }
+        if let Some(wcu) = request.global_table_provisioned_write_capacity_units {
+            if wcu < 1 {
+                return Err(ApiError::validation(
+                    "provisioned write capacity units must be at least 1",
+                ));
+            }
+        }
+        let Some(previous) = self.global_tables.get(&request.global_table_name).cloned() else {
+            return Err(ApiError::new(
+                400,
+                "GlobalTableNotFoundException",
+                "global table not found",
+            ));
+        };
+        let mut next = previous.clone();
+        for replica in &next.description.replication_group {
+            next.replica_settings
+                .entry(replica.region_name.clone())
+                .or_insert_with(|| {
+                    self.default_replica_settings(&request.global_table_name, &replica.region_name)
+                });
+        }
+        for settings in next.replica_settings.values_mut() {
+            if !request.global_table_billing_mode.is_empty() {
+                settings.replica_billing_mode_summary = Some(BillingModeSummary {
+                    billing_mode: request.global_table_billing_mode.clone(),
+                });
+            }
+            if let Some(wcu) = request.global_table_provisioned_write_capacity_units {
+                settings.replica_provisioned_write_capacity_units = Some(wcu);
+            }
+            if let Some(upd) =
+                &request.global_table_provisioned_write_capacity_auto_scaling_settings_update
+            {
+                settings.replica_provisioned_write_capacity_auto_scaling_settings =
+                    Some(crate::global_tables::apply_autoscaling_update(
+                        settings
+                            .replica_provisioned_write_capacity_auto_scaling_settings
+                            .as_ref(),
+                        upd,
+                    )?);
+            }
+            for gsi_upd in &request.global_table_global_secondary_index_settings_update {
+                if gsi_upd.index_name.is_empty() {
+                    return Err(ApiError::validation("index name is required"));
+                }
+                if let Some(wcu) = gsi_upd.provisioned_write_capacity_units {
+                    if wcu < 1 {
+                        return Err(ApiError::validation(
+                            "provisioned write capacity units must be at least 1",
+                        ));
+                    }
+                }
+                let entry = upsert_replica_gsi_settings(settings, &gsi_upd.index_name);
+                if let Some(wcu) = gsi_upd.provisioned_write_capacity_units {
+                    entry.provisioned_write_capacity_units = Some(wcu);
+                }
+                if let Some(as_upd) =
+                    &gsi_upd.provisioned_write_capacity_auto_scaling_settings_update
+                {
+                    entry.provisioned_write_capacity_auto_scaling_settings =
+                        Some(crate::global_tables::apply_autoscaling_update(
+                            entry
+                                .provisioned_write_capacity_auto_scaling_settings
+                                .as_ref(),
+                            as_upd,
+                        )?);
+                }
+            }
+        }
+        for r_upd in &request.replica_settings_update {
+            let Some(settings) = next.replica_settings.get_mut(&r_upd.region_name) else {
+                return Err(ApiError::new(
+                    400,
+                    "ReplicaNotFoundException",
+                    "replica not found",
+                ));
+            };
+            if let Some(rcu) = r_upd.replica_provisioned_read_capacity_units {
+                if rcu < 1 {
+                    return Err(ApiError::validation(
+                        "provisioned read capacity units must be at least 1",
+                    ));
+                }
+                settings.replica_provisioned_read_capacity_units = Some(rcu);
+            }
+            if let Some(as_upd) =
+                &r_upd.replica_provisioned_read_capacity_auto_scaling_settings_update
+            {
+                settings.replica_provisioned_read_capacity_auto_scaling_settings =
+                    Some(crate::global_tables::apply_autoscaling_update(
+                        settings
+                            .replica_provisioned_read_capacity_auto_scaling_settings
+                            .as_ref(),
+                        as_upd,
+                    )?);
+            }
+            for gsi_upd in &r_upd.replica_global_secondary_index_settings_update {
+                if gsi_upd.index_name.is_empty() {
+                    return Err(ApiError::validation("index name is required"));
+                }
+                if let Some(rcu) = gsi_upd.provisioned_read_capacity_units {
+                    if rcu < 1 {
+                        return Err(ApiError::validation(
+                            "provisioned read capacity units must be at least 1",
+                        ));
+                    }
+                }
+                let entry = upsert_replica_gsi_settings(settings, &gsi_upd.index_name);
+                if let Some(rcu) = gsi_upd.provisioned_read_capacity_units {
+                    entry.provisioned_read_capacity_units = Some(rcu);
+                }
+                if let Some(as_upd) =
+                    &gsi_upd.provisioned_read_capacity_auto_scaling_settings_update
+                {
+                    entry.provisioned_read_capacity_auto_scaling_settings =
+                        Some(crate::global_tables::apply_autoscaling_update(
+                            entry
+                                .provisioned_read_capacity_auto_scaling_settings
+                                .as_ref(),
+                            as_upd,
+                        )?);
+                }
+            }
+        }
+        let response_settings: Vec<crate::global_tables::ReplicaSettingsDescription> = next
+            .description
+            .replication_group
+            .iter()
+            .filter_map(|r| next.replica_settings.get(&r.region_name).cloned())
+            .collect();
+        self.global_tables
+            .insert(request.global_table_name.clone(), next);
+        if let Err(err) = self.persist() {
+            self.global_tables
+                .insert(request.global_table_name.clone(), previous);
+            return Err(err);
+        }
+        Ok(encode(&crate::global_tables::GlobalTableSettingsResponse {
+            global_table_name: request.global_table_name.clone(),
+            replica_settings: response_settings,
+        }))
+    }
+
+    // --- table replica autoscaling ----------------------------------------
+
+    /// `DescribeTableReplicaAutoScaling`.
+    pub fn describe_table_replica_auto_scaling(&self, table_name: &str) -> OpResult {
+        if table_name.is_empty() {
+            return Err(ApiError::validation("table name is required"));
+        }
+        let state = self
+            .tables
+            .get(table_name)
+            .ok_or_else(|| ApiError::not_found("table not found"))?;
+        self.authorize_table_op(
+            table_name,
+            "dynamodb:DescribeTableReplicaAutoScaling",
+            |_, _| {},
+        )?;
+        let desc = crate::global_tables::build_table_autoscaling_description(
+            &state.description,
+            self.config.region(),
+            state.auto_scaling.as_ref(),
+        );
+        Ok(encode(
+            &crate::global_tables::TableAutoScalingDescriptionResponse {
+                table_auto_scaling_description: desc,
+            },
+        ))
+    }
+
+    /// `UpdateTableReplicaAutoScaling`.
+    pub fn update_table_replica_auto_scaling(
+        &mut self,
+        request: &crate::global_tables::UpdateTableReplicaAutoScalingRequest,
+    ) -> OpResult {
+        if request.table_name.is_empty() {
+            return Err(ApiError::validation("table name is required"));
+        }
+        if !self.tables.contains_key(&request.table_name) {
+            return Err(ApiError::not_found("table not found"));
+        }
+        self.authorize_table_op(
+            &request.table_name,
+            "dynamodb:UpdateTableReplicaAutoScaling",
+            |_, _| {},
+        )?;
+        let state = self.tables.get(&request.table_name).unwrap();
+        let home_region = self.config.region().to_string();
+        let valid_regions =
+            crate::global_tables::table_replica_regions(&state.description, &home_region);
+        let previous = state.auto_scaling.clone();
+        let mut next = previous.clone().unwrap_or_default();
+
+        if let Some(write_upd) = &request.provisioned_write_capacity_auto_scaling_update {
+            next.write_capacity = Some(crate::global_tables::apply_autoscaling_update(
+                next.write_capacity.as_ref(),
+                write_upd,
+            )?);
+        }
+        for gsi_upd in &request.global_secondary_index_updates {
+            if !state
+                .description
+                .global_secondary_indexes
+                .iter()
+                .any(|g| g.index_name == gsi_upd.index_name)
+            {
+                return Err(ApiError::validation("global secondary index not found"));
+            }
+            if let Some(write_upd) = &gsi_upd.provisioned_write_capacity_auto_scaling_update {
+                let updated = crate::global_tables::apply_autoscaling_update(
+                    next.gsi_write_capacity.get(&gsi_upd.index_name),
+                    write_upd,
+                )?;
+                next.gsi_write_capacity
+                    .insert(gsi_upd.index_name.clone(), updated);
+            }
+        }
+        for replica_upd in &request.replica_updates {
+            if !valid_regions.iter().any(|r| r == &replica_upd.region_name) {
+                return Err(ApiError::new(
+                    400,
+                    "ReplicaNotFoundException",
+                    "replica not found",
+                ));
+            }
+            if let Some(read_upd) =
+                &replica_upd.replica_provisioned_read_capacity_auto_scaling_update
+            {
+                let updated = crate::global_tables::apply_autoscaling_update(
+                    next.replica_read_capacity.get(&replica_upd.region_name),
+                    read_upd,
+                )?;
+                next.replica_read_capacity
+                    .insert(replica_upd.region_name.clone(), updated);
+            }
+            for gsi_upd in &replica_upd.replica_global_secondary_index_updates {
+                if !state
+                    .description
+                    .global_secondary_indexes
+                    .iter()
+                    .any(|g| g.index_name == gsi_upd.index_name)
+                {
+                    return Err(ApiError::validation("global secondary index not found"));
+                }
+                if let Some(read_upd) = &gsi_upd.provisioned_read_capacity_auto_scaling_update {
+                    let per_region = next
+                        .replica_gsi_read_capacity
+                        .entry(replica_upd.region_name.clone())
+                        .or_default();
+                    let updated = crate::global_tables::apply_autoscaling_update(
+                        per_region.get(&gsi_upd.index_name),
+                        read_upd,
+                    )?;
+                    per_region.insert(gsi_upd.index_name.clone(), updated);
+                }
+            }
+        }
+
+        let state = self.tables.get_mut(&request.table_name).unwrap();
+        state.auto_scaling = Some(next);
+        let desc = crate::global_tables::build_table_autoscaling_description(
+            &state.description,
+            &home_region,
+            state.auto_scaling.as_ref(),
+        );
+        self.dirty_tables.insert(request.table_name.clone());
+        if let Err(err) = self.persist() {
+            self.tables
+                .get_mut(&request.table_name)
+                .unwrap()
+                .auto_scaling = previous;
+            return Err(err);
+        }
+        Ok(encode(
+            &crate::global_tables::TableAutoScalingDescriptionResponse {
+                table_auto_scaling_description: desc,
+            },
+        ))
+    }
+
+    // --- DAX control-plane metadata ---------------------------------------
+
+    fn mutate_dax<T>(
+        &mut self,
+        op: impl FnOnce(&mut crate::dax::DaxState) -> Result<T, ApiError>,
+    ) -> Result<T, ApiError> {
+        let previous = self.dax.clone();
+        let res = op(&mut self.dax)?;
+        if let Err(err) = self.persist() {
+            self.dax = previous;
+            return Err(err);
+        }
+        Ok(res)
+    }
+
+    pub fn dax_create_cluster(&mut self, req: &crate::dax::CreateClusterRequest) -> OpResult {
+        let region = self.config.region().to_string();
+        let now = self.now_unix();
+        let cluster = self.mutate_dax(|d| crate::dax::create_cluster(d, &region, now, req))?;
+        crate::dax::json_obj_response(vec![("Cluster", serde_json::to_value(cluster).unwrap())])
+    }
+
+    pub fn dax_describe_clusters(&self, req: &crate::dax::DescribeClustersRequest) -> OpResult {
+        let (clusters, next_token) = crate::dax::describe_clusters(&self.dax, req)?;
+        let mut entries = vec![("Clusters", serde_json::to_value(clusters).unwrap())];
+        if let Some(tok) = next_token {
+            entries.push(("NextToken", Value::String(tok)));
+        }
+        crate::dax::json_obj_response(entries)
+    }
+
+    pub fn dax_update_cluster(&mut self, req: &crate::dax::UpdateClusterRequest) -> OpResult {
+        let cluster = self.mutate_dax(|d| crate::dax::update_cluster(d, req))?;
+        crate::dax::json_obj_response(vec![("Cluster", serde_json::to_value(cluster).unwrap())])
+    }
+
+    pub fn dax_delete_cluster(&mut self, req: &crate::dax::DeleteClusterRequest) -> OpResult {
+        let cluster = self.mutate_dax(|d| crate::dax::delete_cluster(d, req))?;
+        crate::dax::json_obj_response(vec![("Cluster", serde_json::to_value(cluster).unwrap())])
+    }
+
+    pub fn dax_increase_replication_factor(
+        &mut self,
+        req: &crate::dax::IncreaseReplicationFactorRequest,
+    ) -> OpResult {
+        let region = self.config.region().to_string();
+        let now = self.now_unix();
+        let cluster =
+            self.mutate_dax(|d| crate::dax::increase_replication_factor(d, &region, now, req))?;
+        crate::dax::json_obj_response(vec![("Cluster", serde_json::to_value(cluster).unwrap())])
+    }
+
+    pub fn dax_decrease_replication_factor(
+        &mut self,
+        req: &crate::dax::DecreaseReplicationFactorRequest,
+    ) -> OpResult {
+        let cluster = self.mutate_dax(|d| crate::dax::decrease_replication_factor(d, req))?;
+        crate::dax::json_obj_response(vec![("Cluster", serde_json::to_value(cluster).unwrap())])
+    }
+
+    pub fn dax_reboot_node(&mut self, req: &crate::dax::RebootNodeRequest) -> OpResult {
+        let cluster = self.mutate_dax(|d| crate::dax::reboot_node(d, req))?;
+        crate::dax::json_obj_response(vec![("Cluster", serde_json::to_value(cluster).unwrap())])
+    }
+
+    pub fn dax_create_subnet_group(
+        &mut self,
+        req: &crate::dax::CreateSubnetGroupRequest,
+    ) -> OpResult {
+        let region = self.config.region().to_string();
+        let group = self.mutate_dax(|d| crate::dax::create_subnet_group(d, &region, req))?;
+        crate::dax::json_obj_response(vec![("SubnetGroup", serde_json::to_value(group).unwrap())])
+    }
+
+    pub fn dax_describe_subnet_groups(
+        &self,
+        req: &crate::dax::DescribeSubnetGroupsRequest,
+    ) -> OpResult {
+        let (groups, next_token) = crate::dax::describe_subnet_groups(&self.dax, req)?;
+        let mut entries = vec![("SubnetGroups", serde_json::to_value(groups).unwrap())];
+        if let Some(tok) = next_token {
+            entries.push(("NextToken", Value::String(tok)));
+        }
+        crate::dax::json_obj_response(entries)
+    }
+
+    pub fn dax_update_subnet_group(
+        &mut self,
+        req: &crate::dax::UpdateSubnetGroupRequest,
+    ) -> OpResult {
+        let region = self.config.region().to_string();
+        let group = self.mutate_dax(|d| crate::dax::update_subnet_group(d, &region, req))?;
+        crate::dax::json_obj_response(vec![("SubnetGroup", serde_json::to_value(group).unwrap())])
+    }
+
+    pub fn dax_delete_subnet_group(
+        &mut self,
+        req: &crate::dax::DeleteSubnetGroupRequest,
+    ) -> OpResult {
+        let msg = self.mutate_dax(|d| crate::dax::delete_subnet_group(d, req))?;
+        crate::dax::json_obj_response(vec![("DeletionMessage", Value::String(msg))])
+    }
+
+    pub fn dax_create_parameter_group(
+        &mut self,
+        req: &crate::dax::CreateParameterGroupRequest,
+    ) -> OpResult {
+        let group = self.mutate_dax(|d| crate::dax::create_parameter_group(d, req))?;
+        crate::dax::json_obj_response(vec![(
+            "ParameterGroup",
+            serde_json::to_value(group).unwrap(),
+        )])
+    }
+
+    pub fn dax_describe_parameter_groups(
+        &self,
+        req: &crate::dax::DescribeParameterGroupsRequest,
+    ) -> OpResult {
+        let (groups, next_token) = crate::dax::describe_parameter_groups(&self.dax, req)?;
+        let mut entries = vec![("ParameterGroups", serde_json::to_value(groups).unwrap())];
+        if let Some(tok) = next_token {
+            entries.push(("NextToken", Value::String(tok)));
+        }
+        crate::dax::json_obj_response(entries)
+    }
+
+    pub fn dax_update_parameter_group(
+        &mut self,
+        req: &crate::dax::UpdateParameterGroupRequest,
+    ) -> OpResult {
+        let group = self.mutate_dax(|d| crate::dax::update_parameter_group(d, req))?;
+        crate::dax::json_obj_response(vec![(
+            "ParameterGroup",
+            serde_json::to_value(group).unwrap(),
+        )])
+    }
+
+    pub fn dax_delete_parameter_group(
+        &mut self,
+        req: &crate::dax::DeleteParameterGroupRequest,
+    ) -> OpResult {
+        let msg = self.mutate_dax(|d| crate::dax::delete_parameter_group(d, req))?;
+        crate::dax::json_obj_response(vec![("DeletionMessage", Value::String(msg))])
+    }
+
+    pub fn dax_describe_parameters(&self, req: &crate::dax::DescribeParametersRequest) -> OpResult {
+        let params = crate::dax::describe_parameters(&self.dax, req)?;
+        crate::dax::json_obj_response(vec![("Parameters", serde_json::to_value(params).unwrap())])
+    }
+
+    pub fn dax_list_tags(&self, req: &crate::dax::DaxListTagsRequest) -> OpResult {
+        let tags = crate::dax::list_tags(&self.dax, req)?;
+        crate::dax::json_obj_response(vec![("Tags", serde_json::to_value(tags).unwrap())])
+    }
+
+    pub fn dax_tag_resource(&mut self, req: &crate::dax::DaxTagResourceRequest) -> OpResult {
+        let tags = self.mutate_dax(|d| crate::dax::tag_resource(d, req))?;
+        crate::dax::json_obj_response(vec![("Tags", serde_json::to_value(tags).unwrap())])
+    }
+
+    pub fn dax_untag_resource(&mut self, req: &crate::dax::DaxUntagResourceRequest) -> OpResult {
+        let tags = self.mutate_dax(|d| crate::dax::untag_resource(d, req))?;
+        crate::dax::json_obj_response(vec![("Tags", serde_json::to_value(tags).unwrap())])
     }
 
     fn enable_stream_description(
@@ -2523,6 +3686,8 @@ struct PersistedTableRef<'a> {
         skip_serializing_if = "ref_string_is_empty"
     )]
     resource_policy_revision: &'a String,
+    #[serde(rename = "autoScaling", skip_serializing_if = "ref_option_is_none")]
+    auto_scaling: &'a Option<crate::global_tables::TableAutoScalingState>,
 }
 
 fn ref_vec_is_empty<T>(value: &&Vec<T>) -> bool {
@@ -2552,7 +3717,43 @@ fn encode_persisted_table(state: &TableState) -> Vec<u8> {
         continuous_backups: &state.continuous_backups,
         resource_policy: &state.resource_policy,
         resource_policy_revision: &state.resource_policy_revision,
+        auto_scaling: &state.auto_scaling,
     })
+}
+
+fn effective_select(select: &str, projection_expression: &str) -> String {
+    if !select.trim().is_empty() {
+        return select.trim().to_ascii_uppercase();
+    }
+    if !projection_expression.trim().is_empty() {
+        "SPECIFIC_ATTRIBUTES".to_string()
+    } else {
+        "ALL_ATTRIBUTES".to_string()
+    }
+}
+
+fn upsert_replica_gsi_settings<'a>(
+    settings: &'a mut crate::global_tables::ReplicaSettingsDescription,
+    index_name: &str,
+) -> &'a mut crate::global_tables::ReplicaGlobalSecondaryIndexSettingsDescription {
+    if let Some(pos) = settings
+        .replica_global_secondary_index_settings
+        .iter()
+        .position(|g| g.index_name == index_name)
+    {
+        return &mut settings.replica_global_secondary_index_settings[pos];
+    }
+    settings.replica_global_secondary_index_settings.push(
+        crate::global_tables::ReplicaGlobalSecondaryIndexSettingsDescription {
+            index_name: index_name.to_string(),
+            index_status: "ACTIVE".to_string(),
+            ..Default::default()
+        },
+    );
+    settings
+        .replica_global_secondary_index_settings
+        .last_mut()
+        .unwrap()
 }
 
 fn billing_mode(value: &str) -> String {

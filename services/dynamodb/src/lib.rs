@@ -6,9 +6,12 @@
 //! SigV4 verifier, and the AWS JSON 1.0 HTTP server.
 
 pub mod attribute;
+pub mod dax;
 pub mod errors;
 pub mod expression;
+pub mod global_tables;
 pub mod http;
+pub mod iam;
 pub mod introspect;
 pub mod model;
 pub mod number;

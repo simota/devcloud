@@ -12,6 +12,8 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::dax::{DaxClusterRecord, DaxParameterGroupRecord, DaxSubnetGroup};
+use crate::global_tables::{GlobalTableRecord, TableAutoScalingState};
 use crate::model::{
     BackupDescription, ContinuousBackupsDescription, Item, StreamRecord, TableDescription,
 };
@@ -34,6 +36,30 @@ pub struct PersistedState {
         skip_serializing_if = "BTreeMap::is_empty"
     )]
     pub backup_items: BTreeMap<String, BTreeMap<String, Item>>,
+    #[serde(
+        rename = "globalTables",
+        default,
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    pub global_tables: BTreeMap<String, GlobalTableRecord>,
+    #[serde(
+        rename = "daxClusters",
+        default,
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    pub dax_clusters: BTreeMap<String, DaxClusterRecord>,
+    #[serde(
+        rename = "daxSubnetGroups",
+        default,
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    pub dax_subnet_groups: BTreeMap<String, DaxSubnetGroup>,
+    #[serde(
+        rename = "daxParameterGroups",
+        default,
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    pub dax_parameter_groups: BTreeMap<String, DaxParameterGroupRecord>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -67,6 +93,12 @@ pub struct PersistedTable {
         skip_serializing_if = "String::is_empty"
     )]
     pub resource_policy_revision: String,
+    #[serde(
+        rename = "autoScaling",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub auto_scaling: Option<TableAutoScalingState>,
 }
 
 impl PersistedState {
