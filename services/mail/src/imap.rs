@@ -1,14 +1,9 @@
 //! Local IMAP4rev1 server (RFC 3501 + RFC 2595 `STARTTLS` + implicit TLS
 //! `IMAPS`) backed by the shared mail `Service`.
 //!
-//! Exposes a single `INBOX` mailbox backed by the shared `Service` store, with
-//! in-process flag persistence (`\Seen`, `\Answered`, `\Flagged`, `\Deleted`,
-//! `\Draft`) across sessions. Never logs credentials, authorization tokens, or
-//! message bodies.
-
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 use std::future::Future;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::Duration;
 
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -22,7 +17,8 @@ use tokio::net::TcpListener;
 use crate::model::MailboxMessage;
 use crate::service::Service;
 use crate::smtp::{SmtpLimits, SMTP_AUTH_STRICT};
-use crate::time_fmt::imap_internaldate_from_rfc3339;
+use crate::store::INBOX;
+use crate::time_fmt::{imap_internaldate_from_rfc3339, rfc3339_from_imap_internaldate};
 use crate::tls::{accept_tls, constant_time_eq, is_transient_accept_error, MailTls, MaybeTls};
 
 /// Configuration for the local IMAP server.
@@ -48,8 +44,6 @@ impl ImapConfig {
     }
 }
 
-type FlagMap = Arc<RwLock<HashMap<String, BTreeSet<String>>>>;
-
 /// Local IMAP4rev1 server sharing the same `Service` as SMTP, POP3, and HTTP.
 #[derive(Clone)]
 pub struct ImapServer {
@@ -57,7 +51,6 @@ pub struct ImapServer {
     service: Arc<Service>,
     limits: SmtpLimits,
     tls: Option<MailTls>,
-    flags: FlagMap,
 }
 
 impl ImapServer {
@@ -67,7 +60,6 @@ impl ImapServer {
             service,
             limits: SmtpLimits::standard(),
             tls: None,
-            flags: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -84,16 +76,6 @@ impl ImapServer {
     pub fn with_optional_tls(mut self, tls: Option<MailTls>) -> Self {
         self.tls = tls;
         self
-    }
-
-    fn clone_for_conn(&self) -> Self {
-        Self {
-            config: self.config.clone(),
-            service: Arc::clone(&self.service),
-            limits: self.limits.clone(),
-            tls: self.tls.clone(),
-            flags: Arc::clone(&self.flags),
-        }
     }
 
     pub async fn run(&self) -> std::io::Result<()> {
@@ -121,7 +103,7 @@ impl ImapServer {
                             continue;
                         }
                     };
-                    let server = self.clone_for_conn();
+                    let server = self.clone();
                     tokio::spawn(async move {
                         server.handle_conn(sock).await;
                     });
@@ -156,7 +138,7 @@ impl ImapServer {
                             continue;
                         }
                     };
-                    let server = self.clone_for_conn();
+                    let server = self.clone();
                     tokio::spawn(async move {
                         server.handle_tls_conn(sock).await;
                     });
@@ -196,7 +178,6 @@ impl ImapServer {
             limits: self.limits,
             tls: self.tls,
             tls_active,
-            flags: self.flags,
             state: ImapState::NotAuthenticated,
         };
 
@@ -209,16 +190,7 @@ impl ImapServer {
         {
             return;
         }
-        loop {
-            match session.read_command_line().await {
-                None => return,
-                Some(line) => {
-                    if !session.handle_line(&line).await {
-                        return;
-                    }
-                }
-            }
-        }
+        while session.read_and_handle_command().await {}
     }
 }
 
@@ -241,12 +213,43 @@ where
             writer: write_half,
         }
     }
+
+    // Cancellation-safe: only consume bytes after fill_buf completes, and
+    // retain partial lines while IDLE sends updates.
+    async fn read_line_chunk(&mut self, buf: &mut Vec<u8>, limit: usize) -> Option<ReadLine> {
+        let available = self.reader.fill_buf().await.ok()?;
+        if available.is_empty() {
+            return None;
+        }
+        let take = available
+            .iter()
+            .position(|&b| b == b'\n')
+            .map_or(available.len(), |i| i + 1);
+        if limit > 0 && buf.len().saturating_add(take) > limit {
+            return Some(ReadLine::TooLong);
+        }
+        let finished = available[take - 1] == b'\n';
+        buf.extend_from_slice(&available[..take]);
+        self.reader.consume(take);
+        Some(if finished {
+            ReadLine::Complete
+        } else {
+            ReadLine::Partial
+        })
+    }
+}
+
+enum ReadLine {
+    Partial,
+    Complete,
+    TooLong,
 }
 
 enum ImapState {
     NotAuthenticated,
     Authenticated,
     Selected {
+        name: String,
         read_only: bool,
         entries: Vec<MailboxMessage>,
     },
@@ -262,7 +265,6 @@ where
     limits: SmtpLimits,
     tls: Option<MailTls>,
     tls_active: bool,
-    flags: FlagMap,
     state: ImapState,
 }
 
@@ -275,7 +277,7 @@ where
     }
 
     fn capabilities_string(&self) -> String {
-        let mut caps = vec!["IMAP4rev1"];
+        let mut caps = vec!["IMAP4rev1", "IDLE", "LITERAL+"];
         if self.tls.is_some() && !self.tls_active {
             caps.push("STARTTLS");
         }
@@ -295,39 +297,27 @@ where
             .idle_timeout
             .map(|t| tokio::time::Instant::now() + t);
         loop {
-            let reader = &mut self.conn.as_mut()?.reader;
-            let available = if let Some(deadline) = deadline {
-                match tokio::time::timeout_at(deadline, reader.fill_buf()).await {
-                    Ok(Ok(bytes)) => bytes,
-                    Ok(Err(_)) => return None,
+            let read = self.conn.as_mut()?.read_line_chunk(&mut buf, limit);
+            let result = if let Some(deadline) = deadline {
+                match tokio::time::timeout_at(deadline, read).await {
+                    Ok(result) => result,
                     Err(_) => {
                         self.send_line("* BYE idle timeout").await;
                         return None;
                     }
                 }
             } else {
-                reader.fill_buf().await.ok()?
+                read.await
             };
-            if available.is_empty() {
-                break;
+            match result {
+                Some(ReadLine::Complete) => break,
+                Some(ReadLine::Partial) => continue,
+                Some(ReadLine::TooLong) => {
+                    self.send_line("* BAD line exceeds limit").await;
+                    return None;
+                }
+                None => return None,
             }
-            let take = available
-                .iter()
-                .position(|&b| b == b'\n')
-                .map_or(available.len(), |i| i + 1);
-            if limit > 0 && buf.len().saturating_add(take) > limit {
-                self.send_line("* BAD line exceeds limit").await;
-                return None;
-            }
-            let finished = available[take - 1] == b'\n';
-            buf.extend_from_slice(&available[..take]);
-            reader.consume(take);
-            if finished {
-                break;
-            }
-        }
-        if buf.is_empty() {
-            return None;
         }
         if buf.last() == Some(&b'\n') {
             buf.pop();
@@ -339,11 +329,6 @@ where
     }
 
     async fn read_exact_bytes(&mut self, len: usize) -> Option<Vec<u8>> {
-        let limit = self.limits.max_line_bytes;
-        if limit > 0 && len > limit {
-            self.send_line("* BAD literal exceeds limit").await;
-            return None;
-        }
         let mut buf = vec![0u8; len];
         let deadline = self
             .limits
@@ -365,31 +350,44 @@ where
         }
     }
 
-    /// Reads an IMAP command line, resolving trailing synchronizing (`{N}`) or
-    /// non-synchronizing (`{N+}`) literals into quoted strings.
-    async fn read_command_line(&mut self) -> Option<String> {
-        let mut assembled = self.read_raw_line().await?;
+    async fn read_and_handle_command(&mut self) -> bool {
+        let Some(mut assembled) = self.read_raw_line().await else {
+            return false;
+        };
         let mut literal_hops = 0usize;
         while let Some((prefix_len, lit_len, sync)) = trailing_literal(&assembled) {
+            let prefix = &assembled[..prefix_len];
+            if let Some((tag, cmd, arg)) = command_parts(prefix) {
+                if cmd.eq_ignore_ascii_case("APPEND") && !arg.is_empty() {
+                    return self.handle_append(tag, arg, lit_len, sync).await;
+                }
+            }
             literal_hops += 1;
             if literal_hops > 16 {
                 self.send_line("* BAD too many literals").await;
-                return None;
+                return false;
+            }
+            let limit = self.limits.max_line_bytes;
+            if limit > 0 && lit_len > limit {
+                self.send_line("* BAD literal exceeds limit").await;
+                return false;
             }
             if sync && !self.send_line("+ Ready for literal data").await {
-                return None;
+                return false;
             }
-            let literal_bytes = self.read_exact_bytes(lit_len).await?;
+            let Some(literal_bytes) = self.read_exact_bytes(lit_len).await else {
+                return false;
+            };
             let literal_str = String::from_utf8_lossy(&literal_bytes);
             assembled.truncate(prefix_len);
             assembled.push_str(&imap_quote(&literal_str));
             if let Some(rest) = self.read_raw_line().await {
                 assembled.push_str(&rest);
             } else {
-                break;
+                return false;
             }
         }
-        Some(assembled)
+        self.handle_line(&assembled).await
     }
 
     async fn send_bytes(&mut self, bytes: &[u8]) -> bool {
@@ -413,40 +411,14 @@ where
         self.send_line(&format!("{tag} {status} {msg}")).await
     }
 
-    fn get_flags(&self, id: &str) -> BTreeSet<String> {
-        self.flags
-            .read()
-            .unwrap()
-            .get(id)
-            .cloned()
-            .unwrap_or_default()
-    }
-
-    fn add_flag(&self, id: &str, flag: &str) -> bool {
-        let mut guard = self.flags.write().unwrap();
-        guard
-            .entry(id.to_string())
-            .or_default()
-            .insert(flag.to_string())
-    }
-
-    fn remove_flags_for(&self, id: &str) {
-        self.flags.write().unwrap().remove(id);
-    }
-
     async fn handle_line(&mut self, line: &str) -> bool {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
+        if line.trim().is_empty() {
             return self.send_line("* BAD empty command").await;
         }
-        let Some((tag, rest)) = trimmed.split_once(|c: char| c == ' ' || c == '\t') else {
+        let Some((tag, cmd, arg)) = command_parts(line) else {
             return self.send_line("* BAD missing command").await;
         };
-        let rest = rest.trim_start();
-        let (cmd, arg) = match rest.split_once(|c: char| c == ' ' || c == '\t') {
-            None => (rest.to_ascii_uppercase(), ""),
-            Some((c, a)) => (c.to_ascii_uppercase(), a.trim()),
-        };
+        let cmd = cmd.to_ascii_uppercase();
 
         match cmd.as_str() {
             "CAPABILITY" => {
@@ -457,6 +429,7 @@ where
                 self.tagged(tag, "OK", "CAPABILITY completed").await
             }
             "NOOP" => self.handle_noop(tag).await,
+            "IDLE" => self.handle_idle(tag, arg).await,
             "LOGOUT" => {
                 let _ = self
                     .send_line("* BYE devcloud IMAP4rev1 server logging out")
@@ -490,11 +463,9 @@ where
             "STORE" => self.handle_store(tag, arg, false).await,
             "SEARCH" => self.handle_search(tag, arg, false).await,
             "UID" => self.handle_uid(tag, arg).await,
-            "CREATE" | "DELETE" | "RENAME" | "SUBSCRIBE" | "UNSUBSCRIBE" => {
-                if matches!(self.state, ImapState::NotAuthenticated) {
-                    return self.tagged(tag, "BAD", "not authenticated").await;
-                }
-                self.tagged(tag, "NO", "only INBOX mailbox is supported")
+            "CREATE" => self.handle_create(tag, arg).await,
+            "APPEND" => {
+                self.tagged(tag, "BAD", "APPEND requires a message literal")
                     .await
             }
             _ => {
@@ -505,25 +476,113 @@ where
     }
 
     async fn handle_noop(&mut self, tag: &str) -> bool {
-        if let ImapState::Selected {
-            read_only,
-            entries: old_entries,
-        } = &self.state
-        {
-            let old_len = old_entries.len();
-            let ro = *read_only;
-            if let Ok(snap) = self.service.list_mailbox() {
-                let new_len = snap.messages.len();
-                self.state = ImapState::Selected {
-                    read_only: ro,
-                    entries: snap.messages,
-                };
-                if new_len != old_len && !self.send_line(&format!("* {new_len} EXISTS")).await {
-                    return false;
+        match self.refresh_selected().await {
+            Ok(true) => self.tagged(tag, "OK", "NOOP completed").await,
+            Ok(false) => false,
+            Err(()) => self.tagged(tag, "NO", "failed to refresh mailbox").await,
+        }
+    }
+
+    async fn refresh_selected(&mut self) -> Result<bool, ()> {
+        let ImapState::Selected { name, entries, .. } = &mut self.state else {
+            return Ok(true);
+        };
+        let snapshot = self.service.list_folder(name).map_err(|_| ())?.ok_or(())?;
+        let mut updates = Vec::new();
+        let mut remaining = 0;
+        for entry in entries.iter() {
+            if snapshot
+                .messages
+                .binary_search_by_key(&entry.uid, |m| m.uid)
+                .is_err()
+            {
+                updates.push(format!("* {} EXPUNGE", remaining + 1));
+            } else {
+                remaining += 1;
+            }
+        }
+        if snapshot.messages.len() > remaining {
+            updates.push(format!("* {} EXISTS", snapshot.messages.len()));
+        }
+        for (idx, entry) in snapshot.messages.iter().enumerate() {
+            if let Ok(old) = entries.binary_search_by_key(&entry.uid, |m| m.uid) {
+                if entries[old].flags != entry.flags {
+                    updates.push(format!(
+                        "* {} FETCH (UID {} FLAGS ({}))",
+                        idx + 1,
+                        entry.uid,
+                        format_flags(&entry.flags),
+                    ));
                 }
             }
         }
-        self.tagged(tag, "OK", "NOOP completed").await
+        *entries = snapshot.messages;
+        for update in updates {
+            if !self.send_line(&update).await {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    async fn handle_idle(&mut self, tag: &str, arg: &str) -> bool {
+        if !arg.is_empty() || matches!(self.state, ImapState::NotAuthenticated) {
+            return self
+                .tagged(tag, "BAD", "IDLE requires authentication and no arguments")
+                .await;
+        }
+        let mut changes = self.service.mailbox_changes();
+        if !self.send_line("+ idling").await {
+            return false;
+        }
+        let idle_timeout = self.limits.idle_timeout;
+        let timeout = async {
+            match idle_timeout {
+                Some(duration) => tokio::time::sleep(duration).await,
+                None => std::future::pending().await,
+            }
+        };
+        tokio::pin!(timeout);
+        let mut buf = Vec::new();
+        loop {
+            match self.refresh_selected().await {
+                Ok(true) => {}
+                Ok(false) => return false,
+                Err(()) => {
+                    self.send_line("* BYE failed to refresh mailbox").await;
+                    return false;
+                }
+            }
+            loop {
+                let conn = self.conn.as_mut().unwrap();
+                tokio::select! {
+                    _ = &mut timeout => {
+                        self.send_line("* BYE idle timeout").await;
+                        return false;
+                    }
+                    _ = changes.changed() => break,
+                    result = conn.read_line_chunk(&mut buf, self.limits.max_line_bytes) => match result {
+                        Some(ReadLine::Partial) => continue,
+                        Some(ReadLine::Complete) if buf.eq_ignore_ascii_case(b"DONE\r\n")
+                            || buf.eq_ignore_ascii_case(b"DONE\n") => {
+                            return match self.refresh_selected().await {
+                                Ok(true) => self.tagged(tag, "OK", "IDLE completed").await,
+                                Ok(false) => false,
+                                Err(()) => self.tagged(tag, "NO", "failed to refresh mailbox").await,
+                            };
+                        }
+                        Some(ReadLine::Complete) => {
+                            return self.tagged(tag, "BAD", "expected DONE").await;
+                        }
+                        Some(ReadLine::TooLong) => {
+                            self.send_line("* BAD line exceeds limit").await;
+                            return false;
+                        }
+                        None => return false,
+                    }
+                }
+            }
+        }
     }
 
     async fn handle_starttls(&mut self, tag: &str, arg: &str) -> bool {
@@ -663,16 +722,107 @@ where
             }
         } else {
             let full_pattern = format!("{reference}{pattern}");
-            if imap_wildcard_match(&full_pattern, "INBOX") {
-                if !self
-                    .send_line(&format!("* {cmd} (\\HasNoChildren) \"/\" \"INBOX\""))
-                    .await
+            let folders = match self.service.folders() {
+                Ok(folders) => folders,
+                Err(_) => return self.tagged(tag, "NO", "failed to list mailboxes").await,
+            };
+            for name in folders {
+                if imap_wildcard_match(&full_pattern, &name)
+                    && !self
+                        .send_line(&format!(
+                            "* {cmd} (\\HasNoChildren) \"/\" {}",
+                            imap_quote(&name)
+                        ))
+                        .await
                 {
                     return false;
                 }
             }
         }
         self.tagged(tag, "OK", &format!("{cmd} completed")).await
+    }
+
+    async fn handle_create(&mut self, tag: &str, arg: &str) -> bool {
+        if matches!(self.state, ImapState::NotAuthenticated) {
+            return self.tagged(tag, "BAD", "not authenticated").await;
+        }
+        let Some((name, "")) = split_first_imap_arg(arg) else {
+            return self.tagged(tag, "BAD", "expected mailbox name").await;
+        };
+        if name.is_empty()
+            || name.len() > 255
+            || !name
+                .bytes()
+                .all(|b| (b' '..=b'~').contains(&b) && !matches!(b, b'/' | b'*' | b'%'))
+        {
+            return self.tagged(tag, "NO", "unsupported mailbox name").await;
+        }
+        match self.service.create_folder(mailbox_name(&name)) {
+            Ok(()) => self.tagged(tag, "OK", "CREATE completed").await,
+            Err(_) => self.tagged(tag, "NO", "could not create mailbox").await,
+        }
+    }
+
+    async fn handle_append(&mut self, tag: &str, arg: &str, len: usize, sync: bool) -> bool {
+        let limit = self.limits.max_line_bytes;
+        if limit > 0 && len > limit {
+            let sent = self
+                .tagged(tag, "NO", "message exceeds literal limit")
+                .await;
+            return sync && sent;
+        }
+        let prepare = || {
+            if matches!(self.state, ImapState::NotAuthenticated) {
+                return Err(("BAD", "not authenticated"));
+            }
+            let (name, flags, internal_date) =
+                parse_append_args(arg).ok_or(("BAD", "invalid APPEND arguments"))?;
+            let folders = self
+                .service
+                .folders()
+                .map_err(|_| ("NO", "failed to inspect mailboxes"))?;
+            if !folders.contains(mailbox_name(&name)) {
+                return Err(("NO", "[TRYCREATE] mailbox does not exist"));
+            }
+            Ok((name, flags, internal_date))
+        };
+        let prepared = prepare();
+        if sync {
+            match &prepared {
+                Err((status, message)) => return self.tagged(tag, status, message).await,
+                Ok(_) if !self.send_line("+ Ready for literal data").await => return false,
+                Ok(_) => {}
+            }
+        }
+        let Some(raw) = self.read_exact_bytes(len).await else {
+            return false;
+        };
+        let Some(trailer) = self.read_exact_bytes(2).await else {
+            return false;
+        };
+        if trailer != b"\r\n" {
+            self.tagged(tag, "BAD", "expected CRLF after message literal")
+                .await;
+            return false;
+        }
+        let (name, flags, internal_date) = match prepared {
+            Ok(args) => args,
+            Err((status, message)) => return self.tagged(tag, status, message).await,
+        };
+        let name = mailbox_name(&name);
+        if self
+            .service
+            .append_to_folder(name, &raw, flags, internal_date)
+            .is_err()
+        {
+            return self.tagged(tag, "NO", "failed to append message").await;
+        }
+        if matches!(&self.state, ImapState::Selected { name: selected, .. } if selected == name)
+            && self.refresh_selected().await == Ok(false)
+        {
+            return false;
+        }
+        self.tagged(tag, "OK", "APPEND completed").await
     }
 
     async fn handle_status(&mut self, tag: &str, arg: &str) -> bool {
@@ -682,22 +832,21 @@ where
         let Some((mailbox_raw, items_raw)) = split_first_imap_arg(arg) else {
             return self.tagged(tag, "BAD", "invalid STATUS arguments").await;
         };
-        if !mailbox_raw.eq_ignore_ascii_case("INBOX") {
-            return self.tagged(tag, "NO", "mailbox does not exist").await;
-        }
         let items_inner = items_raw
             .trim()
             .strip_prefix('(')
             .and_then(|s| s.strip_suffix(')'))
             .unwrap_or(items_raw.trim());
-        let snap = match self.service.list_mailbox() {
-            Ok(s) => s,
+        let name = mailbox_name(&mailbox_raw);
+        let snap = match self.service.list_folder(name) {
+            Ok(Some(s)) => s,
+            Ok(None) => return self.tagged(tag, "NO", "mailbox does not exist").await,
             Err(_) => return self.tagged(tag, "NO", "failed to inspect mailbox").await,
         };
         let unseen = snap
             .messages
             .iter()
-            .filter(|m| !self.get_flags(&m.message.id).contains("\\Seen"))
+            .filter(|m| !m.flags.contains("\\Seen"))
             .count();
         let mut resp_items = Vec::new();
         for item in items_inner.split_whitespace() {
@@ -711,7 +860,11 @@ where
             }
         }
         if !self
-            .send_line(&format!("* STATUS \"INBOX\" ({})", resp_items.join(" ")))
+            .send_line(&format!(
+                "* STATUS {} ({})",
+                imap_quote(name),
+                resp_items.join(" ")
+            ))
             .await
         {
             return false;
@@ -723,24 +876,24 @@ where
         if matches!(self.state, ImapState::NotAuthenticated) {
             return self.tagged(tag, "BAD", "not authenticated").await;
         }
-        let tokens = parse_imap_args(arg);
-        if tokens.len() != 1 {
+        let Some((name, "")) = split_first_imap_arg(arg) else {
             return self.tagged(tag, "BAD", "expected mailbox name").await;
-        }
-        if !tokens[0].eq_ignore_ascii_case("INBOX") {
-            return self.tagged(tag, "NO", "mailbox does not exist").await;
-        }
-        let snap = match self.service.list_mailbox() {
-            Ok(s) => s,
+        };
+        let name = mailbox_name(&name);
+        self.state = ImapState::Authenticated;
+        let snap = match self.service.list_folder(name) {
+            Ok(Some(s)) => s,
+            Ok(None) => return self.tagged(tag, "NO", "mailbox does not exist").await,
             Err(_) => return self.tagged(tag, "NO", "failed to open mailbox").await,
         };
         let exists = snap.messages.len();
         let first_unseen = snap
             .messages
             .iter()
-            .position(|m| !self.get_flags(&m.message.id).contains("\\Seen"))
+            .position(|m| !m.flags.contains("\\Seen"))
             .map(|i| i + 1);
         self.state = ImapState::Selected {
+            name: name.to_string(),
             read_only,
             entries: snap.messages,
         };
@@ -754,7 +907,7 @@ where
             lines.push("* OK [PERMANENTFLAGS ()] Read-only mailbox".to_string());
         } else {
             lines.push(
-                "* OK [PERMANENTFLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft)] Flags permitted"
+                "* OK [PERMANENTFLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft \\*)] Flags permitted"
                     .to_string(),
             );
         }
@@ -781,52 +934,50 @@ where
     }
 
     async fn handle_close(&mut self, tag: &str) -> bool {
-        let (read_only, entries) = match &self.state {
-            ImapState::Selected { read_only, entries } => (*read_only, entries.clone()),
+        let (name, read_only) = match &self.state {
+            ImapState::Selected {
+                name, read_only, ..
+            } => (name, *read_only),
             _ => return self.tagged(tag, "BAD", "no mailbox selected").await,
         };
-        if !read_only {
-            for entry in entries {
-                if self.get_flags(&entry.message.id).contains("\\Deleted") {
-                    let _ = self.service.delete(&entry.message.id);
-                    self.remove_flags_for(&entry.message.id);
-                }
-            }
+        if !read_only && self.expunge_folder(name).is_err() {
+            return self.tagged(tag, "NO", "expunge failed").await;
         }
         self.state = ImapState::Authenticated;
         self.tagged(tag, "OK", "CLOSE completed").await
     }
 
     async fn handle_expunge(&mut self, tag: &str) -> bool {
-        let (read_only, entries) = match &self.state {
-            ImapState::Selected { read_only, entries } => (*read_only, entries.clone()),
+        let (name, read_only) = match &self.state {
+            ImapState::Selected {
+                name, read_only, ..
+            } => (name, *read_only),
             _ => return self.tagged(tag, "BAD", "no mailbox selected").await,
         };
         if read_only {
             return self.tagged(tag, "NO", "mailbox is read-only").await;
         }
-        let mut remaining = Vec::with_capacity(entries.len());
-        let mut removed = 0usize;
-        for (idx, entry) in entries.into_iter().enumerate() {
-            if self.get_flags(&entry.message.id).contains("\\Deleted") {
-                if self.service.delete(&entry.message.id).is_err() {
-                    return self.tagged(tag, "NO", "expunge failed").await;
-                }
-                self.remove_flags_for(&entry.message.id);
-                let seq = idx + 1 - removed;
-                removed += 1;
-                if !self.send_line(&format!("* {seq} EXPUNGE")).await {
-                    return false;
-                }
-            } else {
-                remaining.push(entry);
-            }
+        if self.expunge_folder(name).is_err() {
+            return self.tagged(tag, "NO", "expunge failed").await;
         }
-        self.state = ImapState::Selected {
-            read_only: false,
-            entries: remaining,
-        };
-        self.tagged(tag, "OK", "EXPUNGE completed").await
+        match self.refresh_selected().await {
+            Ok(true) => self.tagged(tag, "OK", "EXPUNGE completed").await,
+            Ok(false) => false,
+            Err(()) => self.tagged(tag, "NO", "failed to refresh mailbox").await,
+        }
+    }
+
+    fn expunge_folder(&self, name: &str) -> Result<(), String> {
+        let snapshot = self
+            .service
+            .list_folder(name)?
+            .ok_or("mailbox does not exist")?;
+        let ids: Vec<_> = snapshot
+            .messages
+            .iter()
+            .map(|entry| entry.message.id.as_str())
+            .collect();
+        self.service.expunge_flagged(&ids)
     }
 
     async fn handle_uid(&mut self, tag: &str, arg: &str) -> bool {
@@ -844,7 +995,9 @@ where
 
     async fn handle_fetch(&mut self, tag: &str, arg: &str, is_uid: bool) -> bool {
         let (read_only, entries) = match &self.state {
-            ImapState::Selected { read_only, entries } => (*read_only, entries.clone()),
+            ImapState::Selected {
+                read_only, entries, ..
+            } => (*read_only, entries.clone()),
             _ => return self.tagged(tag, "BAD", "no mailbox selected").await,
         };
         let Some((set_spec, items_raw)) = arg.split_once(|c: char| c == ' ' || c == '\t') else {
@@ -860,6 +1013,7 @@ where
             items.insert(0, FetchItem::Uid);
         }
 
+        let mark_seen = !read_only && items.iter().any(FetchItem::marks_seen);
         for idx in indices {
             let entry = &entries[idx];
             let seq = idx + 1;
@@ -869,11 +1023,25 @@ where
                 Err(_) => return self.tagged(tag, "NO", "failed to load message").await,
             };
 
-            let mut saw_seen_mutation = false;
-            for item in &items {
-                if item.marks_seen() && !read_only && self.add_flag(&entry.message.id, "\\Seen") {
-                    saw_seen_mutation = true;
-                }
+            let id = entry.message.id.as_str();
+            let Ok(previous) = self.service.message_flags(id) else {
+                return self.tagged(tag, "NO", "failed to load flags").await;
+            };
+            let mut flags = previous;
+            let saw_seen_mutation = mark_seen && !flags.contains("\\Seen");
+            if saw_seen_mutation {
+                let Ok(mut updated) = self.service.update_flags(&[id], |flags| {
+                    flags.insert("\\Seen".to_string());
+                }) else {
+                    return self.tagged(tag, "NO", "failed to save flags").await;
+                };
+                let Some(current) = updated.remove(id) else {
+                    continue;
+                };
+                flags = current;
+                self.remember_flags(idx, &flags);
+            } else if items.iter().any(|i| matches!(i, FetchItem::Flags)) {
+                self.remember_flags(idx, &flags);
             }
             let include_flags =
                 saw_seen_mutation && !items.iter().any(|i| matches!(i, FetchItem::Flags));
@@ -885,19 +1053,13 @@ where
                     out.push(b' ');
                 }
                 first = false;
-                write_fetch_item(
-                    &mut out,
-                    item,
-                    entry,
-                    &raw,
-                    &self.get_flags(&entry.message.id),
-                );
+                write_fetch_item(&mut out, item, entry, &raw, &flags);
             }
             if include_flags {
                 if !first {
                     out.push(b' ');
                 }
-                let f = format_flags(&self.get_flags(&entry.message.id));
+                let f = format_flags(&flags);
                 out.extend_from_slice(format!("FLAGS ({f})").as_bytes());
             }
             out.extend_from_slice(b")\r\n");
@@ -912,7 +1074,9 @@ where
 
     async fn handle_store(&mut self, tag: &str, arg: &str, is_uid: bool) -> bool {
         let (read_only, entries) = match &self.state {
-            ImapState::Selected { read_only, entries } => (*read_only, entries.clone()),
+            ImapState::Selected {
+                read_only, entries, ..
+            } => (*read_only, entries.clone()),
             _ => return self.tagged(tag, "BAD", "no mailbox selected").await,
         };
         if read_only {
@@ -938,36 +1102,30 @@ where
             "-FLAGS.SILENT" => (StoreOp::Remove, true),
             _ => return self.tagged(tag, "BAD", "invalid STORE mode").await,
         };
-        let new_flags = parse_flag_list(flags_raw.trim());
+        let Some(new_flags) = parse_flag_list(flags_raw.trim()) else {
+            return self.tagged(tag, "BAD", "invalid flags").await;
+        };
 
+        let ids: Vec<_> = indices
+            .iter()
+            .map(|&idx| entries[idx].message.id.as_str())
+            .collect();
+        let Ok(current) = self.service.update_flags(&ids, |flags| match op {
+            StoreOp::Replace => *flags = new_flags.clone(),
+            StoreOp::Add => flags.extend(new_flags.iter().cloned()),
+            StoreOp::Remove => flags.retain(|flag| !new_flags.contains(flag)),
+        }) else {
+            return self.tagged(tag, "NO", "failed to save flags").await;
+        };
         for idx in indices {
             let entry = &entries[idx];
             let seq = idx + 1;
-            let current = {
-                let mut guard = self.flags.write().unwrap();
-                let set = guard.entry(entry.message.id.clone()).or_default();
-                match op {
-                    StoreOp::Replace => {
-                        set.clear();
-                        for f in &new_flags {
-                            set.insert(f.clone());
-                        }
-                    }
-                    StoreOp::Add => {
-                        for f in &new_flags {
-                            set.insert(f.clone());
-                        }
-                    }
-                    StoreOp::Remove => {
-                        for f in &new_flags {
-                            set.remove(f);
-                        }
-                    }
-                }
-                set.clone()
+            let Some(flags) = current.get(&entry.message.id) else {
+                continue;
             };
+            self.remember_flags(idx, flags);
             if !silent {
-                let formatted = format_flags(&current);
+                let formatted = format_flags(flags);
                 let line = if is_uid {
                     format!("* {seq} FETCH (UID {} FLAGS ({formatted}))", entry.uid)
                 } else {
@@ -981,6 +1139,12 @@ where
         let cmd_name = if is_uid { "UID STORE" } else { "STORE" };
         self.tagged(tag, "OK", &format!("{cmd_name} completed"))
             .await
+    }
+
+    fn remember_flags(&mut self, idx: usize, flags: &BTreeSet<String>) {
+        if let ImapState::Selected { entries, .. } = &mut self.state {
+            entries[idx].flags.clone_from(flags);
+        }
     }
 
     async fn handle_search(&mut self, tag: &str, arg: &str, is_uid: bool) -> bool {
@@ -1008,7 +1172,9 @@ where
                 Ok(None) => continue,
                 Err(_) => return self.tagged(tag, "NO", "search failed").await,
             };
-            let flags = self.get_flags(&entry.message.id);
+            let Ok(flags) = self.service.message_flags(&entry.message.id) else {
+                return self.tagged(tag, "NO", "search failed").await;
+            };
             if eval_search(&expr, seq, entry, &entries, &raw, &flags) {
                 matches.push(if is_uid { entry.uid } else { seq });
             }
@@ -1038,11 +1204,50 @@ enum StoreOp {
 // Parsing & formatting helpers
 // ---------------------------------------------------------------------------
 
+fn command_parts(line: &str) -> Option<(&str, &str, &str)> {
+    let (tag, rest) = line.trim().split_once([' ', '\t'])?;
+    let rest = rest.trim_start();
+    let (cmd, arg) = rest.split_once([' ', '\t']).unwrap_or((rest, ""));
+    Some((tag, cmd, arg.trim()))
+}
+
+fn mailbox_name(name: &str) -> &str {
+    if name.eq_ignore_ascii_case(INBOX) {
+        INBOX
+    } else {
+        name
+    }
+}
+
+fn parse_append_args(arg: &str) -> Option<(String, BTreeSet<String>, Option<String>)> {
+    let (name, mut rest) = split_first_imap_arg(arg)?;
+    let mut flags = BTreeSet::new();
+    if rest.starts_with('(') {
+        let (list, tail) = rest.split_once(')')?;
+        if !tail.is_empty() && !tail.starts_with([' ', '\t']) {
+            return None;
+        }
+        flags = parse_flag_list(list.strip_prefix('(')?)?;
+        rest = tail.trim_start();
+    }
+    let date = if rest.is_empty() {
+        None
+    } else {
+        Some(rfc3339_from_imap_internaldate(
+            rest.strip_prefix('"')?.strip_suffix('"')?,
+        )?)
+    };
+    Some((name, flags, date))
+}
+
 fn trailing_literal(line: &str) -> Option<(usize, usize, bool)> {
     if !line.ends_with('}') {
         return None;
     }
     let open = line.rfind('{')?;
+    if !line[..open].ends_with([' ', '\t']) {
+        return None;
+    }
     let inner = &line[open + 1..line.len() - 1];
     let (digits, sync) = match inner.strip_suffix('+') {
         Some(d) => (d, false),
@@ -1121,7 +1326,11 @@ fn split_first_imap_arg(input: &str) -> Option<(String, &str)> {
             } else if ch == '\\' {
                 escaped = true;
             } else if ch == '"' {
-                return Some((s, rest[i + 1..].trim_start()));
+                let tail = &rest[i + 1..];
+                if tail.is_empty() || tail.starts_with([' ', '\t']) {
+                    return Some((s, tail.trim_start()));
+                }
+                return None;
             } else {
                 s.push(ch);
             }
@@ -1136,22 +1345,33 @@ fn split_first_imap_arg(input: &str) -> Option<(String, &str)> {
 }
 
 fn imap_wildcard_match(pattern: &str, mailbox: &str) -> bool {
-    let p = pattern.to_ascii_uppercase();
-    let m = mailbox.to_ascii_uppercase();
-    wildcard_match_bytes(p.as_bytes(), m.as_bytes())
-}
-
-fn wildcard_match_bytes(pat: &[u8], text: &[u8]) -> bool {
-    if pat.is_empty() {
-        return text.is_empty();
-    }
-    match pat[0] {
-        b'*' | b'%' => {
-            wildcard_match_bytes(&pat[1..], text)
-                || (!text.is_empty() && wildcard_match_bytes(pat, &text[1..]))
+    let pattern = pattern.as_bytes();
+    let text = mailbox.as_bytes();
+    let (mut pat, mut pos) = (0, 0);
+    let mut wildcard = None;
+    while pos < text.len() {
+        match pattern.get(pat) {
+            Some(b'*' | b'%') => {
+                pat += 1;
+                wildcard = Some((pat, pos));
+            }
+            Some(c)
+                if *c == text[pos] || (mailbox == INBOX && c.eq_ignore_ascii_case(&text[pos])) =>
+            {
+                pat += 1;
+                pos += 1;
+            }
+            _ => {
+                let Some((after, consumed)) = wildcard else {
+                    return false;
+                };
+                pat = after;
+                pos = consumed + 1;
+                wildcard = Some((after, pos));
+            }
         }
-        c => !text.is_empty() && text[0] == c && wildcard_match_bytes(&pat[1..], &text[1..]),
     }
+    pattern[pat..].iter().all(|b| matches!(b, b'*' | b'%'))
 }
 
 fn resolve_set(spec: &str, entries: &[MailboxMessage], is_uid: bool) -> Option<Vec<usize>> {
@@ -1201,7 +1421,7 @@ fn parse_seq_num(s: &str, max_val: u32) -> Option<u32> {
     Some(n)
 }
 
-fn parse_flag_list(raw: &str) -> Vec<String> {
+fn parse_flag_list(raw: &str) -> Option<BTreeSet<String>> {
     let inner = raw
         .strip_prefix('(')
         .and_then(|s| s.strip_suffix(')'))
@@ -1209,14 +1429,22 @@ fn parse_flag_list(raw: &str) -> Vec<String> {
     inner.split_whitespace().map(canonical_flag).collect()
 }
 
-fn canonical_flag(f: &str) -> String {
+fn canonical_flag(f: &str) -> Option<String> {
     match f.to_ascii_lowercase().as_str() {
-        "\\seen" => "\\Seen".to_string(),
-        "\\answered" => "\\Answered".to_string(),
-        "\\flagged" => "\\Flagged".to_string(),
-        "\\deleted" => "\\Deleted".to_string(),
-        "\\draft" => "\\Draft".to_string(),
-        _ => f.to_string(),
+        "\\seen" => Some("\\Seen".to_string()),
+        "\\answered" => Some("\\Answered".to_string()),
+        "\\flagged" => Some("\\Flagged".to_string()),
+        "\\deleted" => Some("\\Deleted".to_string()),
+        "\\draft" => Some("\\Draft".to_string()),
+        keyword
+            if keyword.bytes().all(|b| {
+                (b'!'..=b'~').contains(&b)
+                    && !matches!(b, b'(' | b')' | b'{' | b'%' | b'*' | b'"' | b'\\' | b']')
+            }) =>
+        {
+            Some(keyword.to_string())
+        }
+        _ => None,
     }
 }
 

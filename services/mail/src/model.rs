@@ -10,7 +10,7 @@
 //!   * timestamps are RFC 3339 UTC strings (the only form ever observed for the
 //!     legacy `time.Time` in this service — no time arithmetic is performed).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -115,9 +115,10 @@ pub struct ListMessagesResult {
 pub struct MailboxMessage {
     pub uid: u32,
     pub message: Message,
+    pub flags: BTreeSet<String>,
 }
 
-/// Chronological (oldest-first) mailbox snapshot for IMAP/POP3 sessions.
+/// Mailbox snapshot in arrival order for IMAP/POP3 sessions.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MailboxSnapshot {
     pub messages: Vec<MailboxMessage>,

@@ -9,7 +9,7 @@ use devcloud_mail::{
     Envelope, FileBlobStore, FileStore, ImapConfig, ImapServer, MailTls, Service, Store,
 };
 use rustls_pki_types::{CertificateDer, ServerName};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream};
 use tokio_rustls::rustls::{self, ClientConfig, RootCertStore};
 use tokio_rustls::TlsConnector;
 
@@ -94,11 +94,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin> ImapClient<S> {
                 return String::from_utf8_lossy(&line).into_owned();
             }
             let mut tmp = [0u8; 4096];
-            let n = self.stream.read(&mut tmp).await.unwrap();
-            if n == 0 {
-                let rem = std::mem::take(&mut self.buf);
-                return String::from_utf8_lossy(&rem).into_owned();
-            }
+            let n = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                self.stream.read(&mut tmp),
+            )
+            .await
+            .expect("timed out waiting for IMAP response")
+            .unwrap();
+            assert!(n > 0, "unexpected EOF reading response");
             self.buf.extend_from_slice(&tmp[..n]);
         }
     }
@@ -138,6 +141,356 @@ impl<S: AsyncRead + AsyncWrite + Unpin> ImapClient<S> {
             }
         }
     }
+
+    async fn command(&mut self, command: &str) -> (String, String) {
+        let (tag, _) = command.split_once(' ').unwrap();
+        self.send(command).await;
+        self.read_until_tag(tag).await
+    }
+}
+
+async fn connect(server: ImapServer) -> (ImapClient<DuplexStream>, tokio::task::JoinHandle<()>) {
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+    let task = tokio::spawn(server.handle_conn(server_io));
+    let mut client = ImapClient::new(client_io);
+    assert!(client.read_line().await.starts_with("* OK"));
+    (client, task)
+}
+
+fn relaxed_server(service: Arc<Service>) -> ImapServer {
+    ImapServer::new(
+        ImapConfig {
+            auth_mode: "relaxed".into(),
+            ..Default::default()
+        },
+        service,
+    )
+}
+
+#[tokio::test]
+async fn imap_appends_exact_bytes_to_a_named_folder_and_keeps_inbox_separate() {
+    let tmp = TempDir::new("folders");
+    let service = new_service(&tmp);
+    service
+        .receive(Envelope::default(), b"Subject: SMTP inbox\r\n\r\nhello")
+        .unwrap();
+    let (mut client, task) = connect(relaxed_server(Arc::clone(&service))).await;
+    assert!(client
+        .command("A1 CREATE Archive")
+        .await
+        .1
+        .starts_with("A1 BAD"));
+    assert!(client
+        .command("A2 APPEND INBOX {3}")
+        .await
+        .1
+        .starts_with("A2 BAD"));
+    assert!(client
+        .command("A3 LOGIN arbitrary password")
+        .await
+        .1
+        .starts_with("A3 OK"));
+    assert!(client
+        .command("A4 CREATE \"Sent Items\"")
+        .await
+        .1
+        .starts_with("A4 OK"));
+    assert!(client
+        .command("A5 CREATE Archive")
+        .await
+        .1
+        .starts_with("A5 OK"));
+    assert!(client
+        .command("A6 CREATE inbox")
+        .await
+        .1
+        .starts_with("A6 NO"));
+    assert_eq!(
+        client.command(r#"A7 LIST "" "Sent%""#).await.0.trim(),
+        r#"* LIST (\HasNoChildren) "/" "Sent Items""#,
+    );
+    assert!(client
+        .command("A8 APPEND Missing {3}")
+        .await
+        .1
+        .contains("[TRYCREATE]"));
+    assert!(client
+        .command(r#"A9 APPEND Archive "31-Feb-2020 00:00:00 +0000" {3}"#)
+        .await
+        .1
+        .starts_with("A9 BAD"));
+    assert!(client
+        .command("A10 APPEND Archive {1048577}")
+        .await
+        .1
+        .starts_with("A10 NO"));
+
+    let raw = b"Subject: IMAP copy\r\n\r\n\xff not UTF-8\r\n{4}\r\n";
+    client
+        .send(&format!(
+            r#"A11 APPEND "Sent Items" (\Seen) " 2-Jan-2020 01:30:00 +0900" {{{}}}"#,
+            raw.len()
+        ))
+        .await;
+    assert!(client.read_line().await.starts_with('+'));
+    client.send_raw(raw).await;
+    client.send("").await;
+    assert!(client.read_until_tag("A11").await.1.starts_with("A11 OK"));
+
+    client
+        .send_raw(b"A12 APPEND Missing {3+}\r\nxyz\r\nA13 NOOP\r\n")
+        .await;
+    assert!(client.read_until_tag("A12").await.1.contains("[TRYCREATE]"));
+    assert!(client.read_until_tag("A13").await.1.starts_with("A13 OK"));
+    assert_eq!(
+        client
+            .command("A14 STATUS inbox (MESSAGES UNSEEN)")
+            .await
+            .0
+            .trim(),
+        "* STATUS \"INBOX\" (MESSAGES 1 UNSEEN 1)"
+    );
+    assert_eq!(
+        client
+            .command("A15 STATUS \"Sent Items\" (MESSAGES UNSEEN)")
+            .await
+            .0
+            .trim(),
+        "* STATUS \"Sent Items\" (MESSAGES 1 UNSEEN 0)"
+    );
+    let (selected, _) = client.command("A16 SELECT \"Sent Items\"").await;
+    assert!(selected.contains("* 1 EXISTS"));
+    assert!(client
+        .command("A17 FETCH 1 (UID FLAGS INTERNALDATE)")
+        .await
+        .0
+        .contains("UID 2 FLAGS (\\Seen) INTERNALDATE \"01-Jan-2020 16:30:00 +0000\""));
+    client.send("A18 FETCH 1 BODY.PEEK[]").await;
+    assert_eq!(
+        client.read_line().await,
+        format!("* 1 FETCH (BODY[] {{{}}}", raw.len())
+    );
+    assert_eq!(client.read_exact(raw.len()).await, raw);
+    assert_eq!(client.read_line().await, ")");
+    assert!(client.read_until_tag("A18").await.1.starts_with("A18 OK"));
+    client.send("A18B APPEND {10}").await;
+    assert!(client.read_line().await.starts_with('+'));
+    client.send_raw(b"Sent Items {3+}\r\nabc\r\n").await;
+    let (updates, done) = client.read_until_tag("A18B").await;
+    assert_eq!(updates.trim(), "* 2 EXISTS");
+    assert!(done.starts_with("A18B OK"));
+    assert_eq!(service.list_mailbox().unwrap().messages.len(), 1);
+    assert!(client
+        .command("A19 SELECT INBOX")
+        .await
+        .0
+        .contains("* 1 EXISTS"));
+    assert_eq!(
+        client
+            .command("A20 SEARCH SUBJECT \"IMAP copy\"")
+            .await
+            .0
+            .trim(),
+        "* SEARCH"
+    );
+    assert!(client.command("A21 LOGOUT").await.1.starts_with("A21 OK"));
+    task.await.unwrap();
+}
+
+#[tokio::test]
+async fn imap_disconnect_before_append_terminator_does_not_store_a_message() {
+    let tmp = TempDir::new("append-disconnect");
+    let service = new_service(&tmp);
+    let (mut client, task) = connect(relaxed_server(Arc::clone(&service))).await;
+    assert!(client
+        .command("A1 LOGIN dev any")
+        .await
+        .1
+        .starts_with("A1 OK"));
+    client.send("A2 APPEND INBOX {3}").await;
+    assert!(client.read_line().await.starts_with('+'));
+    client.send_raw(b"abc").await;
+    drop(client);
+    task.await.unwrap();
+    assert!(service.list_mailbox().unwrap().messages.is_empty());
+}
+
+#[tokio::test]
+async fn imap_keeps_folders_uids_and_flags_when_reopening_the_store() {
+    let tmp = TempDir::new("restart");
+    {
+        let service = new_service(&tmp);
+        service
+            .receive(Envelope::default(), b"Subject: SMTP\r\n\r\nbody")
+            .unwrap();
+        let (mut client, task) = connect(relaxed_server(service)).await;
+        assert!(client
+            .command("A1 LOGIN dev any")
+            .await
+            .1
+            .starts_with("A1 OK"));
+        assert!(client
+            .command("A2 CREATE Archive")
+            .await
+            .1
+            .starts_with("A2 OK"));
+        assert!(client
+            .command("A3 CREATE Empty")
+            .await
+            .1
+            .starts_with("A3 OK"));
+        let raw = b"Subject: archived\r\n\r\nbody";
+        client
+            .send(&format!("A4 APPEND Archive (\\Draft) {{{}+}}", raw.len()))
+            .await;
+        client.send_raw(raw).await;
+        client.send("").await;
+        assert!(client.read_until_tag("A4").await.1.starts_with("A4 OK"));
+        assert!(client
+            .command("A5 SELECT INBOX")
+            .await
+            .1
+            .starts_with("A5 OK"));
+        assert!(client
+            .command("A6 FETCH 1 BODY[TEXT]")
+            .await
+            .0
+            .contains("FLAGS (\\Seen)"));
+        assert!(client
+            .command("A7 SELECT Archive")
+            .await
+            .1
+            .starts_with("A7 OK"));
+        assert!(client
+            .command("A8 UID STORE 2 +FLAGS.SILENT (\\Flagged project)")
+            .await
+            .1
+            .starts_with("A8 OK"));
+        assert!(client
+            .command("A9 STORE 1 -FLAGS (\\Draft)")
+            .await
+            .0
+            .contains("FLAGS (\\Flagged project)"));
+        assert!(client.command("A10 LOGOUT").await.1.starts_with("A10 OK"));
+        task.await.unwrap();
+    }
+
+    let (mut client, task) = connect(relaxed_server(new_service(&tmp))).await;
+    assert!(client
+        .command("B1 LOGIN dev any")
+        .await
+        .1
+        .starts_with("B1 OK"));
+    assert!(client
+        .command("B2 EXAMINE Empty")
+        .await
+        .0
+        .contains("* 0 EXISTS"));
+    assert!(client
+        .command("B3 EXAMINE Archive")
+        .await
+        .1
+        .contains("[READ-ONLY]"));
+    assert_eq!(
+        client.command("B4 UID SEARCH FLAGGED").await.0.trim(),
+        "* SEARCH 2"
+    );
+    assert!(client
+        .command("B5 FETCH 1 (UID FLAGS BODY[TEXT])")
+        .await
+        .0
+        .contains("UID 2 FLAGS (\\Flagged project)"));
+    assert!(client
+        .command("B6 STORE 1 FLAGS ()")
+        .await
+        .1
+        .starts_with("B6 NO"));
+    assert_eq!(
+        client.command("B7 STATUS Archive (UNSEEN)").await.0.trim(),
+        "* STATUS \"Archive\" (UNSEEN 1)"
+    );
+    assert!(client
+        .command("B8 SELECT INBOX")
+        .await
+        .1
+        .starts_with("B8 OK"));
+    assert_eq!(
+        client.command("B9 UID SEARCH SEEN").await.0.trim(),
+        "* SEARCH 1"
+    );
+    assert!(client.command("B10 LOGOUT").await.1.starts_with("B10 OK"));
+    task.await.unwrap();
+}
+
+#[tokio::test]
+async fn imap_idle_reports_selected_folder_changes_and_handles_fragmented_done() {
+    let tmp = TempDir::new("idle");
+    let service = new_service(&tmp);
+    let server = relaxed_server(Arc::clone(&service));
+    let (mut watcher, watching) = connect(server.clone()).await;
+    let (mut writer, writing) = connect(server).await;
+    assert!(watcher.command("A1 CAPABILITY").await.0.contains(" IDLE "));
+    assert!(watcher.command("A2 IDLE").await.1.starts_with("A2 BAD"));
+    assert!(watcher
+        .command("A3 LOGIN dev any")
+        .await
+        .1
+        .starts_with("A3 OK"));
+    assert!(watcher
+        .command("A4 SELECT INBOX")
+        .await
+        .0
+        .contains("* 0 EXISTS"));
+    watcher.send("A5 IDLE").await;
+    assert_eq!(watcher.read_line().await, "+ idling");
+
+    assert!(writer
+        .command("B1 LOGIN dev any")
+        .await
+        .1
+        .starts_with("B1 OK"));
+    assert!(writer
+        .command("B2 CREATE Archive")
+        .await
+        .1
+        .starts_with("B2 OK"));
+    writer.send_raw(b"B3 APPEND Archive {3+}\r\nabc\r\n").await;
+    assert!(writer.read_until_tag("B3").await.1.starts_with("B3 OK"));
+    service
+        .receive(Envelope::default(), b"Subject: SMTP arrival\r\n\r\nbody")
+        .unwrap();
+    assert_eq!(watcher.read_line().await, "* 1 EXISTS");
+    writer.send_raw(b"B4 APPEND INBOX {3+}\r\nabc\r\n").await;
+    assert!(writer.read_until_tag("B4").await.1.starts_with("B4 OK"));
+    assert_eq!(watcher.read_line().await, "* 2 EXISTS");
+
+    assert!(writer
+        .command("B5 SELECT INBOX")
+        .await
+        .0
+        .contains("* 2 EXISTS"));
+    watcher.send_raw(b"DO").await;
+    assert!(writer
+        .command("B6 STORE 1 +FLAGS.SILENT (\\Deleted)")
+        .await
+        .1
+        .starts_with("B6 OK"));
+    assert_eq!(
+        watcher.read_line().await,
+        "* 1 FETCH (UID 2 FLAGS (\\Deleted))"
+    );
+    assert!(writer.command("B7 EXPUNGE").await.1.starts_with("B7 OK"));
+    assert_eq!(watcher.read_line().await, "* 1 EXPUNGE");
+    watcher.send_raw(b"NE\r\nA6 UID FETCH 1:* UID\r\n").await;
+    assert_eq!(watcher.read_line().await, "A5 OK IDLE completed");
+    assert_eq!(
+        watcher.read_until_tag("A6").await.0.trim(),
+        "* 1 FETCH (UID 3)"
+    );
+    assert!(writer.command("B8 LOGOUT").await.1.starts_with("B8 OK"));
+    assert!(watcher.command("A7 LOGOUT").await.1.starts_with("A7 OK"));
+    writing.await.unwrap();
+    watching.await.unwrap();
 }
 
 #[tokio::test]
@@ -173,7 +526,7 @@ async fn imap_select_fetch_store_search_expunge_close_and_cross_session_flags() 
         )
         .unwrap();
 
-    // Shared ImapServer clone preserves the in-process FlagMap across sessions.
+    // Both sessions use the same mail service and store.
     let server = ImapServer::new(
         ImapConfig {
             auth_mode: "relaxed".into(),

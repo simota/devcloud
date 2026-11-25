@@ -1,8 +1,11 @@
 //! Mirrors `internal/services/mail/service.rs`.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use tokio::sync::watch;
 
 use crate::model::{
     Envelope, ListMessagesInput, ListMessagesResult, MailboxSnapshot, Message, MessageEntry,
@@ -21,11 +24,15 @@ use crate::time_fmt::now_rfc3339;
 /// message bodies or credentials.
 pub struct Service {
     store: Arc<dyn Store>,
+    mailbox_changes: watch::Sender<()>,
 }
 
 impl Service {
     pub fn new(store: Arc<dyn Store>) -> Self {
-        Self { store }
+        Self {
+            store,
+            mailbox_changes: watch::Sender::new(()),
+        }
     }
 
     /// Mirrors `Service.Receive`: parse the raw body under the envelope, stamp
@@ -69,6 +76,27 @@ impl Service {
         msg.id = new_message_id();
         msg.received_at = Some(now_rfc3339());
         let stored = self.store.append(msg, raw)?;
+        self.message_received(&stored);
+        Ok(stored)
+    }
+
+    pub(crate) fn append_to_folder(
+        &self,
+        name: &str,
+        raw: &[u8],
+        flags: BTreeSet<String>,
+        internal_date: Option<String>,
+    ) -> Result<(), String> {
+        let mut message = parse_message(raw, &Envelope::default());
+        message.id = new_message_id();
+        message.received_at = internal_date;
+        let stored = self.store.append_to_folder(name, message, raw, flags)?;
+        self.message_received(&stored);
+        Ok(())
+    }
+
+    fn message_received(&self, stored: &Message) {
+        self.mailbox_changes.send_replace(());
         emit_event(
             "mail.received",
             serde_json::json!({
@@ -78,7 +106,6 @@ impl Service {
                 "subject": stored.subject,
             }),
         );
-        Ok(stored)
     }
 
     /// Mirrors `Service.List`: read-only passthrough to the store.
@@ -95,6 +122,47 @@ impl Service {
         self.store.list_mailbox()
     }
 
+    pub(crate) fn folders(&self) -> Result<BTreeSet<String>, String> {
+        self.store.folders()
+    }
+
+    pub(crate) fn create_folder(&self, name: &str) -> Result<(), String> {
+        self.store.create_folder(name)
+    }
+
+    pub(crate) fn list_folder(&self, name: &str) -> Result<Option<MailboxSnapshot>, String> {
+        self.store.list_folder(name)
+    }
+
+    pub(crate) fn message_flags(&self, id: &str) -> Result<BTreeSet<String>, String> {
+        self.store.message_flags(id)
+    }
+
+    pub(crate) fn update_flags(
+        &self,
+        ids: &[&str],
+        update: impl Fn(&mut BTreeSet<String>) + Sync,
+    ) -> Result<BTreeMap<String, BTreeSet<String>>, String> {
+        let flags = self.store.update_flags(ids, &update)?;
+        self.mailbox_changes.send_replace(());
+        Ok(flags)
+    }
+
+    pub(crate) fn expunge_flagged(&self, ids: &[&str]) -> Result<(), String> {
+        let removed = self.store.expunge_flagged(ids)?;
+        if !removed.is_empty() {
+            self.mailbox_changes.send_replace(());
+        }
+        for id in removed {
+            emit_event("mail.deleted", serde_json::json!({ "messageID": id }));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn mailbox_changes(&self) -> watch::Receiver<()> {
+        self.mailbox_changes.subscribe()
+    }
+
     /// Mirrors `Service.Get`: read-only passthrough to the store.
     pub fn get(&self, id: &str) -> Result<Option<Message>, String> {
         self.store.get(id)
@@ -108,6 +176,7 @@ impl Service {
     /// Mirrors `Service.Delete`: remove one message, then emit `mail.deleted`.
     pub fn delete(&self, id: &str) -> Result<(), String> {
         self.store.delete(id)?;
+        self.mailbox_changes.send_replace(());
         emit_event("mail.deleted", serde_json::json!({ "messageID": id }));
         Ok(())
     }
@@ -116,6 +185,7 @@ impl Service {
     /// (no payload, matching legacy).
     pub fn delete_all(&self) -> Result<(), String> {
         self.store.delete_all()?;
+        self.mailbox_changes.send_replace(());
         emit_event_no_payload("mail.cleared");
         Ok(())
     }
