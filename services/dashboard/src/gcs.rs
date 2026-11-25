@@ -378,7 +378,10 @@ async fn get(config: &Config, path: &str) -> Result<ForwardResponse, ForwardErro
         base: &config.gcs_base,
         method: "GET",
         path,
-        headers: Vec::new(),
+        headers: crate::forward::bearer_auth_headers(
+            &config.gcs_auth_mode,
+            &config.gcs_bearer_token,
+        ),
         body: Vec::new(),
     })
     .await
@@ -397,7 +400,13 @@ async fn forward_provider(
         base: &config.gcs_base,
         method,
         path,
-        headers,
+        headers: headers
+            .into_iter()
+            .chain(crate::forward::bearer_auth_headers(
+                &config.gcs_auth_mode,
+                &config.gcs_bearer_token,
+            ))
+            .collect(),
         body,
     })
     .await

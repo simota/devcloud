@@ -71,6 +71,17 @@ pub(crate) fn basic_auth_headers(
     vec![("Authorization".into(), format!("Basic {credentials}"))]
 }
 
+/// The GCS, BigQuery, and Pub/Sub provider APIs require the configured bearer
+/// token outside relaxed mode. The token stays on the server-to-server request,
+/// never in the UI.
+pub(crate) fn bearer_auth_headers(mode: &str, token: &str) -> Vec<(String, String)> {
+    let mode = mode.trim().to_ascii_lowercase();
+    if matches!(mode.as_str(), "" | "off" | "relaxed") || token.trim().is_empty() {
+        return Vec::new();
+    }
+    vec![("Authorization".into(), format!("Bearer {}", token.trim()))]
+}
+
 /// Performs a single HTTP/1.1 request to `req.base + req.path` and returns the
 /// parsed response. Connection is one-shot (`Connection: close`).
 pub async fn forward(req: ForwardRequest<'_>) -> Result<ForwardResponse, ForwardError> {

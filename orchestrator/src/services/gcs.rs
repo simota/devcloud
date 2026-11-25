@@ -35,7 +35,7 @@ pub async fn run(
     let upload_session_path = root.join("gcs/upload_sessions");
 
     let project = default_string(&cfg.services.gcs.project, &cfg.auth.gcs.project);
-    let server = Server::new(
+    let mut server = Server::new(
         Config {
             project,
             location: cfg.services.gcs.location.clone(),
@@ -45,6 +45,9 @@ pub async fn run(
         },
         FileBucketStore::new(storage),
     );
+    for (token, member) in devcloud_gcs::strict_auth::parse_principals(&cfg.auth.gcs.principals) {
+        server.add_principal(token, member);
+    }
 
     let listener = tokio::net::TcpListener::bind(&addr)
         .await

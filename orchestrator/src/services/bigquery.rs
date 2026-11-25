@@ -52,6 +52,11 @@ pub async fn run(
         let object_store_path = root.join("s3/buckets");
         server = server.with_object_store(FileBucketStore::new(object_store_path));
     }
+    for (token, member) in
+        devcloud_bigquery::strict_auth::parse_principals(&cfg.auth.bigquery.principals)
+    {
+        server.add_principal(token, member);
+    }
 
     let listener = tokio::net::TcpListener::bind(&addr)
         .await

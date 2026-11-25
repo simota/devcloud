@@ -47,3 +47,8 @@ hex = "0.4"
 devcloud-applicationautoscaling = { path = "../applicationautoscaling" }
 devcloud-lambda = { path = "../lambda" }
 devcloud-cloudrun = { path = "../cloudrun" }
+# ...and strict-mode GCS / BigQuery / Pub/Sub servers for bearer forwarding.
+devcloud-gcs = { path = "../gcs" }
+devcloud-s3 = { path = "../s3" }
+devcloud-bigquery = { path = "../bigquery" }
+devcloud-pubsub = { path = "../pubsub" }

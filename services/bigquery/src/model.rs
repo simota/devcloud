@@ -635,6 +635,10 @@ pub struct IamBinding {
     pub role: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub members: Vec<String>,
+    /// Kept so strict auth can tell conditional bindings apart (they never
+    /// grant access locally).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub condition: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

@@ -413,6 +413,12 @@ where
                 if !self.greeted {
                     return self.reply(503, "bad sequence of commands").await;
                 }
+                // Strict mode is a submission server: RFC 4954 §6 530 until
+                // the client authenticates. Relaxed/off keep open relay-less
+                // inbox behavior.
+                if self.config.auth_mode_normalized() == SMTP_AUTH_STRICT && !self.authenticated {
+                    return self.reply(530, "5.7.0 Authentication required").await;
+                }
                 match parse_mail_from_arg(&arg) {
                     None => self.reply(500, "syntax error").await,
                     Some((from, size, has_size)) => {

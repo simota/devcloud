@@ -50,7 +50,11 @@ impl Request {
 /// legacy `handle` (minus the `Server` response header, which the HTTP layer
 /// adds).
 pub fn handle(server: &Server, req: &Request) -> ApiResponse {
-    if !authorize(server, req) {
+    if server.is_strict_auth() {
+        if let Err(resp) = crate::strict_auth::authorize_strict(server, req) {
+            return resp;
+        }
+    } else if !authorize(server, req) {
         return ApiResponse::error(401, "authError", "invalid authentication credentials")
             .with_www_authenticate();
     }
@@ -112,7 +116,7 @@ fn authorize(server: &Server, req: &Request) -> bool {
 }
 
 /// legacy `subtle.ConstantTimeCompare`.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }
@@ -124,7 +128,7 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 }
 
 /// legacy `bearerTokenFromRequest`.
-fn bearer_token_from_request(req: &Request) -> String {
+pub(crate) fn bearer_token_from_request(req: &Request) -> String {
     let auth = req.authorization.trim();
     match auth.split_once(' ') {
         Some((scheme, token)) if scheme.eq_ignore_ascii_case("Bearer") => token.trim().to_string(),
@@ -556,7 +560,7 @@ fn handle_datasets(server: &Server, req: &Request, parts: &[String]) -> ApiRespo
 /// legacy `projectResourceParts` / `uploadProjectResourceParts`: trim the prefix,
 /// split on `/`, path-unescape each segment, drop empties. An unescape error
 /// surfaces as "invalid resource path".
-fn resource_parts(escaped_path: &str, prefix: &str) -> Option<Vec<String>> {
+pub(crate) fn resource_parts(escaped_path: &str, prefix: &str) -> Option<Vec<String>> {
     let suffix = escaped_path.strip_prefix(prefix).unwrap_or(escaped_path);
     let mut parts = Vec::new();
     for raw in suffix.trim_matches('/').split('/') {
@@ -569,7 +573,7 @@ fn resource_parts(escaped_path: &str, prefix: &str) -> Option<Vec<String>> {
 }
 
 /// legacy `splitResourceAction`.
-fn split_resource_action(part: &str) -> (&str, &str) {
+pub(crate) fn split_resource_action(part: &str) -> (&str, &str) {
     match part.split_once(':') {
         Some((resource_id, action)) => (resource_id, action),
         None => (part, ""),

@@ -66,6 +66,8 @@ pub struct Server {
     next_upload_id: u64,
     hmac_keys: BTreeMap<String, String>,
     pubsub_rest_addr: Option<String>,
+    /// Strict-mode `(bearer token, IAM member)` pairs; see `strict_auth`.
+    pub(crate) principals: Vec<(String, String)>,
 }
 
 impl Server {
@@ -88,6 +90,7 @@ impl Server {
             next_upload_id: 1,
             hmac_keys,
             pubsub_rest_addr,
+            principals: Vec::new(),
         };
         server.load_sessions();
         server
@@ -167,6 +170,14 @@ impl Server {
     /// Returns recorded local Pub/Sub notification events for `bucket`.
     pub fn list_notification_events(&self, bucket: &str) -> Vec<NotificationEvent> {
         crate::notifications::list_notification_events(self, bucket)
+    }
+
+    pub(crate) fn auth_mode_normalized(&self) -> String {
+        self.config.auth_mode.trim().to_ascii_lowercase()
+    }
+
+    pub(crate) fn owner_token(&self) -> &str {
+        self.config.bearer_token.trim()
     }
 
     fn authorized(&self, token: &str) -> bool {
@@ -299,7 +310,7 @@ impl Request {
             .collect()
     }
 
-    fn bearer_token(&self) -> String {
+    pub(crate) fn bearer_token(&self) -> String {
         match self.header("authorization").trim().split_once(' ') {
             Some((scheme, token)) if scheme.eq_ignore_ascii_case("bearer") => {
                 token.trim().to_string()
@@ -574,6 +585,19 @@ pub fn route(server: &mut Server, req: &Request) -> Response {
         || req.path.starts_with("/download/storage/v1/");
 
     match verify_signed_url(server, req) {
+        // Strict mode only trusts signatures it can verify locally (HMAC);
+        // RSA V4 and V2 signatures are only checked for shape and expiry.
+        SignedUrlCheck::Valid
+            if server.is_strict_auth()
+                && req.query_value("X-Goog-Algorithm") != "GOOG4-HMAC-SHA256" =>
+        {
+            let message = "strict auth only accepts GOOG4-HMAC-SHA256 signed URLs";
+            return if is_json_or_introspect {
+                json_error(403, "forbidden", message)
+            } else {
+                crate::xml_api::xml_error(403, "SignatureDoesNotMatch", message)
+            };
+        }
         SignedUrlCheck::Valid => {}
         SignedUrlCheck::Invalid {
             status,
@@ -585,6 +609,12 @@ pub fn route(server: &mut Server, req: &Request) -> Response {
             } else {
                 crate::xml_api::xml_error(status, code, &message)
             };
+        }
+        SignedUrlCheck::NotSigned if server.is_strict_auth() => {
+            if let Err(r) = crate::strict_auth::authorize_strict(server, req, is_json_or_introspect)
+            {
+                return r;
+            }
         }
         SignedUrlCheck::NotSigned => {
             if !server.authorized(&req.bearer_token()) {

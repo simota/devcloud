@@ -56,12 +56,16 @@ pub struct Config {
     pub gcs_base: String,
     pub gcs_endpoint: String,
     pub gcs_storage_path: String,
+    pub gcs_auth_mode: String,
+    pub gcs_bearer_token: String,
     pub dynamodb_base: String,
     pub dynamodb_endpoint: String,
     pub dynamodb_storage_path: String,
     pub bigquery_base: String,
     pub bigquery_endpoint: String,
     pub bigquery_storage_path: String,
+    pub bigquery_auth_mode: String,
+    pub bigquery_bearer_token: String,
     pub redshift_base: String,
     pub redshift_sql_endpoint: String,
     pub redshift_endpoint: String,
@@ -75,6 +79,8 @@ pub struct Config {
     pub pubsub_base: String,
     pub pubsub_endpoint: String,
     pub pubsub_storage_path: String,
+    pub pubsub_auth_mode: String,
+    pub pubsub_bearer_token: String,
 
     pub app_auto_scaling_base: String,
     pub app_auto_scaling_endpoint: String,
@@ -138,6 +144,8 @@ impl Config {
             gcs_base: env("DEVCLOUD_DASHBOARD_GCS_BASE"),
             gcs_endpoint: env_or("DEVCLOUD_DASHBOARD_GCS_ENDPOINT", "http://127.0.0.1:14443"),
             gcs_storage_path: env_or("DEVCLOUD_DASHBOARD_GCS_STORAGE", ".devcloud/data/gcs"),
+            gcs_auth_mode: env_or("DEVCLOUD_DASHBOARD_GCS_AUTH_MODE", "relaxed"),
+            gcs_bearer_token: env("DEVCLOUD_DASHBOARD_GCS_BEARER_TOKEN"),
             dynamodb_base: env("DEVCLOUD_DASHBOARD_DYNAMODB_BASE"),
             dynamodb_endpoint: env_or(
                 "DEVCLOUD_DASHBOARD_DYNAMODB_ENDPOINT",
@@ -156,6 +164,8 @@ impl Config {
                 "DEVCLOUD_DASHBOARD_BIGQUERY_STORAGE",
                 ".devcloud/data/bigquery",
             ),
+            bigquery_auth_mode: env_or("DEVCLOUD_DASHBOARD_BIGQUERY_AUTH_MODE", "relaxed"),
+            bigquery_bearer_token: env("DEVCLOUD_DASHBOARD_BIGQUERY_BEARER_TOKEN"),
             redshift_base: env("DEVCLOUD_DASHBOARD_REDSHIFT_BASE"),
             redshift_sql_endpoint: env_or(
                 "DEVCLOUD_DASHBOARD_REDSHIFT_SQL_ENDPOINT",
@@ -187,6 +197,8 @@ impl Config {
                 "DEVCLOUD_DASHBOARD_PUBSUB_STORAGE",
                 ".devcloud/data/pubsub",
             ),
+            pubsub_auth_mode: env_or("DEVCLOUD_DASHBOARD_PUBSUB_AUTH_MODE", "relaxed"),
+            pubsub_bearer_token: env("DEVCLOUD_DASHBOARD_PUBSUB_BEARER_TOKEN"),
 
             app_auto_scaling_base: env("DEVCLOUD_DASHBOARD_APPAUTOSCALING_BASE"),
             app_auto_scaling_endpoint: env_or(

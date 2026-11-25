@@ -53,7 +53,7 @@ pub fn xml_error(status: u16, code: &str, message: &str) -> Response {
     xml_response(status, body)
 }
 
-fn virtual_host_bucket(host: &str) -> Option<String> {
+pub(crate) fn virtual_host_bucket(host: &str) -> Option<String> {
     let host_only = host.split(':').next().unwrap_or("").trim();
     if host_only.is_empty() {
         return None;

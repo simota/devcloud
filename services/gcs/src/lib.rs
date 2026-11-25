@@ -27,4 +27,5 @@ pub mod notifications;
 pub mod retention;
 pub mod signed_urls;
 pub mod state;
+pub mod strict_auth;
 pub mod xml_api;

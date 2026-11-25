@@ -41,6 +41,15 @@ impl PubSubGrpc {
     pub fn new(server: SharedServer) -> Self {
         PubSubGrpc { server }
     }
+
+    /// Strict-mode authentication/IAM check; `None` means owner-only.
+    fn authorize(
+        &self,
+        metadata: &tonic::metadata::MetadataMap,
+        target: Option<(&str, &str)>,
+    ) -> Result<(), Status> {
+        self.server.lock().unwrap().authorize_grpc(metadata, target)
+    }
 }
 
 // --- error mapping ---------------------------------------------------------
@@ -482,6 +491,7 @@ impl pb::publisher_server::Publisher for PubSubGrpc {
         &self,
         request: Request<pb::Topic>,
     ) -> Result<Response<pb::Topic>, Status> {
+        self.authorize(request.metadata(), None)?;
         let topic = topic_from_proto(&request.into_inner());
         let mut server = self.server.lock().unwrap();
         let created = server.grpc_create_topic(&topic).map_err(to_status)?;
@@ -492,6 +502,17 @@ impl pb::publisher_server::Publisher for PubSubGrpc {
         &self,
         request: Request<pb::UpdateTopicRequest>,
     ) -> Result<Response<pb::Topic>, Status> {
+        self.authorize(
+            request.metadata(),
+            Some((
+                request
+                    .get_ref()
+                    .topic
+                    .as_ref()
+                    .map_or("", |t| t.name.as_str()),
+                crate::strict_auth::TOPICS_UPDATE,
+            )),
+        )?;
         let req = request.into_inner();
         let Some(topic) = req.topic else {
             return Err(Status::invalid_argument("invalid topic name"));
@@ -509,6 +530,10 @@ impl pb::publisher_server::Publisher for PubSubGrpc {
         &self,
         request: Request<pb::GetTopicRequest>,
     ) -> Result<Response<pb::Topic>, Status> {
+        self.authorize(
+            request.metadata(),
+            Some((&request.get_ref().topic, crate::strict_auth::TOPICS_GET)),
+        )?;
         let topic = request.into_inner().topic;
         let server = self.server.lock().unwrap();
         let found = server.grpc_get_topic(&topic).map_err(to_status)?;
@@ -519,6 +544,7 @@ impl pb::publisher_server::Publisher for PubSubGrpc {
         &self,
         request: Request<pb::ListTopicsRequest>,
     ) -> Result<Response<pb::ListTopicsResponse>, Status> {
+        self.authorize(request.metadata(), None)?;
         let req = request.into_inner();
         let project = grpc_project_id(&req.project)?;
         let server = self.server.lock().unwrap();
@@ -535,6 +561,10 @@ impl pb::publisher_server::Publisher for PubSubGrpc {
         &self,
         request: Request<pb::ListTopicSubscriptionsRequest>,
     ) -> Result<Response<pb::ListTopicSubscriptionsResponse>, Status> {
+        self.authorize(
+            request.metadata(),
+            Some((&request.get_ref().topic, crate::strict_auth::TOPICS_GET)),
+        )?;
         let req = request.into_inner();
         let server = self.server.lock().unwrap();
         let (subs, next) = server
@@ -550,6 +580,10 @@ impl pb::publisher_server::Publisher for PubSubGrpc {
         &self,
         request: Request<pb::ListTopicSnapshotsRequest>,
     ) -> Result<Response<pb::ListTopicSnapshotsResponse>, Status> {
+        self.authorize(
+            request.metadata(),
+            Some((&request.get_ref().topic, crate::strict_auth::TOPICS_GET)),
+        )?;
         let req = request.into_inner();
         let server = self.server.lock().unwrap();
         let (snaps, next) = server
@@ -565,6 +599,10 @@ impl pb::publisher_server::Publisher for PubSubGrpc {
         &self,
         request: Request<pb::PublishRequest>,
     ) -> Result<Response<pb::PublishResponse>, Status> {
+        self.authorize(
+            request.metadata(),
+            Some((&request.get_ref().topic, crate::strict_auth::TOPICS_PUBLISH)),
+        )?;
         let req = request.into_inner();
         if req.messages.is_empty() {
             // Mirror legacy: empty messages → InvalidArgument (handled in business
@@ -586,6 +624,10 @@ impl pb::publisher_server::Publisher for PubSubGrpc {
         &self,
         request: Request<pb::DeleteTopicRequest>,
     ) -> Result<Response<()>, Status> {
+        self.authorize(
+            request.metadata(),
+            Some((&request.get_ref().topic, crate::strict_auth::TOPICS_DELETE)),
+        )?;
         let topic = request.into_inner().topic;
         let mut server = self.server.lock().unwrap();
         server.grpc_delete_topic(&topic).map_err(to_status)?;
@@ -596,6 +638,7 @@ impl pb::publisher_server::Publisher for PubSubGrpc {
         &self,
         request: Request<pb::DetachSubscriptionRequest>,
     ) -> Result<Response<pb::DetachSubscriptionResponse>, Status> {
+        self.authorize(request.metadata(), None)?;
         let subscription = request.into_inner().subscription;
         let mut server = self.server.lock().unwrap();
         server
@@ -613,6 +656,7 @@ impl pb::subscriber_server::Subscriber for PubSubGrpc {
         &self,
         request: Request<pb::Subscription>,
     ) -> Result<Response<pb::Subscription>, Status> {
+        self.authorize(request.metadata(), None)?;
         let model = sub_from_proto(&request.into_inner());
         let mut server = self.server.lock().unwrap();
         let created = server.grpc_create_subscription(model).map_err(to_status)?;
@@ -623,6 +667,13 @@ impl pb::subscriber_server::Subscriber for PubSubGrpc {
         &self,
         request: Request<pb::GetSubscriptionRequest>,
     ) -> Result<Response<pb::Subscription>, Status> {
+        self.authorize(
+            request.metadata(),
+            Some((
+                &request.get_ref().subscription,
+                crate::strict_auth::SUBS_GET,
+            )),
+        )?;
         let subscription = request.into_inner().subscription;
         let server = self.server.lock().unwrap();
         let found = server
@@ -635,6 +686,17 @@ impl pb::subscriber_server::Subscriber for PubSubGrpc {
         &self,
         request: Request<pb::UpdateSubscriptionRequest>,
     ) -> Result<Response<pb::Subscription>, Status> {
+        self.authorize(
+            request.metadata(),
+            Some((
+                request
+                    .get_ref()
+                    .subscription
+                    .as_ref()
+                    .map_or("", |s| s.name.as_str()),
+                crate::strict_auth::SUBS_UPDATE,
+            )),
+        )?;
         let req = request.into_inner();
         let Some(sub) = req.subscription else {
             return Err(Status::invalid_argument("invalid subscription name"));
@@ -652,6 +714,7 @@ impl pb::subscriber_server::Subscriber for PubSubGrpc {
         &self,
         request: Request<pb::ListSubscriptionsRequest>,
     ) -> Result<Response<pb::ListSubscriptionsResponse>, Status> {
+        self.authorize(request.metadata(), None)?;
         let req = request.into_inner();
         let project = grpc_project_id(&req.project)?;
         let server = self.server.lock().unwrap();
@@ -668,6 +731,13 @@ impl pb::subscriber_server::Subscriber for PubSubGrpc {
         &self,
         request: Request<pb::DeleteSubscriptionRequest>,
     ) -> Result<Response<()>, Status> {
+        self.authorize(
+            request.metadata(),
+            Some((
+                &request.get_ref().subscription,
+                crate::strict_auth::SUBS_DELETE,
+            )),
+        )?;
         let subscription = request.into_inner().subscription;
         let mut server = self.server.lock().unwrap();
         server
@@ -680,6 +750,13 @@ impl pb::subscriber_server::Subscriber for PubSubGrpc {
         &self,
         request: Request<pb::ModifyAckDeadlineRequest>,
     ) -> Result<Response<()>, Status> {
+        self.authorize(
+            request.metadata(),
+            Some((
+                &request.get_ref().subscription,
+                crate::strict_auth::SUBS_CONSUME,
+            )),
+        )?;
         let req = request.into_inner();
         let mut server = self.server.lock().unwrap();
         server
@@ -692,6 +769,13 @@ impl pb::subscriber_server::Subscriber for PubSubGrpc {
         &self,
         request: Request<pb::AcknowledgeRequest>,
     ) -> Result<Response<()>, Status> {
+        self.authorize(
+            request.metadata(),
+            Some((
+                &request.get_ref().subscription,
+                crate::strict_auth::SUBS_CONSUME,
+            )),
+        )?;
         let req = request.into_inner();
         let mut server = self.server.lock().unwrap();
         server
@@ -704,6 +788,13 @@ impl pb::subscriber_server::Subscriber for PubSubGrpc {
         &self,
         request: Request<pb::PullRequest>,
     ) -> Result<Response<pb::PullResponse>, Status> {
+        self.authorize(
+            request.metadata(),
+            Some((
+                &request.get_ref().subscription,
+                crate::strict_auth::SUBS_CONSUME,
+            )),
+        )?;
         let req = request.into_inner();
         // Validate the subscription name up front (matches legacy ordering) and run
         // the bounded blocking wait when !return_immediately.
@@ -749,6 +840,7 @@ impl pb::subscriber_server::Subscriber for PubSubGrpc {
                 return Err(Status::unimplemented("streaming pull is disabled"));
             }
         }
+        let metadata = request.metadata().clone();
         let mut incoming = request.into_inner();
 
         // First client message: EOF before any message ends the stream cleanly.
@@ -766,6 +858,10 @@ impl pb::subscriber_server::Subscriber for PubSubGrpc {
             return Err(Status::invalid_argument("invalid subscription name"));
         }
         let subscription = initial.subscription.clone();
+        self.authorize(
+            &metadata,
+            Some((&subscription, crate::strict_auth::SUBS_CONSUME)),
+        )?;
 
         // Per-stream ack deadline + subscription validation (locked).
         let mut stream_ack_deadline = {
@@ -910,6 +1006,13 @@ impl pb::subscriber_server::Subscriber for PubSubGrpc {
         &self,
         request: Request<pb::ModifyPushConfigRequest>,
     ) -> Result<Response<()>, Status> {
+        self.authorize(
+            request.metadata(),
+            Some((
+                &request.get_ref().subscription,
+                crate::strict_auth::SUBS_UPDATE,
+            )),
+        )?;
         let req = request.into_inner();
         let push = push_config_from_proto(req.push_config.as_ref());
         let mut server = self.server.lock().unwrap();
@@ -923,6 +1026,7 @@ impl pb::subscriber_server::Subscriber for PubSubGrpc {
         &self,
         request: Request<pb::GetSnapshotRequest>,
     ) -> Result<Response<pb::Snapshot>, Status> {
+        self.authorize(request.metadata(), None)?;
         let snapshot = request.into_inner().snapshot;
         let server = self.server.lock().unwrap();
         let found = server.grpc_get_snapshot(&snapshot).map_err(to_status)?;
@@ -933,6 +1037,7 @@ impl pb::subscriber_server::Subscriber for PubSubGrpc {
         &self,
         request: Request<pb::ListSnapshotsRequest>,
     ) -> Result<Response<pb::ListSnapshotsResponse>, Status> {
+        self.authorize(request.metadata(), None)?;
         let req = request.into_inner();
         let project = grpc_project_id(&req.project)?;
         let server = self.server.lock().unwrap();
@@ -949,6 +1054,7 @@ impl pb::subscriber_server::Subscriber for PubSubGrpc {
         &self,
         request: Request<pb::CreateSnapshotRequest>,
     ) -> Result<Response<pb::Snapshot>, Status> {
+        self.authorize(request.metadata(), None)?;
         let req = request.into_inner();
         let labels = copy_map(&req.labels);
         let mut server = self.server.lock().unwrap();
@@ -962,6 +1068,7 @@ impl pb::subscriber_server::Subscriber for PubSubGrpc {
         &self,
         request: Request<pb::UpdateSnapshotRequest>,
     ) -> Result<Response<pb::Snapshot>, Status> {
+        self.authorize(request.metadata(), None)?;
         let req = request.into_inner();
         let Some(snapshot) = req.snapshot else {
             return Err(Status::invalid_argument("invalid snapshot name"));
@@ -990,6 +1097,7 @@ impl pb::subscriber_server::Subscriber for PubSubGrpc {
         &self,
         request: Request<pb::DeleteSnapshotRequest>,
     ) -> Result<Response<()>, Status> {
+        self.authorize(request.metadata(), None)?;
         let snapshot = request.into_inner().snapshot;
         let mut server = self.server.lock().unwrap();
         server.grpc_delete_snapshot(&snapshot).map_err(to_status)?;
@@ -1000,6 +1108,13 @@ impl pb::subscriber_server::Subscriber for PubSubGrpc {
         &self,
         request: Request<pb::SeekRequest>,
     ) -> Result<Response<pb::SeekResponse>, Status> {
+        self.authorize(
+            request.metadata(),
+            Some((
+                &request.get_ref().subscription,
+                crate::strict_auth::SUBS_CONSUME,
+            )),
+        )?;
         let req = request.into_inner();
         // Validate name + target presence first (matches legacy ordering).
         if !crate::paths::valid_full_subscription_name(&req.subscription) {
@@ -1055,6 +1170,7 @@ impl pb::schema_service_server::SchemaService for PubSubGrpc {
         &self,
         request: Request<pb::CreateSchemaRequest>,
     ) -> Result<Response<pb::Schema>, Status> {
+        self.authorize(request.metadata(), None)?;
         let req = request.into_inner();
         let project = grpc_project_id(&req.parent)?;
         if !crate::paths::valid_resource_id(&req.schema_id) {
@@ -1075,6 +1191,7 @@ impl pb::schema_service_server::SchemaService for PubSubGrpc {
         &self,
         request: Request<pb::GetSchemaRequest>,
     ) -> Result<Response<pb::Schema>, Status> {
+        self.authorize(request.metadata(), None)?;
         let req = request.into_inner();
         let view = schema_view_string(req.view);
         let server = self.server.lock().unwrap();
@@ -1088,6 +1205,7 @@ impl pb::schema_service_server::SchemaService for PubSubGrpc {
         &self,
         request: Request<pb::ListSchemasRequest>,
     ) -> Result<Response<pb::ListSchemasResponse>, Status> {
+        self.authorize(request.metadata(), None)?;
         let req = request.into_inner();
         let project = grpc_project_id(&req.parent)?;
         let view = schema_view_string(req.view);
@@ -1105,6 +1223,7 @@ impl pb::schema_service_server::SchemaService for PubSubGrpc {
         &self,
         request: Request<pb::ListSchemaRevisionsRequest>,
     ) -> Result<Response<pb::ListSchemaRevisionsResponse>, Status> {
+        self.authorize(request.metadata(), None)?;
         let req = request.into_inner();
         let view = schema_view_string(req.view);
         let server = self.server.lock().unwrap();
@@ -1121,6 +1240,7 @@ impl pb::schema_service_server::SchemaService for PubSubGrpc {
         &self,
         request: Request<pb::CommitSchemaRequest>,
     ) -> Result<Response<pb::Schema>, Status> {
+        self.authorize(request.metadata(), None)?;
         let req = request.into_inner();
         let Some(schema) = req.schema else {
             return Err(Status::invalid_argument("schema is required"));
@@ -1137,6 +1257,7 @@ impl pb::schema_service_server::SchemaService for PubSubGrpc {
         &self,
         request: Request<pb::RollbackSchemaRequest>,
     ) -> Result<Response<pb::Schema>, Status> {
+        self.authorize(request.metadata(), None)?;
         let req = request.into_inner();
         let mut server = self.server.lock().unwrap();
         let rolled = server
@@ -1149,6 +1270,7 @@ impl pb::schema_service_server::SchemaService for PubSubGrpc {
         &self,
         request: Request<pb::DeleteSchemaRevisionRequest>,
     ) -> Result<Response<pb::Schema>, Status> {
+        self.authorize(request.metadata(), None)?;
         let req = request.into_inner();
         // `schemaRevisionRequestTarget`: a `name@revision` form overrides the
         // revision_id field.
@@ -1173,6 +1295,7 @@ impl pb::schema_service_server::SchemaService for PubSubGrpc {
         &self,
         request: Request<pb::DeleteSchemaRequest>,
     ) -> Result<Response<()>, Status> {
+        self.authorize(request.metadata(), None)?;
         let name = request.into_inner().name;
         let mut server = self.server.lock().unwrap();
         server.grpc_delete_schema(&name).map_err(to_status)?;
@@ -1183,6 +1306,7 @@ impl pb::schema_service_server::SchemaService for PubSubGrpc {
         &self,
         request: Request<pb::ValidateSchemaRequest>,
     ) -> Result<Response<pb::ValidateSchemaResponse>, Status> {
+        self.authorize(request.metadata(), None)?;
         let req = request.into_inner();
         if grpc_project_id(&req.parent).is_err() {
             return Err(Status::invalid_argument("invalid project name"));
@@ -1200,6 +1324,7 @@ impl pb::schema_service_server::SchemaService for PubSubGrpc {
         &self,
         request: Request<pb::ValidateMessageRequest>,
     ) -> Result<Response<pb::ValidateMessageResponse>, Status> {
+        self.authorize(request.metadata(), None)?;
         let req = request.into_inner();
         let project = grpc_project_id(&req.parent)?;
         let (name, inline) = match req.schema_spec {

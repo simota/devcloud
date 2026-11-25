@@ -372,7 +372,13 @@ async fn forward_rest(config: &Config, req: &Request, path: &str) -> Response {
         base: &config.bigquery_base,
         method: "POST",
         path: &full_path,
-        headers,
+        headers: headers
+            .into_iter()
+            .chain(crate::forward::bearer_auth_headers(
+                &config.bigquery_auth_mode,
+                &config.bigquery_bearer_token,
+            ))
+            .collect(),
         body: req.body.clone(),
     })
     .await
@@ -412,7 +418,10 @@ async fn forward_delete(
         base: &config.bigquery_base,
         method: "DELETE",
         path: &full_path,
-        headers: Vec::new(),
+        headers: crate::forward::bearer_auth_headers(
+            &config.bigquery_auth_mode,
+            &config.bigquery_bearer_token,
+        ),
         body: Vec::new(),
     })
     .await
@@ -442,7 +451,10 @@ async fn introspect(config: &Config, path: &str) -> Result<ForwardResponse, Forw
         base: &config.bigquery_base,
         method: "GET",
         path,
-        headers: Vec::new(),
+        headers: crate::forward::bearer_auth_headers(
+            &config.bigquery_auth_mode,
+            &config.bigquery_bearer_token,
+        ),
         body: Vec::new(),
     })
     .await

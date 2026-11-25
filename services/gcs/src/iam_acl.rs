@@ -227,7 +227,7 @@ fn policy_grants_permission(policy: &GcsIamPolicy, principal: &str, permission: 
     false
 }
 
-fn role_grants_permission(role: &str, permission: &str) -> bool {
+pub(crate) fn role_grants_permission(role: &str, permission: &str) -> bool {
     match role {
         "roles/storage.admin" | "roles/owner" => permission.starts_with("storage."),
         "roles/storage.objectAdmin" => permission.starts_with("storage.objects."),
