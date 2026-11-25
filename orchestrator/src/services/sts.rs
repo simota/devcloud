@@ -1,4 +1,5 @@
-//! STS, run in-process as a supervisor task. Stateless: no storage directory.
+//! STS, run in-process as a supervisor task. No storage directory: sessions
+//! issued in `strict` mode are kept in memory only.
 
 use std::future::Future;
 use std::sync::Arc;

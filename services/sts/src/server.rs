@@ -1,22 +1,36 @@
 //! STS over the AWS Query protocol: `AssumeRole` and `GetCallerIdentity`.
 //!
-//! Stateless. `AssumeRole` validates its inputs the way AWS does, accepts an
-//! inline session `Policy` (it must be JSON) without evaluating it, and issues
-//! fresh temporary credentials. devcloud services in `relaxed` auth mode
-//! accept those credentials; in `strict` mode they only accept the configured
-//! static key, so temporary credentials are rejected there.
+//! `AssumeRole` validates its inputs the way AWS does, accepts an inline
+//! session `Policy` (it must be JSON), and issues fresh temporary credentials.
+//! devcloud services in `relaxed` auth mode accept those credentials without
+//! looking at them. In `strict` mode the STS server also remembers each issued
+//! session in memory (until it expires or the process stops) and accepts
+//! requests signed with it: the signature is verified with the session's
+//! secret, `X-Amz-Security-Token` must match, and the session must not be
+//! expired. Such requests are limited by the session policy: `AssumeRole`
+//! (role chaining) needs an `Allow` for `sts:AssumeRole` on the target role
+//! and no `Deny`; `GetCallerIdentity` needs no permission, as on AWS. Role
+//! identity policies are not emulated, so without a session policy a session
+//! may do anything. Other services in `strict` mode only accept their
+//! configured static key, so temporary credentials are rejected there.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use serde_json::Value;
 use sha2::{Digest, Sha256};
+
+use crate::policy::{self, Decision, RequestContext};
 
 const XMLNS: &str = "https://sts.amazonaws.com/doc/2011-06-15/";
 const DEFAULT_DURATION_SECONDS: i64 = 3600;
 const MIN_DURATION_SECONDS: i64 = 900;
 const MAX_DURATION_SECONDS: i64 = 43200;
 const MAX_POLICY_CHARS: usize = 2048;
+/// AWS caps sessions assumed with temporary credentials at one hour.
+const MAX_CHAINED_DURATION_SECONDS: i64 = 3600;
 
 #[derive(Clone, Debug, Default)]
 pub struct Config {
@@ -53,6 +67,44 @@ fn validation(message: &str) -> Outcome {
 
 pub struct Server {
     config: Config,
+    /// Sessions issued in `strict` mode, by access key id.
+    pub(crate) sessions: Mutex<HashMap<String, Session>>,
+}
+
+/// Temporary credentials issued by `AssumeRole` and what they are limited by.
+#[derive(Clone, Debug)]
+pub struct Session {
+    pub access_key_id: String,
+    pub secret_access_key: String,
+    pub session_token: String,
+    pub account: String,
+    pub role_name: String,
+    pub role_arn: String,
+    pub session_name: String,
+    pub policy: Option<Value>,
+    /// Unix seconds.
+    pub expiration: i64,
+}
+
+impl Session {
+    /// `arn:aws:sts::<account>:assumed-role/<role>/<session>`.
+    pub fn arn(&self) -> String {
+        format!(
+            "arn:aws:sts::{}:assumed-role/{}/{}",
+            self.account, self.role_name, self.session_name
+        )
+    }
+}
+
+pub(crate) fn unix_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
+fn is_strict(mode: &str) -> bool {
+    mode.eq_ignore_ascii_case("strict")
 }
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -145,7 +197,20 @@ fn parse_role_arn(arn: &str) -> Option<(&str, &str)> {
 
 impl Server {
     pub fn new(config: Config) -> Self {
-        Server { config }
+        Server {
+            config,
+            sessions: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// The session issued with `access_key_id`, if it is still remembered
+    /// (only sessions issued in `strict` mode are).
+    pub fn session(&self, access_key_id: &str) -> Option<Session> {
+        self.sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(access_key_id)
+            .cloned()
     }
 
     pub fn config(&self) -> &Config {
@@ -162,9 +227,19 @@ impl Server {
 
     /// `params` are the merged query-string and form-body parameters.
     pub fn dispatch(&self, params: &BTreeMap<String, String>) -> Outcome {
+        self.dispatch_as(params, None)
+    }
+
+    /// Like `dispatch`, for a request signed with the temporary credentials
+    /// of `caller` (`strict` mode); its session policy limits the request.
+    pub fn dispatch_as(
+        &self,
+        params: &BTreeMap<String, String>,
+        caller: Option<&Session>,
+    ) -> Outcome {
         let action = params.get("Action").map(String::as_str).unwrap_or("");
         match action {
-            "AssumeRole" => self.assume_role(params),
+            "AssumeRole" => self.assume_role(params, caller),
             "GetCallerIdentity" => self.get_caller_identity(),
             "" => error_outcome(400, "MissingAction", "Missing Action"),
             other => error_outcome(
@@ -175,7 +250,7 @@ impl Server {
         }
     }
 
-    fn assume_role(&self, params: &BTreeMap<String, String>) -> Outcome {
+    fn assume_role(&self, params: &BTreeMap<String, String>, caller: Option<&Session>) -> Outcome {
         let get = |k: &str| params.get(k).map(String::as_str).unwrap_or("");
         let role_arn = get("RoleArn");
         let session_name = get("RoleSessionName");
@@ -204,8 +279,12 @@ impl Server {
                 }
             },
         };
+        if caller.is_some() && duration > MAX_CHAINED_DURATION_SECONDS {
+            return validation("The requested DurationSeconds exceeds the 1 hour session limit for roles assumed by role chaining.");
+        }
         let policy = get("Policy");
         let mut packed_policy_size = None;
+        let mut session_policy = None;
         if !policy.is_empty() {
             if policy.chars().count() > MAX_POLICY_CHARS
                 || serde_json::from_str::<serde_json::Value>(policy).is_err()
@@ -218,12 +297,15 @@ impl Server {
             }
             // AWS reports the packed size as a percentage of the limit.
             packed_policy_size = Some((policy.len() * 100 / MAX_POLICY_CHARS).max(1));
+            session_policy = serde_json::from_str::<Value>(policy).ok();
+        }
+        if let Some(caller) = caller {
+            if let Some(denied) = authorize(caller, "sts:AssumeRole", role_arn, session_name) {
+                return denied;
+            }
         }
 
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
+        let now = unix_now();
         let access_key_id = format!("ASIA{}", &unique_hex("akid")[..16].to_ascii_uppercase());
         let secret_access_key = format!("{}{}", unique_hex("secret"), &unique_hex("secret2")[..8]);
         let session_token = format!(
@@ -232,6 +314,24 @@ impl Server {
             unique_hex("token2")
         );
         let role_id = format!("AROA{}", &unique_hex(role_arn)[..17].to_ascii_uppercase());
+        if is_strict(&self.config.auth_mode) {
+            let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+            sessions.retain(|_, s| s.expiration > now);
+            sessions.insert(
+                access_key_id.clone(),
+                Session {
+                    access_key_id: access_key_id.clone(),
+                    secret_access_key: secret_access_key.clone(),
+                    session_token: session_token.clone(),
+                    account: account.to_string(),
+                    role_name: role_name.to_string(),
+                    role_arn: role_arn.to_string(),
+                    session_name: session_name.to_string(),
+                    policy: session_policy,
+                    expiration: now + duration,
+                },
+            );
+        }
 
         let packed = packed_policy_size
             .map(|n| format!("<PackedPolicySize>{n}</PackedPolicySize>"))
@@ -286,6 +386,37 @@ impl Server {
             ),
         }
     }
+}
+
+/// `None` when `caller`'s session policy (if any) allows `action` on
+/// `resource`; otherwise the `AccessDenied` outcome AWS returns.
+fn authorize(
+    caller: &Session,
+    action: &str,
+    resource: &str,
+    session_name: &str,
+) -> Option<Outcome> {
+    let doc = caller.policy.as_ref()?;
+    let ctx = RequestContext {
+        action,
+        resource,
+        principal_arn: &caller.role_arn,
+        principal_account: &caller.account,
+        role_session_name: session_name,
+    };
+    let reason = match policy::evaluate(doc, &ctx) {
+        Decision::Allow => return None,
+        Decision::Deny => "with an explicit deny in a session policy".to_string(),
+        Decision::ImplicitDeny => format!("because no session policy allows the {action} action"),
+    };
+    Some(error_outcome(
+        403,
+        "AccessDenied",
+        &format!(
+            "User: {} is not authorized to perform: {action} on resource: {resource} {reason}",
+            caller.arn()
+        ),
+    ))
 }
 
 #[cfg(test)]
