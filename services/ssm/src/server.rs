@@ -15,11 +15,15 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use tokio::sync::broadcast;
+
+mod policies;
+pub use policies::{PolicyEvent, PolicyEventKind};
 
 const MAX_NAME_CHARS: usize = 2048;
 const MAX_STANDARD_VALUE_BYTES: usize = 4096;
@@ -165,6 +169,12 @@ struct Parameter {
     tags: Vec<Tag>,
     #[serde(rename = "History", default, skip_serializing_if = "Vec::is_empty")]
     history: Vec<ParameterVersion>,
+    #[serde(
+        rename = "NotifiedPolicies",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    notified_policies: Vec<usize>,
 }
 
 impl Parameter {
@@ -231,6 +241,8 @@ pub struct Server {
     config: Config,
     state: Mutex<BTreeMap<String, Parameter>>,
     load_err: Option<String>,
+    clock: Box<dyn Fn() -> SystemTime + Send + Sync>,
+    policy_events: broadcast::Sender<PolicyEvent>,
 }
 
 #[derive(Deserialize)]
@@ -407,14 +419,6 @@ fn decode<T: for<'de> Deserialize<'de>>(body: &[u8]) -> Result<T, Outcome> {
         .map_err(|_| error_outcome(400, "SerializationException", "invalid request body"))
 }
 
-fn now_epoch_seconds() -> f64 {
-    let d = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-    // Millisecond precision, as the AWS wire form carries.
-    (d.as_millis() as f64) / 1000.0
-}
-
 /// AWS name rules this emulator enforces: non-empty, bounded length, a
 /// hierarchical name starts with `/`, no reserved `aws`/`ssm` prefix, and only
 /// the documented character set (`a-zA-Z0-9_.-/`).
@@ -569,9 +573,9 @@ fn parse_policies(raw: &str) -> Result<Vec<ParameterInlinePolicy>, Outcome> {
                     .get("Timestamp")
                     .and_then(Value::as_str)
                     .unwrap_or_default();
-                if ts.is_empty() {
+                if policies::expiration_timestamp(ts).is_none() {
                     return Err(validation(
-                        "Expiration policy requires a non-empty Attributes.Timestamp.",
+                        "Expiration policy requires an RFC 3339 Attributes.Timestamp.",
                     ));
                 }
             }
@@ -617,10 +621,19 @@ fn encrypted_placeholder(value: &str) -> String {
 
 impl Server {
     pub fn new(config: Config) -> Self {
+        Self::with_clock(config, SystemTime::now)
+    }
+
+    pub fn with_clock(
+        config: Config,
+        clock: impl Fn() -> SystemTime + Send + Sync + 'static,
+    ) -> Self {
         let mut server = Server {
             config,
             state: Mutex::new(BTreeMap::new()),
             load_err: None,
+            clock: Box::new(clock),
+            policy_events: broadcast::channel(128).0,
         };
         if !server.config.storage_path.is_empty() {
             if let Err(e) = server.load() {
@@ -628,6 +641,12 @@ impl Server {
             }
         }
         server
+    }
+
+    fn time_since_epoch(&self) -> Duration {
+        (self.clock)()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
     }
 
     pub fn config(&self) -> &Config {
@@ -912,7 +931,22 @@ impl Server {
                 .unwrap_or_default(),
         };
 
-        let last_modified = now_epoch_seconds();
+        let last_modified = self.time_since_epoch().as_millis() as f64 / 1000.0;
+        let notified_policies = previous
+            .as_ref()
+            .filter(|p| p.policies == policies)
+            .map(|p| {
+                p.notified_policies
+                    .iter()
+                    .copied()
+                    .filter(|&index| {
+                        policies
+                            .get(index)
+                            .is_some_and(|policy| policy.policy_type == "ExpirationNotification")
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         let mut history = previous
             .as_ref()
             .map(|p| {
@@ -961,6 +995,7 @@ impl Server {
                 policies,
                 tags,
                 history,
+                notified_policies,
             },
         );
         if self.persist(&parameters).is_err() {

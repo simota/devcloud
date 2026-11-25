@@ -1,17 +1,25 @@
 //! SSM Parameter Store behavior through the full request pipeline.
 
 use devcloud_ssm::http::serve_for_test;
-use devcloud_ssm::{Config, Server};
+use devcloud_ssm::{Config, PolicyEvent, PolicyEventKind, Server};
 use serde_json::{json, Value};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, UNIX_EPOCH};
+use tokio::sync::{broadcast, oneshot};
 
-fn server(storage: &str) -> Server {
-    Server::new(Config {
+fn config(storage: &str) -> Config {
+    Config {
         region: "ap-northeast-1".to_string(),
         account_id: "123456789012".to_string(),
         auth_mode: "relaxed".to_string(),
         storage_path: storage.to_string(),
         ..Default::default()
-    })
+    }
+}
+
+fn server(storage: &str) -> Server {
+    Server::new(config(storage))
 }
 
 fn call(s: &Server, op: &str, body: Value) -> (u16, Option<String>, Value) {
@@ -765,6 +773,291 @@ fn policies_and_kms_key_id() {
         }),
     );
     assert_eq!((status, err.as_deref()), (400, Some("ValidationException")));
+}
+
+#[derive(Clone, Default)]
+struct PolicyClock(Arc<AtomicU64>);
+
+impl PolicyClock {
+    fn server(&self, storage: &str) -> Arc<Server> {
+        let clock = self.clone();
+        Arc::new(Server::with_clock(config(storage), move || {
+            UNIX_EPOCH + Duration::from_secs(1_798_761_600 + clock.0.load(Ordering::SeqCst))
+        }))
+    }
+
+    async fn tick_at(&self, seconds_since_2027: u64) {
+        self.0.store(seconds_since_2027, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
+    }
+}
+
+async fn start_policy_server(
+    server: Arc<Server>,
+) -> (oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (stop, shutdown) = oneshot::channel();
+    let task = tokio::spawn(async move {
+        devcloud_ssm::http::serve(listener, server, async {
+            let _ = shutdown.await;
+        })
+        .await
+        .unwrap();
+    });
+    (stop, task)
+}
+
+fn put_policies(server: &Server, name: &str, policies: Value) {
+    let (status, _, _) = call(
+        server,
+        "PutParameter",
+        json!({"Name": name, "Type": "SecureString", "Value": "test-value", "Policies": policies.to_string()}),
+    );
+    assert_eq!(status, 200);
+}
+
+fn expiration(timestamp: &str) -> Value {
+    json!({"Type": "Expiration", "Version": "1.0", "Attributes": {"Timestamp": timestamp}})
+}
+
+fn notification(kind: &str, before: &str, unit: &str) -> Value {
+    json!({"Type": kind, "Version": "1.0", "Attributes": {"Before": before, "Unit": unit}})
+}
+
+#[tokio::test(start_paused = true)]
+async fn expiration_deletes_parameter_and_history_at_deadline_and_persists() {
+    let clock = PolicyClock::default();
+    let dir = temp_dir("expiration");
+    let s = clock.server(&dir);
+    put_policies(
+        &s,
+        "/policy/expired",
+        json!([expiration("2026-12-31T23:59:59Z")]),
+    );
+    put_policies(
+        &s,
+        "/policy/active",
+        json!([
+            expiration("2027-01-02T00:00:00Z"),
+            expiration("2027-01-01T09:00:02+09:00"),
+            notification("ExpirationNotification", "1", "Hours"),
+        ]),
+    );
+    assert_eq!(
+        call(
+            &s,
+            "PutParameter",
+            json!({"Name": "/policy/active", "Value": "updated", "Overwrite": true})
+        )
+        .0,
+        200
+    );
+    let (stop, task) = start_policy_server(s.clone()).await;
+
+    clock.tick_at(1).await;
+    assert_eq!(
+        call(&s, "GetParameter", json!({"Name": "/policy/expired"}))
+            .1
+            .as_deref(),
+        Some("ParameterNotFound")
+    );
+    assert_eq!(
+        call(&s, "GetParameter", json!({"Name": "/policy/active:1"})).0,
+        200
+    );
+    clock.tick_at(2).await;
+    for server in [&s, &clock.server(&dir)] {
+        for (op, name) in [
+            ("GetParameter", "/policy/active:1"),
+            ("GetParameterHistory", "/policy/active"),
+        ] {
+            assert_eq!(
+                call(server, op, json!({"Name": name})).1.as_deref(),
+                Some("ParameterNotFound")
+            );
+        }
+        assert_eq!(
+            call(server, "DescribeParameters", json!({})).2["Parameters"],
+            json!([])
+        );
+    }
+    stop.send(()).unwrap();
+    task.await.unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn notifications_fire_once_and_no_change_rearms_after_overwrite() {
+    let clock = PolicyClock::default();
+    let dir = temp_dir("policy-notifications");
+    let s = clock.server(&dir);
+    put_policies(
+        &s,
+        "watched",
+        json!([
+            expiration("2027-01-03T00:00:00Z"),
+            notification("ExpirationNotification", "1", "Days"),
+            notification("NoChangeNotification", "24", "Hours"),
+        ]),
+    );
+    put_policies(
+        &s,
+        "without-expiration",
+        json!([notification("ExpirationNotification", "1", "Days")]),
+    );
+    let mut events = s.subscribe_policy_events();
+    let (stop, task) = start_policy_server(s.clone()).await;
+
+    clock.tick_at(86_399).await;
+    assert_eq!(
+        events.try_recv(),
+        Err(broadcast::error::TryRecvError::Empty)
+    );
+    clock.tick_at(86_400).await;
+    for kind in [
+        PolicyEventKind::ExpirationNotification,
+        PolicyEventKind::NoChangeNotification,
+    ] {
+        assert_eq!(
+            events.try_recv().unwrap(),
+            PolicyEvent {
+                kind,
+                parameter_name: "watched".to_string(),
+                parameter_version: 1,
+            }
+        );
+    }
+    clock.tick_at(86_401).await;
+    assert_eq!(
+        events.try_recv(),
+        Err(broadcast::error::TryRecvError::Empty)
+    );
+    stop.send(()).unwrap();
+    task.await.unwrap();
+
+    let s = clock.server(&dir);
+    let mut events = s.subscribe_policy_events();
+    let (stop, task) = start_policy_server(s.clone()).await;
+    clock.tick_at(86_402).await;
+    assert_eq!(
+        events.try_recv(),
+        Err(broadcast::error::TryRecvError::Empty)
+    );
+
+    put_policies(
+        &s,
+        "rotation-only",
+        json!([notification("NoChangeNotification", "1", "Hours")]),
+    );
+    assert_eq!(
+        call(
+            &s,
+            "PutParameter",
+            json!({"Name": "watched", "Value": "test-value", "Overwrite": true})
+        )
+        .0,
+        200
+    );
+    clock.tick_at(90_002).await;
+    assert_eq!(
+        events.try_recv().unwrap(),
+        PolicyEvent {
+            kind: PolicyEventKind::NoChangeNotification,
+            parameter_name: "rotation-only".to_string(),
+            parameter_version: 1,
+        }
+    );
+    assert_eq!(
+        events.try_recv(),
+        Err(broadcast::error::TryRecvError::Empty)
+    );
+    assert_eq!(
+        call(
+            &s,
+            "PutParameter",
+            json!({
+                "Name": "rotation-only", "Value": "test-value", "Overwrite": true
+            })
+        )
+        .0,
+        200
+    );
+    clock.tick_at(93_601).await;
+    assert_eq!(
+        events.try_recv(),
+        Err(broadcast::error::TryRecvError::Empty)
+    );
+    clock.tick_at(93_602).await;
+    assert_eq!(
+        events.try_recv().unwrap(),
+        PolicyEvent {
+            kind: PolicyEventKind::NoChangeNotification,
+            parameter_name: "rotation-only".to_string(),
+            parameter_version: 2,
+        }
+    );
+    assert_eq!(
+        events.try_recv(),
+        Err(broadcast::error::TryRecvError::Empty)
+    );
+    stop.send(()).unwrap();
+    task.await.unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn expiration_rejects_invalid_rfc3339_timestamp() {
+    let s = server("");
+    let (status, err, _) = call(
+        &s,
+        "PutParameter",
+        json!({"Name": "invalid", "Type": "String", "Value": "value", "Policies": json!([expiration("2027-02-30T00:00:00Z")]).to_string()}),
+    );
+    assert_eq!((status, err.as_deref()), (400, Some("ValidationException")));
+}
+
+#[tokio::test(start_paused = true)]
+async fn policy_evaluation_retries_without_changes_or_events_after_persist_failure() {
+    let clock = PolicyClock::default();
+    let dir = temp_dir("policy-retry");
+    let s = clock.server(&dir);
+    put_policies(&s, "expires", json!([expiration("2027-01-01T01:00:00Z")]));
+    put_policies(
+        &s,
+        "unmodified",
+        json!([notification("NoChangeNotification", "1", "Hours")]),
+    );
+    let blocked_write = std::path::Path::new(&dir).join("state.json.tmp");
+    std::fs::create_dir(&blocked_write).unwrap();
+    let mut events = s.subscribe_policy_events();
+    let (stop, task) = start_policy_server(s.clone()).await;
+
+    clock.tick_at(3_600).await;
+    assert_eq!(
+        events.try_recv(),
+        Err(broadcast::error::TryRecvError::Empty)
+    );
+    assert_eq!(call(&s, "GetParameter", json!({"Name": "expires"})).0, 200);
+    std::fs::remove_dir(blocked_write).unwrap();
+
+    clock.tick_at(3_601).await;
+    assert_eq!(
+        events.try_recv().unwrap(),
+        PolicyEvent {
+            kind: PolicyEventKind::NoChangeNotification,
+            parameter_name: "unmodified".to_string(),
+            parameter_version: 1,
+        }
+    );
+    assert_eq!(
+        call(&s, "GetParameter", json!({"Name": "expires"}))
+            .1
+            .as_deref(),
+        Some("ParameterNotFound")
+    );
+    stop.send(()).unwrap();
+    task.await.unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]

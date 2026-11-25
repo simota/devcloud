@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -42,9 +43,16 @@ pub async fn serve(
     shutdown: impl std::future::Future<Output = ()>,
 ) -> std::io::Result<()> {
     tokio::pin!(shutdown);
+    let mut policy_tick = tokio::time::interval(Duration::from_secs(1));
+    policy_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
             _ = &mut shutdown => return Ok(()),
+            _ = policy_tick.tick() => {
+                if server.evaluate_policies().is_err() {
+                    eprintln!("ssm: failed to persist parameter policy evaluation");
+                }
+            }
             accepted = listener.accept() => {
                 let (stream, _) = match accepted {
                     Ok(a) => a,

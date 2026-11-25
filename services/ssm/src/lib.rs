@@ -9,4 +9,4 @@ pub mod http;
 pub mod server;
 pub mod sigv4;
 
-pub use server::{Config, Server};
+pub use server::{Config, PolicyEvent, PolicyEventKind, Server};
