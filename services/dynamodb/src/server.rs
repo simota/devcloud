@@ -127,6 +127,7 @@ pub struct Server {
     backup_items: BTreeMap<String, BTreeMap<String, Item>>,
     global_tables: BTreeMap<String, crate::global_tables::GlobalTableRecord>,
     dax: crate::dax::DaxState,
+    pub(crate) dax_items: crate::dax_data::ItemCache,
     active_caller: Option<String>,
     active_auth_mode: Option<String>,
     load_err: Option<String>,
@@ -158,6 +159,7 @@ impl Server {
             backup_items: BTreeMap::new(),
             global_tables: BTreeMap::new(),
             dax: crate::dax::DaxState::default(),
+            dax_items: crate::dax_data::ItemCache::default(),
             active_caller: None,
             active_auth_mode: None,
             load_err: None,
@@ -247,6 +249,10 @@ impl Server {
         self.config.region()
     }
 
+    pub(crate) fn auth_mode(&self) -> &str {
+        &self.config.auth_mode
+    }
+
     /// The configured access key id (raw; the verifier defaults it).
     pub fn sigv4_access_key(&self) -> &str {
         &self.config.access_key_id
@@ -257,11 +263,11 @@ impl Server {
         &self.config.secret_access_key
     }
 
-    fn now_unix(&self) -> i64 {
+    pub(crate) fn now_unix(&self) -> i64 {
         self.fixed_now_unix.unwrap_or_else(time_util::now_unix)
     }
 
-    fn now_millis(&self) -> i64 {
+    pub(crate) fn now_millis(&self) -> i64 {
         self.fixed_now_millis.unwrap_or_else(time_util::now_millis)
     }
 
@@ -559,6 +565,7 @@ impl Server {
                     self.tables.insert(table_name.to_string(), state);
                     return Err(err);
                 }
+                self.dax_items.remove_table(table_name);
                 Ok(encode(&TableDescriptionResponse {
                     table_description: state.description,
                 }))

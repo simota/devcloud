@@ -49,6 +49,7 @@ pub struct ServerConfig {
     pub s3_port: i32,
     pub gcs_port: i32,
     pub dynamodb_port: i32,
+    pub dax_port: u16,
     pub bigquery_port: i32,
     pub bigquery_storage_port: i32,
     pub redshift_port: i32,
@@ -454,6 +455,7 @@ pub fn default_config() -> Config {
             s3_port: 14566,
             gcs_port: 14443,
             dynamodb_port: 18000,
+            dax_port: 8111,
             bigquery_port: 19050,
             bigquery_storage_port: 19051,
             redshift_port: 15439,
@@ -851,6 +853,7 @@ pub fn apply_config_value(cfg: &mut Config, path: &[String], value: &str) -> io:
         "server.dynamodbPort" => {
             cfg.server.dynamodb_port = parse_int("server.dynamodbPort", value)?
         }
+        "server.daxPort" => cfg.server.dax_port = parse_int("server.daxPort", value)?,
         "server.bigqueryPort" | "server.bigQueryPort" => {
             cfg.server.bigquery_port = parse_int("server.bigQueryPort", value)?
         }
@@ -1574,6 +1577,7 @@ pub fn default_config_yaml(cfg: &Config) -> String {
             "  s3Port: {s3_port}\n",
             "  gcsPort: {gcs_port}\n",
             "  dynamodbPort: {dynamodb_port}\n",
+            "  daxPort: {dax_port}\n",
             "  bigqueryPort: {bigquery_port}\n",
             "  bigqueryStoragePort: {bigquery_storage_port}\n",
             "  redshiftPort: {redshift_port}\n",
@@ -1784,6 +1788,7 @@ pub fn default_config_yaml(cfg: &Config) -> String {
         s3_port = s.s3_port,
         gcs_port = s.gcs_port,
         dynamodb_port = s.dynamodb_port,
+        dax_port = s.dax_port,
         bigquery_port = s.bigquery_port,
         bigquery_storage_port = s.bigquery_storage_port,
         redshift_port = s.redshift_port,
@@ -2278,6 +2283,7 @@ mod tests {
         "server.s3Port",
         "server.gcsPort",
         "server.dynamodbPort",
+        "server.daxPort",
         "server.bigqueryPort",
         "server.bigQueryPort",
         "server.bigqueryStoragePort",
@@ -2501,6 +2507,18 @@ mod tests {
         let parsed = parse_yaml_in_memory(&default_config_yaml(&cfg)).unwrap();
         assert_eq!(parsed.server.bigquery_port, 29050);
         assert_eq!(parsed.server.bigquery_storage_port, 29051);
+    }
+
+    #[test]
+    fn dax_port_defaults_round_trips_and_can_be_disabled() {
+        let cfg = parse_yaml_in_memory("server:\n  dynamodbPort: 28000\n").unwrap();
+        assert_eq!(cfg.server.dax_port, 8111);
+        for port in [0, 28111] {
+            let cfg = parse_yaml_in_memory(&format!("server:\n  daxPort: {port}\n")).unwrap();
+            let parsed = parse_yaml_in_memory(&default_config_yaml(&cfg)).unwrap();
+            assert_eq!(parsed.server.dax_port, port);
+        }
+        assert!(parse_yaml_in_memory("server:\n  daxPort: 65536\n").is_err());
     }
 
     #[test]

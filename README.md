@@ -30,6 +30,7 @@ Default local endpoints:
 | S3 | `http://127.0.0.1:14566` | `http://127.0.0.1:18025/dashboard/s3` |
 | GCS | `http://127.0.0.1:14443` | `http://127.0.0.1:18025/dashboard/gcs` |
 | DynamoDB | `http://127.0.0.1:18000` | `http://127.0.0.1:18025/dashboard/dynamodb` |
+| DynamoDB Accelerator (DAX) | `dax://127.0.0.1:8111` | |
 | BigQuery | `http://127.0.0.1:19050` (REST), `127.0.0.1:19051` (Storage gRPC) | `http://127.0.0.1:18025/dashboard/bigquery` |
 | SQS | `http://127.0.0.1:19324` | `http://127.0.0.1:18025/dashboard/sqs` |
 | Pub/Sub gRPC | `127.0.0.1:18085` | `http://127.0.0.1:18025/dashboard/pubsub` |
@@ -95,6 +96,7 @@ server:
   s3Port: 14566
   gcsPort: 14443
   dynamodbPort: 18000
+  daxPort: 8111
   bigqueryPort: 19050
   bigqueryStoragePort: 19051
   sqsPort: 19324
@@ -443,7 +445,7 @@ Storage API rows support nullable, required, and repeated `STRING`, `BYTES`, `IN
 | Tags and resource policies | Partial | Local tag and resource-policy CRUD (`PutResourcePolicy`/`GetResourcePolicy`/`DeleteResourcePolicy`). In `relaxed` (default) and `signed-relaxed` modes resource policies are metadata-only; in `strict` mode attached policies are evaluated locally. |
 | DescribeLimits / DescribeEndpoints | Yes | Local compatibility responses. |
 | AWS SigV4 header auth | Partial | Relaxed mode is default; strict mode validates local credentials (supporting `dynamodb` and `dax` services) for SigV4 and SigV4a (`AWS4-ECDSA-P256-SHA256`, `X-Amz-Region-Set` must cover the configured region), and `aws-chunked` chunk and trailer signatures for both (`STREAMING-AWS4-HMAC-SHA256-PAYLOAD[-TRAILER]`, `STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD[-TRAILER]`). `signed-relaxed` checks only the shape of either. |
-| DAX | Partial | Control-plane metadata API (`AmazonDAXV3.*`: clusters, replication factor, node reboot, subnet groups, parameter groups, and tags) is emulated on the DynamoDB HTTP endpoint. The binary DAX data-plane cache protocol (Tube/CBOR on port 8111/9111) is not emulated. |
+| DAX | Partial | The DynamoDB HTTP endpoint supports `AmazonDAXV3.*` control-plane metadata. Configure a DAX SDK with `dax://127.0.0.1:8111` for single-node Tube/CBOR `GetItem`, `PutItem`, and `DeleteItem` without expressions. Eventual reads cache hits and misses for five minutes with 256-entry LRU eviction. Strong reads bypass the cache and DAX writes update it. The loopback listener runs in `relaxed` auth mode via `devcloud up`. Set `server.daxPort: 0` to disable it. TLS (`daxs`), signed data-plane authentication, managed cluster integration, and query caching are outside this subset. |
 | Global tables | Partial | Metadata emulation for Global Tables v1 (`Create/Describe/List/UpdateGlobalTable`, `Describe/UpdateGlobalTableSettings`) and v2 (`UpdateTable` `ReplicaUpdates` and `DescribeTable.Table.Replicas` / `GlobalTableVersion`); no real cross-region replication. |
 | Autoscaling | Partial | Table replica autoscaling metadata (`DescribeTableReplicaAutoScaling`, `UpdateTableReplicaAutoScaling`) is supported locally alongside the Application Auto Scaling service (`:18030`); real capacity-driven scaling is not simulated. |
 | Real capacity accounting/throttling | No | Local deterministic behavior, not AWS capacity simulation. |

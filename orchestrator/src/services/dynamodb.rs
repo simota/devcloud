@@ -11,7 +11,7 @@ use devcloud_dynamodb::server::{Config, Server};
 
 use crate::config::Config as OrchestratorConfig;
 
-/// Runs the DynamoDB HTTP server until it errors or `shutdown` resolves.
+/// Runs the DynamoDB and local DAX listeners until a listener errors or shutdown.
 ///
 /// Storage layout: state under `<storage>/dynamodb`, matching the legacy daemon's
 /// `internal/services/dynamodb` on-disk format.
@@ -43,10 +43,29 @@ pub async fn run(
         .map_err(|e| format!("dynamodb: bind {addr}: {e}"))?;
     let shared = Arc::new(Mutex::new(server));
     let auth_mode = cfg.auth.dynamodb.mode.clone();
+    let dax_listener = if cfg.server.dax_port != 0
+        && devcloud_dynamodb::dax_data::supports_auth_mode(&auth_mode)
+    {
+        let addr = ("127.0.0.1", cfg.server.dax_port);
+        Some(
+            tokio::net::TcpListener::bind(addr)
+                .await
+                .map_err(|e| format!("dax: bind {}:{}: {e}", addr.0, addr.1))?,
+        )
+    } else {
+        None
+    };
 
     tokio::select! {
-        res = devcloud_dynamodb::http::serve(listener, shared, auth_mode, shutdown) => {
+        _ = shutdown => Ok(()),
+        res = devcloud_dynamodb::http::serve(listener, shared.clone(), auth_mode, std::future::pending()) => {
             res.map_err(|e| format!("dynamodb: server error: {e}"))
         }
+        res = async {
+            match dax_listener {
+                Some(listener) => devcloud_dynamodb::dax_data::serve(listener, shared).await,
+                None => std::future::pending().await,
+            }
+        } => res.map_err(|e| format!("dax: server error: {e}")),
     }
 }
