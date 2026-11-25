@@ -19,6 +19,7 @@ pub mod persistence;
 pub mod proto;
 pub mod responses;
 pub mod server;
+pub mod strict_auth;
 pub mod time_fmt;
 pub mod validation;
 pub mod wire_json;

@@ -9,7 +9,8 @@
 //!   DEVCLOUD_BIGQUERY_PROJECT             default project
 //!   DEVCLOUD_BIGQUERY_LOCATION            default location
 //!   DEVCLOUD_BIGQUERY_AUTH_MODE           relaxed | oauth-relaxed | bearer-dev | strict
-//!   DEVCLOUD_BIGQUERY_BEARER_TOKEN        expected bearer token
+//!   DEVCLOUD_BIGQUERY_BEARER_TOKEN        expected bearer token (strict: owner)
+//!   DEVCLOUD_BIGQUERY_PRINCIPALS          strict-mode `token=member[,token=member]` IAM callers
 //!   DEVCLOUD_BIGQUERY_STORAGE             BigQuery storage root
 //!   DEVCLOUD_BIGQUERY_OBJECT_STORE        shared S3 bucket storage root (optional;
 //!                                         load/extract jobs fail without it, like
@@ -62,6 +63,11 @@ fn main() {
     let object_store = env("DEVCLOUD_BIGQUERY_OBJECT_STORE");
     if !object_store.is_empty() {
         server = server.with_object_store(FileBucketStore::new(object_store));
+    }
+    for (token, member) in
+        devcloud_bigquery::strict_auth::parse_principals(&env("DEVCLOUD_BIGQUERY_PRINCIPALS"))
+    {
+        server.add_principal(token, member);
     }
 
     let runtime = tokio::runtime::Builder::new_multi_thread()

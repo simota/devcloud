@@ -46,6 +46,8 @@ pub struct Server {
     /// whole sequence so concurrent requests against the same table can't
     /// both observe the pre-mutation snapshot before either one writes.
     table_locks: Mutex<HashMap<(String, String, String), Arc<Mutex<()>>>>,
+    /// Strict-mode `(bearer token, IAM member)` pairs; see `strict_auth`.
+    pub(crate) principals: Vec<(String, String)>,
 }
 
 impl Server {
@@ -55,6 +57,7 @@ impl Server {
             object_store: None,
             events_enabled: false,
             table_locks: Mutex::new(HashMap::new()),
+            principals: Vec::new(),
         }
     }
 

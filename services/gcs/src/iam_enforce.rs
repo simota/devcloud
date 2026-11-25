@@ -7,10 +7,14 @@
 //! Identities:
 //! - the configured `bearer_token`, and HMAC keys registered without a service
 //!   account, act as the project owner (all permissions);
-//! - tokens registered with `Server::add_access_token` act as their IAM member;
+//! - tokens registered with `Server::add_access_token` (or configured through
+//!   `auth.gcs.principals` / `DEVCLOUD_GCS_PRINCIPALS`, see [`parse_principals`])
+//!   act as their IAM member;
 //! - RSA / V2 signed URLs act as `serviceAccount:{signer}`, and HMAC keys
 //!   registered with a service account act as that service account;
-//! - unauthenticated requests match only `allUsers` bindings.
+//! - unauthenticated requests match only `allUsers` bindings;
+//! - `domain:{d}` members match `user:` / `serviceAccount:` members whose email
+//!   is in domain `d`.
 //!
 //! Project-level operations (bucket list/create, service listing, the
 //! introspection API) have no bucket policy and are owner-only. Conditional
@@ -24,6 +28,20 @@ use crate::iam_acl::role_grants_permission;
 use crate::signed_urls::SignedUrlSigner;
 use crate::state::{read_iam_policy, GcsIamPolicy};
 use crate::xml_api::{virtual_host_bucket, xml_error};
+
+/// Parses `token=member[,token=member...]` (the `auth.gcs.principals` config
+/// value) into pairs for `Server::add_access_token`. Entries without `=` or with
+/// an empty side are ignored.
+pub fn parse_principals(raw: &str) -> Vec<(String, String)> {
+    raw.split(',')
+        .filter_map(|entry| {
+            let (token, member) = entry.split_once('=')?;
+            let (token, member) = (token.trim(), member.trim());
+            (!token.is_empty() && !member.is_empty())
+                .then(|| (token.to_string(), member.to_string()))
+        })
+        .collect()
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Principal {
@@ -150,10 +168,27 @@ pub fn policy_allows(policy: &GcsIamPolicy, principal: &Principal, permission: &
             Principal::Owner => true,
             Principal::Anonymous => m == "allUsers",
             Principal::Member(member) => {
-                m == "allUsers" || m == "allAuthenticatedUsers" || m == member
+                m == "allUsers"
+                    || m == "allAuthenticatedUsers"
+                    || m == member
+                    || domain_matches(m, member)
             }
         })
     })
+}
+
+/// Whether binding member `domain:{d}` covers `member` (`user:`/`serviceAccount:`
+/// with an email in domain `d`).
+fn domain_matches(binding_member: &str, member: &str) -> bool {
+    match (
+        binding_member.strip_prefix("domain:"),
+        member.split_once(':'),
+    ) {
+        (Some(domain), Some((_, email))) => email
+            .rsplit_once('@')
+            .is_some_and(|(_, d)| d.eq_ignore_ascii_case(domain)),
+        _ => false,
+    }
 }
 
 /// Maps a request to the permissions it needs. Unknown routes need nothing

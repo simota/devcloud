@@ -42,7 +42,12 @@ pub async fn run(
         streaming_pull_disabled: !cfg.services.pubsub.enable_streaming_pull,
     };
 
-    let server = Server::new(config);
+    let mut server = Server::new(config);
+    for (token, member) in
+        devcloud_pubsub::strict_auth::parse_principals(&cfg.auth.pubsub.principals)
+    {
+        server.add_principal(token, member);
+    }
     if let Some(err) = server.load_err() {
         return Err(format!("pubsub: failed to load state: {err}"));
     }

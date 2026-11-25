@@ -421,3 +421,118 @@ async fn cloudrun_mutations_forward_bearer_in_strict_mode() {
     );
     let _ = std::fs::remove_dir_all(dir);
 }
+
+async fn bind() -> (tokio::net::TcpListener, String) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    (listener, base)
+}
+
+#[tokio::test]
+async fn google_services_forwarding_sends_bearer_for_strict_mode() {
+    let dir = temp_dir("google");
+
+    let (gcs_listener, gcs_base) = bind().await;
+    let gcs = devcloud_gcs::http::Server::new(
+        devcloud_gcs::http::Config {
+            project: "p".into(),
+            auth_mode: "strict".into(),
+            bearer_token: "gcs-secret".into(),
+            upload_session_path: dir.join("gcs-sessions").to_string_lossy().into_owned(),
+            ..Default::default()
+        },
+        devcloud_s3::store::FileBucketStore::new(dir.join("buckets")),
+    );
+    tokio::spawn(devcloud_gcs::http::serve(
+        gcs_listener,
+        Arc::new(std::sync::Mutex::new(gcs)),
+        std::future::pending(),
+    ));
+
+    let (bq_listener, bq_base) = bind().await;
+    let bq = devcloud_bigquery::server::Server::new(devcloud_bigquery::server::Config {
+        project: "p".into(),
+        auth_mode: "strict".into(),
+        bearer_token: "bq-secret".into(),
+        storage_path: dir.join("bigquery").to_string_lossy().into_owned(),
+        ..Default::default()
+    });
+    tokio::spawn(devcloud_bigquery::http::serve(
+        bq_listener,
+        Arc::new(bq),
+        std::future::pending(),
+    ));
+
+    let (ps_listener, ps_base) = bind().await;
+    let ps = devcloud_pubsub::server::Server::new(devcloud_pubsub::server::Config {
+        project: "p".into(),
+        auth_mode: "strict".into(),
+        bearer_token: "ps-secret".into(),
+        ..Default::default()
+    });
+    tokio::spawn(devcloud_pubsub::http::serve(
+        ps_listener,
+        Arc::new(std::sync::Mutex::new(ps)),
+        std::future::pending(),
+    ));
+
+    let cfg = Config {
+        gcs_base,
+        gcs_auth_mode: "strict".into(),
+        gcs_bearer_token: "gcs-secret".into(),
+        bigquery_base: bq_base,
+        bigquery_auth_mode: "strict".into(),
+        bigquery_bearer_token: "bq-secret".into(),
+        pubsub_base: ps_base,
+        pubsub_auth_mode: "strict".into(),
+        pubsub_bearer_token: "ps-secret".into(),
+        ..Config::default()
+    };
+    let get = |path: &'static str| req("GET", path, &[], b"");
+    for path in [
+        "/api/gcs/buckets",
+        "/api/bigquery/projects",
+        "/api/pubsub/topics",
+    ] {
+        let resp = route(&cfg, &get(path)).await;
+        assert_eq!(
+            resp.status,
+            200,
+            "{path}: {}",
+            String::from_utf8_lossy(&resp.body)
+        );
+    }
+    // Mutations take the provider-protocol path with the same token.
+    let created = route(
+        &cfg,
+        &req(
+            "POST",
+            "/api/pubsub/topics",
+            &[],
+            br#"{"topicId":"orders"}"#,
+        ),
+    )
+    .await;
+    assert_eq!(
+        created.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&created.body)
+    );
+
+    // Without the token (relaxed dashboard config) the services refuse.
+    let relaxed = Config {
+        gcs_auth_mode: "relaxed".into(),
+        bigquery_auth_mode: "relaxed".into(),
+        pubsub_auth_mode: "relaxed".into(),
+        ..cfg
+    };
+    for path in [
+        "/api/gcs/buckets",
+        "/api/bigquery/projects",
+        "/api/pubsub/topics",
+    ] {
+        assert_eq!(route(&relaxed, &get(path)).await.status, 401, "{path}");
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}

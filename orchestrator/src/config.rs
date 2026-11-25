@@ -101,6 +101,8 @@ pub struct GcsAuthConfig {
     pub mode: String,
     pub project: String,
     pub bearer_token: String,
+    /// Strict-mode extra bearer tokens: `token=member[,token=member...]`.
+    pub principals: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -115,6 +117,8 @@ pub struct BigQueryAuthConfig {
     pub mode: String,
     pub project: String,
     pub bearer_token: String,
+    /// Strict-mode extra bearer tokens: `token=member[,token=member...]`.
+    pub principals: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -146,6 +150,8 @@ pub struct PubSubAuthConfig {
     pub mode: String,
     pub project_id: String,
     pub bearer_token: String,
+    /// Strict-mode extra bearer tokens: `token=member[,token=member...]`.
+    pub principals: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -475,6 +481,7 @@ pub fn default_config() -> Config {
                 mode: "relaxed".to_string(),
                 project: "devcloud".to_string(),
                 bearer_token: String::new(),
+                principals: String::new(),
             },
             dynamodb: DynamoDbAuthConfig {
                 mode: "relaxed".to_string(),
@@ -485,6 +492,7 @@ pub fn default_config() -> Config {
                 mode: "relaxed".to_string(),
                 project: "devcloud".to_string(),
                 bearer_token: "dev".to_string(),
+                principals: String::new(),
             },
             redshift: RedshiftAuthConfig {
                 mode: "relaxed".to_string(),
@@ -508,6 +516,7 @@ pub fn default_config() -> Config {
                 mode: "relaxed".to_string(),
                 project_id: "devcloud".to_string(),
                 bearer_token: "dev".to_string(),
+                principals: String::new(),
             },
             app_auto_scaling: AppAutoScalingAuthConfig {
                 mode: "relaxed".to_string(),
@@ -876,12 +885,14 @@ pub fn apply_config_value(cfg: &mut Config, path: &[String], value: &str) -> io:
         "auth.gcs.mode" => cfg.auth.gcs.mode = value.to_string(),
         "auth.gcs.project" => cfg.auth.gcs.project = value.to_string(),
         "auth.gcs.bearerToken" => cfg.auth.gcs.bearer_token = value.to_string(),
+        "auth.gcs.principals" => cfg.auth.gcs.principals = trim_quotes(value),
         "auth.dynamodb.mode" => cfg.auth.dynamodb.mode = value.to_string(),
         "auth.dynamodb.accessKeyId" => cfg.auth.dynamodb.access_key_id = value.to_string(),
         "auth.dynamodb.secretAccessKey" => cfg.auth.dynamodb.secret_access_key = value.to_string(),
         "auth.bigquery.mode" => cfg.auth.bigquery.mode = value.to_string(),
         "auth.bigquery.project" => cfg.auth.bigquery.project = value.to_string(),
         "auth.bigquery.bearerToken" => cfg.auth.bigquery.bearer_token = value.to_string(),
+        "auth.bigquery.principals" => cfg.auth.bigquery.principals = trim_quotes(value),
         "auth.redshift.mode" => cfg.auth.redshift.mode = value.to_string(),
         "auth.redshift.user" => cfg.auth.redshift.user = value.to_string(),
         "auth.redshift.password" => cfg.auth.redshift.password = value.to_string(),
@@ -899,6 +910,7 @@ pub fn apply_config_value(cfg: &mut Config, path: &[String], value: &str) -> io:
             cfg.auth.pubsub.project_id = value.to_string()
         }
         "auth.pubsub.bearerToken" => cfg.auth.pubsub.bearer_token = value.to_string(),
+        "auth.pubsub.principals" => cfg.auth.pubsub.principals = trim_quotes(value),
         "auth.appAutoScaling.mode" => cfg.auth.app_auto_scaling.mode = value.to_string(),
         "auth.appAutoScaling.accessKeyId" => {
             cfg.auth.app_auto_scaling.access_key_id = value.to_string()
@@ -2313,6 +2325,24 @@ mod tests {
                 assert_eq!(cfg, before, "invalid {key} must not mutate configuration");
             }
         }
+    }
+
+    #[test]
+    fn strict_auth_principals_parse_for_google_services() {
+        let mut cfg = default_config();
+        for svc in ["gcs", "bigquery", "pubsub"] {
+            let path = vec![
+                "auth".to_string(),
+                svc.to_string(),
+                "principals".to_string(),
+            ];
+            apply_config_value(&mut cfg, &path, "\"t1=user:a@example.com,t2=allUsers\"").unwrap();
+        }
+        let want = "t1=user:a@example.com,t2=allUsers";
+        assert_eq!(cfg.auth.gcs.principals, want);
+        assert_eq!(cfg.auth.bigquery.principals, want);
+        assert_eq!(cfg.auth.pubsub.principals, want);
+        assert!(default_config().auth.gcs.principals.is_empty());
     }
 
     #[test]
