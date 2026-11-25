@@ -152,6 +152,27 @@ impl Server {
         self.config.project().to_string()
     }
 
+    /// Effective quota and limit parameters for `/_introspect/quotas`.
+    pub(crate) fn quota_limits_snapshot(&self) -> crate::dashboard::QuotaLimitsSnapshot {
+        let retention = if self.config.message_retention_seconds > 0 {
+            self.config.message_retention_seconds
+        } else {
+            604_800
+        };
+        crate::dashboard::QuotaLimitsSnapshot {
+            default_ack_deadline_seconds: self.default_ack_deadline(),
+            max_ack_deadline_seconds: self.max_ack_deadline(),
+            max_pull_messages: self.max_pull_messages(),
+            message_retention_seconds: retention,
+            max_topics_per_project: 10_000,
+            max_subscriptions_per_project: 10_000,
+            max_snapshots_per_project: 10_000,
+            max_schemas_per_project: 10_000,
+            max_delivery_attempts_min: 5,
+            max_delivery_attempts_max: 100,
+        }
+    }
+
     fn resource_file_path(&self) -> std::path::PathBuf {
         std::path::Path::new(&self.config.storage_path).join("resources.json")
     }
