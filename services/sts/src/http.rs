@@ -9,9 +9,10 @@ use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-use crate::server::{error_outcome, Outcome, Server};
+use crate::server::{error_outcome, unix_now, Outcome, Server};
 use crate::sigv4::{
-    decode_aws_chunked, is_aws_chunked, verify_signature, Credentials, SignedRequest,
+    authorization_access_key, decode_aws_chunked, is_aws_chunked, verify_signature, Credentials,
+    SignedRequest,
 };
 
 const MAX_HEADER_BYTES: usize = 64 * 1024;
@@ -217,14 +218,49 @@ fn process(server: &Server, req: &Request) -> Outcome {
         body: &req.body,
     };
     let cfg = server.config();
-    let creds = Credentials {
-        auth_mode: &cfg.auth_mode,
-        access_key_id: &cfg.access_key_id,
-        secret_access_key: &cfg.secret_access_key,
-        region: &cfg.region,
+    // In strict mode a request may be signed with temporary credentials this
+    // server issued; it is verified with the session's secret.
+    let session = if cfg.auth_mode.eq_ignore_ascii_case("strict") {
+        authorization_access_key(signed.authorization).and_then(|key| server.session(&key))
+    } else {
+        None
+    };
+    let creds = match &session {
+        Some(s) => Credentials {
+            auth_mode: &cfg.auth_mode,
+            access_key_id: &s.access_key_id,
+            secret_access_key: &s.secret_access_key,
+            region: &cfg.region,
+        },
+        None => Credentials {
+            auth_mode: &cfg.auth_mode,
+            access_key_id: &cfg.access_key_id,
+            secret_access_key: &cfg.secret_access_key,
+            region: &cfg.region,
+        },
     };
     if let Err(e) = verify_signature(&signed, &creds) {
         return error_outcome(e.status, e.name, e.name);
+    }
+    if let Some(s) = &session {
+        let sent = match req.header("x-amz-security-token") {
+            "" => query_param(&req.query, "X-Amz-Security-Token").unwrap_or_default(),
+            value => value.to_string(),
+        };
+        if !constant_time_eq(sent.as_bytes(), s.session_token.as_bytes()) {
+            return error_outcome(
+                403,
+                "InvalidClientTokenId",
+                "The security token included in the request is invalid.",
+            );
+        }
+        if unix_now() >= s.expiration {
+            return error_outcome(
+                400,
+                "ExpiredToken",
+                "The security token included in the request is expired",
+            );
+        }
     }
 
     let decoded_body = if is_aws_chunked(
@@ -245,7 +281,17 @@ fn process(server: &Server, req: &Request) -> Outcome {
     if req.method == "POST" {
         parse_form(&String::from_utf8_lossy(body), &mut params);
     }
-    server.dispatch(&params)
+    server.dispatch_as(&params, session.as_ref())
+}
+
+fn query_param(query: &str, name: &str) -> Option<String> {
+    let mut params = BTreeMap::new();
+    parse_form(query, &mut params);
+    params.remove(name)
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 /// `application/x-www-form-urlencoded` decoding; later keys win.
@@ -414,5 +460,94 @@ mod form_tests {
         }
         // Not an escape: the `%` stays and `+` is a space as usual.
         assert_eq!(form_decode("%+1"), "% 1");
+    }
+}
+
+#[cfg(test)]
+mod session_tests {
+    use super::*;
+    use crate::server::Config;
+    use crate::sigv4::signature_for_request;
+
+    #[test]
+    fn expired_session_credentials_are_rejected() {
+        let server = Server::new(Config {
+            region: "us-east-1".to_string(),
+            auth_mode: "strict".to_string(),
+            access_key_id: "dev".to_string(),
+            secret_access_key: "dev".to_string(),
+            ..Default::default()
+        });
+        let body = b"Action=AssumeRole&RoleArn=arn:aws:iam::1:role/r&RoleSessionName=s1";
+        // Unsigned owner calls are refused in strict mode, so dispatch directly.
+        let mut params = BTreeMap::new();
+        parse_form(std::str::from_utf8(body).unwrap(), &mut params);
+        let xml = server.dispatch(&params).body;
+        let tag = |name: &str| {
+            let start = xml.find(&format!("<{name}>")).unwrap() + name.len() + 2;
+            xml[start..start + xml[start..].find('<').unwrap()].to_string()
+        };
+        let (key, secret, token) = (
+            tag("AccessKeyId"),
+            tag("SecretAccessKey"),
+            tag("SessionToken"),
+        );
+
+        let request = |expired: bool| {
+            if expired {
+                let mut sessions = server.sessions.lock().unwrap();
+                sessions.get_mut(&key).unwrap().expiration = unix_now() - 1;
+            }
+            let get_body = b"Action=GetCallerIdentity";
+            let headers: HashMap<String, String> = [
+                ("host", "127.0.0.1:18032"),
+                ("x-amz-date", "20261125T100000Z"),
+                ("x-amz-security-token", token.as_str()),
+            ]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+            let header_fn = |name: &str| headers.get(name).cloned();
+            let signed_headers = "host;x-amz-date;x-amz-security-token";
+            let signed = SignedRequest {
+                method: "POST",
+                path: "/",
+                query: "",
+                host: "127.0.0.1:18032",
+                authorization: "",
+                amz_date: "20261125T100000Z",
+                content_sha256: "",
+                header: &header_fn,
+                body: get_body,
+            };
+            let creds = Credentials {
+                auth_mode: "strict",
+                access_key_id: &key,
+                secret_access_key: &secret,
+                region: "us-east-1",
+            };
+            let payload = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(get_body));
+            let signature = signature_for_request(
+                &signed,
+                "20261125",
+                "us-east-1",
+                signed_headers,
+                &payload,
+                &creds,
+            );
+            let auth = format!(
+                "AWS4-HMAC-SHA256 Credential={key}/20261125/us-east-1/sts/aws4_request, SignedHeaders={signed_headers}, Signature={signature}"
+            );
+            let mut all: Vec<(&str, &str)> = headers
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.as_str()))
+                .collect();
+            all.push(("authorization", &auth));
+            serve_for_test(&server, "POST", "/", &all, get_body)
+        };
+        assert_eq!(request(false).status, 200);
+        let expired = request(true);
+        assert_eq!(expired.status, 400);
+        assert!(expired.body.contains("<Code>ExpiredToken</Code>"));
     }
 }

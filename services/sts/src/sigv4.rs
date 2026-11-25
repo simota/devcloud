@@ -80,6 +80,17 @@ pub fn verify_signature(req: &SignedRequest, creds: &Credentials) -> Result<(), 
     verify_full(req, auth, creds)
 }
 
+/// The access key named in a SigV4 or SigV4a `Authorization` header, if any.
+pub fn authorization_access_key(authorization: &str) -> Option<String> {
+    let auth = authorization.trim();
+    if devcloud_sigv4a::is_authorization(auth) {
+        return devcloud_sigv4a::parse_authorization(auth).map(|a| a.access_key.to_string());
+    }
+    let rest = auth.strip_prefix(SIGV4_ALGORITHM)?.trim_start();
+    let credential = parse_auth_params(rest).remove("Credential")?;
+    parse_credential_scope(&credential).map(|(key, _, _, _)| key)
+}
+
 fn verify_full(req: &SignedRequest, auth: &str, creds: &Credentials) -> Result<(), SignatureError> {
     let prefix = format!("{SIGV4_ALGORITHM} ");
     if !auth.starts_with(&prefix) {
@@ -452,7 +463,7 @@ fn verify_streaming_chunks(
     Ok(())
 }
 
-fn signature_for_request(
+pub(crate) fn signature_for_request(
     req: &SignedRequest,
     date_stamp: &str,
     region: &str,
