@@ -196,6 +196,14 @@ pub struct TableDescription {
         skip_serializing_if = "Option::is_none"
     )]
     pub time_to_live_description: Option<TimeToLiveDescription>,
+    #[serde(
+        rename = "GlobalTableVersion",
+        default,
+        skip_serializing_if = "String::is_empty"
+    )]
+    pub global_table_version: String,
+    #[serde(rename = "Replicas", default, skip_serializing_if = "Vec::is_empty")]
+    pub replicas: Vec<crate::global_tables::ReplicaDescription>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

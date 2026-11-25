@@ -406,12 +406,14 @@ Completed resumable uploads retain a small metadata receipt and notification mar
 | TTL | Yes | TTL metadata and expiration are supported locally. |
 | Streams | Partial | Stream metadata, shard iterators, and record reads exist for local inspection. |
 | Backups and restore | Partial | Local backup metadata and restore flow. |
-| Tags and resource policies | Partial | Local metadata only; no IAM enforcement. |
+| Tags and resource policies | Partial | Local tag and resource-policy CRUD (`PutResourcePolicy`/`GetResourcePolicy`/`DeleteResourcePolicy`) with local policy and condition evaluation when a resource policy is attached. |
 | DescribeLimits / DescribeEndpoints | Yes | Local compatibility responses. |
-| AWS SigV4 header auth | Partial | Relaxed mode is default; strict mode validates local credentials. |
-| DAX, global tables, autoscaling | No | Not implemented. |
+| AWS SigV4 header auth | Partial | Relaxed mode is default; strict mode validates local credentials (supporting `dynamodb` and `dax` services). |
+| DAX | Partial | Control-plane metadata API (`AmazonDAXV3.*`: clusters, replication factor, node reboot, subnet groups, parameter groups, and tags) is emulated on the DynamoDB HTTP endpoint. The binary DAX data-plane cache protocol (Tube/CBOR on port 8111/9111) is not emulated. |
+| Global tables | Partial | Metadata emulation for Global Tables v1 (`Create/Describe/List/UpdateGlobalTable`, `Describe/UpdateGlobalTableSettings`) and v2 (`UpdateTable` `ReplicaUpdates` and `DescribeTable.Table.Replicas` / `GlobalTableVersion`); no real cross-region replication. |
+| Autoscaling | Partial | Table replica autoscaling metadata (`DescribeTableReplicaAutoScaling`, `UpdateTableReplicaAutoScaling`) is supported locally alongside the Application Auto Scaling service (`:18030`); real capacity-driven scaling is not simulated. |
 | Real capacity accounting/throttling | No | Local deterministic behavior, not AWS capacity simulation. |
-| IAM condition enforcement | No | Not implemented. |
+| IAM condition enforcement | Partial | Evaluates resource policies attached via `PutResourcePolicy` (`Allow`/`Deny`, `Principal`, `Action`/`Resource` wildcards, `String*`/`Numeric*`/`Bool`/`Null`, `ForAllValues:`/`ForAnyValue:`, `IfExists`, and `${aws:*}` variables) over `dynamodb:LeadingKeys`, `dynamodb:Attributes`, `dynamodb:Select`, `dynamodb:ReturnValues`, `dynamodb:IndexName`, `dynamodb:EnclosingOperation`, `aws:ResourceTag/*`, `aws:RequestTag/*`, `aws:TagKeys`, `aws:RequestedRegion`, and `aws:username`/`aws:PrincipalArn`. Tables without a resource policy remain open in relaxed mode. |
 
 DynamoDB dashboard management is available under `/dashboard/dynamodb` and the local `/api/dynamodb/*` dashboard API. The dashboard can inspect tables, items, indexes, TTL, and streams, and can run guarded local management flows for `CreateTable`, `PutItem`, `UpdateItem`, `UpdateTimeToLive`, `DeleteItem`, `DeleteTable`, `Query`, and `Scan`. Query and Scan expose result pagination with count, scanned count, next/previous controls, and selected result item JSON. Recent operation history is stored only in browser `localStorage` as metadata; it does not persist item payloads, credentials, full request payloads, or pagination keys. Dashboard mutation endpoints forward through the local DynamoDB JSON protocol path instead of editing storage directly. Destructive `DeleteItem` and `DeleteTable` flows require confirmation text matching the selected table name, and disabled DynamoDB services do not expose active mutation controls.
 

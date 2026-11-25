@@ -115,6 +115,8 @@ pub struct UpdateTableRequest {
     pub billing_mode: String,
     #[serde(rename = "GlobalSecondaryIndexUpdates")]
     pub global_secondary_index_updates: Vec<GlobalSecondaryIndexUpdate>,
+    #[serde(rename = "ReplicaUpdates")]
+    pub replica_updates: Vec<crate::global_tables::ReplicationGroupUpdate>,
     #[serde(rename = "StreamSpecification")]
     pub stream_specification: Option<StreamSpecification>,
 }

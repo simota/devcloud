@@ -20,6 +20,7 @@ use crate::server::Server;
 use crate::sigv4::{Credentials, SignedRequest};
 
 const TARGET_PREFIX: &str = "DynamoDB_20120810.";
+const DAX_TARGET_PREFIX: &str = "AmazonDAXV3.";
 const MAX_HEADER_BYTES: usize = 64 * 1024;
 const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
 
@@ -64,6 +65,8 @@ impl Server {
         signed: Option<&SignedRequest>,
         now_unix: i64,
     ) -> Outcome {
+        let is_dax = target.starts_with(DAX_TARGET_PREFIX);
+
         // SigV4 (no-op in relaxed mode).
         if let Some(req) = signed {
             let creds = Credentials {
@@ -72,9 +75,14 @@ impl Server {
                 access_key_id: self.sigv4_access_key(),
                 secret_access_key: self.sigv4_secret(),
             };
-            if let Err(sig) = crate::sigv4::verify_signature(&creds, req) {
+            let service = if is_dax { "dax" } else { crate::sigv4::SERVICE };
+            if let Err(sig) = crate::sigv4::verify_signature_for_service(&creds, req, service) {
                 return Outcome::error(sig.status, sig.code, sig.code);
             }
+        }
+
+        if let Some(dax_op) = target.strip_prefix(DAX_TARGET_PREFIX) {
+            return self.dispatch_dax(dax_op, body);
         }
 
         let Some(op) = target.strip_prefix(TARGET_PREFIX) else {
@@ -86,6 +94,109 @@ impl Server {
             return Outcome::from_error(err);
         }
 
+        let caller_override = signed
+            .and_then(|req| req.headers.get("authorization"))
+            .and_then(|auth| crate::iam::access_key_from_auth_header(auth));
+        self.set_active_caller(caller_override);
+        let outcome = self.dispatch_dynamodb_op(op, body);
+        self.set_active_caller(None);
+        outcome
+    }
+
+    fn dispatch_dax(&mut self, op: &str, body: &[u8]) -> Outcome {
+        macro_rules! run_dax {
+            ($req:ty, $call:expr) => {{
+                match decode::<$req>(body) {
+                    Ok(req) => to_outcome($call(self, &req)),
+                    Err(out) => out,
+                }
+            }};
+        }
+        match op {
+            "CreateCluster" => run_dax!(crate::dax::CreateClusterRequest, |s: &mut Server, r| {
+                s.dax_create_cluster(r)
+            }),
+            "DescribeClusters" => {
+                run_dax!(crate::dax::DescribeClustersRequest, |s: &mut Server, r| {
+                    s.dax_describe_clusters(r)
+                })
+            }
+            "UpdateCluster" => run_dax!(crate::dax::UpdateClusterRequest, |s: &mut Server, r| {
+                s.dax_update_cluster(r)
+            }),
+            "DeleteCluster" => run_dax!(crate::dax::DeleteClusterRequest, |s: &mut Server, r| {
+                s.dax_delete_cluster(r)
+            }),
+            "IncreaseReplicationFactor" => run_dax!(
+                crate::dax::IncreaseReplicationFactorRequest,
+                |s: &mut Server, r| s.dax_increase_replication_factor(r)
+            ),
+            "DecreaseReplicationFactor" => run_dax!(
+                crate::dax::DecreaseReplicationFactorRequest,
+                |s: &mut Server, r| s.dax_decrease_replication_factor(r)
+            ),
+            "RebootNode" => run_dax!(crate::dax::RebootNodeRequest, |s: &mut Server, r| {
+                s.dax_reboot_node(r)
+            }),
+            "CreateSubnetGroup" => {
+                run_dax!(crate::dax::CreateSubnetGroupRequest, |s: &mut Server, r| {
+                    s.dax_create_subnet_group(r)
+                })
+            }
+            "DescribeSubnetGroups" => run_dax!(
+                crate::dax::DescribeSubnetGroupsRequest,
+                |s: &mut Server, r| s.dax_describe_subnet_groups(r)
+            ),
+            "UpdateSubnetGroup" => {
+                run_dax!(crate::dax::UpdateSubnetGroupRequest, |s: &mut Server, r| {
+                    s.dax_update_subnet_group(r)
+                })
+            }
+            "DeleteSubnetGroup" => {
+                run_dax!(crate::dax::DeleteSubnetGroupRequest, |s: &mut Server, r| {
+                    s.dax_delete_subnet_group(r)
+                })
+            }
+            "CreateParameterGroup" => run_dax!(
+                crate::dax::CreateParameterGroupRequest,
+                |s: &mut Server, r| s.dax_create_parameter_group(r)
+            ),
+            "DescribeParameterGroups" => run_dax!(
+                crate::dax::DescribeParameterGroupsRequest,
+                |s: &mut Server, r| s.dax_describe_parameter_groups(r)
+            ),
+            "UpdateParameterGroup" => run_dax!(
+                crate::dax::UpdateParameterGroupRequest,
+                |s: &mut Server, r| s.dax_update_parameter_group(r)
+            ),
+            "DeleteParameterGroup" => run_dax!(
+                crate::dax::DeleteParameterGroupRequest,
+                |s: &mut Server, r| s.dax_delete_parameter_group(r)
+            ),
+            "DescribeParameters" => run_dax!(
+                crate::dax::DescribeParametersRequest,
+                |s: &mut Server, r| s.dax_describe_parameters(r)
+            ),
+            "ListTags" => run_dax!(crate::dax::DaxListTagsRequest, |s: &mut Server, r| {
+                s.dax_list_tags(r)
+            }),
+            "TagResource" => run_dax!(crate::dax::DaxTagResourceRequest, |s: &mut Server, r| {
+                s.dax_tag_resource(r)
+            }),
+            "UntagResource" => {
+                run_dax!(crate::dax::DaxUntagResourceRequest, |s: &mut Server, r| {
+                    s.dax_untag_resource(r)
+                })
+            }
+            _ => Outcome::from_error(ApiError::dax(
+                400,
+                "UnknownOperationException",
+                "unknown operation",
+            )),
+        }
+    }
+
+    fn dispatch_dynamodb_op(&mut self, op: &str, body: &[u8]) -> Outcome {
         macro_rules! run {
             ($req:ty, $call:expr) => {{
                 match decode::<$req>(body) {
@@ -217,6 +328,39 @@ impl Server {
                 run!(crate::requests::ResourceArnRequest, |s: &mut Server, r| s
                     .delete_resource_policy(r))
             }
+            "CreateGlobalTable" => run!(
+                crate::global_tables::CreateGlobalTableRequest,
+                |s: &mut Server, r| s.create_global_table(r)
+            ),
+            "DescribeGlobalTable" => run!(
+                crate::global_tables::GlobalTableNameRequest,
+                |s: &mut Server, r| s.describe_global_table(r)
+            ),
+            "ListGlobalTables" => run!(
+                crate::global_tables::ListGlobalTablesRequest,
+                |s: &mut Server, r| s.list_global_tables(r)
+            ),
+            "UpdateGlobalTable" => run!(
+                crate::global_tables::UpdateGlobalTableRequest,
+                |s: &mut Server, r| s.update_global_table(r)
+            ),
+            "DescribeGlobalTableSettings" => run!(
+                crate::global_tables::GlobalTableNameRequest,
+                |s: &mut Server, r| s.describe_global_table_settings(r)
+            ),
+            "UpdateGlobalTableSettings" => run!(
+                crate::global_tables::UpdateGlobalTableSettingsRequest,
+                |s: &mut Server, r| s.update_global_table_settings(r)
+            ),
+            "DescribeTableReplicaAutoScaling" => run!(
+                crate::requests::TableNameRequest,
+                |s: &mut Server, r: &crate::requests::TableNameRequest| s
+                    .describe_table_replica_auto_scaling(&r.table_name)
+            ),
+            "UpdateTableReplicaAutoScaling" => run!(
+                crate::global_tables::UpdateTableReplicaAutoScalingRequest,
+                |s: &mut Server, r| s.update_table_replica_auto_scaling(r)
+            ),
             _ => Outcome::error(400, "UnknownOperationException", "unknown operation"),
         }
     }
@@ -309,8 +453,16 @@ async fn handle_conn(
         Ok(Some(req)) => req,
         _ => return Ok(()),
     };
+    let response_content_type = if request
+        .header("x-amz-target")
+        .starts_with(DAX_TARGET_PREFIX)
+    {
+        "application/x-amz-json-1.1"
+    } else {
+        "application/x-amz-json-1.0"
+    };
     let outcome = process(&server, &request, &auth_mode);
-    write_response(&mut stream, outcome).await
+    write_response(&mut stream, outcome, response_content_type).await
 }
 
 fn process(server: &Mutex<Server>, req: &Request, auth_mode: &str) -> Outcome {
@@ -338,7 +490,10 @@ fn process(server: &Mutex<Server>, req: &Request, auth_mode: &str) -> Outcome {
         return Outcome::error(405, "ValidationException", "method not allowed");
     }
     let content_type = req.header("content-type");
-    if !content_type.is_empty() && !content_type.starts_with("application/x-amz-json-1.0") {
+    if !content_type.is_empty()
+        && !content_type.starts_with("application/x-amz-json-1.0")
+        && !content_type.starts_with("application/x-amz-json-1.1")
+    {
         return Outcome::error(400, "ValidationException", "unsupported content type");
     }
     let target = req.header("x-amz-target").to_string();
@@ -454,14 +609,18 @@ async fn read_request(stream: &mut (impl AsyncRead + Unpin)) -> std::io::Result<
     }))
 }
 
-async fn write_response(stream: &mut TcpStream, outcome: Outcome) -> std::io::Result<()> {
+async fn write_response(
+    stream: &mut (impl AsyncWriteExt + Unpin),
+    outcome: Outcome,
+    content_type: &str,
+) -> std::io::Result<()> {
     let mut head = format!(
         "HTTP/1.1 {} {}\r\n",
         outcome.status,
         reason_phrase(outcome.status)
     );
     head.push_str("Server: devcloud-dynamodb\r\n");
-    head.push_str("Content-Type: application/x-amz-json-1.0\r\n");
+    head.push_str(&format!("Content-Type: {content_type}\r\n"));
     if let Some(error_type) = &outcome.error_type {
         head.push_str(&format!("X-Amzn-Errortype: {error_type}\r\n"));
     }
@@ -547,5 +706,39 @@ mod request_framing_tests {
             "a".repeat(MAX_HEADER_BYTES)
         );
         assert!(read_request(&mut wire.as_bytes()).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn dax_json_1_1_request_and_response_content_type() {
+        let body = br#"{"ClusterName":"http-dax","NodeType":"dax.t3.small","ReplicationFactor":1,"IamRoleArn":"arn:aws:iam::000000000000:role/dax"}"#;
+        let wire = format!(
+            "POST / HTTP/1.1\r\nHost: 127.0.0.1:18000\r\nContent-Type: application/x-amz-json-1.1\r\nX-Amz-Target: AmazonDAXV3.CreateCluster\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            String::from_utf8_lossy(body)
+        );
+        let req = read_request(&mut wire.as_bytes()).await.unwrap().unwrap();
+        let server = Mutex::new(Server::new(crate::server::Config {
+            region: "us-east-1".to_string(),
+            auth_mode: "relaxed".to_string(),
+            ..Default::default()
+        }));
+        let response_content_type = if req.header("x-amz-target").starts_with(DAX_TARGET_PREFIX) {
+            "application/x-amz-json-1.1"
+        } else {
+            "application/x-amz-json-1.0"
+        };
+        let outcome = process(&server, &req, "relaxed");
+        assert_eq!(outcome.status, 200);
+        let mut out_bytes = Vec::new();
+        write_response(&mut out_bytes, outcome, response_content_type)
+            .await
+            .unwrap();
+        let text = String::from_utf8(out_bytes).unwrap();
+        assert!(text.starts_with("HTTP/1.1 200 OK\r\n"), "{text}");
+        assert!(
+            text.contains("Content-Type: application/x-amz-json-1.1\r\n"),
+            "{text}"
+        );
+        assert!(text.contains("\"ClusterName\":\"http-dax\""), "{text}");
     }
 }

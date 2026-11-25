@@ -510,6 +510,8 @@ mod tests {
             table_size_bytes: 0,
             table_status: String::new(),
             time_to_live_description: None,
+            global_table_version: String::new(),
+            replicas: vec![],
         }
     }
 }
