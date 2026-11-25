@@ -156,6 +156,7 @@ pub struct Invocation {
     pub code_dir: PathBuf,
     pub function_name: String,
     pub function_arn: String,
+    pub function_version: String,
     pub memory_size: i64,
     pub timeout_seconds: i64,
     pub region: String,
@@ -166,6 +167,9 @@ pub struct Invocation {
     /// `python/` and `nodejs/node_modules/` trees are on the default
     /// `PYTHONPATH` / `NODE_PATH`.
     pub opt_dir: PathBuf,
+    /// Extracted trees of attached layers, in attachment order (later layers
+    /// override earlier ones when merged into a per-environment `opt` dir).
+    pub layer_dirs: Vec<PathBuf>,
     pub credentials: Option<FunctionCredentials>,
     /// The function configuration an environment is started from (its
     /// revision): only an idle environment with the same key is reused.
@@ -297,12 +301,38 @@ impl Pool {
     }
 
     /// Retires configuration `key` of `function` (updated or deleted): its
-    /// idle environments stop now, and environments still running an
-    /// invocation stop when it ends instead of returning to the pool.
+    /// idle environments stop now (leaving other published versions of the
+    /// same function warm), and environments still running an invocation stop
+    /// when it ends instead of returning to the pool.
     pub fn retire(&self, function: &str, key: &str) {
-        let stopped = {
+        let mut stopped = Vec::new();
+        {
             let mut st = self.state.lock().unwrap();
             st.retired.insert(key.to_string());
+            if let Some(list) = st.idle.get_mut(function) {
+                let mut i = 0;
+                while i < list.len() {
+                    if list[i].key == key {
+                        stopped.push(list.swap_remove(i));
+                    } else {
+                        i += 1;
+                    }
+                }
+                if list.is_empty() {
+                    st.idle.remove(function);
+                }
+            }
+        }
+        drop(stopped);
+    }
+
+    /// Retires every configuration of `function` (whole-function delete).
+    pub fn retire_function(&self, function: &str, keys: &[String]) {
+        let stopped = {
+            let mut st = self.state.lock().unwrap();
+            for key in keys {
+                st.retired.insert(key.clone());
+            }
             st.idle.remove(function)
         };
         drop(stopped);
@@ -340,20 +370,30 @@ impl Pool {
     }
 
     /// An idle environment of `function` started from `key`, if one is still
-    /// healthy. Environments of another configuration are stopped: they can
-    /// never be used again.
+    /// healthy. Environments of other live versions stay warm; retired or
+    /// unhealthy ones encountered for `key` are stopped.
     fn take(&self, function: &str, key: &str) -> Option<Environment> {
         let mut stopped = Vec::new();
         let mut found = None;
         {
             let mut st = self.state.lock().unwrap();
+            let retired = st.retired.clone();
             let list = st.idle.get_mut(function)?;
-            while let Some(mut env) = list.pop() {
-                if env.key == key && env.healthy() {
-                    found = Some(env);
-                    break;
+            let mut i = list.len();
+            while i > 0 {
+                i -= 1;
+                if retired.contains(&list[i].key) {
+                    stopped.push(list.remove(i));
+                    continue;
                 }
-                stopped.push(env);
+                if list[i].key == key {
+                    let mut env = list.remove(i);
+                    if env.healthy() {
+                        found = Some(env);
+                        break;
+                    }
+                    stopped.push(env);
+                }
             }
             if list.is_empty() {
                 st.idle.remove(function);
@@ -724,6 +764,7 @@ pub async fn run(
         "deadlineMs": deadline_ms as u64,
         "resultPath": result_path,
         "event": String::from_utf8_lossy(&inv.payload),
+        "invokedFunctionArn": inv.function_arn,
     });
     let mut line = serde_json::to_vec(&request).unwrap_or_default();
     line.push(b'\n');
@@ -877,6 +918,16 @@ fn spawn(
     let id = pool.seq.fetch_add(1, Ordering::Relaxed);
     let work_dir = pool.work_root.join(format!("env-{id}"));
     std::fs::create_dir_all(&work_dir).map_err(|e| RuntimeError::Spawn(e.to_string()))?;
+    let layer_opt = if inv.layer_dirs.is_empty() {
+        None
+    } else {
+        let opt = work_dir.join("opt");
+        if let Err(e) = crate::layers::materialize_layers(&inv.layer_dirs, &opt) {
+            let _ = std::fs::remove_dir_all(&work_dir);
+            return Err(RuntimeError::Spawn(e));
+        }
+        Some(opt)
+    };
     let marker = new_marker(id);
 
     let bin = match family {
@@ -904,7 +955,7 @@ fn spawn(
     // Precedence: devcloud defaults < the function's Environment.Variables <
     // Lambda-reserved variables (which CreateFunction refuses to accept).
     cmd.env_clear()
-        .envs(default_env(family, inv))
+        .envs(default_env(family, inv, layer_opt.as_deref()))
         .envs(&inv.environment)
         .envs(reserved_env(inv, id))
         .env("_DEVCLOUD_MARKER", &marker)
@@ -1001,11 +1052,27 @@ async fn spawn_provided(
     code: Box<dyn Send>,
 ) -> Result<Result<Environment, Completed>, RuntimeError> {
     let started = Instant::now();
-    let candidates = [
-        inv.code_dir.join("bootstrap"),
-        inv.opt_dir.join("bootstrap"),
-    ];
+    let id = pool.seq.fetch_add(1, Ordering::Relaxed);
+    let work_dir = pool.work_root.join(format!("env-{id}"));
+    std::fs::create_dir_all(&work_dir).map_err(|e| RuntimeError::Spawn(e.to_string()))?;
+    let cleanup = |msg: String| {
+        let _ = std::fs::remove_dir_all(&work_dir);
+        RuntimeError::Spawn(msg)
+    };
+    let layer_opt = if inv.layer_dirs.is_empty() {
+        None
+    } else {
+        let opt = work_dir.join("opt");
+        crate::layers::materialize_layers(&inv.layer_dirs, &opt).map_err(cleanup)?;
+        Some(opt)
+    };
+    let mut candidates = vec![inv.code_dir.join("bootstrap")];
+    if let Some(opt) = &layer_opt {
+        candidates.push(opt.join("bootstrap"));
+    }
+    candidates.push(inv.opt_dir.join("bootstrap"));
     let Some(bootstrap) = candidates.iter().find(|p| p.is_file()) else {
+        let _ = std::fs::remove_dir_all(&work_dir);
         let searched: Vec<String> = candidates
             .iter()
             .map(|p| p.to_string_lossy().into_owned())
@@ -1018,13 +1085,6 @@ async fn spawn_provided(
         )));
     };
 
-    let id = pool.seq.fetch_add(1, Ordering::Relaxed);
-    let work_dir = pool.work_root.join(format!("env-{id}"));
-    std::fs::create_dir_all(&work_dir).map_err(|e| RuntimeError::Spawn(e.to_string()))?;
-    let cleanup = |msg: String| {
-        let _ = std::fs::remove_dir_all(&work_dir);
-        RuntimeError::Spawn(msg)
-    };
     let marker = new_marker(id);
 
     // The bootstrap's stdout and stderr share one pipe; devcloud keeps a write
@@ -1040,7 +1100,7 @@ async fn spawn_provided(
         work_dir.join(INIT_ERROR_FILE),
         serde_json::json!({
             "functionName": inv.function_name,
-            "functionVersion": "$LATEST",
+            "functionVersion": inv.version_str(),
             "handler": inv.handler,
         }),
     )
@@ -1055,7 +1115,7 @@ async fn spawn_provided(
 
     let mut cmd = tokio::process::Command::new(bootstrap);
     cmd.env_clear()
-        .envs(default_env(Family::Provided, inv))
+        .envs(default_env(Family::Provided, inv, layer_opt.as_deref()))
         .envs(&inv.environment)
         .envs(env_vars)
         .current_dir(&inv.code_dir)
@@ -1592,9 +1652,10 @@ fn docker_start_error(docker: &str, what: &str, e: &std::io::Error) -> String {
 /// The variables Lambda sets in an image function's environment. The RIE
 /// reads `AWS_LAMBDA_FUNCTION_TIMEOUT` and the memory size for its REPORT.
 fn container_env(inv: &Invocation, env_id: u64) -> Vec<(String, String)> {
+    let ver = inv.version_str();
     let mut env: Vec<(String, String)> = vec![
         ("AWS_LAMBDA_FUNCTION_NAME".into(), inv.function_name.clone()),
-        ("AWS_LAMBDA_FUNCTION_VERSION".into(), "$LATEST".into()),
+        ("AWS_LAMBDA_FUNCTION_VERSION".into(), ver.to_string()),
         (
             "AWS_LAMBDA_FUNCTION_MEMORY_SIZE".into(),
             inv.memory_size.to_string(),
@@ -1609,7 +1670,7 @@ fn container_env(inv: &Invocation, env_id: u64) -> Vec<(String, String)> {
         ),
         (
             "AWS_LAMBDA_LOG_STREAM_NAME".into(),
-            format!("devcloud/[$LATEST]env-{env_id}"),
+            format!("devcloud/[{ver}]env-{env_id}"),
         ),
         ("AWS_REGION".into(), inv.region.clone()),
         ("AWS_DEFAULT_REGION".into(), inv.region.clone()),
@@ -1811,31 +1872,69 @@ fn is_executable(path: &Path) -> bool {
     }
 }
 
+impl Invocation {
+    fn version_str(&self) -> &str {
+        if self.function_version.is_empty() {
+            "$LATEST"
+        } else {
+            &self.function_version
+        }
+    }
+}
+
 /// Values Lambda provides but lets functions override (`TZ`, `LANG`, `PATH`,
 /// and the `/opt` layer paths in `PYTHONPATH` / `NODE_PATH`).
-fn default_env(family: Family, inv: &Invocation) -> Vec<(String, String)> {
+fn default_env(
+    family: Family,
+    inv: &Invocation,
+    layer_opt: Option<&Path>,
+) -> Vec<(String, String)> {
     let mut env = vec![
         ("TZ".to_string(), "UTC".to_string()),
         ("LANG".to_string(), "en_US.UTF-8".to_string()),
         ("PYTHONDONTWRITEBYTECODE".to_string(), "1".to_string()),
     ];
-    if let Ok(path) = std::env::var("PATH") {
-        env.push(("PATH".to_string(), path));
+    let mut path_parts: Vec<String> = Vec::new();
+    if let Some(opt) = layer_opt {
+        path_parts.push(format!("{}/bin", opt.to_string_lossy()));
     }
-    let opt = inv.opt_dir.to_string_lossy();
+    if let Ok(path) = std::env::var("PATH") {
+        if !path.is_empty() {
+            path_parts.push(path);
+        }
+    }
+    if !path_parts.is_empty() {
+        env.push(("PATH".to_string(), path_parts.join(":")));
+    }
+    let opt_roots: Vec<&Path> = layer_opt
+        .into_iter()
+        .chain(std::iter::once(inv.opt_dir.as_path()))
+        .collect();
     let v = version(&inv.runtime);
-    let layer_path = match (family, v) {
-        (Family::Provided, _) => return env,
-        (Family::Python, Some(v)) => (
-            "PYTHONPATH",
-            format!("{opt}/python/lib/python{v}/site-packages:{opt}/python"),
-        ),
-        (Family::Python, None) => ("PYTHONPATH", format!("{opt}/python")),
-        (Family::Node, Some(v)) => (
-            "NODE_PATH",
-            format!("{opt}/nodejs/node{v}/node_modules:{opt}/nodejs/node_modules"),
-        ),
-        (Family::Node, None) => ("NODE_PATH", format!("{opt}/nodejs/node_modules")),
+    let layer_path = match family {
+        Family::Provided => return env,
+        Family::Python => {
+            let mut entries = Vec::new();
+            for root in opt_roots {
+                let opt = root.to_string_lossy();
+                if let Some(v) = v.as_deref() {
+                    entries.push(format!("{opt}/python/lib/python{v}/site-packages"));
+                }
+                entries.push(format!("{opt}/python"));
+            }
+            ("PYTHONPATH", entries.join(":"))
+        }
+        Family::Node => {
+            let mut entries = Vec::new();
+            for root in opt_roots {
+                let opt = root.to_string_lossy();
+                if let Some(v) = v.as_deref() {
+                    entries.push(format!("{opt}/nodejs/node{v}/node_modules"));
+                }
+                entries.push(format!("{opt}/nodejs/node_modules"));
+            }
+            ("NODE_PATH", entries.join(":"))
+        }
     };
     env.push((layer_path.0.to_string(), layer_path.1));
     env
@@ -1843,9 +1942,10 @@ fn default_env(family: Family, inv: &Invocation) -> Vec<(String, String)> {
 
 fn reserved_env(inv: &Invocation, env_id: u64) -> Vec<(String, String)> {
     let task_root = inv.code_dir.to_string_lossy().into_owned();
+    let ver = inv.version_str();
     let mut env: Vec<(String, String)> = vec![
         ("AWS_LAMBDA_FUNCTION_NAME".into(), inv.function_name.clone()),
-        ("AWS_LAMBDA_FUNCTION_VERSION".into(), "$LATEST".into()),
+        ("AWS_LAMBDA_FUNCTION_VERSION".into(), ver.to_string()),
         (
             "AWS_LAMBDA_FUNCTION_MEMORY_SIZE".into(),
             inv.memory_size.to_string(),
@@ -1856,7 +1956,7 @@ fn reserved_env(inv: &Invocation, env_id: u64) -> Vec<(String, String)> {
         ),
         (
             "AWS_LAMBDA_LOG_STREAM_NAME".into(),
-            format!("devcloud/[$LATEST]env-{env_id}"),
+            format!("devcloud/[{ver}]env-{env_id}"),
         ),
         ("AWS_REGION".into(), inv.region.clone()),
         ("AWS_DEFAULT_REGION".into(), inv.region.clone()),
@@ -1979,8 +2079,9 @@ fn frame_log(
         push_block(&mut log, init_log);
     }
     log.push_str(&format!(
-        "START RequestId: {} Version: $LATEST\n",
-        inv.request_id
+        "START RequestId: {} Version: {}\n",
+        inv.request_id,
+        inv.version_str()
     ));
     push_block(&mut log, body);
     if timed_out {
@@ -2150,6 +2251,7 @@ mod tests {
             code_dir: PathBuf::new(),
             function_name: function.into(),
             function_arn: String::new(),
+            function_version: "$LATEST".into(),
             memory_size: 128,
             timeout_seconds: 3,
             region: "us-east-1".into(),
@@ -2157,6 +2259,7 @@ mod tests {
             environment: BTreeMap::new(),
             payload: Vec::new(),
             opt_dir: PathBuf::new(),
+            layer_dirs: Vec::new(),
             credentials: None,
             env_key: String::new(),
             image: None,
