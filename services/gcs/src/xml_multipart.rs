@@ -11,6 +11,11 @@
 //! Cloud Storage, every part except the last must be at least 5 MiB, part
 //! numbers are 1..=10000, and completion requires ascending part numbers whose
 //! ETags match the uploaded parts.
+//!
+//! Initiate accepts `x-goog-acl` (predefined object ACL), `x-goog-storage-class`,
+//! and `x-goog-object-retention-mode` / `-retain-until-time`. They are validated
+//! up front like a single-request XML `PUT`, kept in a per-upload sidecar, and
+//! applied to the object when the upload completes.
 
 use devcloud_s3::model::MultipartPart;
 use devcloud_s3::objops::CreateMultipartUploadInput;
@@ -18,10 +23,13 @@ use devcloud_s3::store::{ConditionalError, StoreError};
 use devcloud_s3::xml::Element;
 
 use crate::http::{emit_dashboard_event, user_metadata, Request, Response, Server};
-use crate::iam_acl::extract_tag_text;
+use crate::iam_acl::{expand_predefined_acl, extract_tag_text};
 use crate::notifications::emit_object_notification;
-use crate::retention::object_mutation_blocked_reason;
-use crate::state::{read_bucket_meta, write_object_meta, GcsObjectMeta};
+use crate::retention::{object_mutation_blocked_reason, validate_object_retention_update};
+use crate::state::{
+    delete_multipart_init, read_bucket_meta, read_multipart_init, write_multipart_init,
+    write_object_acl, write_object_meta, GcsMultipartInit, GcsObjectMeta, GcsObjectRetention,
+};
 use crate::xml_api::{check_xml_preconditions, xml_error, xml_response};
 
 pub const MIN_PART_SIZE: i64 = 5 * 1024 * 1024;
@@ -94,17 +102,85 @@ pub fn handle_object_multipart(
     Some(resp)
 }
 
+/// Validates the object settings carried by initiate headers the same way a
+/// single-request XML `PUT` does.
+fn parse_initiate_settings(
+    server: &Server,
+    req: &Request,
+    bucket: &str,
+) -> Result<GcsMultipartInit, Response> {
+    let bucket_meta = read_bucket_meta(server.store(), bucket).unwrap_or_default();
+    let predefined_acl = req.header("x-goog-acl").trim();
+    let acl = if predefined_acl.is_empty() {
+        None
+    } else {
+        if bucket_meta.uniform_bucket_level_access_enabled() {
+            return Err(xml_error(
+                400,
+                "InvalidArgument",
+                "Cannot specify ACL when uniform bucket-level access is enabled.",
+            ));
+        }
+        Some(
+            expand_predefined_acl(predefined_acl, server.project(), false)
+                .map_err(|e| xml_error(400, "InvalidArgument", &e))?,
+        )
+    };
+    let ret_mode = req.header("x-goog-object-retention-mode").trim();
+    let ret_until = req
+        .header("x-goog-object-retention-retain-until-time")
+        .trim();
+    let retention = if ret_mode.is_empty() && ret_until.is_empty() {
+        None
+    } else {
+        validate_object_retention_update(
+            &bucket_meta,
+            &None,
+            Some(GcsObjectRetention {
+                mode: ret_mode.to_string(),
+                retain_until_time: ret_until.to_string(),
+            }),
+            false,
+            &server.now(),
+        )
+        .map_err(|r| {
+            xml_error(
+                r.status,
+                if r.status == 403 {
+                    "AccessDenied"
+                } else {
+                    "InvalidArgument"
+                },
+                "invalid object retention configuration",
+            )
+        })?
+    };
+    Ok(GcsMultipartInit {
+        acl,
+        storage_class: req
+            .header("x-goog-storage-class")
+            .trim()
+            .to_ascii_uppercase(),
+        retention,
+    })
+}
+
+fn display_storage_class(init: &GcsMultipartInit) -> &str {
+    if init.storage_class.is_empty() {
+        "STANDARD"
+    } else {
+        &init.storage_class
+    }
+}
+
 fn initiate(server: &mut Server, req: &Request, bucket: &str, key: &str) -> Response {
     if server.store().get_bucket(bucket).ok().flatten().is_none() {
         return no_such_bucket();
     }
-    if !req.header("x-goog-acl").trim().is_empty() {
-        return xml_error(
-            501,
-            "NotImplemented",
-            "x-goog-acl is not supported on XML multipart uploads in devcloud.",
-        );
-    }
+    let settings = match parse_initiate_settings(server, req, bucket) {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
     let upload = match server
         .store()
         .create_multipart_upload(CreateMultipartUploadInput {
@@ -120,6 +196,14 @@ fn initiate(server: &mut Server, req: &Request, bucket: &str, key: &str) -> Resp
         Ok(u) => u,
         Err(e) => return store_error(&e),
     };
+    if settings != GcsMultipartInit::default()
+        && write_multipart_init(server.store(), bucket, &upload.upload_id, &settings).is_err()
+    {
+        let _ = server
+            .store()
+            .abort_multipart_upload(bucket, key, &upload.upload_id);
+        return xml_error(500, "InternalError", "internal error");
+    }
     xml_ok(
         &Element::new("InitiateMultipartUploadResult")
             .attr("xmlns", "http://s3.amazonaws.com/doc/2006-03-01/")
@@ -182,6 +266,7 @@ fn list_parts(server: &mut Server, req: &Request, bucket: &str, key: &str) -> Re
             _ => return xml_error(400, "InvalidArgument", "invalid part-number-marker"),
         }
     };
+    let init = read_multipart_init(server.store(), bucket, &upload.upload_id).unwrap_or_default();
     let remaining: Vec<&MultipartPart> = parts.iter().filter(|p| p.part_number > marker).collect();
     let truncated = remaining.len() > max_parts;
     let page = &remaining[..remaining.len().min(max_parts)];
@@ -191,7 +276,7 @@ fn list_parts(server: &mut Server, req: &Request, bucket: &str, key: &str) -> Re
         .text_child("Bucket", bucket)
         .text_child("Key", &upload.key)
         .text_child("UploadId", &upload.upload_id)
-        .text_child("StorageClass", "STANDARD")
+        .text_child("StorageClass", display_storage_class(&init))
         .text_child("PartNumberMarker", &marker.to_string())
         .text_child("NextPartNumberMarker", &next_marker.to_string())
         .text_child("MaxParts", &max_parts.to_string())
@@ -302,12 +387,19 @@ fn complete(server: &mut Server, req: &Request, bucket: &str, key: &str) -> Resp
         Err(ConditionalError::Store(e)) => return store_error(&e),
     };
 
+    let init = read_multipart_init(server.store(), bucket, &upload_id).unwrap_or_default();
     let bucket_meta = read_bucket_meta(server.store(), bucket).unwrap_or_default();
     let obj_meta = GcsObjectMeta {
+        storage_class: init.storage_class,
         event_based_hold: bucket_meta.default_event_based_hold,
+        retention: init.retention,
         ..Default::default()
     };
     let _ = write_object_meta(server.store(), bucket, key, &obj_meta);
+    if let Some(entries) = init.acl {
+        let _ = write_object_acl(server.store(), bucket, key, &entries);
+    }
+    let _ = delete_multipart_init(server.store(), bucket, &upload_id);
     emit_dashboard_event(
         "gcs.object.put",
         serde_json::json!({
@@ -335,11 +427,15 @@ fn complete(server: &mut Server, req: &Request, bucket: &str, key: &str) -> Resp
 }
 
 fn abort(server: &mut Server, req: &Request, bucket: &str, key: &str) -> Response {
+    let upload_id = req.query_value("uploadId");
     match server
         .store()
-        .abort_multipart_upload(bucket, key, req.query_value("uploadId"))
+        .abort_multipart_upload(bucket, key, upload_id)
     {
-        Ok(true) => Response::empty_status(204),
+        Ok(true) => {
+            let _ = delete_multipart_init(server.store(), bucket, upload_id);
+            Response::empty_status(204)
+        }
         Ok(false) => no_such_upload(),
         Err(e) => store_error(&e),
     }
@@ -387,11 +483,13 @@ pub fn list_uploads(server: &mut Server, req: &Request, bucket: &str) -> Respons
         }
     }
     for upload in page {
+        let init =
+            read_multipart_init(server.store(), bucket, &upload.upload_id).unwrap_or_default();
         root = root.child(
             Element::new("Upload")
                 .text_child("Key", &upload.key)
                 .text_child("UploadId", &upload.upload_id)
-                .text_child("StorageClass", "STANDARD")
+                .text_child("StorageClass", display_storage_class(&init))
                 .text_child("Initiated", &upload.created_at),
         );
     }

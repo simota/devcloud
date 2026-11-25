@@ -685,3 +685,125 @@ fn xml_multipart_respects_strict_mode_iam() {
     drop(s);
     let _ = fs::remove_dir_all(&root);
 }
+
+#[test]
+fn xml_multipart_initiate_retains_acl_storage_class_and_retention() {
+    let mut f = Fixture::new();
+    let root = f.root.clone();
+    let s = &mut f.server;
+    let created = call(
+        s,
+        "POST",
+        "/storage/v1/b?enableObjectRetention=true",
+        br#"{"name":"mp-keep"}"#,
+        &[("Content-Type", "application/json")],
+    );
+    assert_eq!(created.status, 200, "{}", body_text(&created));
+
+    let id = initiate(
+        s,
+        "/mp-keep/obj.bin",
+        &[
+            ("x-goog-acl", "publicRead"),
+            ("x-goog-storage-class", "nearline"),
+            ("x-goog-object-retention-mode", "Unlocked"),
+            (
+                "x-goog-object-retention-retain-until-time",
+                "2027-01-01T00:00:00Z",
+            ),
+        ],
+    );
+    let r = call(s, "GET", "/mp-keep?uploads", b"", &[]);
+    assert_eq!(tag(&body_text(&r), "StorageClass"), "NEARLINE");
+    let r = call(
+        s,
+        "GET",
+        &format!("/mp-keep/obj.bin?uploadId={id}"),
+        b"",
+        &[],
+    );
+    assert_eq!(tag(&body_text(&r), "StorageClass"), "NEARLINE");
+
+    let etag = upload_part(s, "/mp-keep/obj.bin", &id, 1, b"payload");
+    let r = call(
+        s,
+        "POST",
+        &format!("/mp-keep/obj.bin?uploadId={id}"),
+        &complete_body(&[(1, &etag)]),
+        &[],
+    );
+    assert_eq!(r.status, 200, "{}", body_text(&r));
+
+    let r = call(s, "GET", "/storage/v1/b/mp-keep/o/obj.bin", b"", &[]);
+    let meta: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
+    assert_eq!(meta["storageClass"], "NEARLINE");
+    assert_eq!(meta["retention"]["mode"], "Unlocked");
+    assert_eq!(meta["retention"]["retainUntilTime"], "2027-01-01T00:00:00Z");
+    let r = call(s, "GET", "/mp-keep/obj.bin?acl", b"", &[]);
+    assert_eq!(r.status, 200);
+    assert!(
+        body_text(&r).contains(r#"<Scope type="AllUsers">"#),
+        "{}",
+        body_text(&r)
+    );
+    // The retained retention blocks deletion like a single-request PUT does.
+    assert_eq!(call(s, "DELETE", "/mp-keep/obj.bin", b"", &[]).status, 403);
+
+    // The per-upload settings sidecar is removed on completion and abort.
+    let id = initiate(s, "/mp-keep/gone", &[("x-goog-storage-class", "COLDLINE")]);
+    let sidecars = root.join("buckets/mp-keep/gcs/multipart_uploads");
+    assert_eq!(fs::read_dir(&sidecars).unwrap().count(), 1);
+    let r = call(
+        s,
+        "DELETE",
+        &format!("/mp-keep/gone?uploadId={id}"),
+        b"",
+        &[],
+    );
+    assert_eq!(r.status, 204);
+    assert_eq!(fs::read_dir(&sidecars).unwrap().count(), 0);
+}
+
+#[test]
+fn xml_multipart_initiate_rejects_invalid_settings_without_creating_uploads() {
+    let mut f = Fixture::new();
+    let s = &mut f.server;
+    assert_eq!(call(s, "PUT", "/mp-bad", b"", &[]).status, 200);
+    for headers in [
+        vec![("x-goog-acl", "bogus")],
+        // publicReadWrite is a bucket-only predefined ACL.
+        vec![("x-goog-acl", "publicReadWrite")],
+        // The bucket does not have object retention enabled.
+        vec![
+            ("x-goog-object-retention-mode", "Unlocked"),
+            (
+                "x-goog-object-retention-retain-until-time",
+                "2027-01-01T00:00:00Z",
+            ),
+        ],
+    ] {
+        let r = call(s, "POST", "/mp-bad/k?uploads", b"", &headers);
+        assert_eq!(r.status, 400, "{headers:?}: {}", body_text(&r));
+    }
+    let r = call(s, "GET", "/mp-bad?uploads", b"", &[]);
+    assert!(!body_text(&r).contains("<Upload>"), "{}", body_text(&r));
+
+    // ACLs cannot be set under uniform bucket-level access.
+    let r = call(
+        s,
+        "PATCH",
+        "/storage/v1/b/mp-bad",
+        br#"{"iamConfiguration":{"uniformBucketLevelAccess":{"enabled":true}}}"#,
+        &[("Content-Type", "application/json")],
+    );
+    assert_eq!(r.status, 200, "{}", body_text(&r));
+    let r = call(
+        s,
+        "POST",
+        "/mp-bad/k?uploads",
+        b"",
+        &[("x-goog-acl", "publicRead")],
+    );
+    assert_eq!(r.status, 400);
+    assert!(body_text(&r).contains("uniform bucket-level access"));
+}

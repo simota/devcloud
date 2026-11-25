@@ -1,5 +1,6 @@
 //! GCS Pub/Sub notifications (`notificationConfigs` CRUD, event recording,
-//! loopback Pub/Sub REST forwarding) and Signed URLs (V4 HMAC, V4 RSA, V2).
+//! loopback Pub/Sub REST forwarding) and Signed URLs (V4 HMAC, V4 RSA, V2 RSA,
+//! V2 HMAC-SHA1).
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -12,8 +13,8 @@ use devcloud_gcs::http::{
 };
 use devcloud_gcs::notifications::build_pubsub_publish_request;
 use devcloud_gcs::signed_urls::{
-    sign_v2_target, sign_v4_hmac_target, sign_v4_rsa_target, SignV2Input, SignV4HmacInput,
-    SignV4RsaInput,
+    sign_v2_hmac_target, sign_v2_target, sign_v4_hmac_target, sign_v4_rsa_target, SignV2HmacInput,
+    SignV2Input, SignV4HmacInput, SignV4RsaInput,
 };
 use devcloud_s3::base64;
 use devcloud_s3::store::FileBucketStore;
@@ -784,4 +785,155 @@ fn rsa_keys_register_from_service_account_json_and_strict_mode_requires_a_key() 
         call(&mut relaxed.server, "GET", &unregistered, b"", &host).status,
         200
     );
+}
+
+const V2_NOW: &str = "2026-06-01T12:00:00Z";
+const V2_EXPIRES: i64 = 1_780_315_800; // V2_NOW + 10 minutes
+
+fn v2_hmac_fixture(mode: &str) -> Fixture {
+    let mut f = Fixture::new(
+        Config {
+            project: "devcloud".to_string(),
+            auth_mode: mode.to_string(),
+            bearer_token: "owner".to_string(),
+            ..Default::default()
+        },
+        V2_NOW,
+    );
+    let owner = [("Authorization", "Bearer owner")];
+    let s = &mut f.server;
+    assert_eq!(
+        call(s, "POST", "/storage/v1/b", br#"{"name":"v2h"}"#, &owner).status,
+        200
+    );
+    assert_eq!(call(s, "PUT", "/v2h/a.txt", b"hello", &owner).status, 200);
+    f
+}
+
+fn v2_hmac(method: &str, path: &str, id: &str, secret: &str, expires: i64, ct: &str) -> String {
+    sign_v2_hmac_target(&SignV2HmacInput {
+        method,
+        path,
+        access_id: id,
+        secret,
+        expires,
+        content_md5: "",
+        content_type: ct,
+        extra_headers: BTreeMap::new(),
+    })
+}
+
+#[test]
+fn v2_hmac_sha1_signed_urls_are_verified() {
+    let mut f = v2_hmac_fixture("bearer-dev");
+    f.server
+        .add_hmac_key(DEFAULT_HMAC_ACCESS_ID, DEFAULT_HMAC_SECRET);
+    let s = &mut f.server;
+
+    // Matches an independently computed base64 HMAC-SHA1 of
+    // "GET\n\n\n1780315800\n/v2h/a.txt".
+    let target = v2_hmac(
+        "GET",
+        "/v2h/a.txt",
+        DEFAULT_HMAC_ACCESS_ID,
+        DEFAULT_HMAC_SECRET,
+        V2_EXPIRES,
+        "",
+    );
+    assert_eq!(
+        target,
+        "/v2h/a.txt?GoogleAccessId=GOOG1DEVCLOUD&Expires=1780315800&Signature=5MM3HMXcrHObKAan2to1437gXnM%3D"
+    );
+    let r = call(s, "GET", &target, b"", &[]);
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.body, b"hello");
+
+    // Signed PUT covering Content-Type.
+    let put = v2_hmac(
+        "PUT",
+        "/v2h/b.txt",
+        DEFAULT_HMAC_ACCESS_ID,
+        DEFAULT_HMAC_SECRET,
+        V2_EXPIRES,
+        "text/plain",
+    );
+    let r = call(s, "PUT", &put, b"put", &[("Content-Type", "text/plain")]);
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    // A different Content-Type, method, or resource breaks the signature.
+    let r = call(s, "PUT", &put, b"put", &[("Content-Type", "text/html")]);
+    assert_eq!(r.status, 403);
+    assert_eq!(call(s, "DELETE", &target, b"", &[]).status, 403);
+    let moved = target.replace("/v2h/a.txt?", "/v2h/b.txt?");
+    assert_eq!(call(s, "GET", &moved, b"", &[]).status, 403);
+    // Wrong secret and expired URLs are rejected.
+    let wrong = v2_hmac(
+        "GET",
+        "/v2h/a.txt",
+        DEFAULT_HMAC_ACCESS_ID,
+        "not-the-secret",
+        V2_EXPIRES,
+        "",
+    );
+    let r = call(s, "GET", &wrong, b"", &[]);
+    assert_eq!(r.status, 403);
+    assert!(String::from_utf8_lossy(&r.body).contains("SignatureDoesNotMatch"));
+    let expired = v2_hmac(
+        "GET",
+        "/v2h/a.txt",
+        DEFAULT_HMAC_ACCESS_ID,
+        DEFAULT_HMAC_SECRET,
+        1_780_315_100,
+        "",
+    );
+    assert_eq!(call(s, "GET", &expired, b"", &[]).status, 400);
+}
+
+#[test]
+fn v2_hmac_sha1_signed_urls_act_as_the_key_service_account_in_strict_mode() {
+    let mut f = v2_hmac_fixture("strict");
+    let sa = "uploader@devcloud.iam.gserviceaccount.com";
+    f.server
+        .add_hmac_key_for_service_account("GOOG1SA", "sa-secret", sa);
+    f.server.add_hmac_key("GOOG1OWNER", "owner-secret");
+    let s = &mut f.server;
+
+    let as_sa = v2_hmac("GET", "/v2h/a.txt", "GOOG1SA", "sa-secret", V2_EXPIRES, "");
+    assert_eq!(call(s, "GET", &as_sa, b"", &[]).status, 403);
+    let policy = format!(
+        r#"{{"bindings":[{{"role":"roles/storage.objectViewer","members":["serviceAccount:{sa}"]}}]}}"#
+    );
+    let owner = [("Authorization", "Bearer owner")];
+    assert_eq!(
+        call(s, "PUT", "/storage/v1/b/v2h/iam", policy.as_bytes(), &owner).status,
+        200
+    );
+    assert_eq!(call(s, "GET", &as_sa, b"", &[]).status, 200);
+    let bad = v2_hmac("GET", "/v2h/a.txt", "GOOG1SA", "nope", V2_EXPIRES, "");
+    assert_eq!(call(s, "GET", &bad, b"", &[]).status, 403);
+    // Keys without a service account act as the project owner.
+    let as_owner = v2_hmac(
+        "PUT",
+        "/v2h/c.txt",
+        "GOOG1OWNER",
+        "owner-secret",
+        V2_EXPIRES,
+        "",
+    );
+    assert_eq!(call(s, "PUT", &as_owner, b"c", &[]).status, 200);
+}
+
+#[test]
+fn relaxed_mode_keeps_structural_v2_checks_for_hmac_access_ids() {
+    let mut f = v2_hmac_fixture("relaxed");
+    f.server
+        .add_hmac_key(DEFAULT_HMAC_ACCESS_ID, DEFAULT_HMAC_SECRET);
+    let wrong = v2_hmac(
+        "GET",
+        "/v2h/a.txt",
+        DEFAULT_HMAC_ACCESS_ID,
+        "not-the-secret",
+        V2_EXPIRES,
+        "",
+    );
+    assert_eq!(call(&mut f.server, "GET", &wrong, b"", &[]).status, 200);
 }

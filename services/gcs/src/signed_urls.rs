@@ -1,6 +1,11 @@
 //! GCS V4 (`GOOG4-HMAC-SHA256`, `GOOG4-RSA-SHA256`) and V2
 //! (`GoogleAccessId`/`Expires`/`Signature`) signed URL validation, plus V4 HMAC,
-//! V4 RSA, and V2 RSA signing helpers for deterministic local testing.
+//! V4 RSA, V2 RSA, and V2 HMAC-SHA1 signing helpers for deterministic local
+//! testing.
+//!
+//! V2 URLs whose `GoogleAccessId` is a registered HMAC access ID are verified
+//! as base64 HMAC-SHA1 over the V2 string-to-sign outside `relaxed` mode;
+//! `relaxed` mode keeps its previous structural/expiry-only handling for them.
 //!
 //! RSA-signed URLs (V4 RSA and V2) are cryptographically verified against the
 //! public key registered for the signing service account
@@ -244,14 +249,14 @@ fn unregistered_rsa_key(server: &Server) -> SignedUrlCheck {
 /// Identity proven (or, in relaxed modes, asserted) by a signed URL.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SignedUrlSigner {
-    /// V4 `GOOG4-HMAC-SHA256` access ID.
+    /// V4 `GOOG4-HMAC-SHA256` / V2 HMAC-SHA1 access ID.
     Hmac(String),
     /// V4 `GOOG4-RSA-SHA256` / V2 service-account email.
     ServiceAccount(String),
 }
 
 /// Returns the signer of a request that `verify_signed_url` accepted.
-pub fn signed_url_signer(req: &Request) -> Option<SignedUrlSigner> {
+pub fn signed_url_signer(server: &Server, req: &Request) -> Option<SignedUrlSigner> {
     if !has_signed_url_params(req) {
         return None;
     }
@@ -267,7 +272,13 @@ pub fn signed_url_signer(req: &Request) -> Option<SignedUrlSigner> {
         }
     } else {
         let id = req.query_value("GoogleAccessId").trim();
-        (!id.is_empty()).then(|| SignedUrlSigner::ServiceAccount(id.to_string()))
+        if id.is_empty() {
+            None
+        } else if v2_hmac_secret(server, id).is_some() {
+            Some(SignedUrlSigner::Hmac(id.to_string()))
+        } else {
+            Some(SignedUrlSigner::ServiceAccount(id.to_string()))
+        }
     }
 }
 
@@ -288,9 +299,6 @@ fn verify_v2(server: &Server, req: &Request) -> SignedUrlCheck {
     let Some(sig_bytes) = decode_v2_signature(sig) else {
         return invalid(400, "InvalidArgument", "Signature must be valid base64");
     };
-    let Some(key) = server.rsa_public_key(access_id) else {
-        return unregistered_rsa_key(server);
-    };
     let string_to_sign = build_v2_string_to_sign(
         &req.method,
         req.header("content-md5"),
@@ -299,6 +307,20 @@ fn verify_v2(server: &Server, req: &Request) -> SignedUrlCheck {
         &req.headers,
         &v2_canonical_resource(req),
     );
+    if let Some(secret) = v2_hmac_secret(server, access_id) {
+        let expected = hmac_sha1(secret.as_bytes(), string_to_sign.as_bytes());
+        if !constant_time_eq(&expected, &sig_bytes) {
+            return invalid(
+                403,
+                "SignatureDoesNotMatch",
+                "request signature does not match calculated signature",
+            );
+        }
+        return SignedUrlCheck::Valid;
+    }
+    let Some(key) = server.rsa_public_key(access_id) else {
+        return unregistered_rsa_key(server);
+    };
     if !key.verify_sha256(string_to_sign.as_bytes(), &sig_bytes) {
         return invalid(
             403,
@@ -307,6 +329,20 @@ fn verify_v2(server: &Server, req: &Request) -> SignedUrlCheck {
         );
     }
     SignedUrlCheck::Valid
+}
+
+/// The HMAC secret used to verify a V2 URL signed by `access_id`. `relaxed`
+/// mode never verifies V2 HMAC signatures.
+fn v2_hmac_secret<'a>(server: &'a Server, access_id: &str) -> Option<&'a str> {
+    if server.is_relaxed_auth() {
+        return None;
+    }
+    server.hmac_secret(access_id)
+}
+
+fn hmac_sha1(key: &[u8], data: &[u8]) -> Vec<u8> {
+    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY, key);
+    ring::hmac::sign(&key, data).as_ref().to_vec()
 }
 
 /// Decodes a V2 `Signature` value. A literal `+` that reached us unescaped is
@@ -626,6 +662,39 @@ pub fn sign_v2_target(input: &SignV2Input<'_>) -> Result<String, String> {
         input.expires,
         percent_encode_strict(&base64::std_encode(&signature))
     ))
+}
+
+/// Parameters for generating a V2 signed URL target signed with an HMAC key
+/// (base64 HMAC-SHA1). `path` is the path-style `/{bucket}/{object}` resource.
+#[derive(Debug, Clone)]
+pub struct SignV2HmacInput<'a> {
+    pub method: &'a str,
+    pub path: &'a str,
+    pub access_id: &'a str,
+    pub secret: &'a str,
+    pub expires: i64,
+    pub content_md5: &'a str,
+    pub content_type: &'a str,
+    pub extra_headers: BTreeMap<String, String>,
+}
+
+pub fn sign_v2_hmac_target(input: &SignV2HmacInput<'_>) -> String {
+    let string_to_sign = build_v2_string_to_sign(
+        input.method,
+        input.content_md5,
+        input.content_type,
+        input.expires,
+        &input.extra_headers,
+        input.path,
+    );
+    let signature = hmac_sha1(input.secret.as_bytes(), string_to_sign.as_bytes());
+    format!(
+        "{}?GoogleAccessId={}&Expires={}&Signature={}",
+        input.path,
+        percent_encode_strict(input.access_id),
+        input.expires,
+        percent_encode_strict(&base64::std_encode(&signature))
+    )
 }
 
 struct V4TargetParts<'a> {

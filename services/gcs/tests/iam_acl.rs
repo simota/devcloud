@@ -639,11 +639,17 @@ fn strict_mode_anonymous_conditions_and_hmac_service_accounts() {
     assert_eq!(call(s, "PUT", "/pub-b/a.txt", "x", &[]).status, 401);
     assert_eq!(call(s, "GET", "/", "", &[]).status, 401);
 
-    // Conditional bindings are not evaluated and never grant access.
+    // Conditional bindings grant only while their condition holds.
     set_policy(
         s,
         "pub-b",
         r#"[{"role":"roles/storage.objectViewer","members":["user:alice@example.com"],"condition":{"title":"t","expression":"request.time < timestamp('2030-01-01T00:00:00Z')"}}]"#,
+    );
+    assert_eq!(call(s, "GET", "/pub-b/a.txt", "", &[ALICE]).status, 200);
+    set_policy(
+        s,
+        "pub-b",
+        r#"[{"role":"roles/storage.objectViewer","members":["user:alice@example.com"],"condition":{"title":"t","expression":"request.time < timestamp('2020-01-01T00:00:00Z')"}}]"#,
     );
     assert_eq!(call(s, "GET", "/pub-b/a.txt", "", &[ALICE]).status, 403);
 

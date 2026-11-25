@@ -17,17 +17,36 @@
 //!   is in domain `d`.
 //!
 //! Project-level operations (bucket list/create, service listing, the
-//! introspection API) have no bucket policy and are owner-only. Conditional
-//! bindings are not evaluated and never grant access. Legacy ACLs are not
-//! consulted. This module is only invoked when `Server::is_strict_auth()`.
+//! introspection API) have no bucket policy and are owner-only.
+//!
+//! Conditional bindings grant only when their CEL expression evaluates to
+//! `true` for the request (see [`crate::iam_conditions`] for the supported
+//! subset; unsupported expressions never grant). The resource is the object
+//! (`projects/_/buckets/{b}/objects/{o}`) when the request names one and the
+//! bucket otherwise (listing, bucket metadata, JSON inserts without a `name`,
+//! compose sources).
+//!
+//! When uniform bucket-level access is disabled, legacy ACLs also grant
+//! (IAM OR ACL, as in Cloud Storage): bucket `READER` = `storage.buckets.get`
+//! and `storage.objects.list`; `WRITER` adds object create/delete and
+//! multipart uploads; `OWNER` adds `storage.buckets.update` and bucket IAM/ACL
+//! read/write. Object `READER` = `storage.objects.get`; `OWNER` adds
+//! `storage.objects.update` and object ACL read/write. ACL entities `allUsers`,
+//! `allAuthenticatedUsers`, `user-{email}` (users and service accounts),
+//! `group-{email}`, and `domain-{d}` are matched; `project-*` entities have no
+//! local project membership and never match.
+//!
+//! This module is only invoked when `Server::is_strict_auth()`.
 
 use crate::http::{
     bucket_suffix, json_error, url_decode, url_decode_path, Request, Response, Server,
 };
-use crate::iam_acl::role_grants_permission;
+use crate::iam_acl::{effective_bucket_acl, effective_object_acl, role_grants_permission};
+use crate::iam_conditions::{condition_holds, ConditionContext};
 use crate::signed_urls::SignedUrlSigner;
-use crate::state::{read_iam_policy, GcsIamPolicy};
+use crate::state::{read_bucket_meta, read_iam_policy, AccessControlEntry, GcsIamPolicy};
 use crate::xml_api::{virtual_host_bucket, xml_error};
+use devcloud_s3::time_fmt::parse_rfc3339;
 
 /// Parses `token=member[,token=member...]` (the `auth.gcs.principals` config
 /// value) into pairs for `Server::add_access_token`. Entries without `=` or with
@@ -82,6 +101,8 @@ pub enum Requirement {
     ProjectOwner,
     Bucket {
         bucket: String,
+        /// The object the permission is checked on, when the request names one.
+        object: Option<String>,
         permission: &'static str,
     },
 }
@@ -89,6 +110,15 @@ pub enum Requirement {
 fn need(bucket: &str, permission: &'static str) -> Requirement {
     Requirement::Bucket {
         bucket: bucket.to_string(),
+        object: None,
+        permission,
+    }
+}
+
+fn need_object(bucket: &str, object: &str, permission: &'static str) -> Requirement {
+    Requirement::Bucket {
+        bucket: bucket.to_string(),
+        object: (!object.is_empty()).then(|| object.to_string()),
         permission,
     }
 }
@@ -103,12 +133,19 @@ pub fn authorize_request(
     if *principal == Principal::Owner {
         return Ok(());
     }
+    let now = parse_rfc3339(&server.now()).map(|(s, _)| s).unwrap_or(0);
     for requirement in required_permissions(req) {
         let allowed = match &requirement {
             Requirement::ProjectOwner => false,
-            Requirement::Bucket { bucket, permission } => {
+            Requirement::Bucket {
+                bucket,
+                object,
+                permission,
+            } => {
                 let policy = read_iam_policy(server.store(), bucket).unwrap_or_default();
-                policy_allows(&policy, principal, permission)
+                let ctx = ConditionContext::new(bucket, object.as_deref(), now);
+                policy_allows_in_context(&policy, principal, permission, &ctx)
+                    || acl_allows(server, bucket, object.as_deref(), principal, permission)
             }
         };
         if !allowed {
@@ -143,7 +180,9 @@ fn denied(principal: &Principal, requirement: &Requirement, json_surface: bool) 
         Requirement::ProjectOwner => {
             format!("{member} does not have project-level storage access.")
         }
-        Requirement::Bucket { bucket, permission } => format!(
+        Requirement::Bucket {
+            bucket, permission, ..
+        } => format!(
             "{member} does not have {permission} access to the Google Cloud Storage bucket {bucket}."
         ),
     };
@@ -156,13 +195,38 @@ fn denied(principal: &Principal, requirement: &Requirement, json_surface: bool) 
 
 /// True when an unconditional binding grants `permission` to `principal`.
 pub fn policy_allows(policy: &GcsIamPolicy, principal: &Principal, permission: &str) -> bool {
+    policy_grants(policy, principal, permission, None)
+}
+
+/// True when a binding grants `permission` to `principal`; conditional
+/// bindings count only when their condition holds for `ctx`.
+pub fn policy_allows_in_context(
+    policy: &GcsIamPolicy,
+    principal: &Principal,
+    permission: &str,
+    ctx: &ConditionContext,
+) -> bool {
+    policy_grants(policy, principal, permission, Some(ctx))
+}
+
+fn policy_grants(
+    policy: &GcsIamPolicy,
+    principal: &Principal,
+    permission: &str,
+    ctx: Option<&ConditionContext>,
+) -> bool {
     policy.bindings.iter().any(|binding| {
-        let conditional = binding
+        if !role_grants_permission(&binding.role, permission) {
+            return false;
+        }
+        if let Some(condition) = binding
             .condition
             .as_ref()
-            .is_some_and(|c| !c.expression.trim().is_empty());
-        if conditional || !role_grants_permission(&binding.role, permission) {
-            return false;
+            .filter(|c| !c.expression.trim().is_empty())
+        {
+            if !ctx.is_some_and(|ctx| condition_holds(&condition.expression, ctx)) {
+                return false;
+            }
         }
         binding.members.iter().any(|m| match principal {
             Principal::Owner => true,
@@ -175,6 +239,82 @@ pub fn policy_allows(policy: &GcsIamPolicy, principal: &Principal, permission: &
             }
         })
     })
+}
+
+/// Legacy ACL grant check; never grants under uniform bucket-level access.
+fn acl_allows(
+    server: &Server,
+    bucket: &str,
+    object: Option<&str>,
+    principal: &Principal,
+    permission: &str,
+) -> bool {
+    let meta = read_bucket_meta(server.store(), bucket).unwrap_or_default();
+    if meta.uniform_bucket_level_access_enabled() {
+        return false;
+    }
+    let object_roles: &[&str] = match permission {
+        "storage.objects.get" => &["READER", "OWNER"],
+        "storage.objects.update"
+        | "storage.objects.getIamPolicy"
+        | "storage.objects.setIamPolicy" => &["OWNER"],
+        _ => &[],
+    };
+    if !object_roles.is_empty() {
+        let Some(object) = object else {
+            return false;
+        };
+        let entries = effective_object_acl(server.store(), bucket, object, server.project());
+        return entries_grant(&entries, principal, object_roles);
+    }
+    let bucket_roles: &[&str] = match permission {
+        "storage.buckets.get" | "storage.objects.list" => &["READER", "WRITER", "OWNER"],
+        "storage.objects.create"
+        | "storage.objects.delete"
+        | "storage.multipartUploads.create"
+        | "storage.multipartUploads.abort"
+        | "storage.multipartUploads.list"
+        | "storage.multipartUploads.listParts" => &["WRITER", "OWNER"],
+        "storage.buckets.update"
+        | "storage.buckets.getIamPolicy"
+        | "storage.buckets.setIamPolicy" => &["OWNER"],
+        _ => return false,
+    };
+    let entries = effective_bucket_acl(server.store(), bucket, server.project());
+    entries_grant(&entries, principal, bucket_roles)
+}
+
+fn entries_grant(entries: &[AccessControlEntry], principal: &Principal, roles: &[&str]) -> bool {
+    entries
+        .iter()
+        .any(|e| roles.contains(&e.role.as_str()) && acl_entity_matches(&e.entity, principal))
+}
+
+fn acl_entity_matches(entity: &str, principal: &Principal) -> bool {
+    if entity == "allUsers" {
+        return true;
+    }
+    let Principal::Member(member) = principal else {
+        return false;
+    };
+    if entity == "allAuthenticatedUsers" {
+        return true;
+    }
+    let Some((kind, email)) = member.split_once(':') else {
+        return false;
+    };
+    if let Some(user) = entity.strip_prefix("user-") {
+        return matches!(kind, "user" | "serviceAccount") && user.eq_ignore_ascii_case(email);
+    }
+    if let Some(group) = entity.strip_prefix("group-") {
+        return kind == "group" && group.eq_ignore_ascii_case(email);
+    }
+    if let Some(domain) = entity.strip_prefix("domain-") {
+        return email
+            .rsplit_once('@')
+            .is_some_and(|(_, d)| d.eq_ignore_ascii_case(domain));
+    }
+    false
 }
 
 /// Whether binding member `domain:{d}` covers `member` (`user:`/`serviceAccount:`
@@ -202,10 +342,15 @@ pub fn required_permissions(req: &Request) -> Vec<Requirement> {
         return json_requirements(req, &bucket, &suffix);
     }
     if let Some((bucket, _)) = bucket_suffix(path, "/upload/storage/v1/b/") {
-        return vec![need(&bucket, "storage.objects.create")];
+        return vec![need_object(
+            &bucket,
+            req.query_value("name"),
+            "storage.objects.create",
+        )];
     }
-    if let Some((bucket, _)) = bucket_suffix(path, "/download/storage/v1/b/") {
-        return vec![need(&bucket, "storage.objects.get")];
+    if let Some((bucket, suffix)) = bucket_suffix(path, "/download/storage/v1/b/") {
+        let object = url_decode(suffix.strip_prefix("o/").unwrap_or(""));
+        return vec![need_object(&bucket, &object, "storage.objects.get")];
     }
     if path.starts_with("/storage/v1/")
         || path.starts_with("/upload/storage/v1/")
@@ -267,25 +412,35 @@ fn json_requirements(req: &Request, bucket: &str, suffix: &str) -> Vec<Requireme
     let Some(object) = suffix.strip_prefix("o/") else {
         return Vec::new();
     };
-    if object.ends_with("/compose") {
+    if let Some(dest) = object.strip_suffix("/compose") {
+        // Source names live in the request body; they are checked on the bucket.
         return vec![
             need(bucket, "storage.objects.get"),
-            need(bucket, "storage.objects.create"),
+            need_object(bucket, &url_decode(dest), "storage.objects.create"),
         ];
     }
     let copy = object
         .split_once("/copyTo/b/")
         .or_else(|| object.split_once("/rewriteTo/b/"));
-    if let Some((_, dest)) = copy {
-        let dest_bucket = url_decode(dest.split('/').next().unwrap_or(""));
+    if let Some((source, dest)) = copy {
+        let (dest_bucket, dest_rest) = dest.split_once('/').unwrap_or((dest, ""));
+        let dest_object = dest_rest.strip_prefix("o/").unwrap_or("");
         return vec![
-            need(bucket, "storage.objects.get"),
-            need(&dest_bucket, "storage.objects.create"),
+            need_object(bucket, &url_decode(source), "storage.objects.get"),
+            need_object(
+                &url_decode(dest_bucket),
+                &url_decode(dest_object),
+                "storage.objects.create",
+            ),
         ];
     }
-    if object.ends_with("/acl") || object.contains("/acl/") {
-        return vec![need(
+    let acl_object = object
+        .strip_suffix("/acl")
+        .or_else(|| object.split_once("/acl/").map(|(o, _)| o));
+    if let Some(acl_object) = acl_object {
+        return vec![need_object(
             bucket,
+            &url_decode(acl_object),
             read_or_write(
                 req,
                 "storage.objects.getIamPolicy",
@@ -293,8 +448,9 @@ fn json_requirements(req: &Request, bucket: &str, suffix: &str) -> Vec<Requireme
             ),
         )];
     }
-    vec![need(
+    vec![need_object(
         bucket,
+        &url_decode(object),
         match method {
             "GET" | "HEAD" => "storage.objects.get",
             "DELETE" => "storage.objects.delete",
@@ -315,6 +471,7 @@ fn xml_requirements(req: &Request) -> Vec<Requirement> {
             (url_decode_path(raw_bucket), raw_key.to_string())
         }
     };
+    let object = url_decode_path(&key);
     let q = |name: &str| req.query.contains_key(name);
     let method = req.method.as_str();
     if key.is_empty() {
@@ -343,16 +500,17 @@ fn xml_requirements(req: &Request) -> Vec<Requirement> {
         "PUT" => {
             let source = req.header("x-goog-copy-source").trim();
             if !source.is_empty() {
-                let source_bucket = url_decode_path(
-                    source
-                        .trim_start_matches('/')
-                        .split('/')
-                        .next()
-                        .unwrap_or(""),
-                );
+                let trimmed_source = source.trim_start_matches('/');
+                let (source_bucket, source_object) = trimmed_source
+                    .split_once('/')
+                    .unwrap_or((trimmed_source, ""));
                 return vec![
-                    need(&source_bucket, "storage.objects.get"),
-                    need(&bucket, "storage.objects.create"),
+                    need_object(
+                        &url_decode_path(source_bucket),
+                        &url_decode_path(source_object),
+                        "storage.objects.get",
+                    ),
+                    need_object(&bucket, &object, "storage.objects.create"),
                 ];
             }
             "storage.objects.create"
@@ -363,5 +521,5 @@ fn xml_requirements(req: &Request) -> Vec<Requirement> {
         "DELETE" => "storage.objects.delete",
         _ => return Vec::new(),
     };
-    vec![need(&bucket, permission)]
+    vec![need_object(&bucket, &object, permission)]
 }
