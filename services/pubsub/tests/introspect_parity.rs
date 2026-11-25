@@ -173,3 +173,139 @@ fn message_snapshot_lists_pending_deliveries_without_payload() {
     assert_eq!(subs[0]["state"], "backlog");
     assert!(subs[0].get("data").is_none());
 }
+
+#[test]
+fn metrics_snapshot_reports_monitoring_counters_and_ages_without_payload() {
+    let dir = tempdir();
+    let mut s = server(&dir);
+    s.create_topic("devcloud", "orders", &Topic::default())
+        .expect("create topic");
+    let sub1 = Subscription {
+        topic: "projects/devcloud/topics/orders".to_string(),
+        ack_deadline_seconds: 30,
+        ..Default::default()
+    };
+    s.create_subscription("devcloud", "sub-active", &sub1)
+        .expect("create sub-active");
+    let sub2 = Subscription {
+        topic: "projects/devcloud/topics/orders".to_string(),
+        ack_deadline_seconds: 30,
+        ..Default::default()
+    };
+    s.create_subscription("devcloud", "sub-detached", &sub2)
+        .expect("create sub-detached");
+    s.detach_subscription("devcloud", "sub-detached")
+        .expect("detach sub-detached");
+
+    let messages = vec![
+        serde_json::json!({ "data": "aGVsbG8=" }),
+        serde_json::json!({ "data": "d29ybGQ=" }),
+    ];
+    s.publish("devcloud", "orders", &messages).expect("publish");
+
+    s.set_fixed_now("2026-05-30T12:00:25Z");
+    s.pull("devcloud", "sub-active", 1).expect("pull one");
+
+    let (status, metrics) = body_json(&mut s, &get("/_introspect/metrics"));
+    assert_eq!(status, 200);
+    assert_eq!(metrics["project"], "devcloud");
+    assert_eq!(metrics["topicCount"], 1);
+    assert_eq!(metrics["subscriptionCount"], 2);
+    assert_eq!(metrics["snapshotCount"], 0);
+    assert_eq!(metrics["schemaCount"], 0);
+    assert_eq!(metrics["retainedMessages"], 2);
+    assert_eq!(metrics["numUndeliveredMessages"], 1);
+    assert_eq!(metrics["numInFlightMessages"], 1);
+    assert_eq!(metrics["oldestUnackedMessageAgeSeconds"], 25);
+
+    let topics = metrics["topics"].as_array().expect("topics");
+    assert_eq!(topics.len(), 1);
+    assert_eq!(topics[0]["name"], "projects/devcloud/topics/orders");
+    assert_eq!(topics[0]["attachedSubscriptionCount"], 1);
+    assert_eq!(topics[0]["detachedSubscriptionCount"], 1);
+    assert_eq!(topics[0]["snapshotCount"], 0);
+    assert_eq!(topics[0]["retainedMessageCount"], 2);
+    assert_eq!(topics[0]["unackedMessageCount"], 2);
+
+    let subs = metrics["subscriptions"].as_array().expect("subscriptions");
+    assert_eq!(subs.len(), 2);
+    assert_eq!(
+        subs[0]["name"],
+        "projects/devcloud/subscriptions/sub-active"
+    );
+    assert_eq!(subs[0]["detached"], false);
+    assert_eq!(subs[0]["numUndeliveredMessages"], 1);
+    assert_eq!(subs[0]["numInFlightMessages"], 1);
+    assert_eq!(subs[0]["totalRetainedMessages"], 2);
+    assert_eq!(subs[0]["oldestUnackedMessageAgeSeconds"], 25);
+    assert_eq!(subs[0]["maxDeliveryAttemptSeen"], 1);
+    assert!(subs[0].get("data").is_none());
+
+    assert_eq!(
+        subs[1]["name"],
+        "projects/devcloud/subscriptions/sub-detached"
+    );
+    assert_eq!(subs[1]["detached"], true);
+    assert_eq!(subs[1]["numUndeliveredMessages"], 0);
+}
+
+#[test]
+fn quotas_snapshot_reports_effective_limits_and_usage() {
+    let dir = tempdir();
+    let mut s = Server::new(Config {
+        project: "devcloud".to_string(),
+        storage_path: dir.to_string_lossy().to_string(),
+        default_ack_deadline_seconds: 15,
+        max_ack_deadline_seconds: 300,
+        max_pull_messages: 500,
+        message_retention_seconds: 86_400,
+        ..Default::default()
+    });
+    s.set_fixed_now(NOW);
+
+    s.create_topic("devcloud", "t1", &Topic::default())
+        .expect("create t1");
+    let sub = Subscription {
+        topic: "projects/devcloud/topics/t1".to_string(),
+        ..Default::default()
+    };
+    s.create_subscription("devcloud", "s1", &sub)
+        .expect("create s1");
+    s.create_snapshot("devcloud", "snap1", "projects/devcloud/subscriptions/s1")
+        .expect("create snap1");
+    let messages = vec![serde_json::json!({ "data": "aGVsbG8=" })];
+    s.publish("devcloud", "t1", &messages).expect("publish");
+
+    let (status, quotas) = body_json(&mut s, &get("/_introspect/quotas"));
+    assert_eq!(status, 200);
+    assert_eq!(quotas["project"], "devcloud");
+    assert_eq!(quotas["limits"]["defaultAckDeadlineSeconds"], 15);
+    assert_eq!(quotas["limits"]["maxAckDeadlineSeconds"], 300);
+    assert_eq!(quotas["limits"]["maxPullMessages"], 500);
+    assert_eq!(quotas["limits"]["messageRetentionSeconds"], 86_400);
+    assert_eq!(quotas["limits"]["maxTopicsPerProject"], 10_000);
+    assert_eq!(quotas["limits"]["maxSubscriptionsPerProject"], 10_000);
+    assert_eq!(quotas["limits"]["maxDeliveryAttemptsMin"], 5);
+    assert_eq!(quotas["limits"]["maxDeliveryAttemptsMax"], 100);
+
+    assert_eq!(quotas["usage"]["topics"], 1);
+    assert_eq!(quotas["usage"]["subscriptions"], 1);
+    assert_eq!(quotas["usage"]["snapshots"], 1);
+    assert_eq!(quotas["usage"]["schemas"], 0);
+    assert_eq!(quotas["usage"]["retainedMessages"], 1);
+    assert_eq!(quotas["usage"]["unackedDeliveries"], 1);
+
+    let entries = quotas["quotas"].as_array().expect("quotas array");
+    assert_eq!(entries.len(), 6);
+    assert_eq!(
+        entries[0]["metric"],
+        "pubsub.googleapis.com/topics_per_project"
+    );
+    assert_eq!(entries[0]["limit"], 10_000);
+    assert_eq!(entries[0]["usage"], 1);
+    assert_eq!(
+        entries[4]["metric"],
+        "pubsub.googleapis.com/max_pull_messages"
+    );
+    assert_eq!(entries[4]["limit"], 500);
+}

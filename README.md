@@ -432,7 +432,7 @@ DynamoDB dashboard management is available under `/dashboard/dynamodb` and the l
 | Push subscriptions | Partial | Local HTTP push worker, retry policy, and OIDC/no-wrapper metadata are supported when push is enabled. |
 | IAM endpoints | Partial | Local policy shape is supported; no real Google IAM enforcement. |
 | Exactly-once delivery | Partial | Metadata is accepted; no real cloud-grade exactly-once guarantee. |
-| Cloud Monitoring, quotas, billing | No | Not implemented. |
+| Cloud Monitoring, quotas, billing | Partial | `GET /_introspect/metrics` exposes deterministic local Pub/Sub monitoring counters and backlog ages (undelivered/in-flight counts, oldest unacked message age, per-topic and per-subscription breakdown); `GET /_introspect/quotas` exposes effective local quota limits and resource usage. Billing is not implemented. |
 | Production durability / HA | No | Filesystem-backed local emulator only. |
 
 Pub/Sub dashboard actions are available under `/dashboard/pubsub`:
