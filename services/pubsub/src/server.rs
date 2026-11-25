@@ -3934,10 +3934,14 @@ fn snapshot_deliveries(
 /// message: decoded data length + ack id length + ordering key length + sum of
 /// attribute key/value lengths (matches the legacy computation on the proto message).
 fn streaming_received_message_size(ack_id: &str, message: &crate::model::PubsubMessage) -> usize {
+    ack_id.len() + message_content_size(message)
+}
+
+pub(crate) fn message_content_size(message: &crate::model::PubsubMessage) -> usize {
     let data_len = crate::validation::decode_base64_bytes(&message.data)
         .map(|b| b.len())
         .unwrap_or(0);
-    let mut size = data_len + ack_id.len() + message.ordering_key.len();
+    let mut size = data_len + message.ordering_key.len();
     for (k, v) in &message.attributes {
         size += k.len() + v.len();
     }

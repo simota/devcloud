@@ -15,7 +15,7 @@ use std::collections::BTreeMap;
 use serde::Serialize;
 use serde_json::{Map, Value};
 
-use crate::server::Server;
+use crate::server::{message_content_size, Server};
 
 fn is_false(b: &bool) -> bool {
     !*b
@@ -222,6 +222,19 @@ pub struct QuotaEntrySnapshot {
     pub unit: String,
     pub limit: i64,
     pub usage: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BillingSnapshot {
+    pub project: String,
+    pub usage: BillingUsageSnapshot,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BillingUsageSnapshot {
+    pub retained_messages: usize,
+    pub retained_message_bytes: usize,
 }
 
 /// `copyAnyMap` parity: `None` / empty object → `None`, else the object as-is.
@@ -521,6 +534,19 @@ impl Server {
             oldest_unacked_message_age_seconds: global_oldest_age,
             topics,
             subscriptions,
+        }
+    }
+
+    pub fn billing_snapshot(&mut self) -> BillingSnapshot {
+        let (now_secs, _) = self.now_parts();
+        self.cleanup_retained_messages(now_secs);
+
+        BillingSnapshot {
+            project: self.snapshot_project(),
+            usage: BillingUsageSnapshot {
+                retained_messages: self.messages.len(),
+                retained_message_bytes: self.messages.values().map(message_content_size).sum(),
+            },
         }
     }
 

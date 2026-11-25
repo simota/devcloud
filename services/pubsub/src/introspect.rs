@@ -15,6 +15,7 @@
 //!   GET /_introspect/snapshot       -> Server::snapshot()
 //!   GET /_introspect/metrics        -> Server::metrics_snapshot()
 //!   GET /_introspect/quotas         -> Server::quotas_snapshot()
+//!   GET /_introspect/billing        -> Server::billing_snapshot()
 //!   GET /_introspect/messages/{id}  -> Server::message_snapshot(id)
 
 use crate::errors::ApiError;
@@ -49,6 +50,9 @@ pub fn handle_introspect(server: &mut Server, method: &str, path: &str) -> RestR
     }
     if rest == "quotas" {
         return RestResponse::ok_struct(&server.quotas_snapshot());
+    }
+    if rest == "billing" {
+        return RestResponse::ok_struct(&server.billing_snapshot());
     }
     if let Some(message_id) = rest.strip_prefix("messages/") {
         // Reject empty ids and sub-paths like /_introspect/messages/id/extra.
