@@ -55,6 +55,8 @@ impl Server {
         }
 
         let table_id = request.table_reference.table_id.clone();
+        let table_lock = self.table_lock(project_id, dataset_id, &table_id);
+        let _guard = table_lock.lock().unwrap();
         let path = self.table_path(project_id, dataset_id, &table_id);
         match std::fs::metadata(&path) {
             Ok(_) => {
@@ -179,6 +181,8 @@ impl Server {
         replace: bool,
         body: &[u8],
     ) -> ApiResponse {
+        let table_lock = self.table_lock(project_id, dataset_id, table_id);
+        let _guard = table_lock.lock().unwrap();
         let mut existing = match self.read_table(project_id, dataset_id, table_id) {
             Err(_) => return ApiResponse::error(500, "backendError", "internal error"),
             Ok(None) => {
@@ -263,6 +267,8 @@ impl Server {
     /// `DELETE /bigquery/v2/projects/{p}/datasets/{d}/tables/{t}`
     /// (legacy `deleteTable`).
     pub fn delete_table(&self, project_id: &str, dataset_id: &str, table_id: &str) -> ApiResponse {
+        let table_lock = self.table_lock(project_id, dataset_id, table_id);
+        let _guard = table_lock.lock().unwrap();
         let dir = self.table_dir(project_id, dataset_id, table_id);
         match std::fs::metadata(dir.join("table.json")) {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {

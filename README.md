@@ -30,7 +30,7 @@ Default local endpoints:
 | S3 | `http://127.0.0.1:14566` | `http://127.0.0.1:18025/dashboard/s3` |
 | GCS | `http://127.0.0.1:14443` | `http://127.0.0.1:18025/dashboard/gcs` |
 | DynamoDB | `http://127.0.0.1:18000` | `http://127.0.0.1:18025/dashboard/dynamodb` |
-| BigQuery | `http://127.0.0.1:19050` | `http://127.0.0.1:18025/dashboard/bigquery` |
+| BigQuery | `http://127.0.0.1:19050` (REST), `127.0.0.1:19051` (Storage gRPC) | `http://127.0.0.1:18025/dashboard/bigquery` |
 | SQS | `http://127.0.0.1:19324` | `http://127.0.0.1:18025/dashboard/sqs` |
 | Pub/Sub gRPC | `127.0.0.1:18085` | `http://127.0.0.1:18025/dashboard/pubsub` |
 | Pub/Sub REST | `http://127.0.0.1:18086` | `http://127.0.0.1:18025/dashboard/pubsub` |
@@ -96,6 +96,7 @@ server:
   gcsPort: 14443
   dynamodbPort: 18000
   bigqueryPort: 19050
+  bigqueryStoragePort: 19051
   sqsPort: 19324
   pubsubGrpcPort: 18085
   pubsubRestPort: 18086
@@ -382,7 +383,7 @@ The standalone S3 image also ships a web console and a server-wide CORS default;
 
 Completed resumable uploads retain a small metadata receipt and notification marker in the shared object-store root until the workspace is reset; these contain no uploaded body and let retries return the original result after restarts, overwrites, or deletions.
 
-### BigQuery-Compatible REST API
+### BigQuery-Compatible APIs
 
 | Feature | Status | Notes |
 | --- | --- | --- |
@@ -397,7 +398,9 @@ Completed resumable uploads retain a small metadata receipt and notification mar
 | IAM policy endpoints | Partial | Dataset and table `getIamPolicy`/`setIamPolicy`/`testIamPermissions` persist local policies (bindings, including `condition`). `strict` mode: the configured `auth.bigquery.bearerToken` is the project owner (full access); extra tokens from `auth.bigquery.principals` (`token=member[,token=member]`, e.g. `ci-token=serviceAccount:ci@p.iam.gserviceaccount.com`) authenticate as that IAM member; requests without a token are anonymous (`allUsers`); unknown tokens get `401`. Principals and anonymous callers are authorized against the dataset policy, and for table calls the table policy too (`roles/bigquery.admin`/`dataOwner`/`dataEditor`/`dataViewer`/`metadataViewer` and `roles/owner`/`editor`/`viewer`), covering dataset, table, `tabledata`, routine, and model calls. Project-level calls (jobs, queries, dataset list/create, uploads, introspection) are owner-only, so principals cannot run queries. Conditional bindings never grant access; dataset `access` entries and project IAM are not used for authorization. |
 | BigQuery ML | Partial | REST v2 `models.list/get/patch/delete` plus SQL `CREATE [OR REPLACE] MODEL`, `DROP MODEL`, `ML.PREDICT`, `ML.EVALUATE`, and `ML.WEIGHTS` for deterministic local `LINEAR_REG` and `LOGISTIC_REG` over numeric/boolean features; other model types and remote/Vertex AI models fail closed. |
 | BI Engine | Partial | Reservation API v1 `GET`/`PATCH /v1/projects/{project}/locations/{location}/biReservation` persists local reservation size and `preferredTables`, and query jobs populate `statistics.query.biEngineStatistics` when size > 0; real in-memory columnar caching and acceleration are not emulated. |
-| BigQuery Storage API | No | Not implemented (requires gRPC HTTP/2 streaming with Arrow/Avro/Protobuf binary row codecs on a dedicated Storage API endpoint). |
+| BigQuery Storage API | Partial | Plaintext gRPC on `server.bigqueryStoragePort` (default `19051`). `CreateReadSession` and `ReadRows` expose one Avro snapshot stream with top-level column selection and row offsets. Bidirectional `AppendRows` accepts Protobuf batches on the table's `_default` stream, with immediate REST and SQL visibility. |
+
+Storage API rows support nullable and required scalar `STRING`, `BYTES`, `INT64`, `FLOAT64`, and `BOOL` columns. Local read sessions expire after six hours or on restart, with up to 16 sessions and 16 MiB of encoded row data and indexing per snapshot. Arrow, nested or repeated columns, read filters, historical snapshots, and managed write streams are outside this subset. The default write stream does not accept offsets and retries may append duplicates.
 
 ### DynamoDB-Compatible API
 

@@ -61,6 +61,7 @@ pub mod sql_eval;
 pub mod sql_expr;
 pub mod sql_parser;
 pub mod storage;
+pub mod storage_api;
 pub mod strict_auth;
 pub mod table_handlers;
 pub mod tabledata_handlers;

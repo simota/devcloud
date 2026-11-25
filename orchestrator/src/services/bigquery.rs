@@ -5,14 +5,15 @@
 //! enabled the object store is wired in so load/extract jobs can read/write
 //! `gs://` and `s3://` URIs without leaving the process.
 
-use std::future::Future;
 use std::path::Path;
 use std::sync::Arc;
 
 use devcloud_bigquery::server::{Config, Server};
 use devcloud_s3::store::FileBucketStore;
+use tokio::sync::watch;
 
 use crate::config::Config as OrchestratorConfig;
+use crate::supervisor::shutdown_future;
 
 fn default_string(a: &str, b: &str) -> String {
     if !a.is_empty() {
@@ -22,14 +23,12 @@ fn default_string(a: &str, b: &str) -> String {
     }
 }
 
-/// Runs the BigQuery JSON API server until it errors or `shutdown` resolves.
+/// Runs the BigQuery JSON and Storage API listeners over one server.
 ///
 /// Storage layout: dataset/table data under `<storage>/bigquery`.
-pub async fn run(
-    cfg: &OrchestratorConfig,
-    shutdown: impl Future<Output = ()>,
-) -> Result<(), String> {
+pub async fn run(cfg: &OrchestratorConfig, shutdown: watch::Receiver<bool>) -> Result<(), String> {
     let addr = format!("127.0.0.1:{}", cfg.server.bigquery_port);
+    let storage_addr = format!("127.0.0.1:{}", cfg.server.bigquery_storage_port);
     let root = Path::new(&cfg.storage.path);
     let storage = root.join("bigquery");
 
@@ -61,11 +60,30 @@ pub async fn run(
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .map_err(|e| format!("bigquery: bind {addr}: {e}"))?;
+    let storage_listener = tokio::net::TcpListener::bind(&storage_addr)
+        .await
+        .map_err(|e| format!("bigquery: bind Storage API {storage_addr}: {e}"))?;
     let shared = Arc::new(server);
 
-    tokio::select! {
-        res = devcloud_bigquery::http::serve(listener, shared, shutdown) => {
-            res.map_err(|e| format!("bigquery: server error: {e}"))
-        }
-    }
+    tokio::try_join!(
+        async {
+            devcloud_bigquery::http::serve(
+                listener,
+                shared.clone(),
+                shutdown_future(shutdown.clone()),
+            )
+            .await
+            .map_err(|e| format!("bigquery: server error: {e}"))
+        },
+        async {
+            devcloud_bigquery::storage_api::serve(
+                storage_listener,
+                shared.clone(),
+                shutdown_future(shutdown.clone()),
+            )
+            .await
+            .map_err(|e| format!("bigquery: Storage API server error: {e}"))
+        },
+    )?;
+    Ok(())
 }

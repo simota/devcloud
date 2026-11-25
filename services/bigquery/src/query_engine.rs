@@ -168,6 +168,12 @@ impl Server {
             ));
         }
 
+        let table_lock = self.table_lock(
+            &destination_ref.project_id,
+            &destination_ref.dataset_id,
+            &destination_ref.table_id,
+        );
+        let _guard = table_lock.lock().unwrap();
         let destination = self
             .read_table(
                 &destination_ref.project_id,

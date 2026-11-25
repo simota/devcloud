@@ -28,6 +28,9 @@ impl Server {
         table_id: &str,
         body: &[u8],
     ) -> ApiResponse {
+        // Share the row and metadata mutation boundary with Storage API appends.
+        let table_lock = self.table_lock(project_id, dataset_id, table_id);
+        let _table_guard = table_lock.lock().unwrap();
         let table = match self.read_table(project_id, dataset_id, table_id) {
             Err(_) => return ApiResponse::error(500, "backendError", "internal error"),
             Ok(None) => {
@@ -43,13 +46,6 @@ impl Server {
             Ok(request) => request,
             Err(()) => return ApiResponse::error(400, "invalid", "invalid json request"),
         };
-
-        // Hold the per-table lock across the whole read-check-append
-        // sequence: without it, two concurrent requests can each snapshot
-        // `existing_rows`, both pass the insertId dedup / row-quota checks
-        // against that stale snapshot, and both append.
-        let table_lock = self.table_lock(project_id, dataset_id, table_id);
-        let _table_guard = table_lock.lock().unwrap();
 
         let existing_rows = match self.read_rows(project_id, dataset_id, table_id) {
             Ok(rows) => rows,
