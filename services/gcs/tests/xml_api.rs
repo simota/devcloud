@@ -376,3 +376,312 @@ fn xml_list_objects_v1_v2_and_virtual_host_routing() {
     assert!(v2n.contains("<Key>docs/beta.txt</Key>"));
     assert!(v2n.contains("<IsTruncated>false</IsTruncated>"));
 }
+
+fn tag<'a>(xml: &'a str, name: &str) -> &'a str {
+    let open = format!("<{name}>");
+    let start = xml
+        .find(&open)
+        .unwrap_or_else(|| panic!("missing <{name}> in {xml}"))
+        + open.len();
+    let end = xml[start..].find(&format!("</{name}>")).unwrap() + start;
+    &xml[start..end]
+}
+
+fn initiate(server: &mut Server, target: &str, headers: &[(&str, &str)]) -> String {
+    let r = call(server, "POST", &format!("{target}?uploads"), b"", headers);
+    assert_eq!(r.status, 200, "{}", body_text(&r));
+    tag(&body_text(&r), "UploadId").to_string()
+}
+
+fn upload_part(server: &mut Server, target: &str, id: &str, n: i64, body: &[u8]) -> String {
+    let r = call(
+        server,
+        "PUT",
+        &format!("{target}?partNumber={n}&uploadId={id}"),
+        body,
+        &[],
+    );
+    assert_eq!(r.status, 200, "{}", body_text(&r));
+    r.headers.get("ETag").cloned().unwrap()
+}
+
+fn complete_body(parts: &[(i64, &str)]) -> Vec<u8> {
+    let mut xml = String::from("<CompleteMultipartUpload>");
+    for (n, etag) in parts {
+        xml.push_str(&format!(
+            "<Part><PartNumber>{n}</PartNumber><ETag>{etag}</ETag></Part>"
+        ));
+    }
+    xml.push_str("</CompleteMultipartUpload>");
+    xml.into_bytes()
+}
+
+#[test]
+fn xml_multipart_upload_lifecycle() {
+    let mut f = Fixture::new();
+    let s = &mut f.server;
+    assert_eq!(call(s, "PUT", "/mp-bucket", b"", &[]).status, 200);
+
+    let id = initiate(
+        s,
+        "/mp-bucket/big.bin",
+        &[
+            ("Content-Type", "application/x-test"),
+            ("x-goog-meta-origin", "mp"),
+        ],
+    );
+    let part1 = vec![b'a'; 5 * 1024 * 1024];
+    let part2 = b"tail".to_vec();
+    let e1 = upload_part(s, "/mp-bucket/big.bin", &id, 1, &part1);
+    let e2 = upload_part(s, "/mp-bucket/big.bin", &id, 2, &part2);
+    assert_eq!(e1, md5_etag(&part1));
+
+    // In-progress uploads and parts are listable.
+    let r = call(s, "GET", "/mp-bucket?uploads", b"", &[]);
+    assert_eq!(r.status, 200);
+    let text = body_text(&r);
+    assert!(text.contains("<ListMultipartUploadsResult"));
+    assert_eq!(tag(&text, "UploadId"), id);
+    assert_eq!(tag(&text, "Key"), "big.bin");
+    let r = call(
+        s,
+        "GET",
+        &format!("/mp-bucket/big.bin?uploadId={id}&max-parts=1"),
+        b"",
+        &[],
+    );
+    let text = body_text(&r);
+    assert_eq!(r.status, 200);
+    assert_eq!(tag(&text, "IsTruncated"), "true");
+    assert_eq!(tag(&text, "NextPartNumberMarker"), "1");
+    let r = call(
+        s,
+        "GET",
+        &format!("/mp-bucket/big.bin?uploadId={id}&part-number-marker=1"),
+        b"",
+        &[],
+    );
+    let text = body_text(&r);
+    assert_eq!(tag(&text, "PartNumber"), "2");
+    assert_eq!(tag(&text, "Size"), "4");
+
+    // Completion validation: order, ETag match, existence, malformed XML.
+    let target = format!("/mp-bucket/big.bin?uploadId={id}");
+    let r = call(
+        s,
+        "POST",
+        &target,
+        &complete_body(&[(2, &e2), (1, &e1)]),
+        &[],
+    );
+    assert_eq!(r.status, 400);
+    assert!(body_text(&r).contains("InvalidPartOrder"));
+    let r = call(
+        s,
+        "POST",
+        &target,
+        &complete_body(&[(1, &e1), (2, "\"bad\"")]),
+        &[],
+    );
+    assert_eq!(r.status, 400);
+    assert!(body_text(&r).contains("InvalidPart"));
+    let r = call(
+        s,
+        "POST",
+        &target,
+        &complete_body(&[(1, &e1), (3, &e2)]),
+        &[],
+    );
+    assert_eq!(r.status, 400);
+    assert!(body_text(&r).contains("InvalidPart"));
+    assert_eq!(call(s, "POST", &target, b"<nope/>", &[]).status, 400);
+
+    // Precondition evaluated on completion (object must not exist yet).
+    assert_eq!(
+        call(s, "PUT", "/mp-bucket/big.bin", b"old", &[]).status,
+        200
+    );
+    let r = call(
+        s,
+        "POST",
+        &target,
+        &complete_body(&[(1, &e1), (2, &e2)]),
+        &[("x-goog-if-generation-match", "0")],
+    );
+    assert_eq!(r.status, 412);
+
+    // Success: object is the concatenation with a multipart ETag.
+    let r = call(
+        s,
+        "POST",
+        &target,
+        &complete_body(&[(1, &e1), (2, &e2)]),
+        &[],
+    );
+    assert_eq!(r.status, 200, "{}", body_text(&r));
+    let text = body_text(&r);
+    assert!(text.contains("<CompleteMultipartUploadResult"));
+    assert!(tag(&text, "ETag").replace("&#34;", "\"").ends_with("-2\""));
+    assert!(r.headers.contains_key("x-goog-generation"));
+    let r = call(s, "GET", "/mp-bucket/big.bin", b"", &[]);
+    assert_eq!(r.status, 200);
+    assert_eq!(r.body.len(), part1.len() + part2.len());
+    assert!(r.body.ends_with(b"tail"));
+    assert_eq!(
+        r.headers.get("Content-Type").map(String::as_str),
+        Some("application/x-test")
+    );
+    assert_eq!(
+        r.headers.get("X-Goog-Meta-Origin").map(String::as_str),
+        Some("mp")
+    );
+    // The upload is gone after completion.
+    let r = call(s, "GET", &target, b"", &[]);
+    assert_eq!(r.status, 404);
+    assert!(body_text(&r).contains("NoSuchUpload"));
+    // The JSON API sees the completed object.
+    let r = call(s, "GET", "/storage/v1/b/mp-bucket/o/big.bin", b"", &[]);
+    assert_eq!(r.status, 200);
+}
+
+#[test]
+fn xml_multipart_size_limits_abort_and_errors() {
+    let mut f = Fixture::new();
+    let s = &mut f.server;
+    assert_eq!(call(s, "PUT", "/mp2", b"", &[]).status, 200);
+
+    // Non-final parts below 5 MiB are rejected at completion.
+    let id = initiate(s, "/mp2/small", &[]);
+    let e1 = upload_part(s, "/mp2/small", &id, 1, b"one");
+    let e2 = upload_part(s, "/mp2/small", &id, 2, b"two");
+    let r = call(
+        s,
+        "POST",
+        &format!("/mp2/small?uploadId={id}"),
+        &complete_body(&[(1, &e1), (2, &e2)]),
+        &[],
+    );
+    assert_eq!(r.status, 400);
+    assert!(body_text(&r).contains("EntityTooSmall"));
+    // A single small part is a valid final part.
+    let r = call(
+        s,
+        "POST",
+        &format!("/mp2/small?uploadId={id}"),
+        &complete_body(&[(1, &e1)]),
+        &[],
+    );
+    assert_eq!(r.status, 200, "{}", body_text(&r));
+    assert_eq!(call(s, "GET", "/mp2/small", b"", &[]).body, b"one");
+
+    // Invalid part numbers, unknown uploads, and abort.
+    let id = initiate(s, "/mp2/aborted", &[]);
+    for n in ["0", "10001", "x"] {
+        let r = call(
+            s,
+            "PUT",
+            &format!("/mp2/aborted?partNumber={n}&uploadId={id}"),
+            b"p",
+            &[],
+        );
+        assert_eq!(r.status, 400, "part {n}");
+    }
+    let r = call(
+        s,
+        "PUT",
+        "/mp2/aborted?partNumber=1&uploadId=missing",
+        b"p",
+        &[],
+    );
+    assert_eq!(r.status, 404);
+    assert!(body_text(&r).contains("NoSuchUpload"));
+    assert_eq!(
+        call(
+            s,
+            "DELETE",
+            &format!("/mp2/aborted?uploadId={id}"),
+            b"",
+            &[]
+        )
+        .status,
+        204
+    );
+    assert_eq!(
+        call(
+            s,
+            "DELETE",
+            &format!("/mp2/aborted?uploadId={id}"),
+            b"",
+            &[]
+        )
+        .status,
+        404
+    );
+    assert_eq!(call(s, "GET", "/mp2/aborted", b"", &[]).status, 404);
+    // Unknown bucket and bare POST.
+    assert_eq!(
+        call(s, "POST", "/nope-bucket/k?uploads", b"", &[]).status,
+        404
+    );
+    assert_eq!(call(s, "POST", "/mp2/k", b"", &[]).status, 400);
+    assert_eq!(call(s, "GET", "/nope-bucket?uploads", b"", &[]).status, 404);
+}
+
+#[test]
+fn xml_multipart_respects_strict_mode_iam() {
+    let root = std::env::temp_dir().join(format!(
+        "devcloud-gcs-xml-mp-strict-{}-{}",
+        std::process::id(),
+        NEXT_ID.fetch_add(1, Ordering::Relaxed),
+    ));
+    let mut s = Server::new(
+        Config {
+            auth_mode: "strict".to_string(),
+            bearer_token: "owner".to_string(),
+            ..Default::default()
+        },
+        FileBucketStore::new(root.join("buckets")),
+    );
+    s.add_access_token("writer", "user:writer@example.com");
+    let owner = [("Authorization", "Bearer owner")];
+    let writer = [("Authorization", "Bearer writer")];
+    assert_eq!(call(&mut s, "PUT", "/mp3", b"", &owner).status, 200);
+    assert_eq!(
+        call(&mut s, "POST", "/mp3/k?uploads", b"", &writer).status,
+        403
+    );
+    let policy = br#"{"bindings":[{"role":"roles/storage.objectCreator","members":["user:writer@example.com"]}]}"#;
+    assert_eq!(
+        call(&mut s, "PUT", "/storage/v1/b/mp3/iam", policy, &owner).status,
+        200
+    );
+    let r = call(&mut s, "POST", "/mp3/k?uploads", b"", &writer);
+    assert_eq!(r.status, 200);
+    let id = tag(&body_text(&r), "UploadId").to_string();
+    let r = call(
+        &mut s,
+        "PUT",
+        &format!("/mp3/k?partNumber=1&uploadId={id}"),
+        b"d",
+        &writer,
+    );
+    assert_eq!(r.status, 200);
+    let etag = r.headers.get("ETag").cloned().unwrap();
+    // objectCreator lacks storage.multipartUploads.list.
+    assert_eq!(
+        call(&mut s, "GET", "/mp3?uploads", b"", &writer).status,
+        403
+    );
+    let r = call(
+        &mut s,
+        "POST",
+        &format!("/mp3/k?uploadId={id}"),
+        &complete_body(&[(1, &etag)]),
+        &writer,
+    );
+    assert_eq!(r.status, 200, "{}", body_text(&r));
+    assert_eq!(call(&mut s, "GET", "/mp3/k", b"", &writer).status, 403);
+    assert_eq!(call(&mut s, "GET", "/mp3/k", b"", &owner).body, b"d");
+    drop(s);
+    let _ = fs::remove_dir_all(&root);
+}

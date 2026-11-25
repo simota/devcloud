@@ -227,14 +227,23 @@ fn policy_grants_permission(policy: &GcsIamPolicy, principal: &str, permission: 
     false
 }
 
-fn role_grants_permission(role: &str, permission: &str) -> bool {
+pub(crate) fn role_grants_permission(role: &str, permission: &str) -> bool {
     match role {
         "roles/storage.admin" | "roles/owner" => permission.starts_with("storage."),
-        "roles/storage.objectAdmin" => permission.starts_with("storage.objects."),
+        "roles/storage.objectAdmin" => {
+            permission.starts_with("storage.objects.")
+                || permission.starts_with("storage.multipartUploads.")
+        }
         "roles/storage.objectViewer" | "roles/storage.legacyObjectReader" => {
             matches!(permission, "storage.objects.get" | "storage.objects.list")
         }
-        "roles/storage.objectCreator" => permission == "storage.objects.create",
+        "roles/storage.objectCreator" => matches!(
+            permission,
+            "storage.objects.create"
+                | "storage.multipartUploads.create"
+                | "storage.multipartUploads.abort"
+                | "storage.multipartUploads.listParts"
+        ),
         "roles/storage.legacyBucketOwner" => matches!(
             permission,
             "storage.buckets.get"

@@ -2,7 +2,8 @@
 //! `{bucket}.localhost` / `{bucket}.storage.googleapis.com`).
 //!
 //! Covers service bucket listing, bucket CRUD + `?acl`/`?lifecycle`/`?location`/
-//! `?storageClass`/`?versioning`, and object PUT/Copy/GET/HEAD/DELETE + `?acl`.
+//! `?storageClass`/`?versioning`, object PUT/Copy/GET/HEAD/DELETE + `?acl`, and
+//! multipart uploads (`?uploads` / `?uploadId`, see `xml_multipart`).
 
 use std::collections::BTreeMap;
 
@@ -53,7 +54,7 @@ pub fn xml_error(status: u16, code: &str, message: &str) -> Response {
     xml_response(status, body)
 }
 
-fn virtual_host_bucket(host: &str) -> Option<String> {
+pub(crate) fn virtual_host_bucket(host: &str) -> Option<String> {
     let host_only = host.split(':').next().unwrap_or("").trim();
     if host_only.is_empty() {
         return None;
@@ -186,6 +187,9 @@ fn handle_xml_bucket(server: &mut Server, req: &Request, bucket: &str) -> Respon
             }
             if req.query.contains_key("acl") {
                 return handle_xml_get_bucket_acl(server, bucket);
+            }
+            if req.query.contains_key("uploads") {
+                return crate::xml_multipart::list_uploads(server, req, bucket);
             }
             if req.query.contains_key("lifecycle") {
                 return handle_xml_get_bucket_lifecycle(server, bucket);
@@ -480,6 +484,9 @@ fn handle_xml_object(server: &mut Server, req: &Request, bucket: &str, key: &str
     if key.is_empty() {
         return xml_error(400, "InvalidArgument", "object key is required");
     }
+    if let Some(resp) = crate::xml_multipart::handle_object_multipart(server, req, bucket, key) {
+        return resp;
+    }
     match req.method.as_str() {
         "GET" | "HEAD" => {
             if req.query.contains_key("acl") && req.method == "GET" {
@@ -505,7 +512,7 @@ fn handle_xml_object(server: &mut Server, req: &Request, bucket: &str, key: &str
     }
 }
 
-fn check_xml_preconditions(
+pub(crate) fn check_xml_preconditions(
     req: &Request,
     found: Option<&devcloud_s3::model::Object>,
 ) -> Result<(), Response> {
