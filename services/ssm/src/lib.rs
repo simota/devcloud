@@ -1,6 +1,8 @@
-//! devcloud SSM Parameter Store: `PutParameter`, `GetParameter` (including
-//! `SecureString` with `WithDecryption`), `DeleteParameter`, and
-//! `DescribeParameters` over the AWS JSON 1.1 protocol, persisted to
+//! devcloud SSM Parameter Store: `PutParameter`, `GetParameter`, `GetParameters`,
+//! `GetParametersByPath`, `GetParameterHistory`, `DeleteParameter`,
+//! `DeleteParameters`, `DescribeParameters`, `LabelParameterVersion`,
+//! `UnlabelParameterVersion`, `AddTagsToResource`, `RemoveTagsFromResource`,
+//! and `ListTagsForResource` over the AWS JSON 1.1 protocol, persisted to
 //! `state.json`.
 
 pub mod http;
