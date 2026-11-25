@@ -718,6 +718,8 @@ fn spawn_devcloud_up(workspace: &Path) -> Child {
     cfg.push_str(
         "\nserver:\n\
 \u{20}\u{20}smtpPort: 21025\n\
+\u{20}\u{20}imapPort: 21143\n\
+\u{20}\u{20}pop3Port: 21110\n\
 \u{20}\u{20}mailHttpPort: 21080\n\
 \u{20}\u{20}dashboardPort: 28025\n\
 \u{20}\u{20}eventRelayPort: 28027\n\

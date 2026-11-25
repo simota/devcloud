@@ -50,6 +50,26 @@ pub fn unix_from_rfc3339(s: &str) -> (i64, u32) {
     parse_rfc3339(s).unwrap_or((i64::MIN, 0))
 }
 
+/// Formats an RFC 3339 UTC timestamp as an IMAP4rev1 `INTERNALDATE` string
+/// (`DD-Mon-YYYY HH:MM:SS +0000`). Falls back to the UNIX epoch if malformed.
+pub fn imap_internaldate_from_rfc3339(s: &str) -> String {
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let secs = parse_rfc3339(s).map(|(sec, _)| sec).unwrap_or(0);
+    let days = secs.div_euclid(86_400);
+    let secs_of_day = secs.rem_euclid(86_400);
+    let (year, month, day) = civil_from_days(days);
+    let hour = secs_of_day / 3_600;
+    let minute = (secs_of_day % 3_600) / 60;
+    let second = secs_of_day % 60;
+    let mon = MONTHS
+        .get(month.saturating_sub(1) as usize)
+        .copied()
+        .unwrap_or("Jan");
+    format!("{day:02}-{mon}-{year:04} {hour:02}:{minute:02}:{second:02} +0000")
+}
+
 fn parse_rfc3339(s: &str) -> Option<(i64, u32)> {
     let (date, rest) = s.split_once('T')?;
     let time = rest.strip_suffix('Z').or_else(|| rest.strip_suffix('z'))?;
@@ -147,5 +167,9 @@ mod tests {
         assert!(unix_from_rfc3339(&half) > unix_from_rfc3339(&whole));
         // Malformed sorts oldest.
         assert_eq!(unix_from_rfc3339("not-a-time"), (i64::MIN, 0));
+        assert_eq!(
+            super::imap_internaldate_from_rfc3339("2026-04-30T10:00:00Z"),
+            "30-Apr-2026 10:00:00 +0000"
+        );
     }
 }

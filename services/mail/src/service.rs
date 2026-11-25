@@ -4,7 +4,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::model::{Envelope, ListMessagesInput, ListMessagesResult, Message, MessageEntry};
+use crate::model::{
+    Envelope, ListMessagesInput, ListMessagesResult, MailboxSnapshot, Message, MessageEntry,
+};
 use crate::parser::parse_message;
 use crate::store::Store;
 use crate::time_fmt::now_rfc3339;
@@ -86,6 +88,11 @@ impl Service {
 
     pub fn list_all(&self) -> Result<Vec<MessageEntry>, String> {
         self.store.list_all()
+    }
+
+    /// Chronological (oldest-first) snapshot with stable 1-based UIDs for IMAP/POP3.
+    pub fn list_mailbox(&self) -> Result<MailboxSnapshot, String> {
+        self.store.list_mailbox()
     }
 
     /// Mirrors `Service.Get`: read-only passthrough to the store.

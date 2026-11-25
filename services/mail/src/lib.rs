@@ -32,21 +32,28 @@ pub(crate) fn event_sink() -> Option<&'static UnboundedSender<String>> {
 pub mod blob;
 mod browser_guard;
 pub mod http;
+pub mod imap;
 pub mod model;
 pub mod parser;
+pub mod pop3;
 pub mod service;
 pub mod smtp;
 pub mod store;
 pub mod time_fmt;
+pub mod tls;
 
 pub use blob::{BlobId, BlobStore, FileBlobStore};
 pub use http::serve_http;
+pub use imap::{ImapConfig, ImapServer};
 pub use model::{
-    Attachment, Envelope, ListMessagesInput, ListMessagesResult, Message, MessageEntry,
+    Attachment, Envelope, ListMessagesInput, ListMessagesResult, MailboxMessage, MailboxSnapshot,
+    Message, MessageEntry,
 };
 pub use parser::parse_message;
+pub use pop3::{Pop3Config, Pop3Server};
 pub use service::Service;
 pub use smtp::{
     SmtpConfig, SmtpLimits, SmtpServer, SMTP_AUTH_OFF, SMTP_AUTH_RELAXED, SMTP_AUTH_STRICT,
 };
 pub use store::{FileStore, RecordingStore, Store};
+pub use tls::{mail_tls_from_config, MailTls};

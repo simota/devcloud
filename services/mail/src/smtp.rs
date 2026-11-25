@@ -5,6 +5,7 @@
 //! the legacy server: same reply codes, same sequence checks, same DATA framing
 //! (dot-unstuffing + cumulative size limit), same AUTH PLAIN/LOGIN flows.
 
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -17,6 +18,7 @@ use tokio::net::TcpListener;
 
 use crate::model::Envelope;
 use crate::service::Service;
+use crate::tls::{accept_tls, constant_time_eq, is_transient_accept_error, MailTls, MaybeTls};
 
 pub const SMTP_AUTH_OFF: &str = "off";
 pub const SMTP_AUTH_RELAXED: &str = "relaxed";
@@ -44,11 +46,13 @@ impl SmtpConfig {
 }
 
 /// Mirrors legacy `SMTPServer`.
+#[derive(Clone)]
 pub struct SmtpServer {
     config: SmtpConfig,
     service: Arc<Service>,
     envelope_capture: bool,
     limits: SmtpLimits,
+    tls: Option<MailTls>,
 }
 
 /// Zero/None limits retain the existing unlimited session behavior.
@@ -82,6 +86,7 @@ impl SmtpServer {
             service,
             envelope_capture: false,
             limits: SmtpLimits::standard(),
+            tls: None,
         }
     }
 
@@ -95,42 +100,101 @@ impl SmtpServer {
         self
     }
 
+    /// Enables TLS (STARTTLS on plaintext listeners, or implicit TLS via
+    /// `serve_tls` / `handle_tls_conn`).
+    pub fn with_tls(mut self, tls: MailTls) -> Self {
+        self.tls = Some(tls);
+        self
+    }
+
+    pub fn with_optional_tls(mut self, tls: Option<MailTls>) -> Self {
+        self.tls = tls;
+        self
+    }
+
+    fn clone_for_conn(&self) -> Self {
+        Self {
+            config: self.config.clone(),
+            service: Arc::clone(&self.service),
+            envelope_capture: self.envelope_capture,
+            limits: self.limits.clone(),
+            tls: self.tls.clone(),
+        }
+    }
+
     /// Mirrors `SMTPServer.Run`: accept loop on the configured address. A fresh
     /// per-connection `SmtpServer` (cheap: config clone + `Arc` clone) is moved
     /// into each spawned task so the session future is `'static`.
     pub async fn run(&self) -> std::io::Result<()> {
         let listener = TcpListener::bind(&self.config.addr).await?;
+        self.serve(listener, std::future::pending()).await
+    }
+
+    /// Serves plaintext (and optional STARTTLS) SMTP on a pre-bound listener
+    /// until `shutdown` resolves.
+    pub async fn serve(
+        &self,
+        listener: TcpListener,
+        shutdown: impl Future<Output = ()>,
+    ) -> std::io::Result<()> {
+        tokio::pin!(shutdown);
         loop {
-            let sock = match listener.accept().await {
-                Ok((sock, _)) => sock,
-                // Out of descriptors, or a peer that went away before the
-                // accept: wait and keep serving rather than stop the service.
-                Err(e) => {
-                    // Only transient errors; a broken listener still stops.
-                    let transient = matches!(
-                        e.kind(),
-                        std::io::ErrorKind::ConnectionAborted
-                            | std::io::ErrorKind::ConnectionReset
-                            | std::io::ErrorKind::Interrupted
-                            | std::io::ErrorKind::WouldBlock
-                            | std::io::ErrorKind::TimedOut
-                    ) || matches!(e.raw_os_error(), Some(12 | 23 | 24)); // ENOMEM, ENFILE, EMFILE
-                    if !transient {
-                        return Err(e);
-                    }
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                    continue;
+            tokio::select! {
+                _ = &mut shutdown => return Ok(()),
+                accepted = listener.accept() => {
+                    let sock = match accepted {
+                        Ok((sock, _)) => sock,
+                        Err(e) => {
+                            if !is_transient_accept_error(&e) {
+                                return Err(e);
+                            }
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                            continue;
+                        }
+                    };
+                    let server = self.clone_for_conn();
+                    tokio::spawn(async move {
+                        server.handle_conn(sock).await;
+                    });
                 }
-            };
-            let server = SmtpServer {
-                config: self.config.clone(),
-                service: Arc::clone(&self.service),
-                envelope_capture: self.envelope_capture,
-                limits: self.limits.clone(),
-            };
-            tokio::spawn(async move {
-                server.handle_conn(sock).await;
-            });
+            }
+        }
+    }
+
+    /// Serves implicit-TLS SMTP (SMTPS) on a pre-bound listener until
+    /// `shutdown` resolves. Requires `with_tls` to have been configured.
+    pub async fn serve_tls(
+        &self,
+        listener: TcpListener,
+        shutdown: impl Future<Output = ()>,
+    ) -> std::io::Result<()> {
+        if self.tls.is_none() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "SMTPS listener requires TLS configuration",
+            ));
+        }
+        tokio::pin!(shutdown);
+        loop {
+            tokio::select! {
+                _ = &mut shutdown => return Ok(()),
+                accepted = listener.accept() => {
+                    let sock = match accepted {
+                        Ok((sock, _)) => sock,
+                        Err(e) => {
+                            if !is_transient_accept_error(&e) {
+                                return Err(e);
+                            }
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                            continue;
+                        }
+                    };
+                    let server = self.clone_for_conn();
+                    tokio::spawn(async move {
+                        server.handle_tls_conn(sock).await;
+                    });
+                }
+            }
         }
     }
 
@@ -141,12 +205,32 @@ impl SmtpServer {
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
-        let (read_half, write_half) = tokio::io::split(io);
+        self.run_session(MaybeTls::Plain(io), false).await;
+    }
+
+    /// Handles an implicit-TLS (SMTPS) connection: completes the TLS handshake
+    /// before issuing the `220` greeting.
+    pub async fn handle_tls_conn<S>(self, io: S)
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        let Some(tls) = self.tls.as_ref() else {
+            return;
+        };
+        let Ok(stream) = accept_tls(io, &tls.acceptor, self.limits.idle_timeout).await else {
+            return;
+        };
+        self.run_session(stream, true).await;
+    }
+
+    async fn run_session<S>(self, io: MaybeTls<S>, tls_active: bool)
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
         let mut session = Session {
             config: self.config,
             service: self.service,
-            reader: BufReader::new(read_half),
-            writer: write_half,
+            conn: Some(Conn::new(io)),
             greeted: false,
             has_mail_from: false,
             authenticated: false,
@@ -156,6 +240,8 @@ impl SmtpServer {
             helo: String::new(),
             envelope_capture: self.envelope_capture,
             limits: self.limits,
+            tls: self.tls,
+            tls_active,
         };
 
         if !session.reply(220, "devcloud ESMTP ready").await {
@@ -174,14 +260,34 @@ impl SmtpServer {
     }
 }
 
+struct Conn<S>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    reader: BufReader<ReadHalf<MaybeTls<S>>>,
+    writer: WriteHalf<MaybeTls<S>>,
+}
+
+impl<S> Conn<S>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    fn new(io: MaybeTls<S>) -> Self {
+        let (read_half, write_half) = tokio::io::split(io);
+        Self {
+            reader: BufReader::new(read_half),
+            writer: write_half,
+        }
+    }
+}
+
 struct Session<S>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     config: SmtpConfig,
     service: Arc<Service>,
-    reader: BufReader<ReadHalf<S>>,
-    writer: WriteHalf<S>,
+    conn: Option<Conn<S>>,
     greeted: bool,
     has_mail_from: bool,
     authenticated: bool,
@@ -196,12 +302,18 @@ where
     helo: String,
     envelope_capture: bool,
     limits: SmtpLimits,
+    tls: Option<MailTls>,
+    tls_active: bool,
 }
 
 impl<S> Session<S>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    fn tls_required(&self) -> bool {
+        !self.tls_active && self.tls.as_ref().is_some_and(|t| t.require)
+    }
+
     /// One line with its terminator kept, bounded by `max_line_bytes`; with
     /// an idle timeout the whole line must arrive in time (a client trickling
     /// a byte at a time cannot hold the session forever). `None` on EOF/error.
@@ -213,8 +325,9 @@ where
             .idle_timeout
             .map(|t| tokio::time::Instant::now() + t);
         loop {
+            let reader = &mut self.conn.as_mut()?.reader;
             let available = if let Some(deadline) = deadline {
-                match tokio::time::timeout_at(deadline, self.reader.fill_buf()).await {
+                match tokio::time::timeout_at(deadline, reader.fill_buf()).await {
                     Ok(Ok(bytes)) => bytes,
                     Ok(Err(_)) => return None,
                     Err(_) => {
@@ -223,7 +336,7 @@ where
                     }
                 }
             } else {
-                self.reader.fill_buf().await.ok()?
+                reader.fill_buf().await.ok()?
             };
             if available.is_empty() {
                 break;
@@ -238,7 +351,7 @@ where
             }
             let finished = available[take - 1] == b'\n';
             buf.extend_from_slice(&available[..take]);
-            self.reader.consume(take);
+            reader.consume(take);
             if finished {
                 break;
             }
@@ -265,11 +378,14 @@ where
     }
 
     async fn reply(&mut self, code: u16, message: &str) -> bool {
+        let Some(conn) = self.conn.as_mut() else {
+            return false;
+        };
         let line = format!("{} {}\r\n", code, message);
-        if self.writer.write_all(line.as_bytes()).await.is_err() {
+        if conn.writer.write_all(line.as_bytes()).await.is_err() {
             return false;
         }
-        self.writer.flush().await.is_ok()
+        conn.writer.flush().await.is_ok()
     }
 
     /// Mirrors `smtpSession.handleLine`.
@@ -289,7 +405,11 @@ where
                     self.reply(250, "OK").await
                 }
             }
+            "STARTTLS" => self.handle_starttls(&arg).await,
             "MAIL" => {
+                if self.tls_required() {
+                    return self.reply(530, "Must issue a STARTTLS command first").await;
+                }
                 if !self.greeted {
                     return self.reply(503, "bad sequence of commands").await;
                 }
@@ -311,6 +431,9 @@ where
                 }
             }
             "RCPT" => {
+                if self.tls_required() {
+                    return self.reply(530, "Must issue a STARTTLS command first").await;
+                }
                 if !self.has_mail_from {
                     return self.reply(503, "bad sequence of commands").await;
                 }
@@ -328,6 +451,9 @@ where
                 }
             }
             "DATA" => {
+                if self.tls_required() {
+                    return self.reply(530, "Must issue a STARTTLS command first").await;
+                }
                 if !self.has_mail_from || self.envelope.to.is_empty() {
                     return self.reply(503, "bad sequence of commands").await;
                 }
@@ -337,6 +463,9 @@ where
                 self.handle_data().await
             }
             "AUTH" => {
+                if self.tls_required() {
+                    return self.reply(530, "Must issue a STARTTLS command first").await;
+                }
                 if !self.greeted {
                     return self.reply(503, "bad sequence of commands").await;
                 }
@@ -365,6 +494,55 @@ where
             "" => self.reply(500, "syntax error").await,
             _ => self.reply(502, "command not implemented").await,
         }
+    }
+
+    /// RFC 3207 STARTTLS upgrade.
+    async fn handle_starttls(&mut self, arg: &str) -> bool {
+        if !arg.trim().is_empty() {
+            return self
+                .reply(501, "syntax error (no parameters allowed)")
+                .await;
+        }
+        let Some(tls) = self.tls.clone() else {
+            return self.reply(502, "command not implemented").await;
+        };
+        if self.tls_active {
+            return self.reply(503, "bad sequence of commands").await;
+        }
+        // Reject pipelined plaintext bytes after STARTTLS (CVE-2011-0411).
+        if self
+            .conn
+            .as_ref()
+            .is_some_and(|c| !c.reader.buffer().is_empty())
+        {
+            self.reply(501, "pipelining not allowed with STARTTLS")
+                .await;
+            return false;
+        }
+        if !self.reply(220, "Ready to start TLS").await {
+            return false;
+        }
+        let Some(conn) = self.conn.take() else {
+            return false;
+        };
+        let maybe = conn.reader.into_inner().unsplit(conn.writer);
+        let Some(plain) = maybe.into_plain() else {
+            return false;
+        };
+        let Ok(tls_stream) = accept_tls(plain, &tls.acceptor, self.limits.idle_timeout).await
+        else {
+            return false;
+        };
+        self.conn = Some(Conn::new(tls_stream));
+        self.tls_active = true;
+        // RFC 3207 §4.2: discard all state learned prior to TLS negotiation.
+        self.greeted = false;
+        self.helo.clear();
+        self.authenticated = false;
+        self.crlf_seen = false;
+        self.last_crlf = false;
+        self.reset_envelope();
+        true
     }
 
     /// Mirrors `smtpSession.handleData`.
@@ -449,19 +627,25 @@ where
         if max > 0 {
             lines.push(format!("SIZE {}", max));
         }
-        if auth_enabled {
+        if self.tls.is_some() && !self.tls_active {
+            lines.push("STARTTLS".to_string());
+        }
+        if auth_enabled && !self.tls_required() {
             lines.push("AUTH PLAIN LOGIN".to_string());
         }
 
+        let Some(conn) = self.conn.as_mut() else {
+            return false;
+        };
         let last = lines.len() - 1;
         for (i, payload) in lines.iter().enumerate() {
             let separator = if i == last { ' ' } else { '-' };
             let line = format!("250{}{}\r\n", separator, payload);
-            if self.writer.write_all(line.as_bytes()).await.is_err() {
+            if conn.writer.write_all(line.as_bytes()).await.is_err() {
                 return false;
             }
         }
-        self.writer.flush().await.is_ok()
+        conn.writer.flush().await.is_ok()
     }
 
     /// Mirrors `smtpSession.handleAuth`.
@@ -550,14 +734,6 @@ where
         self.authenticated = true;
         self.reply(235, "authentication succeeded").await
     }
-}
-
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    let mut diff = a.len() ^ b.len();
-    for i in 0..a.len().max(b.len()) {
-        diff |= usize::from(a.get(i).copied().unwrap_or(0) ^ b.get(i).copied().unwrap_or(0));
-    }
-    diff == 0
 }
 
 /// Strips a trailing `\r\n` or `\n`; `true` when it was `\r\n`.

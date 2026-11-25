@@ -25,6 +25,8 @@ Default local endpoints:
 | Service | Endpoint | Dashboard |
 | --- | --- | --- |
 | Mail SMTP | `127.0.0.1:11025` | `http://127.0.0.1:18025/dashboard/mail` |
+| Mail IMAP | `127.0.0.1:11143` | `http://127.0.0.1:18025/dashboard/mail` |
+| Mail POP3 | `127.0.0.1:11110` | `http://127.0.0.1:18025/dashboard/mail` |
 | S3 | `http://127.0.0.1:14566` | `http://127.0.0.1:18025/dashboard/s3` |
 | GCS | `http://127.0.0.1:14443` | `http://127.0.0.1:18025/dashboard/gcs` |
 | DynamoDB | `http://127.0.0.1:18000` | `http://127.0.0.1:18025/dashboard/dynamodb` |
@@ -85,6 +87,8 @@ project: dev
 
 server:
   smtpPort: 11025
+  imapPort: 11143
+  pop3Port: 11110
   mailHttpPort: 11080
   dashboardPort: 18025
   eventRelayPort: 18027
@@ -319,8 +323,8 @@ Legend:
 | SMTP AUTH | Partial | `PLAIN` and `LOGIN` are available when `auth.smtp.mode` is not `off`; strict mode validates supplied credentials. `MAIL FROM` before AUTH remains accepted. The default mode is `off`. |
 | HTTP API authentication | Partial | Strict mode protects the introspection/control API with the configured SMTP Basic credentials; the dashboard forwards those credentials for reads and mutations. |
 | Browser guards | Yes | Direct introspection/control HTTP endpoints reject public DNS Host names and cross-site mutations, using the Dashboard API host allowlist. SDK/CLI requests without Origin remain supported. |
-| TLS / STARTTLS | No | Local plaintext development endpoint only. |
-| IMAP / POP3 | No | Not implemented. |
+| TLS / STARTTLS | Yes | Off by default to avoid breaking plaintext clients that auto-upgrade with system CA verification. Set `services.mail.tls.enabled: true` for a locally generated in-memory self-signed certificate (`localhost` / `127.0.0.1` / `::1`), or set `services.mail.tls.certFile` and `services.mail.tls.keyFile` (PEM) for custom CA-signed verification. Enables `STARTTLS` on SMTP/IMAP and `STLS` on POP3 (TLS 1.2/1.3); set `services.mail.tls.require: true` to refuse auth/mail commands before TLS. Optional implicit-TLS ports (`server.smtpsPort`, `server.imapsPort`, `server.pop3sPort`) serve SMTPS/IMAPS/POP3S. Standalone `devcloud-mail` reads `DEVCLOUD_MAIL_TLS_*` and `DEVCLOUD_MAIL_*S_ADDR`. |
+| IMAP / POP3 | Partial | Local `INBOX` listeners on `127.0.0.1:11143` (IMAP4rev1) and `127.0.0.1:11110` (POP3) backed by the shared mail store (`0` disables a port). IMAP supports `CAPABILITY`, `STARTTLS`, `LOGIN`, `AUTHENTICATE PLAIN`, `LIST`/`LSUB`, `STATUS`, `SELECT`/`EXAMINE`, `FETCH`/`UID FETCH` (macros, `ENVELOPE`, `BODY[]`/`BODY.PEEK[]`, `HEADER`, `HEADER.FIELDS`, `TEXT`, partial slices), `STORE`/`UID STORE` (in-process flags across sessions), `SEARCH`/`UID SEARCH`, `EXPUNGE`, `CLOSE`, `UNSELECT`, `CHECK`, `NOOP`, `LOGOUT`. POP3 supports `CAPA`, `STLS`, `USER`/`PASS`, `AUTH PLAIN`, `STAT`, `LIST`, `UIDL`, `RETR`, `TOP`, `DELE`, `RSET`, `NOOP`, `QUIT` (commits deletions only on `QUIT`). Both honor `auth.smtp` (`relaxed`/`off` accept any credentials; `strict` validates configured credentials). Multiple folders, `APPEND`, `IDLE`, and persistent flags across restarts are not implemented. |
 
 ### S3-Compatible API
 
