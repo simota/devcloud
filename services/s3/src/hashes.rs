@@ -3,7 +3,28 @@
 //! checksum, and `Content-MD5` validation.
 
 use crate::base64;
+use hmac::{Hmac, Mac};
 use md5::{Digest, Md5};
+use sha2::Sha256;
+
+type HmacSha256 = Hmac<Sha256>;
+
+/// SHA-256 of `data` as lowercase hex.
+pub fn sha256_hex(data: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    hex::encode(hasher.finalize())
+}
+
+/// HMAC-SHA256 of `data` with `key`.
+pub fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
+    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key size");
+    mac.update(data);
+    let bytes = mac.finalize().into_bytes();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&bytes);
+    out
+}
 
 /// CRC32C (Castagnoli) of `data`, big-endian, base64-StdEncoding — matching legacy
 /// `base64.StdEncoding.EncodeToString(be32(crc32.Checksum(data, Castagnoli)))`.

@@ -1,4 +1,4 @@
-//! Rust reimplementation of the devcloud GCS JSON API surface.
+//! Rust reimplementation of the devcloud GCS API surface (JSON API v1 + XML API).
 //!
 //! This crate intentionally reuses `devcloud_s3::store::FileBucketStore` so GCS
 //! and S3 continue to share the same object-core layout under `.devcloud/s3`.
@@ -21,3 +21,10 @@ pub(crate) fn event_sink() -> Option<&'static UnboundedSender<String>> {
 }
 
 pub mod http;
+pub mod iam_acl;
+pub mod lifecycle;
+pub mod notifications;
+pub mod retention;
+pub mod signed_urls;
+pub mod state;
+pub mod xml_api;

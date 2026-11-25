@@ -29,8 +29,26 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
+use crate::iam_acl::expand_predefined_acl;
+use crate::lifecycle::{apply_bucket_lifecycle, effective_storage_class, validate_lifecycle};
+use crate::notifications::emit_object_notification;
+use crate::retention::{
+    apply_bucket_retention_policy_update, effective_retention_expiration_time,
+    object_mutation_blocked_reason, recompute_retention_after_event_hold_release,
+    validate_object_retention_update,
+};
+use crate::signed_urls::{verify_signed_url, SignedUrlCheck};
+use crate::state::{
+    delete_object_sidecars, read_bucket_meta, read_object_meta, write_bucket_acl,
+    write_bucket_meta, write_default_object_acl, write_object_acl, write_object_meta,
+    BucketObjectRetention, BucketRetentionPolicy, GcsBucketMeta, GcsLifecycle, GcsObjectMeta,
+    GcsObjectRetention, IamConfiguration, NotificationEvent,
+};
+
 const MAX_HEADER_BYTES: usize = 64 * 1024;
 const MAX_BODY_BYTES: usize = 128 * 1024 * 1024;
+pub const DEFAULT_HMAC_ACCESS_ID: &str = "GOOG1DEVCLOUD";
+pub const DEFAULT_HMAC_SECRET: &str = "devcloud-hmac-secret";
 
 #[derive(Debug, Clone, Default)]
 pub struct Config {
@@ -46,18 +64,109 @@ pub struct Server {
     store: FileBucketStore,
     sessions: BTreeMap<String, ResumableSession>,
     next_upload_id: u64,
+    hmac_keys: BTreeMap<String, String>,
+    pubsub_rest_addr: Option<String>,
 }
 
 impl Server {
     pub fn new(config: Config, store: FileBucketStore) -> Self {
+        let mut hmac_keys = BTreeMap::new();
+        let default_secret = if !config.bearer_token.trim().is_empty() {
+            config.bearer_token.trim().to_string()
+        } else {
+            DEFAULT_HMAC_SECRET.to_string()
+        };
+        hmac_keys.insert(DEFAULT_HMAC_ACCESS_ID.to_string(), default_secret);
+        let pubsub_rest_addr = std::env::var("DEVCLOUD_GCS_PUBSUB_REST_ADDR")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
         let mut server = Self {
             config,
             store,
             sessions: BTreeMap::new(),
             next_upload_id: 1,
+            hmac_keys,
+            pubsub_rest_addr,
         };
         server.load_sessions();
         server
+    }
+
+    pub fn store(&self) -> &FileBucketStore {
+        &self.store
+    }
+
+    pub fn store_mut(&mut self) -> &mut FileBucketStore {
+        &mut self.store
+    }
+
+    /// Pins the server and store clock for deterministic retention, lifecycle,
+    /// and signed URL tests.
+    pub fn set_fixed_now(&mut self, ts: &str) {
+        self.store.set_fixed_now(ts);
+    }
+
+    pub fn now(&self) -> String {
+        self.store.current_time()
+    }
+
+    pub fn project(&self) -> &str {
+        if self.config.project.is_empty() {
+            "devcloud"
+        } else {
+            &self.config.project
+        }
+    }
+
+    pub fn default_location(&self) -> &str {
+        if self.config.location.is_empty() {
+            "US"
+        } else {
+            &self.config.location
+        }
+    }
+
+    pub fn is_relaxed_auth(&self) -> bool {
+        matches!(
+            self.config.auth_mode.trim().to_ascii_lowercase().as_str(),
+            "" | "off" | "relaxed"
+        )
+    }
+
+    /// Registers an HMAC key pair for V4 `GOOG4-HMAC-SHA256` signed URL
+    /// verification.
+    pub fn add_hmac_key(&mut self, access_id: impl Into<String>, secret: impl Into<String>) {
+        self.hmac_keys.insert(access_id.into(), secret.into());
+    }
+
+    pub fn hmac_secret(&self, access_id: &str) -> Option<&str> {
+        self.hmac_keys.get(access_id).map(String::as_str)
+    }
+
+    /// Configures a local loopback Pub/Sub REST address (e.g. `127.0.0.1:18086`)
+    /// to receive published GCS notification messages.
+    pub fn set_pubsub_rest_addr(&mut self, addr: impl Into<String>) {
+        let addr = addr.into();
+        self.pubsub_rest_addr = if addr.trim().is_empty() {
+            None
+        } else {
+            Some(addr)
+        };
+    }
+
+    pub fn pubsub_rest_addr(&self) -> Option<&str> {
+        self.pubsub_rest_addr.as_deref()
+    }
+
+    /// Explicitly evaluates a bucket's GCS lifecycle rules at the current clock.
+    pub fn apply_bucket_lifecycle(&mut self, bucket: &str) -> usize {
+        apply_bucket_lifecycle(self, bucket)
+    }
+
+    /// Returns recorded local Pub/Sub notification events for `bucket`.
+    pub fn list_notification_events(&self, bucket: &str) -> Vec<NotificationEvent> {
+        crate::notifications::list_notification_events(self, bucket)
     }
 
     fn authorized(&self, token: &str) -> bool {
@@ -129,31 +238,65 @@ pub struct Request {
     pub method: String,
     pub path: String,
     pub query: BTreeMap<String, String>,
+    pub query_multi: Vec<(String, String)>,
     pub headers: BTreeMap<String, String>,
     pub body: Vec<u8>,
 }
 
 impl Request {
     pub fn new(method: &str, target: &str, body: Vec<u8>) -> Self {
-        let (path, query) = parse_target(target);
+        let (path, query, query_multi) = parse_target(target);
         Self {
             method: method.to_string(),
             path,
             query,
+            query_multi,
             headers: BTreeMap::new(),
             body,
         }
     }
 
-    fn header(&self, name: &str) -> &str {
+    pub(crate) fn header(&self, name: &str) -> &str {
         self.headers
             .get(&name.to_ascii_lowercase())
             .map(String::as_str)
             .unwrap_or("")
     }
 
-    fn query_value(&self, name: &str) -> &str {
+    pub(crate) fn query_value(&self, name: &str) -> &str {
         self.query.get(name).map(String::as_str).unwrap_or("")
+    }
+
+    pub(crate) fn query_all(&self, name: &str) -> Vec<&str> {
+        let vals: Vec<&str> = self
+            .query_multi
+            .iter()
+            .filter(|(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
+            .collect();
+        if !vals.is_empty() {
+            return vals;
+        }
+        self.query
+            .get(name)
+            .map(|v| vec![v.as_str()])
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn query_pairs(&self) -> Vec<(String, String)> {
+        if !self.query_multi.is_empty() {
+            let mut out = self.query_multi.clone();
+            for (k, v) in &self.query {
+                if !out.iter().any(|(ek, _)| ek == k) {
+                    out.push((k.clone(), v.clone()));
+                }
+            }
+            return out;
+        }
+        self.query
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
     }
 
     fn bearer_token(&self) -> String {
@@ -191,6 +334,10 @@ impl Response {
         }
     }
 
+    pub(crate) fn json_ok<T: Serialize>(value: &T) -> Self {
+        Self::json(200, value)
+    }
+
     fn empty(status: u16) -> Self {
         Self {
             status,
@@ -198,10 +345,18 @@ impl Response {
             body: Vec::new(),
         }
     }
+
+    pub(crate) fn empty_status(status: u16) -> Self {
+        Self::empty(status)
+    }
+}
+
+fn is_false_bool(v: &bool) -> bool {
+    !*v
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct BucketResource {
+pub(crate) struct BucketResource {
     kind: String,
     id: String,
     #[serde(rename = "selfLink")]
@@ -215,6 +370,22 @@ struct BucketResource {
     location: String,
     #[serde(rename = "storageClass")]
     storage_class: String,
+    metageneration: String,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    labels: BTreeMap<String, String>,
+    #[serde(
+        rename = "defaultEventBasedHold",
+        skip_serializing_if = "is_false_bool"
+    )]
+    default_event_based_hold: bool,
+    #[serde(rename = "retentionPolicy", skip_serializing_if = "Option::is_none")]
+    retention_policy: Option<BucketRetentionPolicy>,
+    #[serde(rename = "objectRetention", skip_serializing_if = "Option::is_none")]
+    object_retention: Option<BucketObjectRetention>,
+    #[serde(rename = "iamConfiguration", skip_serializing_if = "Option::is_none")]
+    iam_configuration: Option<IamConfiguration>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lifecycle: Option<GcsLifecycle>,
 }
 
 #[derive(Debug, Serialize)]
@@ -227,7 +398,7 @@ struct BucketsListResponse {
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct ObjectResource {
+pub(crate) struct ObjectResource {
     kind: String,
     id: String,
     #[serde(rename = "selfLink")]
@@ -260,6 +431,17 @@ struct ObjectResource {
         skip_serializing_if = "String::is_empty"
     )]
     content_disposition: String,
+    #[serde(rename = "temporaryHold", skip_serializing_if = "is_false_bool")]
+    temporary_hold: bool,
+    #[serde(rename = "eventBasedHold", skip_serializing_if = "is_false_bool")]
+    event_based_hold: bool,
+    #[serde(
+        rename = "retentionExpirationTime",
+        skip_serializing_if = "String::is_empty"
+    )]
+    retention_expiration_time: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    retention: Option<GcsObjectRetention>,
 }
 
 #[derive(Debug, Serialize)]
@@ -318,6 +500,18 @@ struct BucketRequest {
     location: String,
     #[serde(rename = "storageClass", default)]
     storage_class: String,
+    #[serde(default)]
+    labels: Option<BTreeMap<String, String>>,
+    #[serde(rename = "defaultEventBasedHold", default)]
+    default_event_based_hold: Option<bool>,
+    #[serde(rename = "retentionPolicy", default)]
+    retention_policy: Option<BucketRetentionPolicy>,
+    #[serde(rename = "objectRetention", default)]
+    object_retention: Option<BucketObjectRetention>,
+    #[serde(rename = "iamConfiguration", default)]
+    iam_configuration: Option<IamConfiguration>,
+    #[serde(default)]
+    lifecycle: Option<GcsLifecycle>,
 }
 
 /// The legacy `multipartUploadMetadata` JSON shape, shared by multipart metadata
@@ -336,8 +530,16 @@ struct ObjectMetadataRequest {
     cache_control: String,
     #[serde(rename = "contentDisposition", default)]
     content_disposition: String,
+    #[serde(rename = "storageClass", default)]
+    storage_class: String,
     #[serde(default)]
     metadata: Option<BTreeMap<String, String>>,
+    #[serde(rename = "temporaryHold", default)]
+    temporary_hold: Option<bool>,
+    #[serde(rename = "eventBasedHold", default)]
+    event_based_hold: Option<bool>,
+    #[serde(default)]
+    retention: Option<GcsObjectRetention>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -365,14 +567,45 @@ struct ComposeObjectPreconditions {
 }
 
 pub fn route(server: &mut Server, req: &Request) -> Response {
-    if !server.authorized(&req.bearer_token()) {
-        let mut r = json_error(401, "authError", "invalid authentication credentials");
-        r.headers.insert(
-            "WWW-Authenticate".to_string(),
-            "Bearer realm=\"devcloud-gcs\"".to_string(),
-        );
-        return r;
+    let is_json_or_introspect = is_introspect_path(&req.path)
+        || req.path == "/storage/v1/b"
+        || req.path.starts_with("/storage/v1/")
+        || req.path.starts_with("/upload/storage/v1/")
+        || req.path.starts_with("/download/storage/v1/");
+
+    match verify_signed_url(server, req) {
+        SignedUrlCheck::Valid => {}
+        SignedUrlCheck::Invalid {
+            status,
+            code,
+            message,
+        } => {
+            return if is_json_or_introspect {
+                json_error(status, code, &message)
+            } else {
+                crate::xml_api::xml_error(status, code, &message)
+            };
+        }
+        SignedUrlCheck::NotSigned => {
+            if !server.authorized(&req.bearer_token()) {
+                let mut r = if is_json_or_introspect {
+                    json_error(401, "authError", "invalid authentication credentials")
+                } else {
+                    crate::xml_api::xml_error(
+                        401,
+                        "AuthenticationRequired",
+                        "Anonymous caller does not have storage access.",
+                    )
+                };
+                r.headers.insert(
+                    "WWW-Authenticate".to_string(),
+                    "Bearer realm=\"devcloud-gcs\"".to_string(),
+                );
+                return r;
+            }
+        }
     }
+
     if is_introspect_path(&req.path) {
         return handle_introspect(server, req);
     }
@@ -381,7 +614,13 @@ pub fn route(server: &mut Server, req: &Request) -> Response {
         p if p.starts_with("/storage/v1/b/") => handle_bucket_or_object(server, req),
         p if p.starts_with("/upload/storage/v1/b/") => handle_upload(server, req),
         p if p.starts_with("/download/storage/v1/b/") => handle_download(server, req),
-        _ => json_error(404, "notFound", "not found"),
+        p if p.starts_with("/storage/v1/")
+            || p.starts_with("/upload/storage/v1/")
+            || p.starts_with("/download/storage/v1/") =>
+        {
+            json_error(404, "notFound", "not found")
+        }
+        _ => crate::xml_api::handle_xml_request(server, req),
     }
 }
 
@@ -568,6 +807,9 @@ fn handle_introspect(server: &mut Server, req: &Request) -> Response {
         if suffix == "objects" {
             return introspect_objects(server, req, &bucket);
         }
+        if suffix == "notification-events" {
+            return introspect_notification_events(server, &bucket);
+        }
         if let Some(escaped_name) = suffix.strip_prefix("objects/") {
             let name = url_decode(escaped_name);
             if name.is_empty() {
@@ -679,6 +921,54 @@ fn introspect_object_detail(server: &Server, bucket: &str, name: &str) -> Respon
     }
 }
 
+fn introspect_notification_events(server: &Server, bucket: &str) -> Response {
+    match server.store.get_bucket(bucket) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            let mut r = json_error(404, "notFound", "bucket not found");
+            r.headers
+                .insert("Content-Type".to_string(), "application/json".to_string());
+            return r;
+        }
+        Err(e) => return introspect_backend_error(&e),
+    }
+    let events = server.list_notification_events(bucket);
+    introspect_json(
+        200,
+        &serde_json::json!({
+            "bucket": bucket,
+            "events": events,
+        }),
+    )
+}
+
+fn check_bucket_preconditions(req: &Request, meta: &GcsBucketMeta) -> Result<(), Response> {
+    let current = meta.metageneration.max(1);
+    let if_match = req.query_value("ifMetagenerationMatch").trim();
+    if !if_match.is_empty() {
+        let Ok(expected) = if_match.parse::<i64>() else {
+            return Err(json_error(400, "invalid", "invalid ifMetagenerationMatch"));
+        };
+        if expected != current {
+            return Err(json_error(412, "conditionNotMet", "precondition failed"));
+        }
+    }
+    let if_not_match = req.query_value("ifMetagenerationNotMatch").trim();
+    if !if_not_match.is_empty() {
+        let Ok(expected) = if_not_match.parse::<i64>() else {
+            return Err(json_error(
+                400,
+                "invalid",
+                "invalid ifMetagenerationNotMatch",
+            ));
+        };
+        if expected == current {
+            return Err(json_error(412, "conditionNotMet", "precondition failed"));
+        }
+    }
+    Ok(())
+}
+
 fn handle_buckets(server: &mut Server, req: &Request) -> Response {
     match req.method.as_str() {
         "GET" => {
@@ -688,7 +978,9 @@ fn handle_buckets(server: &mut Server, req: &Request) -> Response {
                     let mut items = Vec::new();
                     for bucket in buckets {
                         if prefix.is_empty() || bucket.name.starts_with(prefix) {
-                            items.push(bucket_resource(server, &bucket, None, None));
+                            let meta =
+                                read_bucket_meta(&server.store, &bucket.name).unwrap_or_default();
+                            items.push(build_bucket_resource(server, &bucket, &meta));
                         }
                     }
                     let (start, end, next) = match page_window(&req.query, items.len()) {
@@ -716,17 +1008,94 @@ fn handle_buckets(server: &mut Server, req: &Request) -> Response {
             if parsed.name.is_empty() {
                 return json_error(400, "required", "bucket name is required");
             }
+            let now = server.now();
+            let retention_policy =
+                match apply_bucket_retention_policy_update(&None, parsed.retention_policy, &now) {
+                    Ok(v) => v,
+                    Err(r) => return r,
+                };
+            let lifecycle = match parsed.lifecycle {
+                Some(lc) => {
+                    if let Err(r) = validate_lifecycle(&lc) {
+                        return r;
+                    }
+                    if lc.rule.is_empty() {
+                        None
+                    } else {
+                        Some(lc)
+                    }
+                }
+                None => None,
+            };
+            let ubla_enabled = parsed
+                .iam_configuration
+                .as_ref()
+                .is_some_and(|c| c.uniform_bucket_level_access.enabled);
+            let predefined_acl = req.query_value("predefinedAcl").trim();
+            let bucket_acl_entries = if !predefined_acl.is_empty() {
+                if ubla_enabled {
+                    return json_error(
+                        400,
+                        "invalid",
+                        "Cannot specify predefinedAcl when uniform bucket-level access is enabled",
+                    );
+                }
+                match expand_predefined_acl(predefined_acl, server.project(), true) {
+                    Ok(v) => Some(v),
+                    Err(e) => return json_error(400, "invalid", &e),
+                }
+            } else {
+                None
+            };
+            let predefined_def_acl = req.query_value("predefinedDefaultObjectAcl").trim();
+            let default_obj_acl_entries = if !predefined_def_acl.is_empty() {
+                if ubla_enabled {
+                    return json_error(
+                        400,
+                        "invalid",
+                        "Cannot specify predefinedDefaultObjectAcl when uniform bucket-level access is enabled",
+                    );
+                }
+                match expand_predefined_acl(predefined_def_acl, server.project(), false) {
+                    Ok(v) => Some(v),
+                    Err(e) => return json_error(400, "invalid", &e),
+                }
+            } else {
+                None
+            };
+            let object_retention = if req
+                .query_value("enableObjectRetention")
+                .eq_ignore_ascii_case("true")
+            {
+                Some(BucketObjectRetention {
+                    mode: "Enabled".to_string(),
+                })
+            } else {
+                parsed.object_retention
+            };
+
             match server.store.create_bucket(&parsed.name) {
                 Ok((bucket, true)) => {
-                    let mut r = Response::json(
-                        200,
-                        &bucket_resource(
-                            server,
-                            &bucket,
-                            Some(parsed.location.as_str()),
-                            Some(parsed.storage_class.as_str()),
-                        ),
-                    );
+                    let meta = GcsBucketMeta {
+                        location: parsed.location.clone(),
+                        storage_class: parsed.storage_class.clone(),
+                        metageneration: 1,
+                        updated: bucket.created_at.clone(),
+                        labels: parsed.labels.unwrap_or_default(),
+                        default_event_based_hold: parsed.default_event_based_hold.unwrap_or(false),
+                        retention_policy,
+                        object_retention,
+                        iam_configuration: parsed.iam_configuration,
+                        lifecycle,
+                    };
+                    let _ = write_bucket_meta(&server.store, &bucket.name, &meta);
+                    if let Some(entries) = bucket_acl_entries {
+                        let _ = write_bucket_acl(&server.store, &bucket.name, &entries);
+                    }
+                    if let Some(entries) = default_obj_acl_entries {
+                        let _ = write_default_object_acl(&server.store, &bucket.name, &entries);
+                    }
+                    let mut r = Response::json(200, &build_bucket_resource(server, &bucket, &meta));
                     r.headers.insert(
                         "Location".to_string(),
                         format!("/storage/v1/b/{}", url_encode(&bucket.name)),
@@ -752,6 +1121,33 @@ fn handle_bucket_or_object(server: &mut Server, req: &Request) -> Response {
     if suffix.is_empty() {
         return handle_bucket(server, req, &bucket);
     }
+    if suffix == "lockRetentionPolicy" {
+        return crate::retention::handle_lock_retention_policy(server, req, &bucket);
+    }
+    if suffix == "iam" {
+        return crate::iam_acl::handle_bucket_iam(server, req, &bucket);
+    }
+    if suffix == "iam/testPermissions" {
+        return crate::iam_acl::handle_bucket_test_iam_permissions(server, req, &bucket);
+    }
+    if suffix == "acl" {
+        return crate::iam_acl::handle_bucket_acl(server, req, &bucket, None);
+    }
+    if let Some(entity) = suffix.strip_prefix("acl/") {
+        return crate::iam_acl::handle_bucket_acl(server, req, &bucket, Some(entity));
+    }
+    if suffix == "defaultObjectAcl" {
+        return crate::iam_acl::handle_default_object_acl(server, req, &bucket, None);
+    }
+    if let Some(entity) = suffix.strip_prefix("defaultObjectAcl/") {
+        return crate::iam_acl::handle_default_object_acl(server, req, &bucket, Some(entity));
+    }
+    if suffix == "notificationConfigs" {
+        return crate::notifications::handle_notification_configs(server, req, &bucket, None);
+    }
+    if let Some(id) = suffix.strip_prefix("notificationConfigs/") {
+        return crate::notifications::handle_notification_configs(server, req, &bucket, Some(id));
+    }
     if suffix == "o" {
         return handle_objects(server, req, &bucket);
     }
@@ -765,6 +1161,26 @@ fn handle_bucket_or_object(server: &mut Server, req: &Request) -> Response {
         if let Some((source, rewrite_suffix)) = object.split_once("/rewriteTo/b/") {
             return handle_rewrite_object(server, req, &bucket, source, rewrite_suffix);
         }
+        if let Some(obj_escaped) = object.strip_suffix("/acl") {
+            let key = url_decode(obj_escaped);
+            if key.is_empty() {
+                return json_error(400, "invalid", "invalid object name");
+            }
+            return crate::iam_acl::handle_object_acl(server, req, &bucket, &key, None);
+        }
+        if let Some((obj_escaped, entity_escaped)) = object.split_once("/acl/") {
+            let key = url_decode(obj_escaped);
+            if key.is_empty() {
+                return json_error(400, "invalid", "invalid object name");
+            }
+            return crate::iam_acl::handle_object_acl(
+                server,
+                req,
+                &bucket,
+                &key,
+                Some(entity_escaped),
+            );
+        }
         let key = url_decode(object);
         if key.is_empty() {
             return json_error(400, "invalid", "invalid object name");
@@ -777,10 +1193,124 @@ fn handle_bucket_or_object(server: &mut Server, req: &Request) -> Response {
 fn handle_bucket(server: &mut Server, req: &Request, name: &str) -> Response {
     match req.method.as_str() {
         "GET" => match server.store.get_bucket(name) {
-            Ok(Some(bucket)) => Response::json(200, &bucket_resource(server, &bucket, None, None)),
+            Ok(Some(bucket)) => {
+                let meta = read_bucket_meta(&server.store, name).unwrap_or_default();
+                if let Err(r) = check_bucket_preconditions(req, &meta) {
+                    return r;
+                }
+                Response::json(200, &build_bucket_resource(server, &bucket, &meta))
+            }
             Ok(None) => json_error(404, "notFound", "bucket not found"),
             Err(e) => json_error(400, "invalid", &store_error_text(&e, name, "")),
         },
+        "PATCH" | "PUT" => {
+            let bucket = match server.store.get_bucket(name) {
+                Ok(Some(b)) => b,
+                Ok(None) => return json_error(404, "notFound", "bucket not found"),
+                Err(e) => return json_error(400, "invalid", &store_error_text(&e, name, "")),
+            };
+            let mut meta = read_bucket_meta(&server.store, name).unwrap_or_default();
+            if let Err(r) = check_bucket_preconditions(req, &meta) {
+                return r;
+            }
+            let raw: serde_json::Value = if req.body.is_empty() {
+                serde_json::json!({})
+            } else {
+                match serde_json::from_slice::<serde_json::Value>(&req.body) {
+                    Ok(v) if v.is_object() => v,
+                    _ => return json_error(400, "invalid", "invalid json request"),
+                }
+            };
+            let parsed: BucketRequest = match serde_json::from_value(raw.clone()) {
+                Ok(v) => v,
+                Err(_) => return json_error(400, "invalid", "invalid json request"),
+            };
+            let obj_map = raw.as_object().unwrap();
+            let is_put = req.method == "PUT";
+            let now = server.now();
+
+            if obj_map.contains_key("retentionPolicy") || is_put {
+                let updated_policy = match apply_bucket_retention_policy_update(
+                    &meta.retention_policy,
+                    parsed.retention_policy,
+                    &now,
+                ) {
+                    Ok(v) => v,
+                    Err(r) => return r,
+                };
+                meta.retention_policy = updated_policy;
+            }
+            if obj_map.contains_key("lifecycle") || is_put {
+                meta.lifecycle = match parsed.lifecycle {
+                    Some(lc) => {
+                        if let Err(r) = validate_lifecycle(&lc) {
+                            return r;
+                        }
+                        if lc.rule.is_empty() {
+                            None
+                        } else {
+                            Some(lc)
+                        }
+                    }
+                    None => None,
+                };
+            }
+            if obj_map.contains_key("iamConfiguration") || is_put {
+                meta.iam_configuration = parsed.iam_configuration;
+            }
+            if obj_map.contains_key("defaultEventBasedHold") || is_put {
+                meta.default_event_based_hold = parsed.default_event_based_hold.unwrap_or(false);
+            }
+            if obj_map.contains_key("labels") || is_put {
+                meta.labels = parsed.labels.unwrap_or_default();
+            }
+            if !parsed.storage_class.is_empty() {
+                meta.storage_class = parsed.storage_class;
+            }
+            if !parsed.location.is_empty() {
+                meta.location = parsed.location;
+            }
+
+            let predefined_acl = req.query_value("predefinedAcl").trim();
+            if !predefined_acl.is_empty() {
+                if meta.uniform_bucket_level_access_enabled() {
+                    return json_error(
+                        400,
+                        "invalid",
+                        "Cannot specify predefinedAcl when uniform bucket-level access is enabled",
+                    );
+                }
+                match expand_predefined_acl(predefined_acl, server.project(), true) {
+                    Ok(entries) => {
+                        let _ = write_bucket_acl(&server.store, name, &entries);
+                    }
+                    Err(e) => return json_error(400, "invalid", &e),
+                }
+            }
+            let predefined_def_acl = req.query_value("predefinedDefaultObjectAcl").trim();
+            if !predefined_def_acl.is_empty() {
+                if meta.uniform_bucket_level_access_enabled() {
+                    return json_error(
+                        400,
+                        "invalid",
+                        "Cannot specify predefinedDefaultObjectAcl when uniform bucket-level access is enabled",
+                    );
+                }
+                match expand_predefined_acl(predefined_def_acl, server.project(), false) {
+                    Ok(entries) => {
+                        let _ = write_default_object_acl(&server.store, name, &entries);
+                    }
+                    Err(e) => return json_error(400, "invalid", &e),
+                }
+            }
+
+            meta.metageneration = meta.metageneration.max(1) + 1;
+            meta.updated = now;
+            if write_bucket_meta(&server.store, name, &meta).is_err() {
+                return json_error(500, "backendError", "internal error");
+            }
+            Response::json(200, &build_bucket_resource(server, &bucket, &meta))
+        }
         "DELETE" => match server.store.delete_bucket(name) {
             Ok(true) => {
                 emit_dashboard_event("gcs.bucket.deleted", serde_json::json!({"bucket": name}));
@@ -789,7 +1319,7 @@ fn handle_bucket(server: &mut Server, req: &Request, name: &str) -> Response {
             Ok(false) => json_error(404, "notFound", "bucket not found"),
             Err(e) => json_error(409, "conflict", &store_error_text(&e, name, "")),
         },
-        _ => method_not_allowed("GET, DELETE"),
+        _ => method_not_allowed("GET, PATCH, PUT, DELETE"),
     }
 }
 
@@ -797,6 +1327,7 @@ fn handle_objects(server: &mut Server, req: &Request, bucket: &str) -> Response 
     if req.method != "GET" {
         return method_not_allowed("GET");
     }
+    apply_bucket_lifecycle(server, bucket);
     let prefix = req.query_value("prefix");
     let delimiter = req.query_value("delimiter");
     let start_offset = req.query_value("startOffset");
@@ -829,7 +1360,7 @@ fn handle_objects(server: &mut Server, req: &Request, bucket: &str) -> Response 
                 }
             }
         }
-        items.push(object_resource(&object));
+        items.push(build_object_resource(&server.store, &object));
     }
     let mut entries = Vec::with_capacity(items.len() + prefixes.len());
     for object in items {
@@ -895,35 +1426,179 @@ fn check_existing_object(req: &Request, found: Option<&Object>) -> Result<(), Re
     check_preconditions(Some(object), &preconditions_from_request(req))
 }
 
+fn initialize_object_sidecar(
+    server: &Server,
+    req: &Request,
+    bucket: &str,
+    key: &str,
+    meta_req: Option<&ObjectMetadataRequest>,
+) -> Result<(), Response> {
+    let bucket_meta = read_bucket_meta(&server.store, bucket).unwrap_or_default();
+    let predefined_acl = req.query_value("predefinedAcl").trim();
+    let acl_entries = if !predefined_acl.is_empty() {
+        if bucket_meta.uniform_bucket_level_access_enabled() {
+            return Err(json_error(
+                400,
+                "invalid",
+                "Cannot specify predefinedAcl when uniform bucket-level access is enabled",
+            ));
+        }
+        Some(
+            expand_predefined_acl(predefined_acl, server.project(), false)
+                .map_err(|e| json_error(400, "invalid", &e))?,
+        )
+    } else {
+        None
+    };
+
+    let requested_retention = meta_req.and_then(|m| m.retention.clone());
+    let validated_retention = if requested_retention.is_some() {
+        validate_object_retention_update(
+            &bucket_meta,
+            &None,
+            requested_retention,
+            false,
+            &server.now(),
+        )?
+    } else {
+        None
+    };
+    let obj_meta = GcsObjectMeta {
+        storage_class: meta_req
+            .map(|m| m.storage_class.trim().to_ascii_uppercase())
+            .unwrap_or_default(),
+        temporary_hold: meta_req.and_then(|m| m.temporary_hold).unwrap_or(false),
+        event_based_hold: meta_req
+            .and_then(|m| m.event_based_hold)
+            .unwrap_or(bucket_meta.default_event_based_hold),
+        retention_expiration_time: String::new(),
+        retention: validated_retention,
+    };
+    let _ = write_object_meta(&server.store, bucket, key, &obj_meta);
+    if let Some(entries) = acl_entries {
+        let _ = write_object_acl(&server.store, bucket, key, &entries);
+    }
+    Ok(())
+}
+
+fn validate_upload_sidecar_request(
+    server: &Server,
+    req: &Request,
+    bucket: &str,
+    meta_req: Option<&ObjectMetadataRequest>,
+) -> Result<(), Response> {
+    let bucket_meta = read_bucket_meta(&server.store, bucket).unwrap_or_default();
+    let predefined_acl = req.query_value("predefinedAcl").trim();
+    if !predefined_acl.is_empty() {
+        if bucket_meta.uniform_bucket_level_access_enabled() {
+            return Err(json_error(
+                400,
+                "invalid",
+                "Cannot specify predefinedAcl when uniform bucket-level access is enabled",
+            ));
+        }
+        expand_predefined_acl(predefined_acl, server.project(), false)
+            .map_err(|e| json_error(400, "invalid", &e))?;
+    }
+    if let Some(ret) = meta_req.and_then(|m| m.retention.clone()) {
+        validate_object_retention_update(&bucket_meta, &None, Some(ret), false, &server.now())?;
+    }
+    Ok(())
+}
+
 fn handle_object(server: &mut Server, req: &Request, bucket: &str, key: &str) -> Response {
     match req.method.as_str() {
         "GET" | "HEAD" => {
+            apply_bucket_lifecycle(server, bucket);
             let (object, body) = match read_object(server, req, bucket, key) {
                 Ok(v) => v,
                 Err(r) => return r,
             };
             if req.query_value("alt") == "media" {
-                return media_response(req, &object, &body);
+                let mut r = build_media_response(&server.store, req, &object, &body, false);
+                apply_response_header_overrides(req, &mut r);
+                return r;
             }
             if req.method == "HEAD" {
                 let mut r = Response::empty(200);
-                set_object_headers(&mut r, &object);
+                let bucket_meta = read_bucket_meta(&server.store, bucket).unwrap_or_default();
+                let obj_meta = read_object_meta(&server.store, bucket, key).unwrap_or_default();
+                set_object_headers_with_meta(&mut r, &object, &bucket_meta, &obj_meta, false);
                 r.headers
                     .insert("Content-Type".to_string(), "application/json".to_string());
                 r
             } else {
-                Response::json(200, &object_resource(&object))
+                Response::json(200, &build_object_resource(&server.store, &object))
             }
         }
-        "PATCH" => {
+        "PATCH" | "PUT" => {
             if let Err(r) = read_object(server, req, bucket, key) {
                 return r;
             }
-            let parsed: ObjectMetadataRequest = match serde_json::from_slice(&req.body) {
+            let raw: serde_json::Value = if req.body.is_empty() {
+                serde_json::json!({})
+            } else {
+                match serde_json::from_slice::<serde_json::Value>(&req.body) {
+                    Ok(v) if v.is_object() => v,
+                    _ => return json_error(400, "invalid", "invalid json request"),
+                }
+            };
+            let parsed: ObjectMetadataRequest = match serde_json::from_value(raw.clone()) {
                 Ok(v) => v,
-                Err(_) if req.body.is_empty() => ObjectMetadataRequest::default(),
                 Err(_) => return json_error(400, "invalid", "invalid json request"),
             };
+            let obj_map = raw.as_object().unwrap();
+            let bucket_meta = read_bucket_meta(&server.store, bucket).unwrap_or_default();
+            let mut obj_meta = read_object_meta(&server.store, bucket, key).unwrap_or_default();
+            let now = server.now();
+
+            let predefined_acl = req.query_value("predefinedAcl").trim();
+            let acl_entries = if !predefined_acl.is_empty() {
+                if bucket_meta.uniform_bucket_level_access_enabled() {
+                    return json_error(
+                        400,
+                        "invalid",
+                        "Cannot specify predefinedAcl when uniform bucket-level access is enabled",
+                    );
+                }
+                match expand_predefined_acl(predefined_acl, server.project(), false) {
+                    Ok(v) => Some(v),
+                    Err(e) => return json_error(400, "invalid", &e),
+                }
+            } else {
+                None
+            };
+
+            if obj_map.contains_key("retention") {
+                let override_unlocked = req
+                    .query_value("overrideUnlockedRetention")
+                    .eq_ignore_ascii_case("true");
+                match validate_object_retention_update(
+                    &bucket_meta,
+                    &obj_meta.retention,
+                    parsed.retention.clone(),
+                    override_unlocked,
+                    &now,
+                ) {
+                    Ok(updated) => obj_meta.retention = updated,
+                    Err(r) => return r,
+                }
+            }
+            if let Some(temp_hold) = parsed.temporary_hold {
+                obj_meta.temporary_hold = temp_hold;
+            }
+            if let Some(event_hold) = parsed.event_based_hold {
+                let was_held = obj_meta.event_based_hold;
+                obj_meta.event_based_hold = event_hold;
+                if was_held && !event_hold {
+                    obj_meta.retention_expiration_time =
+                        recompute_retention_after_event_hold_release(&bucket_meta, &now);
+                }
+            }
+            if !parsed.storage_class.is_empty() {
+                obj_meta.storage_class = parsed.storage_class.trim().to_ascii_uppercase();
+            }
+
             match server.store.update_object_metadata_if(
                 UpdateObjectMetadataInput {
                     bucket: bucket.to_string(),
@@ -936,33 +1611,53 @@ fn handle_object(server: &mut Server, req: &Request, bucket: &str, key: &str) ->
                 },
                 |current| check_existing_object(req, current),
             ) {
-                Ok(Some(object)) => Response::json(200, &object_resource(&object)),
+                Ok(Some(object)) => {
+                    let _ = write_object_meta(&server.store, bucket, key, &obj_meta);
+                    if let Some(entries) = acl_entries {
+                        let _ = write_object_acl(&server.store, bucket, key, &entries);
+                    }
+                    emit_object_notification(server, "OBJECT_METADATA_UPDATE", &object);
+                    Response::json(200, &build_object_resource(&server.store, &object))
+                }
                 Ok(None) => json_error(404, "notFound", "object not found"),
                 Err(ConditionalError::Condition(response)) => response,
                 Err(ConditionalError::Store(_)) => json_error(404, "notFound", "bucket not found"),
             }
         }
         "DELETE" => {
-            if let Err(r) = read_object(server, req, bucket, key) {
-                return r;
-            }
-            match server
-                .store
-                .delete_object_if(bucket, key, |current| check_existing_object(req, current))
-            {
+            let (existing, _) = match read_object(server, req, bucket, key) {
+                Ok(v) => v,
+                Err(r) => return r,
+            };
+            let now = server.now();
+            let store = &server.store;
+            match store.delete_object_if(bucket, key, |current| {
+                check_existing_object(req, current)?;
+                if let Some(obj) = current {
+                    if let Some(reason) = object_mutation_blocked_reason(store, bucket, obj, &now) {
+                        return Err(json_error(403, "forbidden", &reason));
+                    }
+                }
+                Ok(())
+            }) {
                 Ok(true) => {
+                    let _ = delete_object_sidecars(&server.store, bucket, key);
                     emit_dashboard_event(
                         "gcs.object.deleted",
                         serde_json::json!({"bucket": bucket, "key": key}),
                     );
+                    emit_object_notification(server, "OBJECT_DELETE", &existing);
                     Response::empty(204)
                 }
                 Ok(false) => json_error(404, "notFound", "object not found"),
                 Err(ConditionalError::Condition(response)) => response,
+                Err(ConditionalError::Store(StoreError::ObjectLocked)) => {
+                    json_error(403, "forbidden", "object is locked")
+                }
                 Err(ConditionalError::Store(_)) => json_error(404, "notFound", "bucket not found"),
             }
         }
-        _ => method_not_allowed("GET, PATCH, DELETE"),
+        _ => method_not_allowed("GET, HEAD, PATCH, PUT, DELETE"),
     }
 }
 
@@ -977,7 +1672,10 @@ fn handle_copy_object(
         return method_not_allowed("POST");
     }
     match copy_object(server, req, source_bucket, source_escaped, copy_suffix) {
-        Ok(object) => Response::json(200, &object_resource(&object)),
+        Ok(object) => {
+            emit_object_notification(server, "OBJECT_FINALIZE", &object);
+            Response::json(200, &build_object_resource(&server.store, &object))
+        }
         Err(response) => response,
     }
 }
@@ -994,6 +1692,7 @@ fn handle_rewrite_object(
     }
     match copy_object(server, req, source_bucket, source_escaped, rewrite_suffix) {
         Ok(object) => {
+            emit_object_notification(server, "OBJECT_FINALIZE", &object);
             let size = object.size.to_string();
             Response::json(
                 200,
@@ -1002,7 +1701,7 @@ fn handle_rewrite_object(
                     total_bytes_rewritten: size.clone(),
                     object_size: size,
                     done: true,
-                    resource: object_resource(&object),
+                    resource: build_object_resource(&server.store, &object),
                 },
             )
         }
@@ -1038,6 +1737,10 @@ fn handle_compose_object(
             "sourceObjects must contain no more than 32 objects",
         );
     }
+    if let Err(r) = validate_upload_sidecar_request(server, req, bucket, Some(&parsed.destination))
+    {
+        return r;
+    }
     if let Err(r) = check_object_preconditions(server, req, bucket, &dest_key) {
         return r;
     }
@@ -1062,7 +1765,9 @@ fn handle_compose_object(
         body.extend_from_slice(&payload);
     }
     let first_source = first_source.unwrap_or_default();
-    match server.store.put_object_if(
+    let now = server.now();
+    let store = &server.store;
+    match store.put_object_if(
         PutObjectInput {
             bucket: bucket.to_string(),
             key: dest_key.clone(),
@@ -1071,10 +1776,10 @@ fn handle_compose_object(
                 &parsed.destination.content_type,
                 &first_source.content_type,
             ),
-            content_encoding: parsed.destination.content_encoding,
-            cache_control: parsed.destination.cache_control,
-            content_disposition: parsed.destination.content_disposition,
-            metadata: parsed.destination.metadata.unwrap_or_default(),
+            content_encoding: parsed.destination.content_encoding.clone(),
+            cache_control: parsed.destination.cache_control.clone(),
+            content_disposition: parsed.destination.content_disposition.clone(),
+            metadata: parsed.destination.metadata.clone().unwrap_or_default(),
             ..Default::default()
         },
         |current| {
@@ -1085,10 +1790,27 @@ fn handle_compose_object(
                     check_compose_source_preconditions(current, source)?;
                 }
             }
-            check_preconditions(current, &preconditions_from_request(req))
+            check_preconditions(current, &preconditions_from_request(req))?;
+            if let Some(existing) = current {
+                if let Some(reason) = object_mutation_blocked_reason(store, bucket, existing, &now)
+                {
+                    return Err(json_error(403, "forbidden", &reason));
+                }
+            }
+            Ok(())
         },
     ) {
-        Ok(object) => Response::json(200, &object_resource(&object)),
+        Ok(object) => {
+            let _ = initialize_object_sidecar(
+                server,
+                req,
+                bucket,
+                &dest_key,
+                Some(&parsed.destination),
+            );
+            emit_object_notification(server, "OBJECT_FINALIZE", &object);
+            Response::json(200, &build_object_resource(&server.store, &object))
+        }
         Err(ConditionalError::Condition(response)) => response,
         Err(ConditionalError::Store(e)) => {
             json_error(404, "notFound", &store_error_text(&e, bucket, &dest_key))
@@ -1147,6 +1869,7 @@ fn copy_object(
             "invalid destination object name",
         ));
     }
+    validate_upload_sidecar_request(server, req, &dest_bucket, Some(&destination))?;
     let (source, body) = match server.store.get_object_snapshot(source_bucket, &source_key) {
         Ok(Some(found)) => found,
         Ok(None) => return Err(json_error(404, "notFound", "source object not found")),
@@ -1159,11 +1882,14 @@ fn copy_object(
     let same_object = source_bucket == dest_bucket && source_key == dest_key;
     let metadata = destination
         .metadata
+        .clone()
         .unwrap_or_else(|| source.metadata.clone());
-    match server.store.put_object_if(
+    let now = server.now();
+    let store = &server.store;
+    match store.put_object_if(
         PutObjectInput {
-            bucket: dest_bucket,
-            key: dest_key,
+            bucket: dest_bucket.clone(),
+            key: dest_key.clone(),
             body,
             content_type: first_non_empty(&destination.content_type, &source.content_type),
             content_encoding: first_non_empty(
@@ -1182,10 +1908,22 @@ fn copy_object(
             if same_object {
                 check_preconditions(current, &source_preconditions)?;
             }
-            check_preconditions(current, &preconditions_from_request(req))
+            check_preconditions(current, &preconditions_from_request(req))?;
+            if let Some(existing) = current {
+                if let Some(reason) =
+                    object_mutation_blocked_reason(store, &dest_bucket, existing, &now)
+                {
+                    return Err(json_error(403, "forbidden", &reason));
+                }
+            }
+            Ok(())
         },
     ) {
-        Ok(object) => Ok(object),
+        Ok(object) => {
+            let _ =
+                initialize_object_sidecar(server, req, &dest_bucket, &dest_key, Some(&destination));
+            Ok(object)
+        }
         Err(ConditionalError::Condition(response)) => Err(response),
         Err(ConditionalError::Store(_)) => {
             Err(json_error(404, "notFound", "destination bucket not found"))
@@ -1226,6 +1964,9 @@ fn handle_media_upload(server: &mut Server, req: &Request, bucket: &str) -> Resp
     if name.is_empty() {
         return json_error(400, "required", "object name is required");
     }
+    if let Err(r) = validate_upload_sidecar_request(server, req, bucket, None) {
+        return r;
+    }
     if let Err(r) = check_object_preconditions(server, req, bucket, &name) {
         return r;
     }
@@ -1243,6 +1984,7 @@ fn handle_media_upload(server: &mut Server, req: &Request, bucket: &str) -> Resp
             metadata: user_metadata(&req.headers),
             ..Default::default()
         },
+        None,
     )
 }
 
@@ -1258,6 +2000,9 @@ fn handle_multipart_upload(server: &mut Server, req: &Request, bucket: &str) -> 
     if name.is_empty() {
         return json_error(400, "required", "object name is required");
     }
+    if let Err(r) = validate_upload_sidecar_request(server, req, bucket, Some(&parsed)) {
+        return r;
+    }
     if let Err(r) = check_object_preconditions(server, req, bucket, &name) {
         return r;
     }
@@ -1269,12 +2014,13 @@ fn handle_multipart_upload(server: &mut Server, req: &Request, bucket: &str) -> 
             key: name,
             body,
             content_type: first_non_empty(&parsed.content_type, &body_content_type),
-            content_encoding: parsed.content_encoding,
-            cache_control: parsed.cache_control,
-            content_disposition: parsed.content_disposition,
-            metadata: parsed.metadata.unwrap_or_default(),
+            content_encoding: parsed.content_encoding.clone(),
+            cache_control: parsed.cache_control.clone(),
+            content_disposition: parsed.content_disposition.clone(),
+            metadata: parsed.metadata.clone().unwrap_or_default(),
             ..Default::default()
         },
+        Some(&parsed),
     )
 }
 
@@ -1442,7 +2188,10 @@ fn put_resumable_upload(server: &mut Server, req: &Request, bucket: &str) -> Res
     }
     // A final write checks its conditions only inside the store lock, after
     // replaying any completion that appeared since the initial lookup.
-    match server.store.put_resumable_object_if(
+    let now = server.now();
+    let store = &server.store;
+    let target_bucket = session.bucket.clone();
+    match store.put_resumable_object_if(
         PutObjectInput {
             bucket: session.bucket.clone(),
             key: session.name.clone(),
@@ -1455,9 +2204,29 @@ fn put_resumable_upload(server: &mut Server, req: &Request, bucket: &str) -> Res
             ..Default::default()
         },
         &id,
-        |current| check_preconditions(current, &session.preconditions),
+        |current| {
+            check_preconditions(current, &session.preconditions)?;
+            if let Some(existing) = current {
+                if let Some(reason) =
+                    object_mutation_blocked_reason(store, &target_bucket, existing, &now)
+                {
+                    return Err(json_error(403, "forbidden", &reason));
+                }
+            }
+            Ok(())
+        },
     ) {
-        Ok(object) => complete_resumable_upload(server, &id, &object),
+        Ok(object) => {
+            let bucket_meta = read_bucket_meta(&server.store, &object.bucket).unwrap_or_default();
+            if bucket_meta.default_event_based_hold {
+                let obj_meta = GcsObjectMeta {
+                    event_based_hold: true,
+                    ..Default::default()
+                };
+                let _ = write_object_meta(&server.store, &object.bucket, &object.key, &obj_meta);
+            }
+            complete_resumable_upload(server, &id, &object)
+        }
         Err(error) => {
             if let Some(prior_received_bytes) = staged_chunk_rollback {
                 // The in-memory and on-disk checkpoints still contain this
@@ -1496,19 +2265,34 @@ fn complete_resumable_upload(server: &mut Server, id: &str, object: &Object) -> 
                 "contentLength": object.size,
             }),
         );
+        emit_object_notification(server, "OBJECT_FINALIZE", object);
     }
-    Response::json(200, &object_resource(object))
+    Response::json(200, &build_object_resource(&server.store, object))
 }
 
 /// Stores the object and writes the legacy upload-handler response: the object
 /// resource on success, or `404 notFound` with the store error text (matching
 /// legacy `writeError(w, http.StatusNotFound, "notFound", err.Error())`).
-fn put_object_response(server: &mut Server, req: &Request, input: PutObjectInput) -> Response {
+fn put_object_response(
+    server: &mut Server,
+    req: &Request,
+    input: PutObjectInput,
+    meta_req: Option<&ObjectMetadataRequest>,
+) -> Response {
     let (bucket, key) = (input.bucket.clone(), input.key.clone());
-    match server.store.put_object_if(input, |current| {
-        check_preconditions(current, &preconditions_from_request(req))
+    let now = server.now();
+    let store = &server.store;
+    match store.put_object_if(input, |current| {
+        check_preconditions(current, &preconditions_from_request(req))?;
+        if let Some(existing) = current {
+            if let Some(reason) = object_mutation_blocked_reason(store, &bucket, existing, &now) {
+                return Err(json_error(403, "forbidden", &reason));
+            }
+        }
+        Ok(())
     }) {
         Ok(object) => {
+            let _ = initialize_object_sidecar(server, req, &bucket, &key, meta_req);
             emit_dashboard_event(
                 "gcs.object.put",
                 serde_json::json!({
@@ -1518,7 +2302,8 @@ fn put_object_response(server: &mut Server, req: &Request, input: PutObjectInput
                     "contentLength": object.size,
                 }),
             );
-            Response::json(200, &object_resource(&object))
+            emit_object_notification(server, "OBJECT_FINALIZE", &object);
+            Response::json(200, &build_object_resource(&server.store, &object))
         }
         Err(ConditionalError::Condition(response)) => response,
         Err(ConditionalError::Store(e)) => {
@@ -1879,21 +2664,57 @@ fn handle_download(server: &mut Server, req: &Request) -> Response {
     if key.is_empty() {
         return json_error(400, "invalid", "invalid object name");
     }
+    apply_bucket_lifecycle(server, &bucket);
     match read_object(server, req, &bucket, &key) {
-        Ok((object, body)) => media_response(req, &object, &body),
+        Ok((object, body)) => {
+            let mut r = build_media_response(&server.store, req, &object, &body, false);
+            apply_response_header_overrides(req, &mut r);
+            r
+        }
         Err(r) => r,
     }
 }
 
-fn media_response(req: &Request, object: &Object, body: &[u8]) -> Response {
+pub(crate) fn apply_response_header_overrides(req: &Request, resp: &mut Response) {
+    if resp.status != 200 && resp.status != 206 {
+        return;
+    }
+    for (param, header) in [
+        ("response-content-type", "Content-Type"),
+        ("response-content-disposition", "Content-Disposition"),
+        ("response-cache-control", "Cache-Control"),
+        ("response-content-encoding", "Content-Encoding"),
+    ] {
+        let value = req.query_value(param);
+        if !value.is_empty() {
+            resp.headers.insert(header.to_string(), value.to_string());
+        }
+    }
+}
+
+pub(crate) fn build_media_response(
+    store: &FileBucketStore,
+    req: &Request,
+    object: &Object,
+    body: &[u8],
+    xml_mode: bool,
+) -> Response {
     let (start, end, partial) = match parse_range(req.header("range"), body.len()) {
         Ok(v) => v,
         Err(_) => {
-            let mut r = json_error(
-                416,
-                "requestedRangeNotSatisfiable",
-                "requested range is not satisfiable",
-            );
+            let mut r = if xml_mode {
+                crate::xml_api::xml_error(
+                    416,
+                    "InvalidRange",
+                    "The requested range is not satisfiable.",
+                )
+            } else {
+                json_error(
+                    416,
+                    "requestedRangeNotSatisfiable",
+                    "requested range is not satisfiable",
+                )
+            };
             r.headers.insert(
                 "Content-Range".to_string(),
                 format!("bytes */{}", body.len()),
@@ -1928,21 +2749,27 @@ fn media_response(req: &Request, object: &Object, body: &[u8]) -> Response {
             format!("bytes {}-{}/{}", start, end, body.len()),
         );
     }
-    set_object_headers(&mut r, object);
+    let bucket_meta = read_bucket_meta(store, &object.bucket).unwrap_or_default();
+    let obj_meta = read_object_meta(store, &object.bucket, &object.key).unwrap_or_default();
+    set_object_headers_with_meta(&mut r, object, &bucket_meta, &obj_meta, xml_mode);
     r
 }
 
-fn bucket_resource(
+pub(crate) fn build_bucket_resource(
     server: &Server,
     bucket: &Bucket,
-    location_override: Option<&str>,
-    class_override: Option<&str>,
+    meta: &GcsBucketMeta,
 ) -> BucketResource {
     let location = first_non_empty(
-        location_override.unwrap_or(""),
+        &meta.location,
         first_non_empty(&server.config.location, "US").as_str(),
     );
-    let storage_class = first_non_empty(class_override.unwrap_or(""), "STANDARD");
+    let storage_class = first_non_empty(&meta.storage_class, "STANDARD");
+    let updated = if meta.updated.is_empty() {
+        bucket.created_at.clone()
+    } else {
+        meta.updated.clone()
+    };
     BucketResource {
         kind: "storage#bucket".to_string(),
         id: bucket.name.clone(),
@@ -1950,13 +2777,30 @@ fn bucket_resource(
         project_number: "0".to_string(),
         name: bucket.name.clone(),
         time_created: bucket.created_at.clone(),
-        updated: bucket.created_at.clone(),
+        updated,
         location,
         storage_class,
+        metageneration: meta.metageneration.max(1).to_string(),
+        labels: meta.labels.clone(),
+        default_event_based_hold: meta.default_event_based_hold,
+        retention_policy: meta.retention_policy.clone(),
+        object_retention: meta.object_retention.clone(),
+        iam_configuration: meta.iam_configuration.clone(),
+        lifecycle: meta.lifecycle.clone(),
     }
 }
 
-fn object_resource(object: &Object) -> ObjectResource {
+pub(crate) fn build_object_resource(store: &FileBucketStore, object: &Object) -> ObjectResource {
+    let bucket_meta = read_bucket_meta(store, &object.bucket).unwrap_or_default();
+    let obj_meta = read_object_meta(store, &object.bucket, &object.key).unwrap_or_default();
+    build_object_resource_with_meta(object, &bucket_meta, &obj_meta)
+}
+
+fn build_object_resource_with_meta(
+    object: &Object,
+    bucket_meta: &GcsBucketMeta,
+    obj_meta: &GcsObjectMeta,
+) -> ObjectResource {
     let created = if object.created_at.is_empty() || object.created_at == "0001-01-01T00:00:00Z" {
         object.last_modified.clone()
     } else {
@@ -1969,6 +2813,9 @@ fn object_resource(object: &Object) -> ObjectResource {
     };
     let generation = generation(object);
     let metageneration = object.metageneration.max(1).to_string();
+    let storage_class = effective_storage_class(bucket_meta, obj_meta);
+    let retention_expiration_time =
+        effective_retention_expiration_time(bucket_meta, object, obj_meta);
     ObjectResource {
         kind: "storage#object".to_string(),
         id: format!("{}/{}/{}", object.bucket, object.key, generation),
@@ -1988,23 +2835,44 @@ fn object_resource(object: &Object) -> ObjectResource {
         etag: gcs_etag(object),
         time_created: created,
         updated,
-        storage_class: "STANDARD".to_string(),
+        storage_class,
         metadata: object.metadata.clone(),
         cache_control: object.cache_control.clone(),
         content_encoding: object.content_encoding.clone(),
         content_disposition: object.content_disposition.clone(),
+        temporary_hold: obj_meta.temporary_hold,
+        event_based_hold: obj_meta.event_based_hold,
+        retention_expiration_time,
+        retention: obj_meta.retention.clone(),
     }
 }
 
-fn set_object_headers(r: &mut Response, object: &Object) {
-    let resource = object_resource(object);
-    r.headers.insert("ETag".to_string(), resource.etag);
+pub(crate) fn set_object_headers_with_meta(
+    r: &mut Response,
+    object: &Object,
+    bucket_meta: &GcsBucketMeta,
+    obj_meta: &GcsObjectMeta,
+    xml_mode: bool,
+) {
+    let resource = build_object_resource_with_meta(object, bucket_meta, obj_meta);
+    r.headers.insert(
+        "ETag".to_string(),
+        if xml_mode {
+            object.etag.clone()
+        } else {
+            resource.etag
+        },
+    );
     r.headers
         .insert("X-Goog-Generation".to_string(), resource.generation);
     r.headers
         .insert("X-Goog-Metageneration".to_string(), resource.metageneration);
     r.headers
         .insert("X-Goog-Stored-Content-Length".to_string(), resource.size);
+    if xml_mode {
+        r.headers
+            .insert("X-Goog-Storage-Class".to_string(), resource.storage_class);
+    }
     if !object.cache_control.is_empty() {
         r.headers
             .insert("Cache-Control".to_string(), object.cache_control.clone());
@@ -2057,6 +2925,14 @@ fn canonical_header(name: &str) -> String {
     out
 }
 
+pub(crate) fn object_generation_value(object: &Object) -> i64 {
+    generation_value(object)
+}
+
+pub(crate) fn object_generation_string(object: &Object) -> String {
+    generation(object)
+}
+
 fn generation_value(object: &Object) -> i64 {
     parse_rfc3339(&object.last_modified)
         .map(|(secs, nanos)| secs.saturating_mul(1_000_000_000) + nanos as i64)
@@ -2092,7 +2968,7 @@ fn md5_hash_from_etag(etag: &str) -> String {
     }
 }
 
-fn user_metadata(headers: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+pub(crate) fn user_metadata(headers: &BTreeMap<String, String>) -> BTreeMap<String, String> {
     headers
         .iter()
         .filter_map(|(k, v)| {
@@ -2207,7 +3083,7 @@ fn bucket_suffix(path: &str, prefix: &str) -> Option<(String, String)> {
     Some((bucket, suffix.to_string()))
 }
 
-fn json_error(status: u16, reason: &str, message: &str) -> Response {
+pub(crate) fn json_error(status: u16, reason: &str, message: &str) -> Response {
     Response::json(
         status,
         &ErrorResponse {
@@ -2224,7 +3100,7 @@ fn json_error(status: u16, reason: &str, message: &str) -> Response {
     )
 }
 
-fn method_not_allowed(allow: &str) -> Response {
+pub(crate) fn method_not_allowed(allow: &str) -> Response {
     let mut r = json_error(405, "methodNotAllowed", "method not allowed");
     r.headers.insert("Allow".to_string(), allow.to_string());
     r
@@ -2249,7 +3125,7 @@ fn store_error_text(e: &StoreError, bucket: &str, key: &str) -> String {
     }
 }
 
-fn emit_dashboard_event(event_type: &str, payload: serde_json::Value) {
+pub(crate) fn emit_dashboard_event(event_type: &str, payload: serde_json::Value) {
     let json = serde_json::json!({
         "type": event_type,
         "service": "gcs",
@@ -2340,7 +3216,7 @@ async fn read_request(stream: &mut (impl AsyncRead + Unpin)) -> std::io::Result<
     let mut rl = request_line.split(' ');
     let method = rl.next().unwrap_or("").to_string();
     let target = rl.next().unwrap_or("/");
-    let (path, query) = parse_target(target);
+    let (path, query, query_multi) = parse_target(target);
 
     let mut headers = BTreeMap::new();
     for line in lines {
@@ -2394,6 +3270,7 @@ async fn read_request(stream: &mut (impl AsyncRead + Unpin)) -> std::io::Result<
         method,
         path,
         query,
+        query_multi,
         headers,
         body,
     }))
@@ -2515,23 +3392,35 @@ async fn read_chunk_line(
     }
 }
 
-fn parse_target(target: &str) -> (String, BTreeMap<String, String>) {
+fn parse_target(target: &str) -> (String, BTreeMap<String, String>, Vec<(String, String)>) {
     let (path, query) = match target.split_once('?') {
         Some((p, q)) => (p.to_string(), q),
         None => (target.to_string(), ""),
     };
     let mut params = BTreeMap::new();
+    let mut multi = Vec::new();
     for pair in query.split('&') {
         if pair.is_empty() {
             continue;
         }
         let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
-        params.insert(url_decode(k), url_decode(v));
+        let dk = url_decode(k);
+        let dv = url_decode(v);
+        params.insert(dk.clone(), dv.clone());
+        multi.push((dk, dv));
     }
-    (path, params)
+    (path, params, multi)
 }
 
-fn url_decode(value: &str) -> String {
+pub(crate) fn url_decode(value: &str) -> String {
+    url_decode_inner(value, true)
+}
+
+pub(crate) fn url_decode_path(value: &str) -> String {
+    url_decode_inner(value, false)
+}
+
+fn url_decode_inner(value: &str, plus_as_space: bool) -> String {
     let bytes = value.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
@@ -2549,7 +3438,7 @@ fn url_decode(value: &str) -> String {
                 out.push(bytes[i]);
                 i += 1;
             }
-            b'+' => {
+            b'+' if plus_as_space => {
                 out.push(b' ');
                 i += 1;
             }
@@ -2562,7 +3451,7 @@ fn url_decode(value: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-fn url_encode(value: &str) -> String {
+pub(crate) fn url_encode(value: &str) -> String {
     let mut out = String::new();
     for &b in value.as_bytes() {
         if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
@@ -2597,11 +3486,15 @@ fn reason_phrase(status: u16) -> &'static str {
         200 => "OK",
         204 => "No Content",
         206 => "Partial Content",
+        304 => "Not Modified",
+        308 => "Resume Incomplete",
         400 => "Bad Request",
         401 => "Unauthorized",
+        403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
         409 => "Conflict",
+        412 => "Precondition Failed",
         416 => "Requested Range Not Satisfiable",
         500 => "Internal Server Error",
         501 => "Not Implemented",
