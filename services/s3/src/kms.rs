@@ -12,11 +12,13 @@
 //! POST /_kms/aliases                       {"AliasName","TargetKeyId"} -> {"AliasArn"}
 //! ```
 //!
-//! Writes with SSE-KMS resolve the requested key (key ID, key ARN, alias name,
-//! or alias ARN; none means the AWS managed `alias/aws/s3`, created on first
-//! use), refuse missing, disabled, or pending-deletion keys, and store the key
-//! ARN. Reads of an object whose key has since been disabled or scheduled for
-//! deletion are refused. Object bytes are not encrypted with the key: the
+//! In `strict` auth mode, writes with SSE-KMS resolve the requested key (key
+//! ID, key ARN, alias name, or alias ARN; none means the AWS managed
+//! `alias/aws/s3`, created on first use), refuse missing, disabled, or
+//! pending-deletion keys, and store the key ARN; reads of an object whose key
+//! has since been disabled or scheduled for deletion are refused. In `relaxed`
+//! mode the keyring is not consulted: the given key ID is stored verbatim and
+//! reads are never refused, as before the keyring existed. Object bytes are not encrypted with the key: the
 //! object store is shared in-process with GCS, BigQuery, Redshift, and Lambda,
 //! which read objects directly, so the bytes stay plaintext at rest.
 

@@ -109,10 +109,12 @@ curl -X POST http://127.0.0.1:9000/_kms/keys/<KeyId>/disable   # or enable, sche
 curl http://127.0.0.1:9000/_kms/keys
 ```
 
-SSE-KMS writes resolve the key ID, key ARN, or alias (none means an AWS managed
-`alias/aws/s3` key created on first use) and store the key ARN. Missing,
-disabled, and pending-deletion keys refuse writes, and GET, Select, and copy
-reads of objects under a disabled or pending-deletion key; HEAD still works.
+In strict mode, SSE-KMS writes resolve the key ID, key ARN, or alias (none
+means an AWS managed `alias/aws/s3` key created on first use) and store the key
+ARN. Missing, disabled, and pending-deletion keys refuse writes, and GET, Select,
+and copy reads of objects under a disabled or pending-deletion key; HEAD still
+works. Relaxed mode does not consult the keyring: any key ID is stored and
+returned as given, and reads are never refused.
 Objects are not encrypted with the KMS key at rest, because the store is shared
 with other devcloud services that read it directly. The keyring is `.kms.json`
 in the storage root.

@@ -115,6 +115,64 @@ fn signed_req(method: &str, target: &str, body: &[u8]) -> Request {
     req
 }
 
+/// Signs `req` like an SDK: every header (including `extra`) and the query.
+fn signed_with_headers(method: &str, target: &str, body: &[u8], extra: &[(&str, &str)]) -> Request {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let amz_date = devcloud_s3::time_fmt::rfc3339_seconds_from_unix(now).replace(['-', ':'], "");
+    let date_stamp = amz_date[..8].to_string();
+    let body_hash = sha256_hex(body);
+    let mut req = Request::new(method, target, body.to_vec());
+    req.headers
+        .insert("host".to_string(), "example.com".to_string());
+    req.headers
+        .insert("x-amz-date".to_string(), amz_date.clone());
+    req.headers
+        .insert("x-amz-content-sha256".to_string(), body_hash.clone());
+    for (k, v) in extra {
+        req.headers.insert((*k).to_string(), (*v).to_string());
+    }
+    let signed_headers = req.headers.keys().cloned().collect::<Vec<_>>().join(";");
+    let canonical_headers: String = req
+        .headers
+        .iter()
+        .map(|(k, v)| format!("{k}:{v}\n"))
+        .collect();
+    let canonical_query = req
+        .query
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join("&");
+    let canonical_request = [
+        method,
+        target.split('?').next().unwrap(),
+        &canonical_query,
+        &canonical_headers,
+        &signed_headers,
+        &body_hash,
+    ]
+    .join("\n");
+    let scope = format!("{date_stamp}/us-east-1/s3/aws4_request");
+    let string_to_sign = format!(
+        "AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}",
+        sha256_hex(canonical_request.as_bytes())
+    );
+    let signature = hex::encode(hmac_sha256(
+        &test_signing_key("dev", &date_stamp, "us-east-1"),
+        string_to_sign.as_bytes(),
+    ));
+    req.headers.insert(
+        "authorization".to_string(),
+        format!(
+            "AWS4-HMAC-SHA256 Credential=dev/{scope}, SignedHeaders={signed_headers}, Signature={signature}"
+        ),
+    );
+    req
+}
+
 fn test_signing_key(secret: &str, date_stamp: &str, region: &str) -> Vec<u8> {
     let date_key = hmac_sha256(format!("AWS4{secret}").as_bytes(), date_stamp.as_bytes());
     let region_key = hmac_sha256(&date_key, region.as_bytes());
@@ -2661,23 +2719,24 @@ fn select_object_content_supports_group_by_order_by_and_self_join() {
 }
 
 #[test]
-fn sse_kms_writes_need_a_usable_local_kms_key() {
+fn sse_kms_writes_need_a_usable_local_kms_key_in_strict_mode() {
     let root = tempdir();
     let store = FileBucketStore::new(&root);
-    assert_eq!(route(&store, &req("PUT", "/kms")).status, 200);
+    let auth = strict_auth();
+    let send = |method: &str, target: &str, body: &[u8], headers: &[(&str, &str)]| {
+        route_with_auth(
+            &store,
+            &signed_with_headers(method, target, body, headers),
+            &auth,
+        )
+    };
+    assert_eq!(send("PUT", "/kms", b"", &[]).status, 200);
     let put = |key: &str, kms_key: Option<&str>| {
-        let mut r = Request::new("PUT", &format!("/kms/{key}"), b"secret".to_vec());
-        r.headers.insert(
-            "x-amz-server-side-encryption".to_string(),
-            "aws:kms".to_string(),
-        );
+        let mut headers = vec![("x-amz-server-side-encryption", "aws:kms")];
         if let Some(id) = kms_key {
-            r.headers.insert(
-                "x-amz-server-side-encryption-aws-kms-key-id".to_string(),
-                id.to_string(),
-            );
+            headers.push(("x-amz-server-side-encryption-aws-kms-key-id", id));
         }
-        route(&store, &r)
+        send("PUT", &format!("/kms/{key}"), b"secret", &headers)
     };
     let json = |response: &devcloud_s3::http::Response| -> serde_json::Value {
         serde_json::from_slice(&response.body).unwrap()
@@ -2702,23 +2761,18 @@ fn sse_kms_writes_need_a_usable_local_kms_key() {
     assert!(String::from_utf8_lossy(&missing.body).contains("KMS.NotFoundException"));
 
     // A customer key resolves by ID, ARN, and alias; the ARN is stored.
-    let created = route(
-        &store,
-        &Request::new("POST", "/_kms/keys", br#"{"Description":"app"}"#.to_vec()),
-    );
+    let created = send("POST", "/_kms/keys", br#"{"Description":"app"}"#, &[]);
     assert_eq!(created.status, 200);
     let metadata = json(&created)["KeyMetadata"].clone();
     let key_id = metadata["KeyId"].as_str().unwrap().to_string();
     let key_arn = metadata["Arn"].as_str().unwrap().to_string();
     assert_eq!(metadata["KeyState"], "Enabled");
     assert_eq!(
-        route(
-            &store,
-            &Request::new(
-                "POST",
-                "/_kms/aliases",
-                format!(r#"{{"AliasName":"alias/app","TargetKeyId":"{key_id}"}}"#).into_bytes(),
-            ),
+        send(
+            "POST",
+            "/_kms/aliases",
+            format!(r#"{{"AliasName":"alias/app","TargetKeyId":"{key_id}"}}"#).as_bytes(),
+            &[]
         )
         .status,
         200
@@ -2733,7 +2787,7 @@ fn sse_kms_writes_need_a_usable_local_kms_key() {
             Some(&key_arn)
         );
     }
-    let head = route(&store, &req("HEAD", "/kms/app.txt"));
+    let head = send("HEAD", "/kms/app.txt", b"", &[]);
     assert_eq!(
         head.headers
             .get("x-amz-server-side-encryption-aws-kms-key-id"),
@@ -2742,6 +2796,128 @@ fn sse_kms_writes_need_a_usable_local_kms_key() {
 
     // Disabling the key blocks new writes and GET (HEAD still works); enabling restores both.
     assert_eq!(
+        send("POST", &format!("/_kms/keys/{key_id}/disable"), b"", &[]).status,
+        200
+    );
+    let disabled = put("other.txt", Some(&key_id));
+    assert_eq!(disabled.status, 400);
+    assert!(String::from_utf8_lossy(&disabled.body).contains("KMS.DisabledException"));
+    let get_disabled = send("GET", "/kms/app.txt", b"", &[]);
+    assert_eq!(get_disabled.status, 400);
+    assert!(String::from_utf8_lossy(&get_disabled.body).contains("KMS.DisabledException"));
+    assert_eq!(send("HEAD", "/kms/app.txt", b"", &[]).status, 200);
+    assert_eq!(
+        send(
+            "PUT",
+            "/kms/copy.txt",
+            b"",
+            &[("x-amz-copy-source", "/kms/app.txt")]
+        )
+        .status,
+        400
+    );
+    assert_eq!(
+        send("POST", &format!("/_kms/keys/{key_id}/enable"), b"", &[]).status,
+        200
+    );
+    let got = send("GET", "/kms/app.txt", b"", &[]);
+    assert_eq!(got.status, 200);
+    assert_eq!(got.body, b"secret");
+
+    // Scheduled deletion: invalid state for writes and reads; cancel leaves it disabled.
+    let scheduled = send(
+        "POST",
+        &format!("/_kms/keys/{key_id}/schedule-deletion"),
+        br#"{"PendingWindowInDays":7}"#,
+        &[],
+    );
+    assert_eq!(
+        json(&scheduled)["KeyMetadata"]["KeyState"],
+        "PendingDeletion"
+    );
+    let pending = send("GET", "/kms/app.txt", b"", &[]);
+    assert!(String::from_utf8_lossy(&pending.body).contains("KMS.KMSInvalidStateException"));
+    let cancelled = send(
+        "POST",
+        &format!("/_kms/keys/{key_id}/cancel-deletion"),
+        b"",
+        &[],
+    );
+    assert_eq!(json(&cancelled)["KeyMetadata"]["KeyState"], "Disabled");
+
+    // The managed key cannot be disabled; listing shows both keys and aliases.
+    let default_id = default_arn.rsplit('/').next().unwrap();
+    assert_eq!(
+        send(
+            "POST",
+            &format!("/_kms/keys/{default_id}/disable"),
+            b"",
+            &[]
+        )
+        .status,
+        400
+    );
+    let listed = json(&send("GET", "/_kms/keys", b"", &[]));
+    assert_eq!(listed["Keys"].as_array().unwrap().len(), 2);
+    assert_eq!(listed["Aliases"].as_array().unwrap().len(), 2);
+    // The keyring file is not a bucket.
+    let buckets = send("GET", "/", b"", &[]);
+    assert!(!String::from_utf8_lossy(&buckets.body).contains(".kms"));
+}
+
+#[test]
+fn sse_kms_relaxed_mode_stores_any_key_id_as_before() {
+    let root = tempdir();
+    let store = FileBucketStore::new(&root);
+    assert_eq!(route(&store, &req("PUT", "/kms")).status, 200);
+    let put = |key: &str, kms_key: Option<&str>| {
+        let mut r = Request::new("PUT", &format!("/kms/{key}"), b"secret".to_vec());
+        r.headers.insert(
+            "x-amz-server-side-encryption".to_string(),
+            "aws:kms".to_string(),
+        );
+        if let Some(id) = kms_key {
+            r.headers.insert(
+                "x-amz-server-side-encryption-aws-kms-key-id".to_string(),
+                id.to_string(),
+            );
+        }
+        route(&store, &r)
+    };
+    let key_header = "x-amz-server-side-encryption-aws-kms-key-id";
+    // Unknown key IDs, ARNs, and aliases are stored and echoed verbatim.
+    for (object, id) in [
+        ("id.txt", "unknown-key-id"),
+        ("arn.txt", "arn:aws:kms:us-east-1:000000000000:key/nope"),
+        ("alias.txt", "alias/not-created"),
+    ] {
+        let response = put(object, Some(id));
+        assert_eq!(response.status, 200, "{id}");
+        assert_eq!(
+            response.headers.get(key_header).map(String::as_str),
+            Some(id)
+        );
+        let head = route(&store, &req("HEAD", &format!("/kms/{object}")));
+        assert_eq!(head.headers.get(key_header).map(String::as_str), Some(id));
+        let got = route(&store, &req("GET", &format!("/kms/{object}")));
+        assert_eq!(got.status, 200);
+        assert_eq!(got.body, b"secret");
+    }
+    // No key ID: no key header and no keyring is created.
+    let default_put = put("default.txt", None);
+    assert_eq!(default_put.status, 200);
+    assert!(!default_put.headers.contains_key(key_header));
+    assert!(!root.join(".kms.json").exists());
+
+    // A keyring key disabled later does not block relaxed-mode writes or reads.
+    let created = route(&store, &Request::new("POST", "/_kms/keys", Vec::new()));
+    let metadata: serde_json::Value = serde_json::from_slice(&created.body).unwrap();
+    let key_id = metadata["KeyMetadata"]["KeyId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(put("keyed.txt", Some(&key_id)).status, 200);
+    assert_eq!(
         route(
             &store,
             &req("POST", &format!("/_kms/keys/{key_id}/disable"))
@@ -2749,62 +2925,8 @@ fn sse_kms_writes_need_a_usable_local_kms_key() {
         .status,
         200
     );
-    let disabled = put("other.txt", Some(&key_id));
-    assert_eq!(disabled.status, 400);
-    assert!(String::from_utf8_lossy(&disabled.body).contains("KMS.DisabledException"));
-    let get_disabled = route(&store, &req("GET", "/kms/app.txt"));
-    assert_eq!(get_disabled.status, 400);
-    assert!(String::from_utf8_lossy(&get_disabled.body).contains("KMS.DisabledException"));
-    assert_eq!(route(&store, &req("HEAD", "/kms/app.txt")).status, 200);
-    let mut copy = req("PUT", "/kms/copy.txt");
-    copy.headers
-        .insert("x-amz-copy-source".to_string(), "/kms/app.txt".to_string());
-    assert_eq!(route(&store, &copy).status, 400);
-    assert_eq!(
-        route(&store, &req("POST", &format!("/_kms/keys/{key_id}/enable"))).status,
-        200
-    );
-    let got = route(&store, &req("GET", "/kms/app.txt"));
-    assert_eq!(got.status, 200);
-    assert_eq!(got.body, b"secret");
-
-    // Scheduled deletion: invalid state for writes and reads; cancel leaves it disabled.
-    let scheduled = route(
-        &store,
-        &Request::new(
-            "POST",
-            &format!("/_kms/keys/{key_id}/schedule-deletion"),
-            br#"{"PendingWindowInDays":7}"#.to_vec(),
-        ),
-    );
-    assert_eq!(
-        json(&scheduled)["KeyMetadata"]["KeyState"],
-        "PendingDeletion"
-    );
-    let pending = route(&store, &req("GET", "/kms/app.txt"));
-    assert!(String::from_utf8_lossy(&pending.body).contains("KMS.KMSInvalidStateException"));
-    let cancelled = route(
-        &store,
-        &req("POST", &format!("/_kms/keys/{key_id}/cancel-deletion")),
-    );
-    assert_eq!(json(&cancelled)["KeyMetadata"]["KeyState"], "Disabled");
-
-    // The managed key cannot be disabled; listing shows both keys and aliases.
-    let default_id = default_arn.rsplit('/').next().unwrap();
-    assert_eq!(
-        route(
-            &store,
-            &req("POST", &format!("/_kms/keys/{default_id}/disable"))
-        )
-        .status,
-        400
-    );
-    let listed = json(&route(&store, &req("GET", "/_kms/keys")));
-    assert_eq!(listed["Keys"].as_array().unwrap().len(), 2);
-    assert_eq!(listed["Aliases"].as_array().unwrap().len(), 2);
-    // The keyring file is not a bucket.
-    let buckets = route(&store, &req("GET", "/"));
-    assert!(!String::from_utf8_lossy(&buckets.body).contains(".kms"));
+    assert_eq!(put("keyed2.txt", Some(&key_id)).status, 200);
+    assert_eq!(route(&store, &req("GET", "/kms/keyed.txt")).status, 200);
 }
 
 #[test]

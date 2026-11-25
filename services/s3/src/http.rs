@@ -542,18 +542,21 @@ fn route_verified(store: &FileBucketStore, req: &Request, auth: &AuthConfig) -> 
     if req.path.starts_with(crate::kms::KMS_PREFIX) {
         return crate::kms::handle(store.root(), req, auth);
     }
+    let kms_enforced = auth.auth_mode.eq_ignore_ascii_case("strict");
     // Decoded in every auth mode: otherwise the chunk framing would be stored as
     // part of the object.
     if req.header("x-amz-content-sha256").starts_with("STREAMING-") {
         return match decode_streaming_request(req, chunk_signing.as_ref()) {
-            Ok(decoded) => dispatch(store, &decoded),
+            Ok(decoded) => dispatch(store, &decoded, kms_enforced),
             Err(err) => xml_error(err.status, err.code, err.code),
         };
     }
-    dispatch(store, req)
+    dispatch(store, req, kms_enforced)
 }
 
-fn dispatch(store: &FileBucketStore, req: &Request) -> Response {
+/// `kms_enforced` (strict mode only) makes SSE-KMS requests check the local
+/// keyring; otherwise key IDs are stored as given, as before the keyring.
+fn dispatch(store: &FileBucketStore, req: &Request, kms_enforced: bool) -> Response {
     if req.path == "/" {
         return handle_service(store, req);
     }
@@ -567,7 +570,7 @@ fn dispatch(store: &FileBucketStore, req: &Request) -> Response {
         return xml_error(501, "NotImplemented", "operation is not implemented");
     };
     if !key.is_empty() {
-        return handle_object(store, req, &bucket, &key);
+        return handle_object(store, req, &bucket, &key, kms_enforced);
     }
     handle_bucket(store, req, &bucket)
 }
@@ -741,14 +744,20 @@ fn handle_bucket(store: &FileBucketStore, req: &Request, bucket: &str) -> Respon
     }
 }
 
-fn handle_object(store: &FileBucketStore, req: &Request, bucket: &str, key: &str) -> Response {
+fn handle_object(
+    store: &FileBucketStore,
+    req: &Request,
+    bucket: &str,
+    key: &str,
+    kms_enforced: bool,
+) -> Response {
     match req.method.as_str() {
         "POST" => {
             if req.query.contains_key("select") {
-                return select_object_content(store, req, bucket, key);
+                return select_object_content(store, req, bucket, key, kms_enforced);
             }
             if req.query.contains_key("uploads") {
-                return create_multipart_upload(store, req, bucket, key);
+                return create_multipart_upload(store, req, bucket, key, kms_enforced);
             }
             if let Some(upload_id) = req.query.get("uploadId") {
                 return complete_multipart_upload(store, req, bucket, key, upload_id);
@@ -769,9 +778,9 @@ fn handle_object(store: &FileBucketStore, req: &Request, bucket: &str, key: &str
                 return upload_part(store, req, bucket, key, upload_id);
             }
             if !req.header("x-amz-copy-source").is_empty() {
-                return copy_object(store, req, bucket, key);
+                return copy_object(store, req, bucket, key, kms_enforced);
             }
-            put_object(store, req, bucket, key)
+            put_object(store, req, bucket, key, kms_enforced)
         }
         "GET" => {
             if req.query.contains_key("acl") {
@@ -786,9 +795,9 @@ fn handle_object(store: &FileBucketStore, req: &Request, bucket: &str, key: &str
             if let Some(upload_id) = req.query.get("uploadId") {
                 return list_parts(store, req, bucket, key, upload_id);
             }
-            get_object(store, req, bucket, key, false)
+            get_object(store, req, bucket, key, false, kms_enforced)
         }
-        "HEAD" => get_object(store, req, bucket, key, true),
+        "HEAD" => get_object(store, req, bucket, key, true, kms_enforced),
         "DELETE" => {
             if let Some(upload_id) = req.query.get("uploadId") {
                 return abort_multipart_upload(store, bucket, key, upload_id);
@@ -1555,8 +1564,9 @@ fn create_multipart_upload(
     req: &Request,
     bucket: &str,
     key: &str,
+    kms_enforced: bool,
 ) -> Response {
-    let (encryption, _) = match server_side_encryption_from_headers(store, req) {
+    let (encryption, _) = match server_side_encryption_from_headers(store, req, kms_enforced) {
         Ok(encryption) => encryption,
         Err(err) => return server_side_encryption_error(err),
     };
@@ -1861,12 +1871,19 @@ fn list_multipart_uploads(store: &FileBucketStore, bucket: &str) -> Response {
     }
 }
 
-fn put_object(store: &FileBucketStore, req: &Request, bucket: &str, key: &str) -> Response {
+fn put_object(
+    store: &FileBucketStore,
+    req: &Request,
+    bucket: &str,
+    key: &str,
+    kms_enforced: bool,
+) -> Response {
     let if_none_match = if_none_match_write(req);
-    let (encryption, sse_c_key) = match server_side_encryption_from_headers(store, req) {
-        Ok(encryption) => encryption,
-        Err(err) => return server_side_encryption_error(err),
-    };
+    let (encryption, sse_c_key) =
+        match server_side_encryption_from_headers(store, req, kms_enforced) {
+            Ok(encryption) => encryption,
+            Err(err) => return server_side_encryption_error(err),
+        };
     let canned_acl = req.header("x-amz-acl").trim();
     if !canned_acl.is_empty() && !supported_acl(canned_acl) {
         return xml_error(400, "InvalidArgument", "object ACL is invalid");
@@ -1954,7 +1971,13 @@ fn put_object(store: &FileBucketStore, req: &Request, bucket: &str, key: &str) -
     }
 }
 
-fn copy_object(store: &FileBucketStore, req: &Request, bucket: &str, key: &str) -> Response {
+fn copy_object(
+    store: &FileBucketStore,
+    req: &Request,
+    bucket: &str,
+    key: &str,
+    kms_enforced: bool,
+) -> Response {
     let if_none_match = if_none_match_write(req);
     let Some((source_bucket, source_key, source_version_id)) =
         parse_copy_source(req.header("x-amz-copy-source"))
@@ -1976,7 +1999,7 @@ fn copy_object(store: &FileBucketStore, req: &Request, bucket: &str, key: &str) 
             }
             Err(_) => return xml_error(500, "InternalError", "internal error"),
         };
-    if let Err(resp) = kms_read_check(store, &source_object) {
+    if let Err(resp) = kms_read_check(store, &source_object, kms_enforced) {
         return resp;
     }
     let body = match decrypt_sse_c_body(
@@ -2025,7 +2048,7 @@ fn copy_object(store: &FileBucketStore, req: &Request, bucket: &str, key: &str) 
     }
     let mut dst_sse_c_key: Option<SseCustomerKey> = None;
     if has_server_side_encryption_headers(req) {
-        match server_side_encryption_from_headers(store, req) {
+        match server_side_encryption_from_headers(store, req, kms_enforced) {
             Ok((encryption, key)) => {
                 input.encryption = encryption;
                 dst_sse_c_key = key;
@@ -2101,6 +2124,7 @@ fn select_object_content(
     req: &Request,
     bucket: &str,
     key: &str,
+    kms_enforced: bool,
 ) -> Response {
     let Some(select_req) = parse_select_object_content_request(&req.body) else {
         return xml_error(400, "MalformedXML", "request body is malformed");
@@ -2130,7 +2154,7 @@ fn select_object_content(
         }
         Err(_) => return xml_error(500, "InternalError", "internal error"),
     };
-    if let Err(resp) = kms_read_check(store, &object) {
+    if let Err(resp) = kms_read_check(store, &object, kms_enforced) {
         return resp;
     }
     let body = match decrypt_sse_c_body(&object, raw_body, sse_c::parse_customer_key(req)) {
@@ -2881,6 +2905,7 @@ fn get_object(
     bucket: &str,
     key: &str,
     head_only: bool,
+    kms_enforced: bool,
 ) -> Response {
     if store.apply_bucket_lifecycle(bucket, &store.now()).is_err() {
         return xml_error(500, "InternalError", "internal error");
@@ -2907,7 +2932,7 @@ fn get_object(
         }
         Ok(Some((object, body))) => {
             if !head_only {
-                if let Err(resp) = kms_read_check(store, &object) {
+                if let Err(resp) = kms_read_check(store, &object, kms_enforced) {
                     return resp;
                 }
             }
@@ -3313,9 +3338,14 @@ enum ServerSideEncryptionHeaderError {
     Kms(crate::kms::KmsError),
 }
 
-/// Refuses reading an SSE-KMS object whose key is disabled or pending deletion.
-fn kms_read_check(store: &FileBucketStore, object: &Object) -> Result<(), Response> {
-    if !object.encryption.algorithm.starts_with("aws:kms") {
+/// In strict mode, refuses reading an SSE-KMS object whose key is disabled or
+/// pending deletion.
+fn kms_read_check(
+    store: &FileBucketStore,
+    object: &Object,
+    kms_enforced: bool,
+) -> Result<(), Response> {
+    if !kms_enforced || !object.encryption.algorithm.starts_with("aws:kms") {
         return Ok(());
     }
     crate::kms::check_readable(store.root(), &object.encryption.kms_key_id)
@@ -3338,6 +3368,7 @@ fn has_server_side_encryption_headers(req: &Request) -> bool {
 fn server_side_encryption_from_headers(
     store: &FileBucketStore,
     req: &Request,
+    kms_enforced: bool,
 ) -> Result<(ServerSideEncryption, Option<SseCustomerKey>), ServerSideEncryptionHeaderError> {
     let customer_key = match sse_c::parse_customer_key(req) {
         Ok(key) => key,
@@ -3394,8 +3425,12 @@ fn server_side_encryption_from_headers(
                     _ => return Err(ServerSideEncryptionHeaderError::Invalid),
                 }
             };
-            let kms_key_id = crate::kms::resolve_for_write(store.root(), kms_key_id)
-                .map_err(ServerSideEncryptionHeaderError::Kms)?;
+            let kms_key_id = if kms_enforced {
+                crate::kms::resolve_for_write(store.root(), kms_key_id)
+                    .map_err(ServerSideEncryptionHeaderError::Kms)?
+            } else {
+                kms_key_id.to_string()
+            };
             Ok((
                 ServerSideEncryption {
                     algorithm: algorithm.to_string(),
