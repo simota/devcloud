@@ -60,7 +60,7 @@ pub struct Config {
 pub struct Server {
     pub(crate) shared: Arc<ServerShared>,
     backend: Arc<dyn SqlBackend>,
-    translator: Arc<dyn RedshiftTranslator>,
+    pub(crate) translator: Arc<dyn RedshiftTranslator>,
     pub(crate) sql_tls: Option<crate::tls::SqlTls>,
 }
 
@@ -247,15 +247,20 @@ impl Server {
     }
 
     /// [`Self::execute_sql`] on a client's own backend session, when it has
-    /// one. Redshift `COPY` is loaded by devcloud itself unless the backend
-    /// implements it (the memory engine).
+    /// one. Redshift `COPY` and `UNLOAD` are handled by devcloud itself unless
+    /// the backend implements them (the memory engine).
     pub fn execute_sql_in(
         &self,
         backend_session: &mut Option<Box<dyn SqlSession>>,
         statement: &str,
     ) -> Result<QueryResult, SqlError> {
-        if !self.backend.handles_copy() && crate::copy_backend::is_copy(statement) {
-            return self.copy_through_backend(backend_session, statement);
+        if !self.backend.handles_copy() {
+            if crate::copy_backend::is_copy(statement) {
+                return self.copy_through_backend(backend_session, statement);
+            }
+            if crate::copy_backend::is_unload(statement) {
+                return self.unload_through_backend(backend_session, statement);
+            }
         }
         let session = Session {
             database: default_str(&self.shared.config.database, "dev"),

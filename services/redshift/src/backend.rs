@@ -24,16 +24,47 @@ pub trait SqlBackend: Send + Sync {
         Ok(None)
     }
 
-    /// Whether `exec` implements Redshift `COPY` itself (the memory engine
-    /// does); otherwise the server loads COPY data through the backend.
+    /// Whether `exec` implements Redshift `COPY` and `UNLOAD` itself (the
+    /// memory engine does); otherwise the server handles them through the
+    /// backend.
     fn handles_copy(&self) -> bool {
         false
+    }
+
+    /// Like [`Self::exec`], but preserves SQL `NULL` as `None` instead of
+    /// rendering it as `""`.
+    fn exec_nullable(
+        &self,
+        statement: &str,
+    ) -> Result<(Vec<Field>, Vec<Vec<Option<String>>>), SqlError> {
+        let res = self.exec(statement)?;
+        let rows = res
+            .rows
+            .into_iter()
+            .map(|r| r.into_iter().map(Some).collect())
+            .collect();
+        Ok((res.fields, rows))
     }
 }
 
 /// One client's backend connection; dropping it ends the session.
 pub trait SqlSession: Send {
     fn exec(&mut self, statement: &str) -> Result<ExecResult, SqlError>;
+
+    /// Like [`Self::exec`], but preserves SQL `NULL` as `None` instead of
+    /// rendering it as `""`.
+    fn exec_nullable(
+        &mut self,
+        statement: &str,
+    ) -> Result<(Vec<Field>, Vec<Vec<Option<String>>>), SqlError> {
+        let res = self.exec(statement)?;
+        let rows = res
+            .rows
+            .into_iter()
+            .map(|r| r.into_iter().map(Some).collect())
+            .collect();
+        Ok((res.fields, rows))
+    }
 }
 
 pub trait SqlTransaction: Send {

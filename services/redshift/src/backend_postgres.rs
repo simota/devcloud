@@ -126,6 +126,17 @@ impl Backend {
             .ok_or_else(|| SqlError::new("postgres redshift backend is not open"))?;
         drive(&self.runtime, conn.simple_query(statement))
     }
+
+    fn query_nullable(
+        &self,
+        statement: &str,
+    ) -> Result<(Vec<Field>, Vec<Vec<Option<String>>>), SqlError> {
+        let mut guard = self.conn.lock().unwrap();
+        let conn = guard
+            .as_mut()
+            .ok_or_else(|| SqlError::new("postgres redshift backend is not open"))?;
+        drive(&self.runtime, conn.simple_query_nullable(statement))
+    }
 }
 
 impl SqlBackend for Backend {
@@ -135,6 +146,17 @@ impl SqlBackend for Backend {
             return Err(SqlError::new("postgres redshift backend is not open"));
         }
         self.query(statement).map_err(|err| wrap_error("exec", err))
+    }
+
+    fn exec_nullable(
+        &self,
+        statement: &str,
+    ) -> Result<(Vec<Field>, Vec<Vec<Option<String>>>), SqlError> {
+        if self.conn.lock().unwrap().is_none() {
+            return Err(SqlError::new("postgres redshift backend is not open"));
+        }
+        self.query_nullable(statement)
+            .map_err(|err| wrap_error("exec", err))
     }
 
     /// Mirrors `Backend.Begin`: opens a fresh connection for the transaction and
@@ -211,6 +233,18 @@ impl SqlSession for Session {
             .as_mut()
             .ok_or_else(|| SqlError::new("session is closed"))?;
         drive(&self.runtime, conn.simple_query(statement)).map_err(|err| wrap_error("exec", err))
+    }
+
+    fn exec_nullable(
+        &mut self,
+        statement: &str,
+    ) -> Result<(Vec<Field>, Vec<Vec<Option<String>>>), SqlError> {
+        let conn = self
+            .conn
+            .as_mut()
+            .ok_or_else(|| SqlError::new("session is closed"))?;
+        drive(&self.runtime, conn.simple_query_nullable(statement))
+            .map_err(|err| wrap_error("exec", err))
     }
 }
 
@@ -445,6 +479,22 @@ impl PgConn {
     /// ReadyForQuery. Mirrors `queryRows`: the returned tag is derived from the
     /// statement (not the wire CommandComplete).
     async fn simple_query(&mut self, statement: &str) -> Result<ExecResult, SqlError> {
+        let (fields, nullable_rows) = self.simple_query_nullable(statement).await?;
+        let rows: Vec<Vec<String>> = nullable_rows
+            .into_iter()
+            .map(|r| r.into_iter().map(|v| v.unwrap_or_default()).collect())
+            .collect();
+        Ok(ExecResult {
+            tag: command_tag(statement, rows.len()),
+            fields,
+            rows,
+        })
+    }
+
+    async fn simple_query_nullable(
+        &mut self,
+        statement: &str,
+    ) -> Result<(Vec<Field>, Vec<Vec<Option<String>>>), SqlError> {
         let mut body = Vec::new();
         put_cstr(&mut body, statement);
         self.write_tagged(b'Q', &body)
@@ -452,13 +502,13 @@ impl PgConn {
             .map_err(SqlError::new)?;
 
         let mut fields: Vec<Field> = Vec::new();
-        let mut rows: Vec<Vec<String>> = Vec::new();
+        let mut rows: Vec<Vec<Option<String>>> = Vec::new();
         let mut error: Option<String> = None;
         loop {
             let (tag, payload) = self.read_message().await.map_err(SqlError::new)?;
             match tag {
                 b'T' => fields = parse_row_description(&payload),
-                b'D' => rows.push(parse_data_row(&payload)),
+                b'D' => rows.push(parse_data_row_nullable(&payload)),
                 b'C' => {} // CommandComplete (tag ignored)
                 b'E' => error = Some(parse_error_response(&payload)),
                 b'I' => {}     // EmptyQueryResponse
@@ -469,11 +519,7 @@ impl PgConn {
         if let Some(message) = error {
             return Err(SqlError::new(message));
         }
-        Ok(ExecResult {
-            tag: command_tag(statement, rows.len()),
-            fields,
-            rows,
-        })
+        Ok((fields, rows))
     }
 
     async fn terminate(&mut self) -> Result<(), String> {
@@ -619,22 +665,22 @@ fn parse_row_description(payload: &[u8]) -> Vec<Field> {
     fields
 }
 
-/// Reads a DataRow body into text values; a -1 column length is SQL NULL,
-/// rendered as the empty string (legacy `stringifyRow` maps `nil` to `""`).
-fn parse_data_row(payload: &[u8]) -> Vec<String> {
+/// Reads a DataRow body into text values (with `None` for a `-1` column length,
+/// i.e. SQL NULL).
+fn parse_data_row_nullable(payload: &[u8]) -> Vec<Option<String>> {
     let mut pos = 0;
     let count = read_i16(payload, &mut pos) as usize;
     let mut values = Vec::with_capacity(count);
     for _ in 0..count {
         let len = read_i32(payload, &mut pos);
         if len < 0 {
-            values.push(String::new());
+            values.push(None);
             continue;
         }
         let len = len as usize;
         let value = String::from_utf8_lossy(&payload[pos..pos + len]).into_owned();
         pos += len;
-        values.push(value);
+        values.push(Some(value));
     }
     values
 }
