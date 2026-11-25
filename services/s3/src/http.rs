@@ -536,6 +536,9 @@ fn route_verified(store: &FileBucketStore, req: &Request, auth: &AuthConfig) -> 
     if iam::authorize_request(store, req, auth, &caller).is_err() {
         return xml_error(403, "AccessDenied", "Access Denied");
     }
+    if let Some(api) = crate::query_api::classify(req) {
+        return crate::query_api::handle(store.root(), req, auth, &caller, api);
+    }
     if req.path.starts_with(crate::identities::IAM_PREFIX) {
         return crate::identities::handle(store.root(), req, auth, &caller);
     }
@@ -2393,7 +2396,7 @@ fn verify_presigned_url(req: &Request, auth: &AuthConfig) -> Result<(), Signatur
         code: "AuthorizationHeaderMalformed",
         status: 400,
     })?;
-    if !valid_credential(auth, access_key, region, service) {
+    if !valid_credential(req, auth, access_key, region, service) {
         return Err(SignatureError {
             code: "InvalidAccessKeyId",
             status: 403,
@@ -2439,6 +2442,9 @@ fn verify_presigned_url(req: &Request, auth: &AuthConfig) -> Result<(), Signatur
     verify_signed_header_coverage(req, signed_headers)?;
     let payload_hash = match req.header("x-amz-content-sha256") {
         "" => "UNSIGNED-PAYLOAD",
+        // Decoded (and its trailer checksums validated) once the URL verifies.
+        STREAMING_UNSIGNED_TRAILER => STREAMING_UNSIGNED_TRAILER,
+        // A chunk-signature chain is seeded by an `Authorization` header signature.
         streaming if streaming.starts_with("STREAMING-") => {
             return Err(SignatureError {
                 code: "NotImplemented",
@@ -2502,7 +2508,7 @@ fn verify_authorization_header(
             status: 400,
         });
     }
-    if !valid_credential(auth, access_key, region, service) {
+    if !valid_credential(req, auth, access_key, region, service) {
         return Err(SignatureError {
             code: "InvalidAccessKeyId",
             status: 403,
@@ -2553,7 +2559,7 @@ fn verify_authorization_header(
         return Ok(None);
     }
     Ok(Some(ChunkSigning::Hmac(HmacChunkSigning {
-        signing_key: derive_signing_key(&auth.secret_access_key, date_stamp, region),
+        signing_key: derive_signing_key(&auth.secret_access_key, date_stamp, region, SIGV4_SERVICE),
         amz_date: amz_date.to_string(),
         scope: format!("{date_stamp}/{region}/{SIGV4_SERVICE}/aws4_request"),
         seed_signature: expected,
@@ -2730,7 +2736,22 @@ pub(crate) fn verify_signed_header_coverage(
     })
 }
 
-fn valid_credential(auth: &AuthConfig, access_key: &str, region: &str, service: &str) -> bool {
+/// The SigV4 service `req` must be signed for: `kms`, `iam`, or `sts` for the
+/// local APIs served at `POST /` (`query_api.rs`), otherwise `s3`.
+fn signing_service(req: &Request) -> &'static str {
+    crate::query_api::classify(req).map_or(SIGV4_SERVICE, |api| api.signing_service())
+}
+
+fn valid_credential(
+    req: &Request,
+    auth: &AuthConfig,
+    access_key: &str,
+    region: &str,
+    service: &str,
+) -> bool {
+    let expected_service = signing_service(req);
+    // SDKs sign IAM, a global service, for us-east-1.
+    let global_region = expected_service == "iam" && region == "us-east-1";
     let configured_access_key = if auth.access_key_id.is_empty() {
         "dev"
     } else {
@@ -2741,7 +2762,9 @@ fn valid_credential(auth: &AuthConfig, access_key: &str, region: &str, service: 
     } else {
         &auth.region
     };
-    access_key == configured_access_key && region == configured_region && service == SIGV4_SERVICE
+    access_key == configured_access_key
+        && (region == configured_region || global_region)
+        && service == expected_service
 }
 
 pub(crate) fn verify_payload_hash(req: &Request, payload_hash: &str) -> Result<(), SignatureError> {
@@ -2804,7 +2827,8 @@ fn signature_for_request(
         .map(String::as_str)
         .filter(|v| !v.is_empty())
         .unwrap_or_else(|| req.header("x-amz-date"));
-    let scope = format!("{date_stamp}/{region}/{SIGV4_SERVICE}/aws4_request");
+    let service = signing_service(req);
+    let scope = format!("{date_stamp}/{region}/{service}/aws4_request");
     let string_to_sign = [
         SIGV4_ALGORITHM.to_string(),
         amz_date.to_string(),
@@ -2813,7 +2837,7 @@ fn signature_for_request(
     ]
     .join("\n");
     hex::encode(hmac_sha256(
-        &derive_signing_key(&auth.secret_access_key, date_stamp, region),
+        &derive_signing_key(&auth.secret_access_key, date_stamp, region, service),
         string_to_sign.as_bytes(),
     ))
 }
@@ -2889,11 +2913,11 @@ fn normalize_header_value(value: &str) -> String {
     value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-fn derive_signing_key(secret: &str, date_stamp: &str, region: &str) -> Vec<u8> {
+fn derive_signing_key(secret: &str, date_stamp: &str, region: &str, service: &str) -> Vec<u8> {
     let secret = if secret.is_empty() { "dev" } else { secret };
     let date_key = hmac_sha256(format!("AWS4{secret}").as_bytes(), date_stamp.as_bytes());
     let region_key = hmac_sha256(&date_key, region.as_bytes());
-    let service_key = hmac_sha256(&region_key, SIGV4_SERVICE.as_bytes());
+    let service_key = hmac_sha256(&region_key, service.as_bytes());
     hmac_sha256(&service_key, b"aws4_request")
 }
 
@@ -4819,6 +4843,7 @@ mod tests {
                 "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
                 date_stamp,
                 "us-east-1",
+                SIGV4_SERVICE,
             ),
             amz_date: "20130524T000000Z".to_string(),
             scope: format!("{date_stamp}/us-east-1/s3/aws4_request"),

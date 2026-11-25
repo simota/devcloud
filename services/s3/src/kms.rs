@@ -12,6 +12,8 @@
 //! POST /_kms/aliases                       {"AliasName","TargetKeyId"} -> {"AliasArn"}
 //! ```
 //!
+//! The same keyring backs the AWS KMS JSON API at `POST /` (`kms_api.rs`).
+//!
 //! In `strict` auth mode, writes with SSE-KMS resolve the requested key (key
 //! ID, key ARN, alias name, or alias ARN; none means the AWS managed
 //! `alias/aws/s3`, created on first use), refuse missing, disabled, or
@@ -37,40 +39,88 @@ const KEYRING_FILE: &str = ".kms.json";
 const DEFAULT_S3_ALIAS: &str = "alias/aws/s3";
 const DEFAULT_REGION: &str = "us-east-1";
 
-const ENABLED: &str = "Enabled";
-const DISABLED: &str = "Disabled";
-const PENDING_DELETION: &str = "PendingDeletion";
+pub(crate) const ENABLED: &str = "Enabled";
+pub(crate) const DISABLED: &str = "Disabled";
+pub(crate) const PENDING_DELETION: &str = "PendingDeletion";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
-struct KmsKey {
-    key_id: String,
-    arn: String,
+pub(crate) struct KmsKey {
+    pub(crate) key_id: String,
+    pub(crate) arn: String,
     #[serde(default)]
-    description: String,
-    key_state: String,
+    pub(crate) description: String,
+    pub(crate) key_state: String,
     /// `CUSTOMER` or `AWS` (the managed `alias/aws/s3` key).
-    key_manager: String,
-    creation_date: String,
+    pub(crate) key_manager: String,
+    pub(crate) creation_date: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    deletion_date: Option<String>,
+    pub(crate) deletion_date: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
-struct KmsAlias {
-    alias_name: String,
-    alias_arn: String,
-    target_key_id: String,
+pub(crate) struct KmsAlias {
+    pub(crate) alias_name: String,
+    pub(crate) alias_arn: String,
+    pub(crate) target_key_id: String,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
-struct Keyring {
+pub(crate) struct Keyring {
     #[serde(default)]
-    keys: Vec<KmsKey>,
+    pub(crate) keys: Vec<KmsKey>,
     #[serde(default)]
-    aliases: Vec<KmsAlias>,
+    pub(crate) aliases: Vec<KmsAlias>,
+}
+
+/// A key state change requested through `/_kms/*` or the KMS API.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Transition {
+    Enable,
+    Disable,
+    ScheduleDeletion { days: i64 },
+    CancelDeletion,
+}
+
+/// A refused keyring change: KMS error code and message (HTTP 400).
+pub(crate) type KeyringError = (&'static str, &'static str);
+
+impl KmsKey {
+    pub(crate) fn apply(&mut self, transition: Transition) -> Result<(), KeyringError> {
+        if self.key_manager == "AWS" {
+            return Err((
+                "UnsupportedOperationException",
+                "AWS managed keys cannot be changed",
+            ));
+        }
+        let pending = self.key_state == PENDING_DELETION;
+        match transition {
+            Transition::Enable | Transition::Disable if pending => {
+                return Err(("KMSInvalidStateException", "key is pending deletion"))
+            }
+            Transition::Enable => self.key_state = ENABLED.to_string(),
+            Transition::Disable => self.key_state = DISABLED.to_string(),
+            Transition::ScheduleDeletion { days } => {
+                if !(7..=30).contains(&days) {
+                    return Err(("ValidationException", "PendingWindowInDays must be 7..=30"));
+                }
+                self.key_state = PENDING_DELETION.to_string();
+                self.deletion_date = Some(crate::time_fmt::rfc3339_seconds_from_unix(
+                    unix_now() + days * 86_400,
+                ));
+            }
+            Transition::CancelDeletion if pending => {
+                self.key_state = DISABLED.to_string();
+                self.deletion_date = None;
+            }
+            Transition::CancelDeletion => {
+                return Err(("KMSInvalidStateException", "key is not pending deletion"))
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Why an SSE-KMS request was refused.
@@ -110,7 +160,7 @@ impl KmsError {
 }
 
 impl Keyring {
-    fn find_key(&self, key_ref: &str) -> Option<&KmsKey> {
+    pub(crate) fn find_key(&self, key_ref: &str) -> Option<&KmsKey> {
         let alias_name = if key_ref.starts_with("alias/") {
             Some(key_ref)
         } else if key_ref.starts_with("arn:") && key_ref.contains(":alias/") {
@@ -127,13 +177,13 @@ impl Keyring {
             .find(|k| k.key_id == key_ref || k.arn == key_ref)
     }
 
-    fn find_key_mut(&mut self, key_id: &str) -> Option<&mut KmsKey> {
+    pub(crate) fn find_key_mut(&mut self, key_id: &str) -> Option<&mut KmsKey> {
         self.keys
             .iter_mut()
             .find(|k| k.key_id == key_id || k.arn == key_id)
     }
 
-    fn create_key(&mut self, region: &str, description: &str, manager: &str) -> KmsKey {
+    pub(crate) fn create_key(&mut self, region: &str, description: &str, manager: &str) -> KmsKey {
         let seed = random_hex(description);
         let key_id = format!(
             "{}-{}-{}-{}-{}",
@@ -156,6 +206,28 @@ impl Keyring {
         key
     }
 
+    /// Validates and adds a customer alias for an existing key.
+    pub(crate) fn create_alias(
+        &mut self,
+        region: &str,
+        name: &str,
+        target: &str,
+    ) -> Result<KmsAlias, KeyringError> {
+        if !name.starts_with("alias/")
+            || name.starts_with("alias/aws/")
+            || name.len() <= "alias/".len()
+        {
+            return Err(("ValidationException", "invalid AliasName"));
+        }
+        if self.aliases.iter().any(|a| a.alias_name == name) {
+            return Err(("AlreadyExistsException", "alias already exists"));
+        }
+        let Some(key_id) = self.find_key(target).map(|k| k.key_id.clone()) else {
+            return Err(("NotFoundException", "key does not exist"));
+        };
+        Ok(self.add_alias(region, name, &key_id))
+    }
+
     fn add_alias(&mut self, region: &str, name: &str, target_key_id: &str) -> KmsAlias {
         let alias = KmsAlias {
             alias_name: name.to_string(),
@@ -167,7 +239,7 @@ impl Keyring {
     }
 }
 
-fn usable(key: &KmsKey) -> Result<(), KmsError> {
+pub(crate) fn usable(key: &KmsKey) -> Result<(), KmsError> {
     match key.key_state.as_str() {
         ENABLED => Ok(()),
         DISABLED => Err(KmsError::Disabled),
@@ -243,52 +315,23 @@ pub(crate) fn handle(root: &Path, req: &Request, auth: &AuthConfig) -> Response 
             }
         }
         ("POST", ["keys", id, action]) => {
+            let transition = match *action {
+                "enable" => Transition::Enable,
+                "disable" => Transition::Disable,
+                "schedule-deletion" => Transition::ScheduleDeletion {
+                    days: body
+                        .get("PendingWindowInDays")
+                        .and_then(Value::as_i64)
+                        .unwrap_or(30),
+                },
+                "cancel-deletion" => Transition::CancelDeletion,
+                _ => return json_error(404, "NotFound", "unknown KMS endpoint"),
+            };
             let Some(key) = keyring.find_key_mut(id) else {
                 return json_error(404, "NotFoundException", "key does not exist");
             };
-            if key.key_manager == "AWS" {
-                return json_error(
-                    400,
-                    "UnsupportedOperationException",
-                    "AWS managed keys cannot be changed",
-                );
-            }
-            let pending = key.key_state == PENDING_DELETION;
-            match *action {
-                "enable" | "disable" if pending => {
-                    return json_error(400, "KMSInvalidStateException", "key is pending deletion")
-                }
-                "enable" => key.key_state = ENABLED.to_string(),
-                "disable" => key.key_state = DISABLED.to_string(),
-                "schedule-deletion" => {
-                    let days = body
-                        .get("PendingWindowInDays")
-                        .and_then(Value::as_i64)
-                        .unwrap_or(30);
-                    if !(7..=30).contains(&days) {
-                        return json_error(
-                            400,
-                            "ValidationException",
-                            "PendingWindowInDays must be 7..=30",
-                        );
-                    }
-                    key.key_state = PENDING_DELETION.to_string();
-                    key.deletion_date = Some(crate::time_fmt::rfc3339_seconds_from_unix(
-                        unix_now() + days * 86_400,
-                    ));
-                }
-                "cancel-deletion" if pending => {
-                    key.key_state = DISABLED.to_string();
-                    key.deletion_date = None;
-                }
-                "cancel-deletion" => {
-                    return json_error(
-                        400,
-                        "KMSInvalidStateException",
-                        "key is not pending deletion",
-                    )
-                }
-                _ => return json_error(404, "NotFound", "unknown KMS endpoint"),
+            if let Err((code, message)) = key.apply(transition) {
+                return json_error(400, code, message);
             }
             json!({"KeyMetadata": key.clone()})
         }
@@ -298,20 +341,13 @@ pub(crate) fn handle(root: &Path, req: &Request, auth: &AuthConfig) -> Response 
                 .get("TargetKeyId")
                 .and_then(Value::as_str)
                 .unwrap_or("");
-            if !name.starts_with("alias/")
-                || name.starts_with("alias/aws/")
-                || name.len() <= "alias/".len()
-            {
-                return json_error(400, "ValidationException", "invalid AliasName");
+            match keyring.create_alias(region, name, target) {
+                Ok(alias) => json!({"AliasArn": alias.alias_arn}),
+                Err(("NotFoundException", message)) => {
+                    return json_error(404, "NotFoundException", message)
+                }
+                Err((code, message)) => return json_error(400, code, message),
             }
-            if keyring.aliases.iter().any(|a| a.alias_name == name) {
-                return json_error(400, "AlreadyExistsException", "alias already exists");
-            }
-            let Some(key_id) = keyring.find_key(target).map(|k| k.key_id.clone()) else {
-                return json_error(404, "NotFoundException", "key does not exist");
-            };
-            let alias = keyring.add_alias(region, name, &key_id);
-            json!({"AliasArn": alias.alias_arn})
         }
         _ => return json_error(404, "NotFound", "unknown KMS endpoint"),
     };
@@ -321,14 +357,14 @@ pub(crate) fn handle(root: &Path, req: &Request, auth: &AuthConfig) -> Response 
     json_response(200, &response)
 }
 
-fn load(root: &Path) -> Keyring {
+pub(crate) fn load(root: &Path) -> Keyring {
     std::fs::read(root.join(KEYRING_FILE))
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok())
         .unwrap_or_default()
 }
 
-fn save(root: &Path, keyring: &Keyring) -> std::io::Result<()> {
+pub(crate) fn save(root: &Path, keyring: &Keyring) -> std::io::Result<()> {
     let bytes = serde_json::to_vec_pretty(keyring).map_err(std::io::Error::other)?;
     write_file(root, KEYRING_FILE, &bytes)
 }

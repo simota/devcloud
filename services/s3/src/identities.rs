@@ -9,6 +9,11 @@
 //!   `POST /_iam/assume-role`, each with its role, optional session policy, and
 //!   expiry.
 //!
+//! The config can also hold customer managed policies (`ManagedPolicies`) that
+//! users and roles reference as their `PermissionsBoundary`, and service control
+//! policies (`ServiceControlPolicies`) attached to member accounts of a local
+//! organization whose management account is `000000000000`.
+//!
 //! In `strict` mode a request signed with a registry access key is verified with
 //! that key's secret and authorized as that principal (see `iam.rs`); session
 //! credentials also need a matching `x-amz-security-token` and must not be
@@ -45,6 +50,35 @@ pub struct IamConfig {
     pub users: Vec<IamUser>,
     #[serde(default)]
     pub roles: Vec<IamRole>,
+    /// Customer managed policies, referenced by ARN as permissions boundaries.
+    #[serde(default)]
+    pub managed_policies: Vec<ManagedPolicy>,
+    /// SCPs, each attached to member accounts of the local organization.
+    #[serde(default)]
+    pub service_control_policies: Vec<ServiceControlPolicy>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct ManagedPolicy {
+    pub policy_name: String,
+    #[serde(default = "owner_account")]
+    pub account: String,
+    pub policy_document: Value,
+}
+
+impl ManagedPolicy {
+    pub(crate) fn arn(&self) -> String {
+        format!("arn:aws:iam::{}:policy/{}", self.account, self.policy_name)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct ServiceControlPolicy {
+    pub policy_name: String,
+    pub target_accounts: Vec<String>,
+    pub policy_document: Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -58,6 +92,12 @@ pub struct IamUser {
     pub secret_access_key: String,
     #[serde(default)]
     pub policies: Vec<Value>,
+    /// ARN of a `ManagedPolicies` entry in the same account.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permissions_boundary: Option<String>,
+    /// Set when the config is written, if not given.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub create_date: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -72,18 +112,57 @@ pub struct IamRole {
     pub policies: Vec<Value>,
     #[serde(default = "default_max_session")]
     pub max_session_duration: i64,
+    /// ARN of a `ManagedPolicies` entry in the same account.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permissions_boundary: Option<String>,
+    /// Set when the config is written, if not given.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub create_date: String,
 }
 
 impl IamUser {
-    fn arn(&self) -> String {
+    pub(crate) fn arn(&self) -> String {
         format!("arn:aws:iam::{}:user/{}", self.account, self.user_name)
+    }
+
+    /// A stable `AIDA...` unique ID derived from the ARN.
+    pub(crate) fn user_id(&self) -> String {
+        unique_id("AIDA", &self.arn())
     }
 }
 
 impl IamRole {
-    fn arn(&self) -> String {
+    pub(crate) fn arn(&self) -> String {
         format!("arn:aws:iam::{}:role/{}", self.account, self.role_name)
     }
+
+    /// A stable `AROA...` unique ID derived from the ARN.
+    pub(crate) fn role_id(&self) -> String {
+        unique_id("AROA", &self.arn())
+    }
+}
+
+impl IamConfig {
+    fn boundary_doc(&self, arn: Option<&str>) -> Option<Value> {
+        let arn = arn?;
+        self.managed_policies
+            .iter()
+            .find(|p| p.arn() == arn)
+            .map(|p| p.policy_document.clone())
+    }
+
+    fn scps_for(&self, account: &str) -> Vec<Value> {
+        self.service_control_policies
+            .iter()
+            .filter(|scp| scp.target_accounts.iter().any(|a| a == account))
+            .map(|scp| scp.policy_document.clone())
+            .collect()
+    }
+}
+
+fn unique_id(prefix: &str, arn: &str) -> String {
+    let digest = hex::encode(Sha256::digest(arn.as_bytes()));
+    format!("{prefix}{}", digest[..17].to_ascii_uppercase())
 }
 
 fn owner_account() -> String {
@@ -126,8 +205,14 @@ pub struct Principal {
     pub principal_arn: String,
     /// `aws:username` (users only).
     pub user_name: String,
+    /// `AIDA...` for users, `AROA...:<session>` for sessions.
+    pub user_id: String,
     pub identity_policies: Vec<Value>,
     pub session_policy: Option<Value>,
+    /// The user's or role's permissions boundary document.
+    pub permissions_boundary: Option<Value>,
+    /// SCPs attached to the principal's account (empty: not restricted).
+    pub scps: Vec<Value>,
 }
 
 impl Principal {
@@ -200,8 +285,11 @@ pub(crate) fn resolve_access_key(root: &Path, access_key_id: &str) -> Option<Res
                 arn: user.arn(),
                 principal_arn: user.arn(),
                 user_name: user.user_name.clone(),
+                user_id: user.user_id(),
                 identity_policies: policy_docs(&user.policies),
                 session_policy: None,
+                permissions_boundary: config.boundary_doc(user.permissions_boundary.as_deref()),
+                scps: config.scps_for(&user.account),
             },
             session: None,
         });
@@ -224,8 +312,11 @@ pub(crate) fn resolve_access_key(root: &Path, access_key_id: &str) -> Option<Res
             ),
             principal_arn: role.arn(),
             user_name: String::new(),
+            user_id: format!("{}:{}", role.role_id(), session.session_name),
             identity_policies: policy_docs(&role.policies),
             session_policy: session.policy,
+            permissions_boundary: config.boundary_doc(role.permissions_boundary.as_deref()),
+            scps: config.scps_for(&role.account),
         },
         session: Some((session.session_token, session.expiration)),
     })
@@ -259,10 +350,7 @@ fn put_config(root: &Path, req: &Request, auth: &AuthConfig) -> Response {
     if let Err(message) = validate_config(&mut config, crate::auth::configured_access_key(auth)) {
         return json_error(400, "ValidationError", &message);
     }
-    let Ok(bytes) = serde_json::to_vec_pretty(&config) else {
-        return json_error(500, "InternalError", "could not encode IAM config");
-    };
-    if write_file(root, CONFIG_FILE, &bytes).is_err() {
+    if save_config(root, &config).is_err() {
         return json_error(500, "InternalError", "could not write IAM config");
     }
     json_response(
@@ -272,6 +360,27 @@ fn put_config(root: &Path, req: &Request, auth: &AuthConfig) -> Response {
 }
 
 fn validate_config(config: &mut IamConfig, owner_key: &str) -> Result<(), String> {
+    let now = crate::time_fmt::rfc3339_seconds_from_unix(unix_now());
+    let mut policy_arns = std::collections::BTreeSet::new();
+    for policy in &mut config.managed_policies {
+        if !valid_name(&policy.policy_name) || policy.policy_name.len() > 128 {
+            return Err(format!("invalid PolicyName {:?}", policy.policy_name));
+        }
+        if !valid_account(&policy.account) {
+            return Err(format!("invalid Account for policy {}", policy.policy_name));
+        }
+        if !policy_arns.insert(policy.arn()) {
+            return Err(format!("duplicate managed policy {}", policy.arn()));
+        }
+        policy.policy_document = policy_doc(&policy.policy_document)
+            .ok_or_else(|| format!("invalid PolicyDocument for policy {}", policy.policy_name))?;
+    }
+    let boundary_ok = |boundary: &Option<String>, account: &str| match boundary {
+        None => true,
+        Some(arn) => {
+            policy_arns.contains(arn) && arn.starts_with(&format!("arn:aws:iam::{account}:policy/"))
+        }
+    };
     let mut keys = std::collections::BTreeSet::new();
     for user in &mut config.users {
         if !valid_name(&user.user_name) {
@@ -293,6 +402,15 @@ fn validate_config(config: &mut IamConfig, owner_key: &str) -> Result<(), String
             ));
         }
         user.policies = normalize_policies(&user.policies)?;
+        if !boundary_ok(&user.permissions_boundary, &user.account) {
+            return Err(format!(
+                "PermissionsBoundary of user {} must name a ManagedPolicies entry in its account",
+                user.user_name
+            ));
+        }
+        if user.create_date.is_empty() {
+            user.create_date = now.clone();
+        }
     }
     let mut roles = std::collections::BTreeSet::new();
     for role in &mut config.roles {
@@ -317,54 +435,129 @@ fn validate_config(config: &mut IamConfig, owner_key: &str) -> Result<(), String
                 )
             })?);
         }
+        if !boundary_ok(&role.permissions_boundary, &role.account) {
+            return Err(format!(
+                "PermissionsBoundary of role {} must name a ManagedPolicies entry in its account",
+                role.role_name
+            ));
+        }
+        if role.create_date.is_empty() {
+            role.create_date = now.clone();
+        }
+    }
+    let mut scp_names = std::collections::BTreeSet::new();
+    for scp in &mut config.service_control_policies {
+        if !valid_name(&scp.policy_name) || !scp_names.insert(scp.policy_name.clone()) {
+            return Err(format!(
+                "invalid or duplicate SCP name {:?}",
+                scp.policy_name
+            ));
+        }
+        for account in &scp.target_accounts {
+            if !valid_account(account) {
+                return Err(format!(
+                    "invalid TargetAccounts entry in SCP {}",
+                    scp.policy_name
+                ));
+            }
+            if account == OWNER_ACCOUNT {
+                return Err(format!(
+                    "SCP {} cannot target the management account {OWNER_ACCOUNT}",
+                    scp.policy_name
+                ));
+            }
+        }
+        scp.policy_document = policy_doc(&scp.policy_document)
+            .ok_or_else(|| format!("invalid PolicyDocument for SCP {}", scp.policy_name))?;
     }
     Ok(())
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "PascalCase")]
-struct AssumeRoleInput {
-    role_arn: String,
-    role_session_name: String,
+pub(crate) struct AssumeRoleInput {
+    pub(crate) role_arn: String,
+    pub(crate) role_session_name: String,
     #[serde(default)]
-    policy: Option<Value>,
+    pub(crate) policy: Option<Value>,
     #[serde(default)]
-    duration_seconds: Option<i64>,
+    pub(crate) duration_seconds: Option<i64>,
 }
+
+/// Temporary credentials issued by [`issue_session`].
+pub(crate) struct IssuedSession {
+    pub(crate) access_key_id: String,
+    pub(crate) secret_access_key: String,
+    pub(crate) session_token: String,
+    pub(crate) expiration: String,
+    pub(crate) assumed_role_arn: String,
+    pub(crate) assumed_role_id: String,
+}
+
+/// Why [`issue_session`] refused: HTTP status, error code, message.
+pub(crate) type IssueError = (u16, &'static str, &'static str);
 
 fn assume_role(root: &Path, req: &Request, auth: &AuthConfig, caller: &Caller) -> Response {
     let input: AssumeRoleInput = match serde_json::from_slice(&req.body) {
         Ok(i) => i,
         Err(_) => return json_error(400, "ValidationError", "invalid AssumeRole JSON"),
     };
+    match issue_session(root, req, auth, caller, &input) {
+        Ok(session) => json_response(
+            200,
+            &json!({
+                "Credentials": {
+                    "AccessKeyId": session.access_key_id,
+                    "SecretAccessKey": session.secret_access_key,
+                    "SessionToken": session.session_token,
+                    "Expiration": session.expiration,
+                },
+                "AssumedRoleUser": {
+                    "Arn": session.assumed_role_arn,
+                    "AssumedRoleId": session.assumed_role_id,
+                },
+            }),
+        ),
+        Err((status, code, message)) => json_error(status, code, message),
+    }
+}
+
+/// `sts:AssumeRole` shared by `POST /_iam/assume-role` and the STS Query API.
+pub(crate) fn issue_session(
+    root: &Path,
+    req: &Request,
+    auth: &AuthConfig,
+    caller: &Caller,
+    input: &AssumeRoleInput,
+) -> Result<IssuedSession, IssueError> {
     let config = load_config(root);
     let Some(role) = config.roles.iter().find(|r| r.arn() == input.role_arn) else {
-        return json_error(404, "NoSuchEntity", "role does not exist");
+        return Err((404, "NoSuchEntity", "role does not exist"));
     };
     if !valid_session_name(&input.role_session_name) {
-        return json_error(400, "ValidationError", "invalid RoleSessionName");
+        return Err((400, "ValidationError", "invalid RoleSessionName"));
     }
     let duration = input.duration_seconds.unwrap_or(3600);
     if duration < MIN_SESSION_SECONDS || duration > role.max_session_duration {
-        return json_error(
+        return Err((
             400,
             "ValidationError",
             "DurationSeconds exceeds the role's MaxSessionDuration or is below 900",
-        );
+        ));
     }
     let policy = match &input.policy {
         None => None,
         Some(doc) => match policy_doc(doc) {
             Some(doc) => Some(doc),
-            None => return json_error(400, "MalformedPolicyDocument", "invalid session Policy"),
+            None => return Err((400, "MalformedPolicyDocument", "invalid session Policy")),
         },
     };
     if auth.auth_mode.eq_ignore_ascii_case("strict") && !may_assume(role, req, caller) {
-        return json_error(
+        return Err((
             403,
             "AccessDenied",
             "not authorized to perform sts:AssumeRole",
-        );
+        ));
     }
 
     let now = unix_now();
@@ -385,29 +578,22 @@ fn assume_role(root: &Path, req: &Request, auth: &AuthConfig, caller: &Caller) -
     sessions.sessions.retain(|s| s.expiration > now);
     sessions.sessions.push(session.clone());
     let Ok(bytes) = serde_json::to_vec_pretty(&sessions) else {
-        return json_error(500, "InternalError", "could not encode sessions");
+        return Err((500, "InternalError", "could not encode sessions"));
     };
     if write_file(root, SESSIONS_FILE, &bytes).is_err() {
-        return json_error(500, "InternalError", "could not write sessions");
+        return Err((500, "InternalError", "could not write sessions"));
     }
-    json_response(
-        200,
-        &json!({
-            "Credentials": {
-                "AccessKeyId": session.access_key_id,
-                "SecretAccessKey": session.secret_access_key,
-                "SessionToken": session.session_token,
-                "Expiration": crate::time_fmt::rfc3339_seconds_from_unix(session.expiration),
-            },
-            "AssumedRoleUser": {
-                "Arn": format!(
-                    "arn:aws:sts::{}:assumed-role/{}/{}",
-                    role.account, role.role_name, session.session_name
-                ),
-                "AssumedRoleId": format!("AROA{}:{}", &seed[16..32].to_ascii_uppercase(), session.session_name),
-            },
-        }),
-    )
+    Ok(IssuedSession {
+        assumed_role_arn: format!(
+            "arn:aws:sts::{}:assumed-role/{}/{}",
+            role.account, role.role_name, session.session_name
+        ),
+        assumed_role_id: format!("{}:{}", role.role_id(), session.session_name),
+        expiration: crate::time_fmt::rfc3339_seconds_from_unix(session.expiration),
+        access_key_id: session.access_key_id,
+        secret_access_key: session.secret_access_key,
+        session_token: session.session_token,
+    })
 }
 
 /// The role's trust policy must allow the caller; a caller from another
@@ -420,6 +606,12 @@ fn may_assume(role: &IamRole, req: &Request, caller: &Caller) -> bool {
     if !crate::iam::trust_allows(trust, &role_arn, req, caller) {
         return false;
     }
+    // SCPs of the caller's account limit sts:AssumeRole like any other action.
+    if let Caller::Iam(p) = caller {
+        if !crate::iam::scps_allow(p, req, "sts:AssumeRole", &role_arn, caller) {
+            return false;
+        }
+    }
     match caller {
         Caller::Iam(p) if p.account != role.account => {
             crate::iam::identity_allows(p, req, "sts:AssumeRole", &role_arn, caller)
@@ -428,11 +620,16 @@ fn may_assume(role: &IamRole, req: &Request, caller: &Caller) -> bool {
     }
 }
 
-fn load_config(root: &Path) -> IamConfig {
+pub(crate) fn load_config(root: &Path) -> IamConfig {
     std::fs::read(root.join(CONFIG_FILE))
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok())
         .unwrap_or_default()
+}
+
+pub(crate) fn save_config(root: &Path, config: &IamConfig) -> std::io::Result<()> {
+    let bytes = serde_json::to_vec_pretty(config).map_err(std::io::Error::other)?;
+    write_file(root, CONFIG_FILE, &bytes)
 }
 
 fn load_sessions(root: &Path) -> SessionFile {
